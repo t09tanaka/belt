@@ -18,7 +18,7 @@ use crate::frozen::{
 use crate::source::{self, SourceInfo, SourceKind, SourceManifest};
 use crate::{cache, config, exec, filter, git, plan, reclaim, report, setup, workflow};
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What the caller wants told while a run goes on.
 pub trait Observer {
@@ -424,18 +424,77 @@ pub fn claim_run_dir(runs: &std::path::Path, stamp: u64, sha7: &str) -> Result<P
     unreachable!("a counter that does not end")
 }
 
-fn prune_runs(dir: &std::path::Path, keep: usize) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+/// How long a run directory without `result.json` is left alone: it may be
+/// that of a run still going on.
+const UNFINISHED_SECS: u64 = 24 * 3600;
+/// How long the runs of a worktree that an earlier version recorded (no
+/// `root` in them) are kept when no run writes to them.
+const UNRECORDED_SECS: u64 = 7 * 24 * 3600;
+
+/// Keep, for each worktree under `all`, only the run its `last` names, and
+/// drop the runs of the worktrees that are gone. `mine` is the directory of
+/// the worktree this run is of, at `root`: it is recorded there, so a later
+/// run can tell when it is gone (the name of the directory cannot say).
+///
+/// Only `local-ci status` reads a run, the one `last` names; the others are
+/// logs nothing reads. A run directory without `result.json` is not touched
+/// for a day, as a run of the same worktree may still be writing it.
+fn prune_runs(all: &Path, mine: &Path, root: &Path, now: std::time::SystemTime) {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let _ = std::fs::write(mine.join("root"), root.as_os_str().as_bytes());
+    let age = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map_or(0, |d| d.as_secs())
     };
-    let mut runs: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
+    for e in std::fs::read_dir(all).into_iter().flatten().flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = e.path();
+        let gone = match std::fs::read(dir.join("root")) {
+            Ok(r) => {
+                std::fs::symlink_metadata(PathBuf::from(std::ffi::OsString::from_vec(r))).is_err()
+            }
+            // recorded by no run of this version: dropped once unused
+            Err(_) => dir != mine && age(&dir.join("last")).max(age(&dir)) > UNRECORDED_SECS,
+        };
+        if gone {
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        keep_last_run(&dir, |p| age(p) > UNFINISHED_SECS);
+    }
+}
+
+/// Remove the runs in `dir` but the one `last` names (the newest finished
+/// one when there is no `last`), and leave those without `result.json`
+/// unless `stale`.
+fn keep_last_run(dir: &Path, stale: impl Fn(&Path) -> bool) {
+    let runs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
         .collect();
-    runs.sort();
-    if runs.len() > keep {
-        for p in &runs[..runs.len() - keep] {
+    let finished = |p: &Path| p.join("result.json").is_file();
+    let keep = std::fs::read_to_string(dir.join("last"))
+        .ok()
+        .and_then(|l| Path::new(l.trim()).file_name().map(|n| n.to_owned()))
+        .or_else(|| {
+            runs.iter()
+                .filter(|p| finished(p))
+                .max()
+                .and_then(|p| p.file_name().map(|n| n.to_owned()))
+        });
+    for p in &runs {
+        if p.file_name() == keep.as_deref() {
+            continue;
+        }
+        if finished(p) || stale(p) {
             let _ = std::fs::remove_dir_all(p);
         }
     }
@@ -896,7 +955,12 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let result = report::RunResult { cpu, ..result };
     exec::write_json(&run_dir.join("result.json"), &result)?;
     std::fs::write(runs.join("last"), run_dir.to_string_lossy().as_bytes())?;
-    prune_runs(&runs, 20);
+    prune_runs(
+        &cache.join("runs"),
+        &runs,
+        &root,
+        std::time::SystemTime::now(),
+    );
     let cancelled = ctx.cancel.is_cancelled();
     Ok(RunReport {
         result,
@@ -1033,6 +1097,91 @@ mod tests {
     }
 
     use super::*;
+
+    fn finished_run(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::create_dir_all(p.join("job")).unwrap();
+        std::fs::write(p.join("result.json"), "{}").unwrap();
+        p
+    }
+
+    fn set_age(p: &Path, secs: u64) {
+        std::fs::File::open(p)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn only_the_last_run_of_each_worktree_is_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let all = t.path().join("runs");
+        let wt = t.path().join("wt-a");
+        std::fs::create_dir_all(&wt).unwrap();
+        let mine = all.join("wt-a-0000aaaa");
+        let old = finished_run(&mine, "100-abcdef0");
+        // a run of the same worktree that finished first but started later
+        let later = finished_run(&mine, "200-abcdef0");
+        let last = finished_run(&mine, "150-abcdef0");
+        std::fs::write(mine.join("last"), last.to_string_lossy().as_bytes()).unwrap();
+        // one still going on, and one a killed run left a day ago
+        let going = mine.join("300-abcdef0");
+        std::fs::create_dir_all(&going).unwrap();
+        let killed = mine.join("50-abcdef0");
+        std::fs::create_dir_all(&killed).unwrap();
+        set_age(&killed, UNFINISHED_SECS + 60);
+
+        prune_runs(&all, &mine, &wt, std::time::SystemTime::now());
+
+        assert!(last.exists() && going.exists());
+        assert!(!old.exists() && !later.exists() && !killed.exists());
+        assert_eq!(
+            std::fs::read_to_string(mine.join("root")).unwrap(),
+            wt.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_runs_of_a_worktree_that_is_gone_are_dropped() {
+        let t = tempfile::tempdir().unwrap();
+        let all = t.path().join("runs");
+        let wt = t.path().join("here");
+        std::fs::create_dir_all(&wt).unwrap();
+        let mine = all.join("here-0000aaaa");
+        finished_run(&mine, "100-abcdef0");
+        // recorded, and its worktree is gone
+        let gone = all.join("gone-0000bbbb");
+        finished_run(&gone, "100-abcdef0");
+        std::fs::write(
+            gone.join("root"),
+            t.path().join("gone").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        // recorded, and its worktree is there: keeps its newest run
+        let other_wt = t.path().join("other");
+        std::fs::create_dir_all(&other_wt).unwrap();
+        let other = all.join("other-0000cccc");
+        let o1 = finished_run(&other, "100-abcdef0");
+        let o2 = finished_run(&other, "200-abcdef0");
+        std::fs::write(other.join("root"), other_wt.to_string_lossy().as_bytes()).unwrap();
+        // by an earlier version: one unused for a week, one in use
+        let stale = all.join("stale-0000dddd");
+        finished_run(&stale, "100-abcdef0");
+        std::fs::write(stale.join("last"), "x").unwrap();
+        set_age(&stale.join("last"), UNRECORDED_SECS + 60);
+        set_age(&stale, UNRECORDED_SECS + 60);
+        let fresh = all.join("fresh-0000eeee");
+        finished_run(&fresh, "100-abcdef0");
+        // what is not a directory is not touched
+        std::fs::write(all.join("notes.txt"), "x").unwrap();
+
+        prune_runs(&all, &mine, &wt, std::time::SystemTime::now());
+
+        assert!(mine.exists() && !gone.exists() && !stale.exists());
+        assert!(!o1.exists() && o2.exists());
+        assert!(fresh.join("100-abcdef0").exists());
+        assert!(all.join("notes.txt").exists());
+    }
 
     #[test]
     fn two_runs_of_one_commit_in_one_second_get_directories_of_their_own() {

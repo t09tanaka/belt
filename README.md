@@ -822,9 +822,9 @@ The cache directory is `~/Library/Caches/local-ci` on macOS and
 `$XDG_CACHE_HOME/local-ci` (or `~/.cache/local-ci`) elsewhere; set
 `LOCAL_CI_HOME` to move it. `LOCAL_CI_HOME` must be an absolute path (an empty
 or relative one is refused), and should be a directory of local-ci's own. It holds the worktrees while they run
-(`wt/<sha>-<pid>`, one `wt/<sha>-u<n>-<pid>` per unit and one `wt/<sha>-c<n>-<pid>` per matrix entry run at once), the last 20
-runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
-`result.json`), the results that may be reused (`results/<repo>/`, a day at
+(`wt/<sha>-<pid>`, one `wt/<sha>-u<n>-<pid>` per unit and one `wt/<sha>-c<n>-<pid>` per matrix entry run at once), the last run
+of each worktree (`runs/<repo>/<time>-<sha>/` with one log per step and
+`result.json`; the runs of a worktree that is gone are dropped), the results that may be reused (`results/<repo>/`, a day at
 most), and the locks.
 
 Nothing a job builds is kept from one run to the next: each run checks the
