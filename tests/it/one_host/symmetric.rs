@@ -734,3 +734,116 @@ async fn a54_a_stopped_member_stalls_only_its_own_runs_and_the_others_end_on_the
     g.succeeded_once(&after[0]);
     assert_eq!(g.only(&after[0]).worker_id.as_str(), "m-b");
 }
+
+/// The sending member keeps its own database while the target's resident
+/// rolls back. In the fixture the trial runs on a SQLite snapshot, and
+/// rollback boots the previous worker database again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a57_an_unconfirmed_retire_survives_the_other_members_rollback() {
+    use belt::worker::control::{self, Control};
+
+    let mut g = group(&["sender", "target"], None);
+    g.start(0, &[]).await;
+    let id = g.members[1].id.clone();
+    let faults = Arc::new(Faults::default());
+    let client = g.connected(0, 1).await.unwrap().client;
+    let delayed_link = Arc::new(FaultLink {
+        inner: ClientLink::new(client, Duration::from_secs(30)),
+        faults: faults.clone(),
+    });
+    faults.lose(Operation::SubmitAttempt, Lost::Request);
+    g.c(0).attach(id.clone(), delayed_link.clone()).await;
+    let probe = g.submit(0, 1, "exit 0").await.remove(0);
+    g.c(0).tick().await.unwrap();
+    let first = g.only(&probe);
+    assert_eq!(first.worker_id, id);
+    let demand = g.c(0).store().unacked_demand().unwrap().remove(0);
+    let late = SubmitAttemptRequest::new(
+        RequestId::generate(),
+        g.c(0).epoch(),
+        first.attempt_id.clone(),
+        serde_json::from_value(demand.demand["payload"].clone()).unwrap(),
+    )
+    .unwrap();
+    g.c(0).detach(&id).await.unwrap();
+    drop(delayed_link);
+    g.members[1].agent.shutdown();
+
+    let trial = worker_agent::fx_named(id.as_str());
+    let state = trial.path("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let saved = g.members[1].fx.path("state/worker.db");
+    rusqlite::Connection::open(&saved)
+        .unwrap()
+        .execute(
+            "VACUUM INTO ?1",
+            [state.join("worker.db").to_str().unwrap()],
+        )
+        .unwrap();
+    control::begin_trial(&state).unwrap();
+    g.members[1].agent = trial.start("trial");
+    let trial_faults = Arc::new(Faults::default());
+    let trial_client = g.connected(0, 1).await.unwrap().client;
+    g.c(0)
+        .attach(
+            id.clone(),
+            Arc::new(FaultLink {
+                inner: ClientLink::new(trial_client, Duration::from_secs(30)),
+                faults: trial_faults.clone(),
+            }),
+        )
+        .await;
+    g.c(0)
+        .request_retire(&first.attempt_id, "move")
+        .await
+        .unwrap();
+    for sends in 1..=2 {
+        let report = g.c(0).tick().await.unwrap();
+        assert!(report.placed.is_empty() && report.retired.is_empty());
+        assert_eq!(trial_faults.arrived(Operation::RetireAttempt), sends);
+        assert!(!g.only(&probe).retired);
+        assert!(matches!(
+            g.c(0).store().retire_tombstone(&first.attempt_id).unwrap(),
+            Some((_, None))
+        ));
+        assert!(trial
+            .store()
+            .for_member(g.c(0).store().coordinator_id())
+            .tombstone(&first.attempt_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(probe.starts(), 0);
+    }
+
+    g.c(0).detach(&id).await.unwrap();
+    g.members[1].agent.shutdown();
+    g.members[1].agent = g.members[1].fx.start("restored");
+    let restored_state = &g.members[1].agent.config().state_dir;
+    control::write(restored_state, Control::draining()).unwrap();
+    g.link(0, 1).await;
+    g.link(0, 0).await;
+    let report = g.c(0).tick().await.unwrap();
+    assert_eq!(report.retired, [first.attempt_id.clone()]);
+    assert!(g.members[1]
+        .store()
+        .for_member(g.c(0).store().coordinator_id())
+        .tombstone(&first.attempt_id)
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        g.c(0).store().retire_tombstone(&first.attempt_id).unwrap(),
+        Some((_, Some(_)))
+    ));
+    control::write(restored_state, Control::default()).unwrap();
+    let client = g.connected(0, 1).await.unwrap().client;
+    let link = ClientLink::new(client, Duration::from_secs(30));
+    assert!(matches!(link.call(Request::SubmitAttempt(late)).await,
+        Err(LinkError::Remote(e)) if e.code == ErrorCode::Retired));
+    g.settle(&[&probe]).await;
+    let all = attempts(g.c(0), &probe.task);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].worker_id, g.members[0].id);
+    assert_eq!(all[1].generation, Generation(2));
+    assert_eq!(report.placed, [all[1].attempt_id.clone()]);
+    g.succeeded_once(&probe);
+}
