@@ -130,47 +130,15 @@ pub async fn command_with_mode(
             invalid(error.to_string())
         }
     })?;
-    let (toolchains, resolution_guard) = {
-        let capture_context = context.clone();
-        let manifest = captured.manifest.clone();
-        let source_digest = digest.clone();
-        let requirements = requirements.clone();
-        tokio::task::spawn_blocking(move || {
-            // Blocking source IO retains ownership even when the submit future
-            // is cancelled. Return the guard only after that IO has drained.
-            let frozen =
-                freeze_toolchains(&capture_context, &manifest, source_digest, &requirements);
-            (frozen, resolution_guard)
-        })
-        .await
-        .map_err(|e| invalid(e.to_string()))?
-    };
-    let toolchains = match toolchains? {
-        Some(bundle) if bundle.validate(&digest).is_err() => {
-            match owner
-                .request(Operation::ResolveToolchains {
-                    bundle,
-                    requirements: requirements.clone(),
-                })
-                .await
-                .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
-            {
-                Reply::ResolvedToolchains { bundle } => {
-                    bundle.validate(&digest).map_err(|e| invalid(e.into()))?;
-                    Some(bundle)
-                }
-                Reply::ControlError { error } => return Err(error),
-                _ => {
-                    return Err(ApiError::blocked(
-                        crate::error::BlockedReason::EnvironmentMismatch,
-                        "toolchain resolve required",
-                    ))
-                }
-            }
-        }
-        other => other,
-    };
-    drop(resolution_guard);
+    let toolchains = freeze_resolved(
+        &context,
+        &owner,
+        &captured.manifest,
+        &digest,
+        &requirements,
+        resolution_guard,
+    )
+    .await?;
     let env = context
         .config
         .pass_env
@@ -338,6 +306,61 @@ pub async fn command_with_mode(
             "unexpected submit receipt",
         )),
     }
+}
+
+/// The toolchain selection a task of this source carries: frozen from the
+/// version declarations the capture holds, and, when the evidence is not
+/// complete, resolved once by the owner's worker. `guard` keeps the captured
+/// source alive until that is done. A plain command and a CI run use this one
+/// path, so the same source freezes to the same bundle.
+pub(super) async fn freeze_resolved(
+    context: &Context,
+    owner: &super::resident::Client,
+    manifest: &crate::source::manifest::SourceManifest,
+    digest: &Digest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    guard: crate::source::retention::Guard,
+) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+    let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+    let (frozen, guard) = {
+        let (context, manifest) = (context.clone(), manifest.clone());
+        let (digest, requirements) = (digest.clone(), requirements.clone());
+        tokio::task::spawn_blocking(move || {
+            // Blocking source IO retains ownership even when the submit future
+            // is cancelled. Return the guard only after that IO has drained.
+            let frozen = freeze_toolchains(&context, &manifest, digest, &requirements);
+            (frozen, guard)
+        })
+        .await
+        .map_err(|e| invalid(e.to_string()))?
+    };
+    let toolchains = match frozen? {
+        Some(bundle) if bundle.validate(digest).is_err() => {
+            match owner
+                .request(Operation::ResolveToolchains {
+                    bundle,
+                    requirements: requirements.clone(),
+                })
+                .await
+                .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
+            {
+                Reply::ResolvedToolchains { bundle } => {
+                    bundle.validate(digest).map_err(|e| invalid(e.into()))?;
+                    Some(bundle)
+                }
+                Reply::ControlError { error } => return Err(error),
+                _ => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        "toolchain resolve required",
+                    ))
+                }
+            }
+        }
+        other => other,
+    };
+    drop(guard);
+    Ok(toolchains)
 }
 
 fn freeze_toolchains(
