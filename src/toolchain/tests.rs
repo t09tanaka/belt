@@ -1544,3 +1544,202 @@ fn requirements_name_tool_and_version_in_order() {
         "node=20.0.0, rust=1.80.0"
     );
 }
+
+#[test]
+fn one_context_reference_is_read_and_nothing_else_is() {
+    assert_eq!(
+        context_reference("${{ matrix.node }}"),
+        Some(("matrix", "node"))
+    );
+    // Spaces do not matter; a key may hold letters, digits, `_` and `-`.
+    assert_eq!(
+        context_reference("  ${{env.NODE_v-1}} "),
+        Some(("env", "NODE_v-1"))
+    );
+    assert_eq!(
+        context_reference("${{ my-ctx_2.k }}"),
+        Some(("my-ctx_2", "k"))
+    );
+    for other in [
+        "matrix.node",
+        "${{ matrix.node",
+        "matrix.node }}",
+        "${{ matrix }}",
+        "${{ .node }}",
+        "${{ matrix. }}",
+        "${{ matrix.a.b }}",
+        "${{ matrix.node || 20 }}",
+        "${{ ma trix.node }}",
+        "${{ matrix.no de }}",
+        "v${{ matrix.node }}",
+        "${{ matrix.node }}.x",
+        "${{ fromJSON(matrix.node) }}",
+    ] {
+        assert_eq!(context_reference(other), None, "{other}");
+    }
+}
+
+fn step_decl(tool: &str, raw: &str, workflow: &str, job: &str, step: usize) -> Declaration {
+    Declaration {
+        tool: ToolId::parse(tool).unwrap(),
+        constraint: Constraint::parse(raw).unwrap(),
+        scope: Scope {
+            project: "".into(),
+            workflow: Some(workflow.into()),
+            job: Some(job.into()),
+            step: Some(step),
+        },
+        location: Location {
+            path: workflow.into(),
+            first_line: step + 5,
+            last_line: step + 5,
+        },
+    }
+}
+fn task_scope(workflow: &str, job: &str) -> Scope {
+    Scope {
+        project: "".into(),
+        workflow: Some(workflow.into()),
+        job: Some(job.into()),
+        step: None,
+    }
+}
+
+#[test]
+fn a_task_takes_the_project_declarations_and_those_of_its_own_jobs() {
+    let none = |_: &Scope, _: &str, _: &str| -> Option<String> { None };
+    let mut elsewhere = decl("18.0.0");
+    elsewhere.scope = Scope::project("sub");
+    let all = [
+        decl("20.0.0"),
+        elsewhere,
+        step_decl("python", "3.12.0", "ci.yml", "build", 0),
+        step_decl("go", "1.22.0", "ci.yml", "other", 2),
+        step_decl("ruby", "3.3.0", "other.yml", "build", 0),
+    ];
+    let narrowed = |d: &Declaration, job: &str| Declaration {
+        scope: task_scope("ci.yml", job),
+        ..d.clone()
+    };
+    // One job: the project file and that job only, in the order they were read.
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &["build".into()], &none).unwrap();
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(got, [all[0].clone(), narrowed(&all[2], "build")]);
+    let required = effective(&got, &scope).unwrap();
+    let tools: Vec<&str> = required.iter().map(|r| r.tool.as_str()).collect();
+    assert_eq!(tools, ["node", "python"]);
+    // Jobs grouped into one task: the union, in one scope that names them all.
+    let jobs = ["build".to_string(), "other".to_string()];
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &jobs, &none).unwrap();
+    assert_eq!(scope, task_scope("ci.yml", "build,other"));
+    assert_eq!(
+        got,
+        [
+            all[0].clone(),
+            narrowed(&all[2], "build,other"),
+            narrowed(&all[3], "build,other")
+        ]
+    );
+    // A task without a setup declaration is frozen exactly as the project is.
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &["lint".into()], &none).unwrap();
+    assert_eq!(scope, Scope::project(""));
+    assert_eq!(got, [all[0].clone()]);
+    assert_eq!(
+        effective(&got, &scope).unwrap(),
+        effective(&all, &Scope::project("")).unwrap()
+    );
+    // The same job id in another workflow is another job.
+    let (scope, got) = task_declarations(&all, "", "other.yml", &["build".into()], &none).unwrap();
+    assert_eq!(scope, task_scope("other.yml", "build"));
+    let mut other = all[4].clone();
+    other.scope = task_scope("other.yml", "build");
+    assert_eq!(got, [all[0].clone(), other]);
+}
+
+#[test]
+fn two_versions_of_a_tool_in_one_task_contradict_with_both_locations() {
+    let none = |_: &Scope, _: &str, _: &str| -> Option<String> { None };
+    let all = [
+        step_decl("node", "18.0.0", "ci.yml", "a", 0),
+        step_decl("node", "20.0.0", "ci.yml", "b", 3),
+    ];
+    // Each step alone is consistent, as `workers sync` reads them.
+    for d in &all {
+        assert!(effective(&all, &d.scope).is_ok());
+    }
+    let jobs = ["a".to_string(), "b".to_string()];
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &jobs, &none).unwrap();
+    let conflict = effective(&got, &scope).unwrap_err();
+    assert_eq!(conflict.code, "conflicting_versions");
+    assert_eq!(
+        conflict.locations,
+        [all[0].location.clone(), all[1].location.clone()]
+    );
+    // A project file and a step that disagree contradict as well.
+    let all = [
+        decl("22.0.0"),
+        step_decl("node", "20.0.0", "ci.yml", "a", 0),
+    ];
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &["a".into()], &none).unwrap();
+    assert_eq!(effective(&got, &scope).unwrap_err().locations.len(), 2);
+}
+
+#[test]
+fn a_reference_takes_the_value_of_its_step_and_anything_else_is_unresolved() {
+    let reference = step_decl("node", "${{ matrix.node }}", "ci.yml", "build", 1);
+    let all = [reference.clone()];
+    let jobs = ["build".to_string()];
+    // The lookup is asked with the step the input is written in.
+    let variant = |scope: &Scope, context: &str, key: &str| {
+        (scope.step == Some(1) && scope.job.as_deref() == Some("build"))
+            .then(|| format!("{context}.{key}"))
+            .filter(|asked| asked == "matrix.node")
+            .map(|_| "18.0.0".to_string())
+    };
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &jobs, &variant).unwrap();
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].constraint, Constraint::parse("18.0.0").unwrap());
+    assert_eq!(got[0].location, reference.location);
+    assert_eq!(
+        effective(&got, &scope).unwrap()[0].describe(),
+        "node=18.0.0"
+    );
+    let unresolved = |d: &Declaration, text: &str| Unresolved {
+        tool: d.tool.clone(),
+        expression: text.into(),
+        location: d.location.clone(),
+    };
+    // A key the variant lacks.
+    let none = |_: &Scope, _: &str, _: &str| -> Option<String> { None };
+    assert_eq!(
+        task_declarations(&all, "", "ci.yml", &jobs, &none).unwrap_err(),
+        unresolved(&reference, "${{ matrix.node }}")
+    );
+    // A value that is no version, or is an expression again.
+    for value in ["a\nb", "${{ matrix.other }}"] {
+        let bad = |_: &Scope, _: &str, _: &str| Some(value.to_string());
+        assert_eq!(
+            task_declarations(&all, "", "ci.yml", &jobs, &bad).unwrap_err(),
+            unresolved(&reference, "${{ matrix.node }}"),
+            "{value}"
+        );
+    }
+    // Any other expression is not looked up at all.
+    let any = |_: &Scope, _: &str, _: &str| Some("18.0.0".to_string());
+    let other = step_decl("node", "${{ matrix.node || 20 }}", "ci.yml", "build", 0);
+    assert_eq!(
+        task_declarations(std::slice::from_ref(&other), "", "ci.yml", &jobs, &any).unwrap_err(),
+        unresolved(&other, "${{ matrix.node || 20 }}")
+    );
+    // A version file whose path is an expression names no file to read.
+    let mut file = reference.clone();
+    file.constraint = Constraint::VersionFileExpression("${{ matrix.file }}".into());
+    assert_eq!(
+        task_declarations(std::slice::from_ref(&file), "", "ci.yml", &jobs, &any).unwrap_err(),
+        unresolved(&file, "${{ matrix.file }}")
+    );
+    // An expression of a job the task does not run does not concern it.
+    let (scope, got) = task_declarations(&all, "", "ci.yml", &["lint".into()], &none).unwrap();
+    assert_eq!((scope, got), (Scope::project(""), vec![]));
+}

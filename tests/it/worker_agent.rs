@@ -4802,6 +4802,90 @@ async fn a_ci_task_runs_under_the_agent_and_its_supervisor_and_hands_its_result_
     assert_eq!(ci.f.wait_terminal(&alone), Outcome::Failed);
 }
 
+const SETUP_WORKFLOW: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 20.0.0\n      - run: echo built\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo plain\n";
+
+/// The worker reads again what the task's own job declares (the workflow and
+/// the job come from the delivered plan) and refuses a bundle the parent
+/// froze from anything else: another scope, another version, or the
+/// requirement of a job the task does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_whose_bundle_is_not_what_its_own_job_declares_is_refused() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let ci = ci_fx(SETUP_WORKFLOW);
+    let file = ".github/workflows/ci.yml";
+    let job = |id: &str| Scope {
+        project: "".into(),
+        workflow: Some(file.into()),
+        job: Some(id.into()),
+        step: None,
+    };
+    let bundle = |scope: &Scope, version: &str, path: &str, line: usize| {
+        let frozen = FrozenToolchains::freeze(
+            ci.base.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse(version).unwrap(),
+                scope: scope.clone(),
+                location: Location {
+                    path: path.into(),
+                    first_line: line,
+                    last_line: line,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        FrozenBundle::seal_exact(frozen).unwrap()
+    };
+    // The check the host makes before it builds the workspace of the attempt.
+    let state = ci.f.state();
+    let store = belt::source::SourceStore::open(&state).unwrap();
+    let source = belt::source::classify::ci_id_of(&ci.base.source_id).unwrap();
+    let manifest = store.manifest(&source).unwrap().unwrap();
+    let why = |task: &str, bundle: FrozenBundle| {
+        let mut p = ci.payload(task);
+        p.toolchains = Some(Box::new(bundle));
+        let checked = belt::worker::machine::check_toolchain_source(&store, &state, &manifest, &p);
+        async move { checked.map_or_else(|e| e.message, |()| "accepted".to_string()) }
+    };
+    // Frozen as a plain command would be, although the job has a setup step.
+    let text = why(
+        "build",
+        bundle(&Scope::project(""), "20.0.0", ".node-version", 1),
+    )
+    .await;
+    assert!(text.contains("toolchain source scope mismatch"), "{text}");
+    // The job's scope, another version than the step names.
+    let text = why("build", bundle(&job("build"), "18.0.0", file, 8)).await;
+    assert!(
+        text.contains("toolchain source declarations mismatch"),
+        "{text}"
+    );
+    // The requirement of `build` on a task that runs `plain`.
+    let text = why("plain", bundle(&job("build"), "20.0.0", file, 8)).await;
+    assert!(text.contains("toolchain source scope mismatch"), "{text}");
+    // What the job declares, and what a job without a setup step declares.
+    let text = why("build", bundle(&job("build"), "20.0.0", file, 8)).await;
+    assert_eq!(text, "accepted");
+    let mut none = bundle(&Scope::project(""), "20.0.0", ".node-version", 1);
+    none.frozen.requirements.clear();
+    none.frozen.selections.clear();
+    none.evidence.clear();
+    assert_eq!(why("plain", none.clone()).await, "accepted");
+    assert!(why("build", none).await.contains("scope mismatch"));
+    // Without the plan the worker cannot tell which job the task runs.
+    let mut p = ci.payload("build");
+    p.toolchains = Some(Box::new(bundle(&job("build"), "20.0.0", file, 8)));
+    p.ci_task.as_mut().unwrap().plan_digest = Digest::of_bytes(b"never delivered");
+    let refused =
+        belt::worker::machine::check_toolchain_source(&store, &state, &manifest, &p).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::NotFound);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ci_task_with_service_containers_is_refused_before_it_is_stored() {
     let ci = ci_fx(

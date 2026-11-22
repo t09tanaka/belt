@@ -229,13 +229,14 @@ pub fn task_specs(
         .collect()
 }
 
-/// Every task of the run carries the run's frozen toolchain selection.
+/// Every task of the run carries its own frozen toolchain selection:
+/// `toolchains` is in the order of the plan's tasks, as `specs` is.
 pub(crate) fn with_toolchains(
     specs: &mut [(String, TaskSpec)],
-    toolchains: Option<&crate::toolchain::contract::FrozenBundle>,
+    toolchains: Vec<Option<crate::toolchain::contract::FrozenBundle>>,
 ) {
-    for (_, spec) in specs {
-        spec.toolchains = toolchains.cloned();
+    for ((_, spec), bundle) in specs.iter_mut().zip(toolchains) {
+        spec.toolchains = bundle;
     }
 }
 
@@ -301,19 +302,21 @@ pub async fn submit(
         &requirements,
         timeout,
     )?;
-    // Frozen once for the run, from the same declarations a plain command of
-    // this source would freeze; every task carries it, and the worker
-    // activates it before the job's steps.
-    let toolchains = super::submit::freeze_resolved(
+    // Frozen once for the run: the declarations a plain command of this
+    // source would freeze, and for each task the `setup-*` inputs of its own
+    // jobs. Every task carries its bundle, and the worker activates it
+    // before the job's steps.
+    let toolchains = super::submit::freeze_resolved_tasks(
         &context,
         &owner,
         &captured.manifest,
         &manifest_digest,
         &requirements,
+        &plan,
         guard,
     )
     .await?;
-    with_toolchains(&mut specs, toolchains.as_ref());
+    with_toolchains(&mut specs, toolchains);
     let capacity = context.config.workers.len() + usize::from(context.config.local_worker.value);
     let capacity = capacity.saturating_mul(context.config.max_active_task.value as usize);
     if capacity > 1 {
@@ -708,15 +711,18 @@ mod tests {
         )
         .unwrap();
         let bundle = FrozenBundle::seal_exact(frozen).unwrap();
-        with_toolchains(&mut specs, Some(&bundle));
+        // Each task takes the bundle frozen for it, in plan order.
+        with_toolchains(&mut specs, vec![None, Some(bundle.clone())]);
         assert_eq!(specs.len(), 2);
-        for (_, spec) in &specs {
-            assert_eq!(spec.toolchains.as_ref(), Some(&bundle));
-            // The bundle is bound to the same source the task is.
-            bundle.validate_partial(&spec.manifest_digest).unwrap();
-        }
-        with_toolchains(&mut specs, None);
-        assert!(specs.iter().all(|(_, spec)| spec.toolchains.is_none()));
+        assert!(specs[0].1.toolchains.is_none());
+        assert_eq!(specs[1].1.toolchains.as_ref(), Some(&bundle));
+        // The bundle is bound to the same source the task is.
+        bundle
+            .validate_partial(&specs[1].1.manifest_digest)
+            .unwrap();
+        with_toolchains(&mut specs, vec![Some(bundle.clone()), None]);
+        assert_eq!(specs[0].1.toolchains.as_ref(), Some(&bundle));
+        assert!(specs[1].1.toolchains.is_none());
     }
 
     #[test]

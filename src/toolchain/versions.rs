@@ -296,6 +296,88 @@ pub fn requirement_scopes(declarations: &[Declaration]) -> Vec<Scope> {
     }
     scopes.into_iter().collect()
 }
+/// A version input that could not be resolved when the run was frozen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub tool: ToolId,
+    pub expression: String,
+    pub location: Location,
+}
+/// `${{ <context>.<key> }}` and nothing else: the context and the key. Any
+/// other expression (an operator, a function, two references, text around it)
+/// is not one reference.
+pub fn context_reference(expression: &str) -> Option<(&str, &str)> {
+    let inner = expression
+        .trim()
+        .strip_prefix("${{")?
+        .strip_suffix("}}")?
+        .trim();
+    let (context, key) = inner.split_once('.')?;
+    let name = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    (name(context) && name(key)).then_some((context, key))
+}
+/// The declarations one CI task runs under, and the scope they are frozen in:
+/// the project's own, and those of the setup steps of `jobs` in `workflow`,
+/// taken together as one requirement set (a task has one environment). A
+/// version that is one context reference takes the value `lookup` gives for
+/// the step it is written in; any other expression, a reference `lookup` does
+/// not know, and a version-file path that is an expression are unresolved.
+/// A task without a setup declaration keeps the project scope unchanged.
+pub fn task_declarations(
+    declarations: &[Declaration],
+    project: &str,
+    workflow: &str,
+    jobs: &[String],
+    lookup: &dyn Fn(&Scope, &str, &str) -> Option<String>,
+) -> Result<(Scope, Vec<Declaration>), Unresolved> {
+    let whole = Scope::project(project);
+    let narrow = Scope {
+        project: project.into(),
+        workflow: Some(workflow.into()),
+        job: Some(jobs.join(",")),
+        step: None,
+    };
+    let mut out = Vec::new();
+    let mut narrowed = false;
+    for d in declarations {
+        if d.scope == whole {
+            out.push(d.clone());
+            continue;
+        }
+        if d.scope.workflow.as_deref() != Some(workflow)
+            || !d.scope.job.as_ref().is_some_and(|job| jobs.contains(job))
+        {
+            continue;
+        }
+        let unresolved = |expression: &str| Unresolved {
+            tool: d.tool.clone(),
+            expression: expression.into(),
+            location: d.location.clone(),
+        };
+        let constraint = match &d.constraint {
+            Constraint::VersionFileExpression(text) => return Err(unresolved(text)),
+            Constraint::Expression(text) => context_reference(text)
+                .and_then(|(context, key)| lookup(&d.scope, context, key))
+                .and_then(|value| Constraint::parse(&value).ok())
+                .filter(|c| !matches!(c, Constraint::Expression(_)))
+                .ok_or_else(|| unresolved(text))?,
+            other => other.clone(),
+        };
+        narrowed = true;
+        out.push(Declaration {
+            tool: d.tool.clone(),
+            constraint,
+            scope: narrow.clone(),
+            location: d.location.clone(),
+        });
+    }
+    Ok((if narrowed { narrow } else { whole }, out))
+}
 /// Reject contradictory constraints in the selected scope. No file wins by
 /// accidental read order. Ranges intersect; unresolved aliases stay unresolved.
 pub fn effective(

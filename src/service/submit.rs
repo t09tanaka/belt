@@ -321,6 +321,37 @@ pub(super) async fn freeze_resolved(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     guard: crate::source::retention::Guard,
 ) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+    let mut all =
+        freeze_resolved_each(context, owner, manifest, digest, requirements, None, guard).await?;
+    Ok(all.pop().flatten())
+}
+
+/// [`freeze_resolved`] for the tasks of a CI plan, in plan order: each task
+/// carries the project's declarations and those of the `setup-*` steps of its
+/// own jobs (spec 22.1). Tasks that freeze to the same bundle are resolved
+/// once.
+pub(super) async fn freeze_resolved_tasks(
+    context: &Context,
+    owner: &super::resident::Client,
+    manifest: &crate::source::manifest::SourceManifest,
+    digest: &Digest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    plan: &local_ci::FrozenPlan,
+    guard: crate::source::retention::Guard,
+) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
+    let plan = Some(plan.clone());
+    freeze_resolved_each(context, owner, manifest, digest, requirements, plan, guard).await
+}
+
+async fn freeze_resolved_each(
+    context: &Context,
+    owner: &super::resident::Client,
+    manifest: &crate::source::manifest::SourceManifest,
+    digest: &Digest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    plan: Option<local_ci::FrozenPlan>,
+    guard: crate::source::retention::Guard,
+) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     let (frozen, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
@@ -328,13 +359,36 @@ pub(super) async fn freeze_resolved(
         tokio::task::spawn_blocking(move || {
             // Blocking source IO retains ownership even when the submit future
             // is cancelled. Return the guard only after that IO has drained.
-            let frozen = freeze_toolchains(&context, &manifest, digest, &requirements);
+            let frozen =
+                freeze_toolchains(&context, &manifest, digest, &requirements, plan.as_ref());
             (frozen, guard)
         })
         .await
         .map_err(|e| invalid(e.to_string()))?
     };
-    let toolchains = match frozen? {
+    let frozen = frozen?;
+    let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
+    for (index, bundle) in frozen.iter().enumerate() {
+        // The same unresolved bundle is the same question to the owner.
+        let earlier = frozen[..index].iter().position(|b| b == bundle);
+        let bundle = match earlier {
+            Some(earlier) => resolved[earlier].clone(),
+            None => resolve_bundle(owner, digest, requirements, bundle.clone()).await?,
+        };
+        resolved.push(bundle);
+    }
+    drop(guard);
+    Ok(resolved)
+}
+
+async fn resolve_bundle(
+    owner: &super::resident::Client,
+    digest: &Digest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    frozen: Option<crate::toolchain::contract::FrozenBundle>,
+) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+    let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+    let toolchains = match frozen {
         Some(bundle) if bundle.validate(digest).is_err() => {
             let asked = bundle.frozen.describe_requirements();
             match owner
@@ -360,19 +414,35 @@ pub(super) async fn freeze_resolved(
         }
         other => other,
     };
-    drop(guard);
     Ok(toolchains)
 }
 
+/// `code at path:line and path:line`: a contradiction says where both sides
+/// are written.
+fn located(diagnostic: &crate::toolchain::versions::Diagnostic) -> String {
+    let at: Vec<String> = diagnostic
+        .locations
+        .iter()
+        .map(|l| format!("{}:{}", l.path, l.first_line))
+        .collect();
+    if at.is_empty() {
+        return diagnostic.code.clone();
+    }
+    format!("{} at {}", diagnostic.code, at.join(" and "))
+}
+
+/// One bundle for a plain command (`plan` is `None`: no workflow is read),
+/// one per task of `plan` otherwise, in plan order.
 fn freeze_toolchains(
     context: &Context,
     captured: &crate::source::manifest::SourceManifest,
     digest: Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
-) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+    plan: Option<&local_ci::FrozenPlan>,
+) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
     use crate::toolchain::{
         contract::{self, FrozenBundle},
-        versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId, VersionObservation},
+        versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId},
     };
     let blocked =
         |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
@@ -387,8 +457,35 @@ fn freeze_toolchains(
     }
     let project = std::str::from_utf8(&manifest.cwd_relative.0)
         .map_err(|_| blocked("invalid toolchain project scope".into()))?;
-    let declarations = crate::toolchain::snapshot::read_captured(&store, &manifest, project, &[])
-        .map_err(|e| blocked(e.code))?;
+    let workflows = plan
+        .map(crate::ci::toolchains::workflows)
+        .unwrap_or_default();
+    let declarations =
+        crate::toolchain::snapshot::read_captured(&store, &manifest, project, &workflows)
+            .map_err(|e| blocked(if plan.is_some() { located(&e) } else { e.code }))?;
+    // What each bundle is frozen from: the project as a whole for a plain
+    // command, the declarations of its own jobs for a task of a plan.
+    let mut sets = Vec::new();
+    match plan {
+        None => sets.push((String::new(), Scope::project(project), declarations)),
+        Some(plan) => {
+            for task in &plan.tasks {
+                let (scope, own) =
+                    crate::ci::toolchains::task_declarations(plan, task, project, &declarations)
+                        .map_err(|u| {
+                            let b = crate::toolchain::envsync::expression_blocked(
+                                u.tool.as_str(),
+                                &u.expression,
+                            );
+                            blocked(format!(
+                                "task `{}` ({}:{}): {}: {}",
+                                task.id, u.location.path, u.location.first_line, b.missing, b.steps
+                            ))
+                        })?;
+                sets.push((format!("task `{}`: ", task.id), scope, own));
+            }
+        }
+    }
     // Required profile tools are capture-time baseline inputs, not all optional probes.
     let profile = crate::toolchain::profile::Profile::load(
         &context.bootstrap.worker_state_dir,
@@ -419,9 +516,6 @@ fn freeze_toolchains(
                 .map_err(|e| blocked(e.into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if declarations.is_empty() && required.is_empty() {
-        return Ok(None);
-    }
     let policy = match context.config.toolchain_match.value {
         crate::config::model::ToolchainMatch::Exact => MatchPolicy::Exact,
         crate::config::model::ToolchainMatch::Minor => MatchPolicy::Minor,
@@ -429,16 +523,49 @@ fn freeze_toolchains(
         crate::config::model::ToolchainMatch::Any => MatchPolicy::Any,
     };
     let observations = contract::observations(&profile.report());
-    let frozen = FrozenToolchains::freeze(
-        digest,
-        profile.definition_digest().clone(),
-        Scope::project(project),
-        &declarations,
-        &required,
-        &observations,
-        policy,
-    )
-    .map_err(|e| blocked(e.code))?;
+    let mut bundles: Vec<Option<FrozenBundle>> = Vec::with_capacity(sets.len());
+    for (index, (who, scope, declarations)) in sets.iter().enumerate() {
+        // Tasks with the same declarations in the same scope share a bundle.
+        let same = |(_, s, d): &(String, Scope, Vec<_>)| s == scope && d == declarations;
+        if let Some(earlier) = sets[..index].iter().position(same) {
+            bundles.push(bundles[earlier].clone());
+            continue;
+        }
+        if declarations.is_empty() && required.is_empty() {
+            bundles.push(None);
+            continue;
+        }
+        let frozen = FrozenToolchains::freeze(
+            digest.clone(),
+            profile.definition_digest().clone(),
+            scope.clone(),
+            declarations,
+            &required,
+            &observations,
+            policy,
+        )
+        .map_err(|e| {
+            blocked(if plan.is_some() {
+                format!("{who}{}", located(&e))
+            } else {
+                e.code
+            })
+        })?;
+        bundles.push(Some(seal(context, &profile, frozen)?));
+    }
+    Ok(bundles)
+}
+
+/// Seal what the source pins exactly, and take what the configured inventory
+/// already answers.
+fn seal(
+    context: &Context,
+    profile: &crate::toolchain::profile::Profile,
+    frozen: crate::toolchain::versions::FrozenToolchains,
+) -> Result<crate::toolchain::contract::FrozenBundle, ApiError> {
+    use crate::toolchain::{contract::FrozenBundle, versions::VersionObservation};
+    let blocked =
+        |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
     let unknown: Vec<&str> = frozen
         .baseline
         .iter()
@@ -453,10 +580,10 @@ fn freeze_toolchains(
     }
     let mut bundle = FrozenBundle::seal_exact(frozen).map_err(|e| blocked(e.into()))?;
     if bundle.validate(&bundle.frozen.source_manifest).is_ok() {
-        return Ok(Some(bundle));
+        return Ok(bundle);
     }
     // Loading a configured inventory is read-only and invokes no managers.
-    if let Some(registry) = worker_inventory(&context.bootstrap.worker_state_dir, &profile) {
+    if let Some(registry) = worker_inventory(&context.bootstrap.worker_state_dir, profile) {
         for requirement in bundle.frozen.requirements.clone() {
             if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
                 continue;
@@ -467,7 +594,7 @@ fn freeze_toolchains(
             }
         }
     }
-    Ok(Some(bundle))
+    Ok(bundle)
 }
 
 /// The inventory of the local worker, if this host has one. The worker opens

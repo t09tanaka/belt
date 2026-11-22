@@ -5374,6 +5374,184 @@ async fn ci_task_needing_an_unauthorized_toolchain_is_blocked_and_runs_with_no_o
     shutdown(&load(&spec)).await;
 }
 
+/// The frozen toolchain of each CI task of the run, by the task of the plan:
+/// the scope it was frozen in and its requirements as `tool=version`.
+fn ci_task_toolchains(
+    spec: &Spec,
+    value: &serde_json::Value,
+) -> BTreeMap<String, (serde_json::Value, Vec<String>)> {
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    rows.into_iter()
+        .map(|row| {
+            let task = row.spec["ci"]["task"]["task_id"].as_str().unwrap();
+            let bundle: belt::toolchain::contract::FrozenBundle =
+                serde_json::from_value(row.spec["toolchains"].clone())
+                    .unwrap_or_else(|e| panic!("task {task} carries no bundle: {e}"));
+            let lines = bundle.frozen.requirements.iter().map(|r| r.describe());
+            (
+                task.to_string(),
+                (
+                    serde_json::to_value(&bundle.frozen.scope).unwrap(),
+                    lines.collect(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Spec 22.1: the `*-version` input of a `setup-*` step is a declaration of
+/// the job it is written in. No version file exists here. The job with the
+/// step runs under the version the step names, each leg of a matrix under
+/// its own value, and a job without a setup step is frozen and run exactly as
+/// before (the project scope, the Node of the base PATH).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_runs_under_the_version_its_own_setup_step_declares() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'18.0.0','20.0.0'");
+    let setup = |version: &str| {
+        format!("      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n")
+    };
+    let jobs = format!(
+        "  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/plain\n  build:\n    runs-on: ubuntu-latest\n    steps:\n{}      - run: node --version >> MARKS/build\n  legs:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: ['18.0.0', '20.0.0']\n    steps:\n{}      - run: node --version >> MARKS/legs-${{{{ matrix.node }}}}\n",
+        setup("20.0.0"),
+        setup("${{ matrix.node }}"),
+    );
+    let marks = ci_project(root.path(), &input, &jobs);
+    let (code, value) = ci_output(&spec, &input).await;
+    if code != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "plain"), ["v22.0.0"]);
+    assert_eq!(ci_marks(&marks, "build"), ["v20.0.0"]);
+    assert_eq!(ci_marks(&marks, "legs-18.0.0"), ["v18.0.0"]);
+    assert_eq!(ci_marks(&marks, "legs-20.0.0"), ["v20.0.0"]);
+    // What each task carries: the job's own requirement in the job's scope.
+    let file = ".github/workflows/ci.yml";
+    let project = serde_json::json!({"project": "", "workflow": null, "job": null, "step": null});
+    let job =
+        |id: &str| serde_json::json!({"project": "", "workflow": file, "job": id, "step": null});
+    let mut carried: Vec<(serde_json::Value, Vec<String>)> =
+        ci_task_toolchains(&spec, &value).into_values().collect();
+    carried.sort_by_key(|(scope, lines)| format!("{scope} {lines:?}"));
+    let mut expected = vec![
+        (project, vec![]),
+        (job("build"), vec!["node=20.0.0".to_string()]),
+        (job("legs"), vec!["node=18.0.0".to_string()]),
+        (job("legs"), vec!["node=20.0.0".to_string()]),
+    ];
+    expected.sort_by_key(|(scope, lines)| format!("{scope} {lines:?}"));
+    assert_eq!(carried, expected);
+    // The managers ran for the declared versions only.
+    let calls = std::fs::read_to_string(host.join("calls")).unwrap();
+    let mut calls: Vec<&str> = calls.lines().collect();
+    calls.sort();
+    calls.dedup();
+    assert_eq!(calls, ["18.0.0", "20.0.0"]);
+    shutdown(&load(&spec)).await;
+}
+
+/// The version only a `setup-*` step names is a requirement of placement as
+/// a version file is: a worker that may not provide it is left out with the
+/// same `unmet` line, no step runs and no other version is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_whose_setup_step_needs_an_unauthorized_version_is_not_placed() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0'");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 21.0.0\n      - run: node --version >> MARKS/build\n",
+    );
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await });
+    let started = std::time::Instant::now();
+    let waiting = loop {
+        let found = CoordinatorStore::open_read_only(&spec.state_dir)
+            .ok()
+            .and_then(|store| store.events_after(0, 10_000).ok())
+            .and_then(|events| events.into_iter().find(|e| e.kind == "task_waiting"));
+        if let Some(event) = found {
+            break event;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the CI task was not reported as blocked");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(waiting.payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(
+        waiting.payload["decision"]["excluded"][0]["unmet"],
+        serde_json::json!(["toolchain node=21.0.0 unavailable"]),
+        "{}",
+        waiting.payload
+    );
+    assert!(
+        !running.is_finished(),
+        "ci ended: the block was not at placement"
+    );
+    assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    running.abort();
+    shutdown(&load(&spec)).await;
+}
+
+/// A version that is an expression the plan does not answer, and two steps
+/// of one job that ask for different versions, are refused when the run is
+/// submitted: nothing is queued, nothing is installed, no step runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_refuses_a_setup_version_it_cannot_freeze() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'18.0.0','20.0.0'");
+    let setup = |version: &str| {
+        format!("      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n")
+    };
+    let job = |steps: String| {
+        format!("  build:\n    runs-on: ubuntu-latest\n    steps:\n{steps}      - run: node --version >> MARKS/build\n")
+    };
+    let refused = |value: &serde_json::Value| {
+        let text = value.to_string();
+        assert_eq!(value["ok"], false, "{text}");
+        assert!(text.contains("environment_mismatch"), "{text}");
+        text
+    };
+    // An expression that is not one matrix or env reference.
+    let marks = ci_project(root.path(), &input, &job(setup("${{ github.ref_name }}")));
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = refused(&value);
+    assert!(
+        text.contains("the project's node version is the expression ${{ github.ref_name }}, which is not known until a run"),
+        "{text}"
+    );
+    assert!(text.contains("pin a concrete node version"), "{text}");
+    assert!(text.contains(".github/workflows/ci.yml:8"), "{text}");
+    // Two versions of one tool in one job: both places are named.
+    ci_project(
+        root.path(),
+        &input,
+        &job(format!("{}{}", setup("18.0.0"), setup("20.0.0"))),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = refused(&value);
+    assert!(
+        text.contains(
+            "conflicting_versions at .github/workflows/ci.yml:8 and .github/workflows/ci.yml:11"
+        ),
+        "{text}"
+    );
+    assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    shutdown(&load(&spec)).await;
+}
+
 /// A worker that holds as many frozen plans as it may does not take one
 /// more. The run does not wait without a word: it gets the event
 /// `ci_plan_refused` once, the worker is left out of the placement by name

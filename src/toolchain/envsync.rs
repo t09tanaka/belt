@@ -59,6 +59,16 @@ fn blocked(subject: &str, missing: String, steps: String) -> Blocked {
     }
 }
 
+/// A version that is an expression: what is missing and what to do. `workers
+/// sync` and the freeze of a CI run say it with the same words.
+pub fn expression_blocked(name: &str, expression: &str) -> Blocked {
+    blocked(
+        name,
+        format!("the project's {name} version is the expression {expression}, which is not known until a run"),
+        format!("pin a concrete {name} version in the workflow or a version file, then rerun workers sync"),
+    )
+}
+
 /// A project requirement against what the worker has and may install.
 fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncPlan) {
     let tool = &req.tool;
@@ -96,11 +106,7 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
         Constraint::Expression(text) | Constraint::VersionFileExpression(text) => Some(text),
         _ => None,
     }) {
-        add_blocked(plan, blocked(
-            name,
-            format!("the project's {name} version is the expression {expression}, which is not known until a run"),
-            format!("pin a concrete {name} version in the workflow or a version file, then rerun workers sync"),
-        ));
+        add_blocked(plan, expression_blocked(name, expression));
         return;
     }
     let candidates = fact
