@@ -19,7 +19,7 @@ def verify(checks, run, original, host, command, ssh, sha256, save):
 
     kept = installed(before)
     probe = run / "upgrade-health-ssh"
-    probe.mkdir(mode=0o700)
+    probe.mkdir(mode=0o700, exist_ok=True)
     wrapper = probe / "ssh"
     transport = shlex.quote(str(run / "bin/ssh"))
     # Only the invoking upgrade CLI uses this wrapper. All calls still go to
@@ -28,7 +28,7 @@ def verify(checks, run, original, host, command, ssh, sha256, save):
         "#!/bin/sh\n" + 'case "$*" in\n  *--stdio*)\n'
         + "    current=$(" + transport + " " + shlex.quote(host)
         + " " + shlex.quote('readlink "$HOME/.config/belt/bin/current"')
-        + ") || exit 1\n" + '    case "$current" in *' + after
+        + " </dev/null) || exit 1\n" + '    case "$current" in *' + after
         + ') exit 255 ;; esac\n    ;;\nesac\nexec ' + transport + ' "$@"\n')
     wrapper.chmod(0o700)
     args = ("workers", "upgrade", host, "--binary", str(candidate))

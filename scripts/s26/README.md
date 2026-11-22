@@ -145,12 +145,15 @@ Expect roughly **5–10 minutes** for a warm acceptance run; cold Rust/image bui
 can take **10–30+ minutes**, depending on Docker resources and network. These are
 estimates, not measured results. The first SSH readiness deadline is 90 seconds.
 
-Not covered: a physical Mac mini / two real Macs (goal 12), Linux x86_64, reboot
-or boot ID, suspend/clock/process identity/sleep inhibition, A35 system-user mode,
-A34 `workers upgrade`, A37 a real project, or goal 16 multi-submitter/failover.
-This proves only the listed parts of A45/A34 if it actually passes. Docker
-Desktop's cgroup/systemd behavior remains an environment-specific prerequisite;
-there is no fallback to a fake service or ephemeral worker.
+On arm64 Docker workers, A34 recovered the original worker after a failed
+post-switch SSH health check. A second upgrade succeeded and its repeat
+returned `already_current`. In the dedicated A35 run, the system unit
+remained enabled, its PID changed after restart, the parent completed the
+bridge handshake and the non-root worker ran a job. The A37 timings below
+record the separate project CI comparison.
+
+Physical Mac startup, suspend and boot identity still need hardware.
+Docker Desktop runs the containers on a shared Linux kernel.
 
 Authoring validation: Bash syntax, ShellCheck, and Python syntax can run without
 Docker. Real Docker/SSH/systemd acceptance must be run on the host; a sandbox
