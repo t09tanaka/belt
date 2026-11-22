@@ -699,7 +699,7 @@ fn job_report(
         else {
             continue;
         };
-        if ci.task.inputs.get("belt_discovery").is_some() {
+        if !lines::has_lines(&ci.task.inputs) {
             continue;
         }
         by_plan_task.insert(ci.task.task_id.clone(), row);
@@ -735,7 +735,7 @@ fn job_report(
         }
         read => read.and_then(Result::ok),
     }
-    .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
+    .filter(lines::has_split_job);
     let mut split = Vec::new();
     if let Some(plan) = plan {
         let row_of = |task: &str| by_plan_task.get(task).copied();

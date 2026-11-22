@@ -6,6 +6,17 @@ use super::{JobLine, Part};
 use crate::ids::TaskId;
 use local_ci::WireTaskResult;
 
+/// Does a task of the run have lines? A discovery probe does not: it only
+/// finds the plan.
+pub(super) fn has_lines(inputs: &serde_json::Value) -> bool {
+    inputs.get("belt_discovery").is_none()
+}
+
+/// Is a split job in `plan`? Without one there is nothing to mark.
+pub(super) fn has_split_job(plan: &local_ci::FrozenPlan) -> bool {
+    plan.shard_groups.iter().any(|group| group.split)
+}
+
 /// The lines of one task: a line for each job its result outcomes, or one
 /// line of the task when it left no result (`core_outcome`, else
 /// `no_result`).
@@ -104,6 +115,24 @@ pub fn render_jobs(jobs: &[JobLine]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_discovery_probe_has_no_lines_and_a_plan_needs_a_split_group_to_be_marked() {
+        assert!(has_lines(&serde_json::json!({})));
+        assert!(has_lines(&serde_json::json!({"other": 1})));
+        assert!(!has_lines(&serde_json::json!({"belt_discovery": null})));
+        assert!(!has_lines(
+            &serde_json::json!({"belt_discovery": {"project": "p"}})
+        ));
+        let mut plan = split_plan(false);
+        assert!(has_split_job(&plan));
+        for group in &mut plan.shard_groups {
+            group.split = false;
+        }
+        assert!(!has_split_job(&plan));
+        plan.shard_groups.clear();
+        assert!(!has_split_job(&plan));
+    }
+
     use super::*;
     use crate::ci::progress::{Input, NeedsProgression, Progression};
     use crate::ci::shards::tests::{group, split_plan};

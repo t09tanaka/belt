@@ -275,6 +275,13 @@ pub fn judge_ci_result(read: Option<&str>, expected: &str) -> Verdict {
     }
 }
 
+/// Does the verdict of a collection need the result of a CI task read? Only
+/// a complete one of a CI task whose result artifact is here does: nothing
+/// else can be made less than it is.
+pub fn needs_ci_read(is_ci_task: bool, has_result_artifact: bool, verdict: Verdict) -> bool {
+    is_ci_task && has_result_artifact && verdict == Verdict::Complete
+}
+
 /// A missing `optional` artifact changes nothing; a `required` one that is
 /// not stored (missing, refused or not even reported) is never complete.
 pub fn judge_artifacts(declared: &[(bool, Standing)]) -> Verdict {
@@ -506,6 +513,21 @@ pub fn run_verdict(expected: u32, tasks: &[TaskStanding]) -> RunVerdict {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_complete_ci_task_with_a_result_artifact_has_its_result_read() {
+        for ci in [false, true] {
+            for record in [false, true] {
+                for verdict in [Verdict::Complete, Verdict::RequiredMissing, Verdict::GaveUp] {
+                    assert_eq!(
+                        needs_ci_read(ci, record, verdict),
+                        ci && record && verdict == Verdict::Complete,
+                        "{ci} {record} {verdict:?}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

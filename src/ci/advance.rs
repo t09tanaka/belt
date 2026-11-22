@@ -25,8 +25,8 @@ mod discovery;
 mod pure;
 
 use pure::{
-    ended_input, join_failure, never_ran, oversize_reason, released_spec, stop_step, timing_scope,
-    Stop,
+    all_joined, discovery_project, ended_input, is_held, join_failure, never_ran, plan_agrees,
+    release_step, result_of_kept, stop_step, timing_scope, Release, Stop,
 };
 pub use pure::{inputs_fit, standing, status_without_result, Standing, MAX_RELEASED_INPUT_BYTES};
 
@@ -255,14 +255,7 @@ fn advance_run(
     if discovery::advance(store, state_dir, results, run, &rows, now_ms, pass)? {
         return Ok(());
     }
-    let project = rows
-        .iter()
-        .find_map(|r| {
-            r.spec
-                .pointer("/ci/task/inputs/belt_discovery/project")
-                .and_then(|v| v.as_str())
-        })
-        .map(str::to_owned);
+    let project = discovery_project(rows.iter().map(|r| &r.spec));
     let mut digest = super::discovery::active_plan(&rows)
         .map(Digest::parse)
         .transpose()
@@ -296,9 +289,8 @@ fn advance_run(
             return Err(unrunnable(format!("task {} is not a CI task", row.task_id)));
         };
         pass.plans.insert(ci.task.plan_digest.clone());
-        if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest
-            && !allowable.contains(&ci.task.plan_digest)
-        {
+        let current = digest.get_or_insert_with(|| ci.task.plan_digest.clone());
+        if !plan_agrees(current, &ci.task.plan_digest, &allowable) {
             return Err(unrunnable("the tasks of the run name different plans"));
         }
         if members
@@ -329,12 +321,11 @@ fn advance_run(
         let Some(outcome) = progress.outcome(&group.workflow, &job) else {
             continue;
         };
-        let marked = |id: &String| members.get(id).and_then(|m| m.spec.ci.as_ref());
-        if group
-            .shards
-            .iter()
-            .all(|id| marked(id).is_some_and(|ci| ci.joined))
-        {
+        let joined = |id: &str| {
+            let ci = members.get(id)?.spec.ci.as_ref()?;
+            Some(ci.joined)
+        };
+        if all_joined(&group.shards, joined) {
             continue;
         }
         let failure = join_failure(outcome.status, progress.split_job_problems(&group.id));
@@ -370,7 +361,7 @@ fn advance_run(
                     Some(probe) => probe,
                     None => member(task)?,
                 };
-                if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
+                if is_held(member.spec.ci.as_ref().map(|ci| ci.hold)) {
                     release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
                 }
             }
@@ -448,10 +439,9 @@ fn ended(
         (Standing::NeverRan, _) => Some(never_ran(task)),
         (Standing::Ended(outcome), Some(attempt)) => {
             let kept = store.persisted_artifacts(&attempt.attempt_id)?;
-            let read = match kept.iter().find(|(name, _)| name == RESULT_ARTIFACT) {
-                None => Err("its result was not collected".to_string()),
-                Some((_, digest)) => read_result(results, &attempt.attempt_id, digest),
-            };
+            let read = result_of_kept(&kept, RESULT_ARTIFACT, |digest| {
+                read_result(results, &attempt.attempt_id, digest)
+            });
             Some(ended_input(task, outcome, read))
         }
         _ => None,
@@ -495,19 +485,19 @@ fn release(
 ) -> crate::storage::Result<()> {
     let task_id = &member.row.task_id;
     let invalid = |e: serde_json::Error| crate::storage::StorageError::Invalid(e.to_string());
-    if !inputs_fit(inputs) {
-        let why = oversize_reason();
-        // The reason, the cancel and the event are one transaction: a pass
-        // that sees the task again finds it cancelled and writes nothing.
-        for task in store.fail_ci_tasks(run, Some(task_id), &why, now_ms)? {
-            pass.unrunnable.push((task, why.clone()));
+    match release_step(&member.spec, inputs).map_err(invalid)? {
+        Release::Refuse(why) => {
+            // The reason, the cancel and the event are one transaction: a pass
+            // that sees the task again finds it cancelled and writes nothing.
+            for task in store.fail_ci_tasks(run, Some(task_id), &why, now_ms)? {
+                pass.unrunnable.push((task, why.clone()));
+            }
         }
-        return Ok(());
-    }
-    let inputs = serde_json::to_value(inputs).map_err(invalid)?;
-    let spec = serde_json::to_value(released_spec(&member.spec, inputs)).map_err(invalid)?;
-    if store.release_ci_task(task_id, &spec, now_ms)? {
-        pass.released.push(task_id.clone());
+        Release::Send(spec) => {
+            if store.release_ci_task(task_id, &spec, now_ms)? {
+                pass.released.push(task_id.clone());
+            }
+        }
     }
     Ok(())
 }
