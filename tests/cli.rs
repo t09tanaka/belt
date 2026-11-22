@@ -44,6 +44,16 @@ impl TestEnv {
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .current_dir(self.dir.path());
+        // Start with default dispositions whatever launched the tests (a
+        // background job has SIGINT ignored, which the wrapper now keeps).
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
         c
     }
 

@@ -10,7 +10,8 @@ the minor version).
 ### Fixed
 
 - `exec` no longer starts the command with SIGINT and SIGQUIT ignored. While the command runs the wrapper used `SIG_IGN` for them (so the terminal's Ctrl-C does not kill the wrapper), and an ignored disposition survives `exec`, so a command without its own handler could not be interrupted. The wrapper now uses a handler that does nothing, which `exec` resets to the default; the wrapper's own behaviour is unchanged.
-- A stop signal that arrives after the last check while waiting but before the command is spawned now means the command is never started (the run ends as interrupted and its entry is released), instead of starting it and forwarding the signal at once.
+- A signal that was ignored when `exec` started (SIGINT/SIGQUIT in a background job of a non-interactive shell, SIGHUP under `nohup`, or SIGTERM) stays ignored in every phase, so the command inherits it exactly as a bare `cmd &` or `nohup cmd` would. The dispositions are read once, before the first handler is installed.
+- A stop signal that arrives after the last check while waiting but before the command is spawned now means the command is never started (the run ends as interrupted and its entry is released), instead of starting it and forwarding the signal at once. A signal that arrives after that check, while the command is being spawned, still starts it and is forwarded to the command right after it starts; a SIGINT in that interval is not forwarded (the terminal delivers its own copy to the command's group).
 
 ## [0.10.5] - 2026-11-23
 
