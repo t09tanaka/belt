@@ -29,8 +29,15 @@ const LEDGER_LOCK_TIMEOUT_ENV: &str = "TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEO
 /// The standalone CLI's name for a run when `--label` is not given.
 const LABEL_ENV: &str = "TASK_TRAFFIC_CONTROLLER_LABEL";
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resident {
+    Uninitialized,
+    Stopped,
+    Running,
+}
+
 /// Direct execution requires both local service endpoints to be absent.
-pub fn resident_running(env: &BTreeMap<String, String>) -> Result<bool, ApiError> {
+pub fn resident_status(env: &BTreeMap<String, String>) -> Result<Resident, ApiError> {
     let unknown = |reason: String| ApiError::new(ErrorCode::CommunicationUnknown, reason);
     let spec = match super::context::runtime_spec(env) {
         Ok(spec) => Some(spec),
@@ -52,7 +59,7 @@ pub fn resident_running(env: &BTreeMap<String, String>) -> Result<bool, ApiError
                 )
                 .await
                 {
-                    Ok(Ok(super::resident::Reply::Ready { .. })) => Ok(true),
+                    Ok(Ok(super::resident::Reply::Ready { .. })) => Ok(Resident::Running),
                     _ => Err(unknown("the coordinator did not confirm readiness".into())),
                 };
             }
@@ -70,7 +77,11 @@ pub fn resident_running(env: &BTreeMap<String, String>) -> Result<bool, ApiError
                 "a worker agent is running; start the coordinator".into(),
             ));
         }
-        Ok(false)
+        Ok(if spec.is_some() {
+            Resident::Stopped
+        } else {
+            Resident::Uninitialized
+        })
     })
 }
 
@@ -397,7 +408,7 @@ mod tests {
     fn an_uninitialized_host_has_no_resident() {
         let home = crate::test_tmp::tempdir().unwrap();
         let env = BTreeMap::from([("HOME".to_string(), home.path().display().to_string())]);
-        assert!(!resident_running(&env).unwrap());
+        assert_eq!(resident_status(&env).unwrap(), Resident::Uninitialized);
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 }

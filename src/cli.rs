@@ -502,9 +502,10 @@ pub fn run(cli: Cli) -> i32 {
     }
 
     if let Command::Exec(args) = &cli.command {
-        match crate::service::direct::resident_running(&process_env()) {
-            Ok(false) => return run_direct(cli.json, args),
-            Ok(true) => (),
+        use crate::service::direct::Resident;
+        match crate::service::direct::resident_status(&process_env()) {
+            Ok(Resident::Stopped | Resident::Uninitialized) => return run_direct(cli.json, args),
+            Ok(Resident::Running) => (),
             Err(error) => return direct_error(cli.json, error),
         }
     }
@@ -624,10 +625,20 @@ pub fn run(cli: Cli) -> i32 {
             let env = std::env::vars_os()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                 .collect();
-            if !crate::service::direct::resident_running(&env)? {
-                return Err(crate::service::direct::not_running(
-                    "submit needs a run, and no resident is running on this host",
-                ));
+            use crate::service::direct::Resident;
+            match crate::service::direct::resident_status(&env)? {
+                Resident::Running => (),
+                Resident::Stopped => {
+                    return Err(crate::service::direct::not_running(
+                        "submit needs a run, and no resident is running on this host",
+                    ))
+                }
+                Resident::Uninitialized => {
+                    return Err(crate::error::ApiError::new(
+                        ErrorCode::NotFound,
+                        "coordinator is not initialized; run belt init to start the resident",
+                    ))
+                }
             }
             let cwd = std::env::current_dir()
                 .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
