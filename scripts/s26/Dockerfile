@@ -13,6 +13,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
        'PermitRootLogin no' 'AllowUsers belt' 'UsePAM yes' > /etc/ssh/sshd_config.d/s26.conf \
     && systemctl enable ssh \
+    && systemctl mask systemd-binfmt.service proc-sys-fs-binfmt_misc.automount \
     && rm -f /etc/ssh/ssh_host_* /etc/machine-id \
     && touch /etc/machine-id
 COPY worker-entrypoint.sh /usr/local/sbin/s26-entrypoint
