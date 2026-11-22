@@ -15,6 +15,7 @@ mod direct_exec;
 mod doctor;
 mod forecast;
 mod gaps_cli;
+mod gaps_worker;
 mod not_implemented;
 mod one_host;
 mod protocol;

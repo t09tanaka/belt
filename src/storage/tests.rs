@@ -6518,3 +6518,92 @@ fn own_runs_ignore_collection_but_include_unplaced_tasks() {
         .unwrap();
     assert!(!f.store.has_nonterminal_runs().unwrap());
 }
+
+#[test]
+fn result_retention_collects_a_retired_attempt_that_never_ended_only_after_confirmation_and_retention(
+) {
+    use crate::results::store::ResultStore;
+    let f = fx();
+    let mk = || {
+        let task = TaskId::generate();
+        f.store.create_task(&task, &f.run, &json!({}), 1).unwrap();
+        let a = f
+            .store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task,
+                    worker_id: f.worker.clone(),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                1,
+            )
+            .unwrap()
+            .attempt_id;
+        f.store
+            .add_blob_ref(
+                &blob(
+                    &format!("ref-{a}"),
+                    &a,
+                    BlobKind::Result,
+                    &ResultStore::result_locator(&a),
+                ),
+                1,
+            )
+            .unwrap();
+        a
+    };
+    let old = mk();
+    f.store.begin_retire(&old, "unknown", 2).unwrap();
+    f.store.confirm_retire(&old, 100).unwrap();
+    let recent = mk();
+    f.store.begin_retire(&recent, "unknown", 2).unwrap();
+    f.store.confirm_retire(&recent, 205).unwrap();
+    // Retire asked for but not confirmed: it may still run.
+    let unconfirmed = mk();
+    f.store.begin_retire(&unconfirmed, "unknown", 2).unwrap();
+    let running = mk();
+    let left = || -> Vec<String> {
+        let mut rows = f
+            .store
+            .db
+            .call(|c| {
+                let mut s = c.prepare("SELECT attempt_id FROM blob_ref ORDER BY attempt_id")?;
+                let rows = s
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    let sorted = |ids: &[&AttemptId]| {
+        let mut v: Vec<String> = ids.iter().map(|a| a.to_string()).collect();
+        v.sort();
+        v
+    };
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
+    let claim = |wall: u64, mono: u64| {
+        f.store
+            .claim_result_page(&guard, &f.run, "", 32, wall, mono, Some("boot".into()), 10)
+            .unwrap()
+    };
+    // The first pass only starts the quarantine.
+    assert!(claim(200, 10).clock_held);
+    assert_eq!(left().len(), 4);
+    // Confirmed retire long enough ago: collected although it never ended. The
+    // one confirmed a moment ago stays within the retention; the unconfirmed
+    // and the running one are never collected.
+    let page = claim(210, 20);
+    assert_eq!((page.examined, page.removed), (4, 1));
+    assert_eq!(left(), sorted(&[&recent, &unconfirmed, &running]));
+    // Once its own retention has passed, the later one follows; the others
+    // are still kept however much time passes.
+    assert_eq!(claim(214, 24).removed, 0);
+    assert_eq!(claim(216, 26).removed, 1);
+    assert_eq!(left(), sorted(&[&unconfirmed, &running]));
+    assert_eq!(claim(100_000, 99_810).removed, 0);
+    assert_eq!(left(), sorted(&[&unconfirmed, &running]));
+}
