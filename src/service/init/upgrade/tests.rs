@@ -450,6 +450,74 @@ async fn a57_workers_resume_does_not_lift_the_upgrade_hold() {
     assert!(!control::held(&h.paths.worker));
 }
 
+/// The journal as a crash between the two journal writes of a key rotation
+/// leaves it: `switching_key` names the staged key's receipt.
+fn leave_key_switch(h: &Host) {
+    let mut j = super::super::read_raw_journal(&h.paths.journal).unwrap();
+    let staged = crate::group::next_key_path(&h.paths.key);
+    crate::secrets::key::init(&staged).unwrap();
+    let mut next = Proof::read(&staged).unwrap();
+    next.path = h.paths.key.clone();
+    j.switching_key = Some(next);
+    fs::write(&h.paths.journal, serde_json::to_vec(&j).unwrap()).unwrap();
+}
+
+/// Neither the live journal nor the copy kept for a rollback names a key
+/// switch, and both receipts match the key on disk.
+fn assert_journals_settled(h: &Host) {
+    for file in [h.paths.journal.clone(), kept(&h.paths, KEPT_JOURNAL)] {
+        assert!(!fs::read_to_string(&file).unwrap().contains("switching_key"));
+        let j = super::super::read_raw_journal(&file).unwrap();
+        j.files
+            .iter()
+            .find(|p| p.path == h.paths.key)
+            .unwrap()
+            .verify()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_leftover_key_switch_before_the_rename_is_cleared_before_the_journal_is_kept() {
+    let h = Host::new().await;
+    leave_key_switch(&h);
+    let old_key = fs::read(&h.paths.key).unwrap();
+    let mut fake = h.fake.clone();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
+    assert_journals_settled(&h);
+    assert_eq!(fs::read(&h.paths.key).unwrap(), old_key);
+}
+
+#[tokio::test]
+async fn a_leftover_key_switch_after_the_rename_is_cleared_before_the_journal_is_kept() {
+    let h = Host::new().await;
+    leave_key_switch(&h);
+    fs::rename(crate::group::next_key_path(&h.paths.key), &h.paths.key).unwrap();
+    let new_key = fs::read(&h.paths.key).unwrap();
+    let mut fake = h.fake.clone();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
+    assert_journals_settled(&h);
+    assert_eq!(fs::read(&h.paths.key).unwrap(), new_key);
+}
+
+#[tokio::test]
+async fn an_unresolvable_leftover_key_switch_stops_the_upgrade_with_nothing_changed() {
+    let h = Host::new().await;
+    leave_key_switch(&h);
+    let bytes = fs::read(&h.paths.key).unwrap();
+    let mut replacement = tempfile::NamedTempFile::new_in(&h.paths.config).unwrap();
+    std::io::Write::write_all(&mut replacement, &bytes).unwrap();
+    replacement.persist(&h.paths.key).unwrap();
+    let journal = fs::read(&h.paths.journal).unwrap();
+    let mut fake = h.fake.clone();
+    assert!(begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).is_err());
+    assert_eq!(fs::read(&h.paths.journal).unwrap(), journal);
+    assert!(fake.0.borrow().calls.is_empty());
+    assert!(!control::held(&h.paths.worker));
+    assert!(!record_path(&h.paths).exists());
+    assert_eq!(h.resident_link(), Path::new(&h.old));
+}
+
 #[tokio::test]
 async fn a57_a_failure_before_the_switch_lifts_the_hold_and_changes_nothing() {
     let h = Host::new().await;

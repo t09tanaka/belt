@@ -476,7 +476,10 @@ pub fn begin<L: Launcher>(
     // Before the live files are read: they may be the new version's.
     let unwatched = recover_unwatched(&initial, launcher)?;
     let spec = bootstrap::read_input(&initial.input).context("resident input unavailable")?;
-    let (from, paths) = managed_journal(&spec)?;
+    let (mut from, paths) = managed_journal(&spec)?;
+    // Before the journal is copied for a rollback or retargeted: a leftover
+    // key switch would reach the new version, which may not know the field.
+    super::key_change::settle_held(&paths.journal, &mut from)?;
     ensure!(
         launcher.backend() == paths.backend,
         "service manager differs"

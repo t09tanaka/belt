@@ -64,6 +64,18 @@ pub(crate) fn install_key(staged: &Path, target: &Path) -> anyhow::Result<()> {
 /// A retry after the key rename also finishes the receipt on disk, so an older
 /// binary can again read the ordinary init journal after rotation completes.
 pub(crate) fn finish_key_change(spec: &Spec) -> anyhow::Result<()> {
+    clear_leftover(spec, false)
+}
+
+/// At a start: a leftover `switching_key` that `read_journal` resolves in
+/// memory is also cleared on disk, so the journal stays readable by an older
+/// binary (`belt upgrade` rollback). A change in progress holds `init.lock`
+/// and will settle the journal itself, so a busy lock is not an error here.
+pub(crate) fn settle_key_change(spec: &Spec) -> anyhow::Result<()> {
+    clear_leftover(spec, true)
+}
+
+fn clear_leftover(spec: &Spec, skip_if_busy: bool) -> anyhow::Result<()> {
     let Some(path) = &spec.managed_service else {
         return Ok(());
     };
@@ -71,16 +83,43 @@ pub(crate) fn finish_key_change(spec: &Spec) -> anyhow::Result<()> {
         return Ok(());
     }
     let lock = resident::secure_file(&path.with_file_name("init.lock"), true)?;
-    lock.try_lock()
-        .context("managed service change in progress")?;
-    let (journal, _) = managed_journal(spec)?;
-    ensure!(
-        journal.switching_key.is_none(),
-        "managed key switch is still pending"
-    );
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) if skip_if_busy => return Ok(()),
+        Err(fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("managed service change in progress")
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+    let (mut journal, _) = managed_journal(spec)?;
+    if skip_if_busy {
+        settle_held(path, &mut journal)
+    } else {
+        ensure!(
+            journal.switching_key.is_none(),
+            "managed key switch is still pending"
+        );
+        save_over(path, &journal)
+    }
+}
+
+/// For a caller that already holds `init.lock` (`belt upgrade`, `belt init`):
+/// `resolved` is what `read_journal` returned for `path`. A leftover
+/// `switching_key` on disk is dropped from it and the journal is rewritten, so
+/// nothing copied or retargeted from it carries the field. The rename did not
+/// happen when a leftover is still in `resolved`; see `clear_leftover`.
+pub(crate) fn settle_held(path: &Path, resolved: &mut Journal) -> anyhow::Result<()> {
+    if read_raw_journal(path)?.switching_key.is_none() {
+        return Ok(());
+    }
+    resolved.switching_key = None;
+    save_over(path, resolved)
+}
+
+fn save_over(path: &Path, journal: &Journal) -> anyhow::Result<()> {
     JournalFile {
-        path: path.clone(),
+        path: path.to_owned(),
         proof: Some(Proof::read(path)?),
     }
-    .save(&journal)
+    .save(journal)
 }

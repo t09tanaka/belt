@@ -680,9 +680,13 @@ async fn initialize_prepared<L: Launcher>(
         proof: None,
     };
     let mut j = if paths.journal.try_exists()? {
-        let j = read_journal(&paths.journal)?;
+        let mut j = read_journal(&paths.journal)?;
         check_name(name, &j.spec.worker_id)?;
         validate_journal(&j, &paths, uid, &digest)?;
+        jf.proof = Some(Proof::read(&paths.journal)?);
+        // The lock is held (here or by the takeover): settle a leftover key
+        // switch before anything is started or saved from this journal.
+        key_change::settle_held(&paths.journal, &mut j)?;
         jf.proof = Some(Proof::read(&paths.journal)?);
         j
     } else {
@@ -1479,7 +1483,7 @@ mod tests;
 
 mod key_change;
 mod membership_undo;
-pub(crate) use key_change::{finish_key_change, install_key};
+pub(crate) use key_change::{finish_key_change, install_key, settle_key_change};
 mod takeover;
 pub mod upgrade;
 

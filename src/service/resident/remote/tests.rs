@@ -442,6 +442,7 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         record.send(worker.id).unwrap();
         Box::pin(async {})
     });
+    let mut seen = Vec::new();
     let client = resident.client();
     let runner = tokio::spawn(resident.run());
     let reload = |client: Client| async move {
@@ -456,12 +457,11 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n",
     );
     assert_eq!(reload(client.clone()).await, ["remote-a"]);
-    assert_eq!(
+    seen.push(
         tokio::time::timeout(Duration::from_secs(10), dialed.recv())
             .await
             .unwrap()
             .unwrap(),
-        "remote-a"
     );
     // Asking again dials nothing twice.
     assert!(reload(client.clone()).await.is_empty());
@@ -470,12 +470,11 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n[[workers]]\nid='remote-b'\nssh='peer-b'\n",
     );
     assert_eq!(reload(client.clone()).await, ["remote-b"]);
-    assert_eq!(
+    seen.push(
         tokio::time::timeout(Duration::from_secs(10), dialed.recv())
             .await
             .unwrap()
             .unwrap(),
-        "remote-b"
     );
     // An unusable registration is an answer, not a crash.
     write_registration(root.path(), "not toml [");
@@ -483,6 +482,13 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         Reply::ControlError { error } => assert!(error.message.contains("unusable")),
         other => panic!("{other:?}"),
     }
+    // Every dial counts: none after the last reload.
+    while let Ok(Some(worker)) =
+        tokio::time::timeout(Duration::from_millis(300), dialed.recv()).await
+    {
+        seen.push(worker);
+    }
+    assert_eq!(seen, ["remote-a", "remote-b"]);
     assert!(matches!(
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
