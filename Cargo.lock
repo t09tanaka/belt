@@ -2015,9 +2015,9 @@ dependencies = [
 
 [[package]]
 name = "task-traffic-controller"
-version = "0.10.2"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ef58705cf8bdaddeb410a27a367e5426fb446b5420396524cd33f8a54d0bca2"
+checksum = "a822b4bae53f8e6f6dd072099ce0e1daaac28b54af99a32a795e17d239aa781e"
 dependencies = [
  "chrono",
  "clap",
@@ -2031,6 +2031,8 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "toml 0.8.23",
+ "unicode-segmentation",
+ "unicode-width 0.2.3",
  "uuid",
 ]
 
@@ -2041,7 +2043,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
