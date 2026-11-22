@@ -304,6 +304,9 @@ class Checks:
     def a45(self):
         for host in ("w1", "w2"):
             self.service(host, "active")
+            machine = ssh(host, "uname -m").stdout.strip()
+            if machine != os.environ["S26_MACHINE"]:
+                raise RuntimeError(f"{host}: expected {os.environ['S26_MACHINE']}, observed {machine}")
             p = ssh(host, 'test "$(id -u)" = 1000 && '
                     'test "$(cat /proc/1/comm)" = systemd && '
                     'test "$(loginctl show-user 1000 -p Linger --value)" = yes')
