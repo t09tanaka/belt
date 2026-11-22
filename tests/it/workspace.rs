@@ -1572,3 +1572,124 @@ fn a_tool_that_succeeds_and_one_that_writes_only_to_stdout() {
         .unwrap_err();
     assert!(matches!(e, FwFailure::Failed { code: None, .. }), "{e:?}");
 }
+
+/// The stand-in `GitFw` with a remove that can be made to fail and a record of
+/// the port releases asked for.
+struct PortSpy {
+    inner: GitFw,
+    remove_fails: bool,
+    release: Result<(), FwFailure>,
+    released: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+impl FastWorktree for PortSpy {
+    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+        self.inner.add(repo, dest, branch, start)
+    }
+    fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        if self.remove_fails {
+            return Err(FwFailure::Failed {
+                code: Some(1),
+                stderr: "stuck".into(),
+            });
+        }
+        self.inner.remove(repo, path)
+    }
+    fn release_ports(&self, _: &Path, path: &Path) -> Result<(), FwFailure> {
+        self.released.lock().unwrap().push(path.to_path_buf());
+        self.release.clone()
+    }
+}
+
+#[test]
+fn ports_are_released_only_when_the_worktree_is_really_gone() {
+    for remove_fails in [true, false] {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let spy = Arc::new(PortSpy {
+            inner: GitFw { env: f.env() },
+            remove_fails,
+            release: Ok(()),
+            released: Default::default(),
+        });
+        let fw: Arc<dyn FastWorktree> = spy.clone();
+        let ws = f.workspaces(&fw);
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m, Some(&repo))
+            .unwrap();
+        let result = ws.remove(&w);
+        let released = spy.released.lock().unwrap().clone();
+        if remove_fails {
+            assert!(result.is_err());
+            assert!(w.root.exists(), "the worktree is still there");
+            assert!(released.is_empty(), "ports kept: {released:?}");
+        } else {
+            result.unwrap();
+            assert!(!w.root.exists());
+            assert_eq!(released.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_registry_the_embedded_portool_cannot_read_blocks_the_release_and_other_failures_keep_their_cause(
+) {
+    for (release, reason) in [
+        (
+            FwFailure::IncompatibleRegistry {
+                message: "newer registry".into(),
+            },
+            "newer registry",
+        ),
+        (
+            FwFailure::Failed {
+                code: None,
+                stderr: "disk gone".into(),
+            },
+            "disk gone",
+        ),
+    ] {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let fw: Arc<dyn FastWorktree> = Arc::new(PortSpy {
+            inner: GitFw { env: f.env() },
+            remove_fails: false,
+            release: Err(release),
+            released: Default::default(),
+        });
+        let ws = f.workspaces(&fw);
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m, Some(&repo))
+            .unwrap();
+        let e = ws.remove(&w).unwrap_err();
+        assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+        assert!(e.message.contains(reason), "{}", e.message);
+    }
+}
+
+#[test]
+fn releasing_ports_refuses_a_newer_registry_without_rewriting_it() {
+    let f = fixture();
+    let state = f.root.join("xdg-state");
+    let ledger = state.join("portool/registry.json");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let body = r#"{"version":999}"#;
+    std::fs::write(&ledger, body).unwrap();
+    let mut env = f.env();
+    env.insert("XDG_STATE_HOME".into(), state.to_str().unwrap().into());
+    let fw = CliFastWorktree::new(env);
+    let err = fw
+        .release_ports(&f.dir, &f.root.join("gone-worktree"))
+        .unwrap_err();
+    assert!(
+        matches!(&err, FwFailure::IncompatibleRegistry { message } if message.contains("v999")),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), body);
+}

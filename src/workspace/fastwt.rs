@@ -204,9 +204,16 @@ impl FastWorktree for CliFastWorktree {
     fn release_ports(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
         portool::release_removed_in(&portool::Context::from_env(&self.env), repo, path)
             .map(|_| ())
-            .map_err(|err| FwFailure::Failed {
-                code: None,
-                stderr: err.to_string(),
+            .map_err(|err| match err {
+                portool::Error::UnsupportedRegistryVersion {
+                    found, supported, ..
+                } => FwFailure::IncompatibleRegistry {
+                    message: super::embedded::registry_diagnostic(found, supported),
+                },
+                err => FwFailure::Failed {
+                    code: None,
+                    stderr: err.to_string(),
+                },
             })
     }
 }

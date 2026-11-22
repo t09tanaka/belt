@@ -35,10 +35,17 @@ pub(crate) fn incompatible_registry(
     env: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
     match portool::check_registry_in(&portool::Context::from_env(env)) {
-        Err(portool::Error::UnsupportedRegistryVersion { found, supported, .. }) =>
-            Some(format!("portool {} reads registry through v{supported}; registry written by standalone portool is v{found}", env!("BELT_PORTOOL_VERSION"))),
+        Err(portool::Error::UnsupportedRegistryVersion {
+            found, supported, ..
+        }) => Some(registry_diagnostic(found, supported)),
         _ => None,
     }
+}
+
+/// The refusal for a registry the embedded portool cannot read (written by a
+/// newer standalone one); it is never rewritten.
+pub(crate) fn registry_diagnostic(found: u32, supported: u32) -> String {
+    format!("portool {} reads registry through v{supported}; registry written by standalone portool is v{found}", env!("BELT_PORTOOL_VERSION"))
 }
 
 pub fn dispatch() -> Option<i32> {
@@ -117,6 +124,22 @@ pub(crate) fn prepend(bin: &Path, path: &str) -> Result<String, String> {
     .map_err(|_| "worker PATH must be UTF-8".into())
 }
 
+/// The environment of a command run under an execution binding: the
+/// activation and `own`, with the tool-bin directory (when there is one) first
+/// on its `PATH` as it is for every other worker command.
+pub(crate) fn activated(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut env = binding.environment(own).map_err(str::to_string)?;
+    if let Some(bin) = bin {
+        let path = prepend(bin, env.get("PATH").ok_or("activation has no PATH")?)?;
+        env.insert("PATH".into(), path);
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +166,47 @@ mod tests {
         std::fs::write(&replaced, "preserve").unwrap();
         assert!(install(&state, &old).is_err());
         assert_eq!(std::fs::read(&replaced).unwrap(), b"preserve");
+    }
+
+    fn bound(
+        environment: std::collections::BTreeMap<String, String>,
+    ) -> crate::toolchain::contract::ExecutionBinding {
+        let activated = environment;
+        let d = Digest::of_bytes(b"x");
+        crate::toolchain::contract::ExecutionBinding {
+            activation: crate::toolchain::adapters::ActivationReceipt {
+                base_profile: d.clone(),
+                frozen: d.clone(),
+                setup_policy: d.clone(),
+                installation: d.clone(),
+                environment: activated,
+                shell: crate::toolchain::adapters::FileIdentity {
+                    path: "/bin/sh".into(),
+                    digest: d.clone(),
+                    size: 1,
+                    executable: true,
+                },
+                binding_digest: d.clone(),
+                execution_fingerprint: d,
+            },
+        }
+    }
+
+    #[test]
+    fn a_bound_command_gets_the_tool_bin_first_and_is_refused_without_a_path() {
+        let bin = Path::new("/state/tool-bin/abc");
+        let with_path = bound([("PATH".to_string(), "/activated/bin".to_string())].into());
+        let env = activated(Some(bin), &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
+        let env = activated(None, &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/activated/bin");
+        let no_path = bound([("HOME".to_string(), "/h".to_string())].into());
+        assert_eq!(
+            activated(Some(bin), &no_path, &Default::default()),
+            Err("activation has no PATH".to_string())
+        );
+        assert!(activated(None, &no_path, &Default::default()).is_ok());
+        let own = [("FLAG".to_string(), "1".to_string())].into();
+        assert_eq!(activated(None, &no_path, &own).unwrap()["FLAG"], "1");
     }
 }

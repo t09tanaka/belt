@@ -397,7 +397,9 @@ pub fn base_env(
 ) -> Result<BTreeMap<String, String>, String> {
     let none = BTreeMap::new();
     match (profile, binding) {
-        (Some(_), Some(binding)) => binding.environment(&none).map_err(str::to_string),
+        (Some(profile), Some(binding)) => {
+            crate::workspace::embedded::activated(profile.embedded_bin(), binding, &none)
+        }
         (Some(profile), None) => profile.execution_environment(&none),
         (None, _) => Ok(["PATH", "HOME"]
             .into_iter()
@@ -1173,5 +1175,47 @@ mod tests {
         let env = base_env(None, None).unwrap();
         assert!(env.keys().all(|k| k == "PATH" || k == "HOME"));
         assert_eq!(env.get("PATH").cloned(), std::env::var("PATH").ok());
+    }
+
+    #[test]
+    fn the_steps_of_a_ci_task_find_the_embedded_tools_first_bound_or_not() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let measured: BTreeMap<String, String> = [
+            ("PATH".to_string(), home.clone()),
+            ("HOME".to_string(), home.clone()),
+        ]
+        .into();
+        let bin = dir.path().join("tool-bin/x");
+        let profile = Profile::load(dir.path(), &measured)
+            .unwrap()
+            .with_embedded_bin(bin.clone())
+            .unwrap();
+        let first =
+            |env: &BTreeMap<String, String>| std::env::split_paths(&env["PATH"]).next().unwrap();
+        assert_eq!(first(&base_env(Some(&profile), None).unwrap()), bin);
+        let d = Digest::of_bytes(b"x");
+        let activated: BTreeMap<String, String> =
+            [("PATH".to_string(), "/activated/bin".to_string())].into();
+        let binding = ExecutionBinding {
+            activation: crate::toolchain::adapters::ActivationReceipt {
+                base_profile: d.clone(),
+                frozen: d.clone(),
+                setup_policy: d.clone(),
+                installation: d.clone(),
+                environment: activated,
+                shell: crate::toolchain::adapters::FileIdentity {
+                    path: "/bin/sh".into(),
+                    digest: d.clone(),
+                    size: 1,
+                    executable: true,
+                },
+                binding_digest: d.clone(),
+                execution_fingerprint: d,
+            },
+        };
+        let env = base_env(Some(&profile), Some(&binding)).unwrap();
+        assert_eq!(first(&env), bin);
+        assert!(env["PATH"].ends_with(":/activated/bin"));
     }
 }

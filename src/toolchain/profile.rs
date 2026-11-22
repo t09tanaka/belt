@@ -351,6 +351,10 @@ impl Profile {
         self.embedded_bin = Some(bin);
         Ok(self)
     }
+    /// The per-version tool-bin directory kept first on every command PATH.
+    pub(crate) fn embedded_bin(&self) -> Option<&Path> {
+        self.embedded_bin.as_deref()
+    }
     /// The absolute PATH directories the profile executes with.
     pub fn path_dirs(&self) -> &[PathBuf] {
         &self.definition.path
@@ -443,16 +447,8 @@ impl Profile {
                 own.remove("PATH");
             }
         }
-        let mut env = binding.environment(&own)?;
-        if let Some(bin) = &self.embedded_bin {
-            env.insert(
-                "PATH".into(),
-                crate::workspace::embedded::prepend(
-                    bin,
-                    env.get("PATH").ok_or("activation has no PATH")?,
-                )?,
-            );
-        }
+        let mut env =
+            crate::workspace::embedded::activated(self.embedded_bin.as_deref(), binding, &own)?;
         crate::config::traffic::apply_step_env(&mut env, &self.scope_env);
         Ok(env)
     }
@@ -897,8 +893,6 @@ fn measured_version(tool: &str, output: &str) -> Option<String> {
         "flutter" => text.strip_prefix("Flutter ")?,
         "dart" => text.strip_prefix("Dart SDK version: ")?,
         "xcode" => text.strip_prefix("Xcode ")?,
-        "portool" => text.strip_prefix("portool ")?,
-        "fast-worktree" => text.strip_prefix("fast-worktree ")?,
         _ => text,
     };
     let token = text.split_whitespace().next()?;

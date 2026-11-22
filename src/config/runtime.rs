@@ -233,13 +233,10 @@ impl ResolvedConfig {
         agent.warmup_idle_ms = settings.warmup_idle_ms;
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
+        let embedded_bin =
+            crate::workspace::embedded::bin(&inputs.state_dir, &inputs.supervisor_exe);
         let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
-            .and_then(|profile| {
-                profile.with_embedded_bin(crate::workspace::embedded::bin(
-                    &inputs.state_dir,
-                    &inputs.supervisor_exe,
-                ))
-            })
+            .and_then(|profile| profile.with_embedded_bin(embedded_bin.clone()))
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         agent.profile = profile.name().into();
         agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
@@ -251,6 +248,7 @@ impl ResolvedConfig {
         agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
         setup.env = env;
+        setup.embedded_bin = Some(embedded_bin);
         setup.scope_env = Some(scope_env);
         setup.profile_definition = Some(profile_definition);
         setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());

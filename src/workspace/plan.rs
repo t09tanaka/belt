@@ -292,6 +292,9 @@ pub enum FwFailure {
     /// The environment map the caller gave lacks something it cannot run
     /// without (the process's own environment is never consulted).
     NoEnv { missing: Vec<String> },
+    /// The port registry is of a format the embedded portool cannot read
+    /// (written by a newer standalone one); it was left as it was.
+    IncompatibleRegistry { message: String },
 }
 
 /// A missing or failing `fast-worktree` is an environment mismatch: the
@@ -315,6 +318,7 @@ pub fn fw_error(op: &str, f: &FwFailure) -> ApiError {
             "fast-worktree {op}: the environment given to it has no {} (the caller passes HOME, PATH and whatever the project's hooks read, such as NPM_CONFIG_* and PORTOOL_*)",
             missing.join(", ")
         ),
+        FwFailure::IncompatibleRegistry { message } => format!("fast-worktree {op}: {message}"),
     };
     ApiError::blocked(BlockedReason::EnvironmentMismatch, msg)
 }
@@ -493,6 +497,14 @@ mod tests {
         );
         assert_eq!(n.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
         assert!(n.message.contains("no HOME, PATH"), "{}", n.message);
+        let r = fw_error(
+            "release ports",
+            &FwFailure::IncompatibleRegistry {
+                message: "registry is v9".into(),
+            },
+        );
+        assert_eq!(r.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+        assert_eq!(r.message, "fast-worktree release ports: registry is v9");
         let s = fw_error(
             "add",
             &FwFailure::Failed {

@@ -661,9 +661,16 @@ impl Workspaces {
             Ok(_) => std::fs::remove_file(&dir)
                 .map_err(|e| io_err("cannot remove what is at the workspace's place", e))?,
         }
-        self.fw
-            .release_ports(clone, &dir)
-            .map_err(|f| plan::fw_error("release ports", &f))?;
+        // The ports are the worktree's: while it is still there they stay.
+        let gone = matches!(
+            std::fs::symlink_metadata(&dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        if gone {
+            self.fw
+                .release_ports(clone, &dir)
+                .map_err(|f| plan::fw_error("release ports", &f))?;
+        }
         hook_result?;
         self.settle(clone, attempt)
     }

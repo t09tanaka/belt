@@ -95,6 +95,9 @@ pub struct SetupConfig {
     /// are no part of `env`, which the keys of the prepared work are made
     /// from. `None`: a step keeps what `env` and its own declaration give it.
     pub scope_env: Option<BTreeMap<String, String>>,
+    /// The worker's per-version tool-bin directory, first on a bound step's
+    /// `PATH` as for every other worker command. `None`: no embedded tools.
+    pub embedded_bin: Option<PathBuf>,
     pub poll_ms: u64,
     pub lease_ms: u64,
     pub term_grace_ms: u64,
@@ -134,6 +137,7 @@ impl SetupConfig {
             log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
             env: BTreeMap::new(),
             scope_env: None,
+            embedded_bin: None,
             poll_ms: 200,
             lease_ms: crate::supervisor::spec::DEFAULT_LEASE_MS,
             term_grace_ms: crate::supervisor::spec::DEFAULT_TERM_GRACE_MS,
@@ -1581,7 +1585,7 @@ impl Setups {
                 Some(b) => {
                     let mut own = s.env.clone();
                     own.retain(|key, _| !crate::config::traffic::is_step_env(key));
-                    b.environment(&own).map_err(str::to_string)?
+                    self.step_environment(b, &own)?
                 }
                 None => {
                     let mut env = base_env.clone();
@@ -1605,6 +1609,14 @@ impl Setups {
             ws.warnings.clone(),
             binding.map(|b| b.fingerprint().clone()),
         )
+    }
+
+    fn step_environment(
+        &self,
+        binding: &ExecutionBinding,
+        own: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        crate::workspace::embedded::activated(self.cfg.embedded_bin.as_deref(), binding, own)
     }
 
     /// Setup steps with the worker's scope variables on top of their
@@ -2463,6 +2475,39 @@ mod tool_validation_tests {
         assert_eq!(setups.preparation_observations(64), vec![value.clone()]);
         setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
         assert_eq!(setups.preparation_observations(64), vec![value]);
+    }
+    #[test]
+    fn a_bound_setup_step_finds_the_embedded_tools_first() {
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let mut cfg = SetupConfig::new(
+            temp.path().join("state"),
+            crate::ids::WorkerId::parse("w-embedded").unwrap(),
+            "/bin/sh".into(),
+        );
+        cfg.embedded_bin = Some("/state/tool-bin/abc".into());
+        let setups = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+        let d = Digest::of_bytes(b"x");
+        let activated: BTreeMap<String, String> =
+            [("PATH".to_string(), "/activated/bin".to_string())].into();
+        let binding = ExecutionBinding {
+            activation: crate::toolchain::adapters::ActivationReceipt {
+                base_profile: d.clone(),
+                frozen: d.clone(),
+                setup_policy: d.clone(),
+                installation: d.clone(),
+                environment: activated,
+                shell: crate::toolchain::adapters::FileIdentity {
+                    path: "/bin/sh".into(),
+                    digest: d.clone(),
+                    size: 1,
+                    executable: true,
+                },
+                binding_digest: d.clone(),
+                execution_fingerprint: d,
+            },
+        };
+        let env = setups.step_environment(&binding, &BTreeMap::new()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
     }
 }
 
