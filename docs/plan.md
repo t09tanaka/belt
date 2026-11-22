@@ -1321,7 +1321,7 @@ A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一
 残り（S21 は完了していない）:
 1. 導入の本番経路は 3 本目で入れた（下の節）。
 2. `doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。
-3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。（2026-11-23 追記: 読むようになった。済み。）
 
 ### S21 `workers sync` の導入（2026-11-17、3 本目: warm-up の要求）
 
@@ -1342,7 +1342,7 @@ A44 の sync 側のテスト（ネットワークに出ない）:
 残り（S21 は完了していない）:
 1. （7 本目で解消）`doctor` への組み込み。下の「S21 `doctor` への接続」。
 2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
-3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。（2026-11-23 追記: 読むようになった。済み。）
 4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
 5. （4 本目で解消）spec 11 章・18 章・22.2 に `env_sync` の意味、feature `env_sync_v1`、N/N+1 の規則を書いた。
 6. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
@@ -1403,12 +1403,12 @@ main（S23 の doctor・upgrade、scope の統一、schema v11 など）を merg
 S21 で終わったもの: `workers diff`（1 本目）、`workers sync` の計画・blocked・導入と warm-up（2〜6 本目）、`doctor` への接続（この節）。
 
 S21 の残り（必須。S21 は完了していない）:
-1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は notice（exit に影響しない）になる。測るようにするのは残り。doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
+1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は notice（exit に影響しない）になる。測るようにするのは残り。（2026-11-23 追記: `envreport::collect` が policy digest を測るようになった。この項は済み。）doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
 2. （解消）doctor の区分は決定済み: fail は `differs`・`missing`・`manual_required` と disk 不足、notice は `auto_installable` と `not_measured`、`not_checked` は到達できなかった worker と親を測れなかった場合。
 3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。読む場所が 2 つあり、doctor 側は `XDG_CONFIG_HOME`・`XDG_STATE_HOME` を除く。2 つが同じ測定になることは確かめていない。
 4. （解消）親は doctor も `workers diff` も保持した service の env で測る。呼び出した shell の env には落とさない保持された env が無い（PATH が無い）と `workers diff` は測定を拒否し、doctor も同じ理由で「親の環境を測れない」の `not_checked` にする（`tests/it/doctor.rs` の `without_a_retained_service_environment_...`）。
-5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。
-6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。
+5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。（2026-11-23 追記: worker の検査は並行になった。1 台の中でも、doctor の答えのあとの bridge `hello` と環境の比較は同時に尋ねる。済み。）
+6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。（2026-11-23 追記: `setup-*` 入力は読むようになった。済み。`installed_inventory` の所要時間は未計測のまま。）
 7. 実機での受入（A44 の native 検証、S26）。
 
 ### S9a/S10 追補: worker と task-traffic-controller CLI の scope 統一（2026-11-17）
@@ -1496,7 +1496,7 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 
 S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
-2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
+2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。（2026-11-23 追記: 実装した（PR #121）。単独 CLI の台帳にある、CLI が起動した job を `traffic_processes` の行に出す。belt が入れ子で登録したものは数えない。初期化済みで何も動いていない host は exit 0。済み。）
 3. S21 の `workers diff` の結果は接続済み（上の「S21 `doctor` への接続」）。policy digest を親も worker も測らないが notice なので、差の無い親は worker を登録しても exit 0 になる（`fail` があれば BLOCKED、`not_checked` があれば exit 1）。
 4. system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S22 の残り）。Linux の linger の確認（仕様 §15）は S24 の親の側で入った（check `linger`）。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
@@ -1621,7 +1621,7 @@ S24 の残り（必須。この変更でも S24 は完了しない）:
 9. forget で `interrupted` に確定した task が明示の retry を受け付けることは、既存の retry の規則（terminal の attempt）に任せており、forget からの通しの試験は無い。
 10. 一時 worker は `doctor` の環境の比較（`workers diff` 相当）の対象外（比較の報告は導入済みの worker の helper が出すため）。`workers diff` / `sync` を一時 worker に対して実行した場合の扱いは決めていない。
 11. binary の version は crate の version（今は `0.0.0`）で比べるので、0.1.0 より前は `--version` の確認がどの build でも通る。
-7. `workers`（一覧）は未実装のまま。一時 worker の接続状態と記録された identity を見る command は無い（`doctor` の bridge の check で分かる）。
+7. `workers`（一覧）は未実装のまま。一時 worker の接続状態と記録された identity を見る command は無い（`doctor` の bridge の check で分かる）。（2026-11-23 追記: `belt workers` の一覧を実装した。形式は `id  ssh  ephemeral|persistent  connection  identity|-`。済み。）
 
 ### S16 (1) の後半: 親の側の `ci` の実行（2026-11-17、main `b673327` 起点）
 
@@ -1650,7 +1650,7 @@ S24 の残り（必須。この変更でも S24 は完了しない）:
 - 宣言が 1024 件のとき結果を足すと 1025 件になる点: CI task が宣言できる artifact と output は合わせて 1023 件まで。`ci` は今、artifact も output も宣言しない。
 - 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。 plan を受け取らなかった worker だけは別で、`CapabilityMismatch` にすると全員がそうのとき `no_compatible_worker` になってしまう（一時的な理由なのに）ので、`Exclusion::InputRefused` を足した。
 - 提出で断るもの: matrix の variant・式の matrix・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。 split 済みの Shard は S18 から受け付ける（plan の ShardGroup と形が合わないものだけを断る）。
-- `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。
+- `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。（2026-11-23 追記: PR #124 で `ci` の task も提出時に toolchain を固定するようになった。済み。）
 
 テスト:
 
@@ -1667,8 +1667,8 @@ S24 の残り（必須。この変更でも S24 は完了しない）:
 - 親の plan は、release 済みで未配置の task が参照していても、保持日数を過ぎれば消える（run が保持日数より長く止まっている場合だけ）。worker の plan も、届いてから保持期間（既定 7 日）を過ぎて配置された task は準備で `NOT_FOUND` になる。入力の gate が run を忘れたあとの再配送では、もう一度送られて保持期間が延びる。
 - `ci` の終了コードは最初に失敗した task のもの（`exec` と同じ計算）で、Job の失敗は attempt の exit 1 として現れる。
 - CI task の実行中の log は `logs --follow` に流れない（終了後に回収される）。
-- `ci` は、`exec` が project の設定から入れるもののうち、toolchain の凍結・`prepare_commands` と fast-worktree の setup（prepared setup は CI task で断られる）・`outputs` の宣言・`pass_env` を task に入れない。
-- `estimate`（`coordinator/estimate.rs`）は workload を `commands` から作るままで、CI task の step を見ない。
+- `ci` は、`exec` が project の設定から入れるもののうち、toolchain の凍結・`prepare_commands`（2026-11-23 追記: toolchain の凍結は PR #124 で入った。） と fast-worktree の setup（prepared setup は CI task で断られる）・`outputs` の宣言・`pass_env` を task に入れない。
+- `estimate`（`coordinator/estimate.rs`）は workload を `commands` から作るままで、CI task の step を見ない。（2026-11-23 追記: 保存済みの CI task の `estimate --task` は、配置と同じ `workload_of_spec` で step ごとの node を作る。済み。）
 - host の loop（`ci::advance`）は `NeedsProgression` の `is_settled`・`dependencies_settled` を trait の外で呼んでいる。Driver に差し替えるときは host の loop も直す。
 - run が受理される前に記録された cancel（`run_cancel_intent` だけが有る状態）と待機中の task の release の関係は、command の task と同じ経路（配置の側の扱い）に任せていて、CI 用のテストは無い。
 - mutation のテストは、変更した pure module（`coordinator/policy.rs`・`coordinator/input_gate.rs`・`scheduler/decide.rs`）だけを手元で回した。`advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` は mutation の対象（`scripts/pure-modules.txt`）に入っていない file に有り、`tests/it` と lib のテストで確かめている。
@@ -1681,7 +1681,7 @@ S24 の残り（必須。この変更でも S24 は完了しない）:
 - plan を受け取らない worker: `forward::plan` の失敗を、worker の答え（`Refused`）・親が読めない（`Unrunnable`）・その他（`Retry`）に分けた。`Refused` は接続の `InputGate` に run ごとの理由として持ち（64 件まで、受け取ったら消える、worker が別の boot / epoch になったら消える）、run に event `ci_plan_refused` を 1 回残す。配置はその worker を `Exclusion::InputRefused`（理由は `unmet`）で外す。tick が見る run（どこかで ready な run）に、断られた run も加えた。そうしないと、どの worker でも ready でない run は `place_one` に届かず、`task_waiting` が残らない。
 - 自分で決めたこと: (a) は run 全体の cancel ではなく、未配置の task だけを cancel する（実行中の Job は結果を残させる。plan が無くても worker は自分の写しで実行できる）。(b) は fail にせず除外にした（worker の GC で空けば解ける一時的な状態で、ほかの worker が取れる）。全 worker が断っている間は、理由付きで待つ。待つ時間に上限は設けていない。
 - テスト: lib（`coordinator::tests` 2 件、`input_gate` 2 件、`policy` 4 件、`ci_runs` 2 件、`advance` の分類）。`tests/it/collection.rs` 2 件（plan が消えた run、plan を受け取らない代役の worker）。`tests/it/bootstrap.rs` 1 件（実 binary・resident・local worker で、worker の `ci-plans/` を 256 件で埋めると `ci` が理由を残して待ち、空けると完了する）。
-- 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。`fail_ci_tasks` が cancel するのは attempt を 1 つも持たない task だけなので、`retry` で queue に戻った task（retire 済みの attempt を持つ）は、親の plan が消えていても cancel されず、配送が失敗し続ける（event も出ない）。どの worker でも ready でなく、1 台が plan を断っている run では、転送時間の実測がある worker に prefetch の hint が出るようになった（以前は何もせず戻っていた。配置はしない）。
+- 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。`fail_ci_tasks` が cancel するのは attempt を 1 つも持たない task だけなので、`retry` で queue に戻った task（retire 済みの attempt を持つ）は、親の plan が消えていても cancel されず、配送が失敗し続ける（event も出ない）。（2026-11-23 追記: `fail_ci_tasks` は retire 済みの attempt だけを持つ task も対象にするようになった。済み（R20）。）どの worker でも ready でなく、1 台が plan を断っている run では、転送時間の実測がある worker に prefetch の hint が出るようになった（以前は何もせず戻っていた。配置はしない）。
 
 ### S18: sharding の配置（2026-11-17、main `979fec2` 起点）
 
@@ -1719,7 +1719,7 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 - coverage の merge、JUnit などの artifact の重複・欠落の検査、assertion 数の集約は無い（local-ci は coverage を集める Job を分割しない）。
 - `ci plan` は split 済みの ShardGroup を JSON の `shard_groups` に出すが、text では数だけである。
 - 集約は resident の進行の pass が行う。resident が止まっている間は、全 Shard が終わっていても run は確定しない（待機中の task を持つ run と同じ）。
-- fail-fast で止めた実行中の Shard には理由を記録していない（未配置で止めたものだけ `ci.unrunnable` に理由が残る）。
+- fail-fast で止めた実行中の Shard には理由を記録していない（未配置で止めたものだけ `ci.unrunnable` に理由が残る）。（2026-11-23 追記: PR #119 で記録するようにした。止める要求と同じ transaction で `ci.unrunnable` に理由を書き、`show <run>` に出る。retry で開き直すと消える。止める直前に成功した Shard にも理由は残る（既知の制限）。）
 
 ### S19 GitHub status（2026-11-17、main `979fec2` 起点）
 
@@ -1745,12 +1745,12 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 
 残り:
 
-- 後からの投稿: `ci` を待たずに終わった run（interrupt、`submit` だけ、wait の中断）や、push 前で `failed`（`... is not on GitHub yet`）になった run に、後で投稿し直す command は無い（local-ci の `local-ci status` に当たるもの）。`retry` で結果が変わった run の status も更新しない。
-- `logs` には status の行を出していない（`ci` の出力と `show <run>` だけ）。
+- 後からの投稿: `ci` を待たずに終わった run（interrupt、`submit` だけ、wait の中断）や、push 前で `failed`（`... is not on GitHub yet`）になった run に、後で投稿し直す command は無い（local-ci の `local-ci status` に当たるもの）。`retry` で結果が変わった run の status も更新しない。（2026-11-23 追記: `belt ci status <run> [--post] [--status-context <name>]` を実装した（PR #132）。`--post` なしは表示だけで、`--post` は記録した結果から状態を決め直して投稿する。投稿できなければ終了コード 1。この呼び出し自体が原因の skip は run の記録に残さない。済み。）
+- `logs` には status の行を出していない（`ci` の出力と `show <run>` だけ）。（2026-11-23 追記: PR #120 で `logs <run>` が、出力のあとに status の行を stderr へ出すようになった。`--json` では `kind: github_status` の record。`--follow` は run が終わったときに 1 回出す。済み。）
 - description の件数は行の数で、split Job は Shard の行と Job の行の両方を数える（3 Shard の Job が成功なら pass 4）。
 - Shard を持たない run で、先に失敗した task が有った後に run 全体を cancel した場合、completion の終了コードは失敗した task のものなので failure を投稿する（S18 の取り込み前は投稿しなかった）。その task が timeout や signal で終わっていれば error を投稿する。進められない run（未配置の task を理由付きで cancel したもの）は cancel で失敗した run なので cancelled のままで、投稿しない。
 - status を決めるとき source store を foreground で開く。別の capture と重なって開けなければ `skipped`（`the input of the run cannot be read`）になり、投稿されない。
-- `gh` の時間切れで止めるのは直接の子 process だけ。`gh` が起こした孫 process（credential helper など）は残り得る。孫が pipe を持ったまま `gh` が失敗で終わると、出力の読み取りが孫の終了まで待つ。
+- `gh` の時間切れで止めるのは直接の子 process だけ。`gh` が起こした孫 process（credential helper など）は残り得る。孫が pipe を持ったまま `gh` が失敗で終わると、出力の読み取りが孫の終了まで待つ。（2026-11-23 追記: PR #122 で `gh` を自分の process group で動かし、時間切れでは group ごと止めるようにした。済み。）
 - `local-ci status` 側に同じ検証を適用する件（仕様の一文）は local-ci の側に既に有り（`publishable`）、この行では local-ci を変えていない。
 - tracked file の exclude や追加 input の扱いは `worktree_tree` の一致に任せている（ignored の secret_files は仕様どおり一致判定に入れない）。CI task は secret_files を伴う source をまだ断るので、その組み合わせの実 binary のテストは無い。
 
@@ -1816,3 +1816,59 @@ WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含む�
 | メンバー更新（A57） | 更新の試行中は変更要求を拒否。異常時はガードが旧版と両DBを復元し、既存attemptを再実行せずに引き継いだ。75秒のジョブの終了を待つ正常更新も確認。追加の対称メンバー試験では、試用中に2回拒否された retire が復旧後に元の DB で tombstone として確定し、遅延 submit を拒否した。再配置先のコマンド起動は1回。 |
 
 マシンの実際の再起動に伴うboot ID変更、Macのsleep、異なる物理ホスト間のLAN性能は実機検証の対象として残る。Dockerではホストカーネルを共有する。x86_64 Dockerはarm64上のRosettaによる実行。
+
+## 仕様1.6への同期（2026-11-23、main `6875f72` 起点）
+
+この節は、仕様1.6（`docs/spec.md`）を実装に合わせた記録である。上の各節にあった「未実装」「残り」のうち、実装済みになったものには、その行の末尾に日付つきの追記を足した。履歴は消していない。
+
+### 実装済みになったもの
+
+| 項目 | 内容 |
+| --- | --- |
+| R18 | `estimate --task` が、保存済みの CI task の step ごとの node を使う（配置と同じ `workload_of_spec`）。 |
+| R20 | `fail_ci_tasks` が、retire 済みの attempt だけを持つ task も cancel の対象にする。 |
+| R62 | `envreport::collect` が policy digest を測る。 |
+| R63 | doctor の worker ごとの確認が並行になった。 |
+| R64 | `workers sync --project` が workflow の `setup-*` の `*-version` 入力を読む。 |
+| R75 | Linux を親にした Docker 受入（S26 の `--linux-parent`、PR #118）。 |
+| R78 | 失われた retire の答えの注入を one_host の `Faults` に寄せた（`tests/it/coordinator.rs` の `link_to`）。 |
+| D06 | `belt workers` の一覧。 |
+| D20 | send-key のときに resident が local link の watch で終了する件。 |
+
+### この数日で入ったもの
+
+- R21（PR #124）: CI task が、提出時に固定した toolchain を持つ。宣言した版を用意できる worker が無ければ配置されず、理由の行は `toolchain node=20.0.0 unavailable` の形。baseline が分からない tool の要求は、提出時に `environment_mismatch` で拒否する。
+- R36（PR #119）: fail-fast で止めた実行中の Shard の理由を `ci.unrunnable` に残す。
+- R40（PR #120）: `logs <run>` の GitHub status 行。
+- R44（PR #122）: `gh` の時間切れで process group ごと止める。
+- R70（PR #121）: doctor の `traffic_processes`。
+- 直接実行（PR #117 とそれ以前）: `--profile`・`--requires` の拒否、`--json` で command の stdout を stderr へ、`TASK_TRAFFIC_CONTROLLER_NESTED=inherit` で admission を取らない、resident の有無を `startup.lock`・`coordinator.lock` の flock で調べる、belt が端末の foreground process group にいるときは SIGINT を子へ転送しない。
+- 鍵の切り替えの後始末（PR #116）: `switching_key` の後始末と、`<key>.installing` への新規作成。
+- 埋め込みの道具と片付け（PR #115）: fast-worktree・portool の bin を PATH の先頭に置く。割当の解放は、ディレクトリが消えたときだけ。
+- 入力の配送 event `ci_input_delivered`（PR #116）。
+- warm-up の解放（PR #129）: resident 上の worker で `supervise` が `reap_warmups` を呼んでいなかった。
+- retry の後続 Job（PR #131）: 失敗のために `skipped` になった後続も開き直す。
+- `belt ci status`（PR #132）。
+- 試験の追加（PR #125・#126・#128）とフレーキーの修正（PR #123・#127）。
+
+### 入れないと決めたもの
+
+- R34: coverage の Job は分割しない。仕様どおりに、merge を持たない runner の Job は分割しない。
+- R49・R50: 旧形式との突き合わせ。0.1.0 は初回公開で、旧形式のデータを持たないため。
+- R53: HOME が symlink のときは、init を拒否したままにする。
+- R54: source と Vault の自動消去は、常に有効にする。
+- R74: service user 上の doctor は、実機試験で確かめる。
+- R80・R81: 製品に試験専用の feature が要る。A26 と A20 は、既存の試験で満たしている。
+- D05、D10: 入れない。
+
+### 試験の書き方の注意
+
+scheduler は、run の入力が届いた remote worker だけを候補にする。特定の配置が要る試験は、タイミングではなく `profile` などの要件で配置を固定する。
+
+### 実機試験（延期中）で確かめるもの
+
+次を、実機試験の一覧に足す。
+- 端末で `belt exec` を動かしている間の Ctrl-C が、子に SIGINT をちょうど1回だけ届けること。
+- R03〜R08、R10、R12、R14、R66、R74、R93。
+
+version 0.1.0 への変更、`cargo publish`、tag、Release は、実機試験のあとに行う。

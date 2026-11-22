@@ -18,13 +18,13 @@ use std::time::Duration;
 const BIN: &str = env!("CARGO_BIN_EXE_belt");
 const T: Duration = Duration::from_secs(40);
 
-struct Owned {
-    child: Option<tokio::process::Child>,
-    pid: u32,
-    start: String,
+pub(super) struct Owned {
+    pub(super) child: Option<tokio::process::Child>,
+    pub(super) pid: u32,
+    pub(super) start: String,
 }
 impl Owned {
-    fn new(child: tokio::process::Child) -> Self {
+    pub(super) fn new(child: tokio::process::Child) -> Self {
         let pid = child.id().unwrap();
         assert!(pid > 1);
         let start = super::common::identity_of(pid).unwrap();
@@ -34,14 +34,14 @@ impl Owned {
             start,
         }
     }
-    async fn wait(mut self) {
+    pub(super) async fn wait(mut self) {
         tokio::time::timeout(T, self.child.as_mut().unwrap().wait())
             .await
             .unwrap()
             .unwrap();
         self.child.take();
     }
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         if super::common::identity_of(self.pid).as_deref() == Some(&self.start) {
             belt::platform::signal_pid(self.pid, libc::SIGTERM);
         }
@@ -58,11 +58,11 @@ impl Drop for Owned {
         }
     }
 }
-fn private(dir: &Path) {
+pub(super) fn private(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
-fn write_private(path: &Path, bytes: &[u8]) {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
@@ -93,7 +93,7 @@ fn spawn_worker(home: &Path, cluster: &ClusterId, key: &Path, id: &str) -> Owned
             .unwrap(),
     )
 }
-async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
+pub(super) async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(T, async {
         while !predicate() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -102,7 +102,7 @@ async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
-fn bridge(home: &Path, parent: u32) -> Option<(u32, String)> {
+pub(super) fn bridge(home: &Path, parent: u32) -> Option<(u32, String)> {
     let pid = std::fs::read_to_string(home.join("bridge.pid"))
         .ok()?
         .trim()
@@ -236,7 +236,7 @@ fn attempt(state: &Path, task: &TaskId) -> Option<belt::storage::AttemptRecord> 
         .unwrap()
 }
 
-async fn start_parent(
+pub(super) async fn start_parent(
     root: &Path,
     state: &Path,
     key: &Path,

@@ -40,6 +40,7 @@ mod status_repost;
 
 mod init;
 
+mod ephemeral_stop;
 mod warmup_stop;
 mod worker_ephemeral;
 mod worker_role;
@@ -49,6 +50,7 @@ mod remote_links;
 mod test_tmp_root;
 
 mod workers_lifecycle;
+mod workers_listing;
 mod workers_upgrade;
 
 mod retry_dependents;

@@ -395,6 +395,18 @@ impl Setups {
                 .any(|f| &f.attempt_id == attempt)
     }
 
+    /// Builders that still run (their process is not confirmed ended), and
+    /// the ones found at the start that could not be settled.
+    pub fn running(&self) -> usize {
+        let leftover = lock(&self.leftover).len();
+        leftover
+            + lock(&self.inner)
+                .flights
+                .values()
+                .filter(|f| f.end.is_none())
+                .count()
+    }
+
     /// Builders found at the start that are still not settled (the processes
     /// could not be confirmed stopped). They are tried again at the next
     /// start.
