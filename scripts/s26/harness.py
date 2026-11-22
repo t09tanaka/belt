@@ -203,12 +203,18 @@ class Checks:
                                        stdout=log, stderr=log)
         log.close()
 
+        spec = json.loads(self.input.read_text())
+
         def ready():
             if self.parent.poll() is not None:
                 raise RuntimeError("parent exited; see evidence/parent.log")
             if not (RUN / "state/parent/request.sock").is_socket():
                 return False
             try:
+                if spec.get("expected_cluster") is None:
+                    # The first start creates the cluster ID needed to authenticate top.
+                    self.belt("ls")
+                    return True
                 return self.belt("top").get("resident_observed") is True
             except RuntimeError:
                 return False
@@ -216,7 +222,6 @@ class Checks:
         # `belt init` would record the group identity; this foreground parent
         # skips init (no LaunchAgent), so record the cluster the parent just
         # created and start it again with it, as init does.
-        spec = json.loads(self.input.read_text())
         if spec.get("expected_cluster") is None:
             import sqlite3
             db = RUN / "state" / "coordinator.db"
