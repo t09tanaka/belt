@@ -140,3 +140,21 @@ fn the_worker_ends_itself_only_after_the_notice_with_nothing_live_and_nothing_to
     assert!(!finished(false, Some(2), Some(0)));
     assert!(!finished(false, None, None));
 }
+
+#[test]
+fn the_stop_bound_is_the_grace_plus_the_kill_wait_and_a_margin() {
+    assert_eq!(stop_bound_ms(10_000), 20_000);
+    assert_eq!(stop_bound_ms(0), 10_000);
+    assert_eq!(stop_bound_ms(u64::MAX), u64::MAX);
+}
+
+#[test]
+fn a_graceful_end_waits_until_nothing_lives_or_the_bound_passes() {
+    assert_eq!(stop_step(Some(0), false), StopStep::Settled);
+    assert_eq!(stop_step(Some(0), true), StopStep::Settled);
+    assert_eq!(stop_step(Some(2), false), StopStep::Wait);
+    assert_eq!(stop_step(Some(2), true), StopStep::GiveUp);
+    // A count that cannot be read is never taken as idle.
+    assert_eq!(stop_step(None, false), StopStep::Wait);
+    assert_eq!(stop_step(None, true), StopStep::GiveUp);
+}

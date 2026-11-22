@@ -105,5 +105,34 @@ pub fn finished(
     told_retired && live_attempts == Some(0) && uncollected_results == Some(0)
 }
 
+/// How long after a TERM to the commands a graceful end waits: the TERM
+/// grace the supervisors use, the wait after their KILL (the agent's
+/// default, 5 s) and a little for the records to settle.
+pub fn stop_bound_ms(term_grace_ms: u64) -> u64 {
+    term_grace_ms.saturating_add(5_000).saturating_add(5_000)
+}
+
+/// What a graceful end does next, given how many attempts are still live
+/// (`None`: not readable now) and whether the bound has passed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StopStep {
+    /// Keep waiting for the supervisors.
+    Wait,
+    /// Nothing runs any more: the state may be erased.
+    Settled,
+    /// Something is still alive at the bound: keep the state, fail.
+    GiveUp,
+}
+
+pub fn stop_step(live_attempts: Option<u64>, bound_passed: bool) -> StopStep {
+    if live_attempts == Some(0) {
+        StopStep::Settled
+    } else if bound_passed {
+        StopStep::GiveUp
+    } else {
+        StopStep::Wait
+    }
+}
+
 #[cfg(test)]
 mod tests;

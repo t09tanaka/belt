@@ -8,7 +8,9 @@
 //! worker is never mistaken for the one before it. The parent reaches it
 //! through `worker --stdio` over the tunnel the user prepared; no port is
 //! opened here. On exit it removes the state directory it created, unless
-//! work is still recorded in it.
+//! work is still recorded in it. When told to end (SIGTERM, SIGINT, SIGHUP)
+//! it first stops its live attempts like a cancel does and waits, bounded, for
+//! their supervisors; only then is the state erased.
 use super::WorkerSpec;
 use crate::service::worker_service::{live_attempts, Paths};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -102,7 +104,18 @@ fn start(args: &Args) -> anyhow::Result<()> {
     })();
     match clean_up(&created) {
         Ok(true) => {}
-        Ok(false) => eprintln!("work is still recorded in the worker state; it was kept"),
+        Ok(false) => {
+            let alive = crate::storage::WorkerStore::open_read_only(&created.path)
+                .and_then(|s| s.list_nonterminal())
+                .map(|l| {
+                    l.iter()
+                        .map(|r| r.attempt_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            eprintln!("work is still recorded in the worker state; it was kept (attempts still alive: {alive})");
+        }
         Err(e) => eprintln!("worker state was not removed: {e}"),
     }
     result

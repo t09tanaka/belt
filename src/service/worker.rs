@@ -344,6 +344,24 @@ impl Drop for Worker {
     }
 }
 
+/// An ephemeral worker told to end stops what runs on it the way an operator's
+/// cancel does: no new placement, every live attempt cancelled on the agent's
+/// ticks, the supervisors ending their commands (TERM, grace, KILL). A second
+/// signal changes nothing.
+fn begin_stop(
+    state: &Path,
+    ending: &mut Option<tokio::time::Instant>,
+    bound: Duration,
+) -> anyhow::Result<()> {
+    if ending.is_some() {
+        return Ok(());
+    }
+    crate::worker::control::write(state, crate::worker::control::Control::cancelling())?;
+    eprintln!("ending: stopping the attempts that still run");
+    *ending = Some(tokio::time::Instant::now() + bound);
+    Ok(())
+}
+
 /// An ephemeral worker advertises its per-start identity to the coordinator.
 /// Process recovery always compares against the actual OS boot.
 async fn run(
@@ -393,6 +411,18 @@ async fn run(
     // Install handlers before publication/background tasks so readiness also
     // implies the foreground role can receive its service stop signal.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // An ephemeral worker also ends gracefully when its terminal goes away.
+    let mut hangup = if ephemeral {
+        Some(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup(),
+        )?)
+    } else {
+        None
+    };
+    let stop_bound = Duration::from_millis(ephemeral::plan::stop_bound_ms(settings.term_grace_ms));
+    // Set when an ephemeral worker was told to end: when its wait for the
+    // supervisors stops.
+    let mut ending: Option<tokio::time::Instant> = None;
     let listener = AgentListener::bind(&spec.state_dir, &spec.expected_cluster, &spec.worker_id)?;
     let permits = Arc::new(Semaphore::new(serve::MAX_CONCURRENT_REQUESTS));
     let mut connections = tokio::task::JoinSet::new();
@@ -415,12 +445,27 @@ async fn run(
     let mut supervisor_done = false;
     let result: anyhow::Result<()> = loop {
         tokio::select! {
-            r = tokio::signal::ctrl_c() => break r.map_err(Into::into),
+            r = tokio::signal::ctrl_c() => {
+                if !ephemeral { break r.map_err(Into::into); }
+                if let Err(e) = r { break Err(e.into()); }
+                if let Err(e) = begin_stop(&spec.state_dir, &mut ending, stop_bound) { break Err(e); }
+            },
+            _ = async {
+                match hangup.as_mut() {
+                    Some(h) => h.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Err(e) = begin_stop(&spec.state_dir, &mut ending, stop_bound) { break Err(e); }
+            },
             done = &mut supervisor => {
                 supervisor_done = true;
                 break match done { Ok(result) => result, Err(e) => Err(e.into()) };
             },
-            _ = terminate.recv() => break Ok(()),
+            _ = terminate.recv() => {
+                if !ephemeral { break Ok(()); }
+                if let Err(e) = begin_stop(&spec.state_dir, &mut ending, stop_bound) { break Err(e); }
+            },
             _ = ticker.tick(), if housekeeping.is_empty() => {
                 let agent = worker.agent.clone();
                 housekeeping.spawn_blocking(move || {
@@ -428,18 +473,32 @@ async fn run(
                     // An ephemeral worker whose identity a member retired
                     // ends itself once nothing runs on it and no other
                     // member has a result to collect (spec 24.3).
-                    ephemeral && {
+                    if ephemeral {
                         let (told, live, uncollected) = agent.retirement();
-                        ephemeral::plan::finished(told, live, uncollected)
+                        (ephemeral::plan::finished(told, live, uncollected), live)
+                    } else {
+                        (false, None)
                     }
                 });
             }
             Some(done) = housekeeping.join_next(), if !housekeeping.is_empty() => {
                 match done {
-                    Ok(false) => {}
-                    Ok(true) => {
+                    Ok((true, _)) => {
                         eprintln!("this worker's identity was retired, nothing runs on it and nothing is left to collect: ending");
                         break Ok(());
+                    }
+                    Ok((false, live)) => {
+                        let Some(deadline) = ending else { continue };
+                        match ephemeral::plan::stop_step(live, tokio::time::Instant::now() >= deadline) {
+                            ephemeral::plan::StopStep::Wait => {}
+                            ephemeral::plan::StopStep::Settled => break Ok(()),
+                            ephemeral::plan::StopStep::GiveUp => {
+                                break Err(anyhow::anyhow!(
+                                    "the attempts did not stop within {} s",
+                                    stop_bound.as_secs()
+                                ))
+                            }
+                        }
                     }
                     Err(e) => break Err(e.into()),
                 }
