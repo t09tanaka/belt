@@ -373,34 +373,61 @@ async fn freeze_resolved_each(
         .await
         .map_err(|e| invalid(e.to_string()))?
     };
-    let mut prepared = prepared?;
-    // The setup-step aliases of each task that nothing resolves: no
-    // requirement, and a notice (spec 22.1).
-    let tasks = plan.as_ref().as_ref().map_or(1, |plan| plan.tasks.len());
-    let mut dropped: Vec<Vec<crate::toolchain::versions::ToolId>> = vec![Vec::new(); tasks];
-    // The refusal that made an alias be left out. When the freeze without the
-    // alias is no bundle of this source (the project's own file names the
-    // same alias, so the requirement is still there), that refusal stands.
-    let mut refused: Option<ApiError> = None;
-    loop {
-        let (frozen, back) = {
-            let (context, digest) = (context.clone(), digest.clone());
-            let (plan, dropped) = (plan.clone(), dropped.clone());
+    let prepared = std::sync::Arc::new(prepared?);
+    // One freeze of every task, with the setup-step aliases `dropped` names
+    // left out.
+    let freeze = |dropped: Vec<Vec<crate::toolchain::versions::ToolId>>| {
+        let (context, digest) = (context.clone(), digest.clone());
+        let (plan, prepared) = (plan.clone(), prepared.clone());
+        async move {
             tokio::task::spawn_blocking(move || {
                 // Reads this host's inventory only: the source was read above.
                 let plan = plan.as_ref().as_ref();
-                let frozen = freeze_prepared(&context, &prepared, digest, plan, &dropped);
-                (frozen, prepared)
+                freeze_prepared(&context, &prepared, digest, plan, &dropped)
             })
             .await
-            .map_err(|e| invalid(e.to_string()))?
-        };
-        prepared = back;
-        let (frozen, aliases, notices, observed) = match (frozen, refused.take()) {
-            (Ok(frozen), _) => frozen,
-            (Err(_), Some(refused)) => return Err(refused),
-            (Err(unread), None) => return Err(unread),
-        };
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?
+        }
+    };
+    let tasks = plan.as_ref().as_ref().map_or(1, |plan| plan.tasks.len());
+    let ask = |bundle, observed: Observed| async move {
+        resolve_bundle(owner, digest, requirements, bundle, &observed).await
+    };
+    let (resolved, notices) = resolve_each(tasks, freeze, ask).await?;
+    drop(guard);
+    Ok((resolved, crate::ci::toolchains::render(&notices)))
+}
+
+/// The resolved bundle of each of `tasks` tasks, and the notices of the
+/// freeze they come from. `freeze` freezes every task with the setup-step
+/// aliases it is given left out, and `ask` resolves one bundle.
+async fn resolve_each<Freeze, Freezing, Ask, Asking>(
+    tasks: usize,
+    freeze: Freeze,
+    ask: Ask,
+) -> Result<
+    (
+        Vec<Option<crate::toolchain::contract::FrozenBundle>>,
+        Vec<crate::ci::toolchains::Notice>,
+    ),
+    ApiError,
+>
+where
+    Freeze: Fn(Vec<Vec<crate::toolchain::versions::ToolId>>) -> Freezing,
+    Freezing: std::future::Future<Output = Result<Bundles, ApiError>>,
+    Ask: Fn(crate::toolchain::contract::FrozenBundle, Observed) -> Asking,
+    Asking: std::future::Future<Output = Result<crate::toolchain::contract::FrozenBundle, Refusal>>,
+{
+    // The setup-step aliases of each task that nothing resolves: no
+    // requirement, and a notice (spec 22.1).
+    let mut dropped: Vec<Vec<crate::toolchain::versions::ToolId>> = vec![Vec::new(); tasks];
+    // What was already resolved: a bundle that comes back unchanged in a
+    // later pass is not asked for again.
+    let mut asked = Asked::default();
+    loop {
+        // A freeze that fails after an alias was left out fails for a reason
+        // of its own, and that is the error.
+        let (frozen, aliases, notices, observed) = freeze(dropped.clone()).await?;
         let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
         let mut again = false;
         for (index, bundle) in frozen.iter().enumerate() {
@@ -409,49 +436,123 @@ async fn freeze_resolved_each(
                 resolved.push(resolved[earlier].clone());
                 continue;
             }
-            match resolve_bundle(owner, digest, requirements, bundle.clone(), &observed).await {
-                Ok(bundle) => resolved.push(bundle),
-                Err(unresolved) => {
-                    // A range the tool of this host satisfies was sealed to
-                    // that version first, and the bundle is still open. An
-                    // alias of a setup step that stays unresolved is no
-                    // requirement. Anything else is refused as it was.
-                    let open = unresolved_aliases(&unresolved, bundle.as_ref(), &aliases[index]);
-                    if open.is_empty() {
-                        return Err(unresolved);
+            let unresolved = match asked.resolve(&ask, bundle.clone(), &observed).await {
+                Ok(bundle) => {
+                    resolved.push(bundle);
+                    continue;
+                }
+                // No answer about the requirements leaves nothing out.
+                Err(Refusal::Other(error)) => return Err(error),
+                Err(Refusal::Unresolved(unresolved)) => unresolved,
+            };
+            // A range the tool of this host satisfies was sealed to that
+            // version first, and the bundle is still open. An alias of a
+            // setup step that stays unresolved is no requirement. Anything
+            // else is refused as it was.
+            let open = unresolved_aliases(bundle.as_ref(), &aliases[index]);
+            // Several aliases are open: each is asked for with the others
+            // left out, and only one that is refused by itself is left out.
+            let mut alone = vec![false; open.len()];
+            for (tool, alone) in open.iter().zip(alone.iter_mut()) {
+                if open.len() == 1 {
+                    break;
+                }
+                let mut without = dropped.clone();
+                for (other, drop) in frozen.iter().zip(without.iter_mut()) {
+                    if other == bundle {
+                        drop.extend(open.iter().filter(|other| *other != tool).cloned());
                     }
-                    for (other, drop) in frozen.iter().zip(dropped.iter_mut()) {
-                        if other == bundle {
-                            drop.extend(open.iter().cloned());
-                        }
-                    }
-                    again = true;
-                    refused = Some(unresolved);
-                    resolved.push(None);
+                }
+                let (probe, _, _, observed) = freeze(without).await?;
+                match asked.resolve(&ask, probe[index].clone(), &observed).await {
+                    Ok(_) => *alone = true,
+                    Err(Refusal::Other(error)) => return Err(error),
+                    Err(Refusal::Unresolved(_)) => {}
                 }
             }
+            let open = left_out(open, &alone);
+            if open.is_empty() {
+                return Err(unresolved);
+            }
+            for (other, drop) in frozen.iter().zip(dropped.iter_mut()) {
+                if other == bundle {
+                    drop.extend(open.iter().cloned());
+                }
+            }
+            again = true;
+            resolved.push(None);
         }
         if !again {
-            drop(guard);
-            return Ok((resolved, crate::ci::toolchains::render(&notices)));
+            return Ok((resolved, notices));
         }
     }
 }
 
+/// Why a bundle was not resolved.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// The owner answered that nothing resolves the requirements, and what
+    /// this host observed does not answer them either.
+    Unresolved(ApiError),
+    /// No answer about the requirements: the owner is stopping, fenced or
+    /// overloaded, the request failed, or the answer is no bundle of this
+    /// source. Nothing is sealed or left out after it.
+    Other(ApiError),
+}
+
+/// The bundles the owner resolved in this submit, by the bundle asked for.
+#[derive(Default)]
+struct Asked(
+    Vec<(
+        crate::toolchain::contract::FrozenBundle,
+        crate::toolchain::contract::FrozenBundle,
+    )>,
+);
+
+impl Asked {
+    /// `ask` for `bundle`, once for each bundle of this submit.
+    async fn resolve<Ask, Asking>(
+        &mut self,
+        ask: &Ask,
+        bundle: Option<crate::toolchain::contract::FrozenBundle>,
+        observed: &Observed,
+    ) -> Result<Option<crate::toolchain::contract::FrozenBundle>, Refusal>
+    where
+        Ask: Fn(crate::toolchain::contract::FrozenBundle, Observed) -> Asking,
+        Asking:
+            std::future::Future<Output = Result<crate::toolchain::contract::FrozenBundle, Refusal>>,
+    {
+        let Some(bundle) = bundle else {
+            return Ok(None);
+        };
+        let same = |(asked, _): &&(_, _)| asked == &bundle;
+        if let Some((_, answer)) = self.0.iter().find(same) {
+            return Ok(Some(answer.clone()));
+        }
+        let answer = ask(bundle.clone(), observed.clone()).await?;
+        self.0.push((bundle, answer.clone()));
+        Ok(Some(answer))
+    }
+}
+
+/// The aliases of `open` that are left out: those the owner refused when
+/// asked for each by itself (`alone` says which were resolved).
+fn left_out(
+    open: Vec<crate::toolchain::versions::ToolId>,
+    alone: &[bool],
+) -> Vec<crate::toolchain::versions::ToolId> {
+    let refused = open.into_iter().zip(alone).filter(|(_, alone)| !**alone);
+    refused.map(|(tool, _)| tool).collect()
+}
+
 /// The tools of `aliases` (the setup-step aliases of the task `bundle` was
-/// frozen for) that `bundle` holds no evidence for, when `refused` says the
-/// bundle could not be resolved. An answer that never came says nothing of
-/// the kind.
+/// frozen for) that `bundle` holds no evidence for, after the owner answered
+/// that the bundle could not be resolved.
 fn unresolved_aliases(
-    refused: &ApiError,
     bundle: Option<&crate::toolchain::contract::FrozenBundle>,
     aliases: &[crate::toolchain::versions::ToolId],
 ) -> Vec<crate::toolchain::versions::ToolId> {
-    let mismatch = matches!(
-        refused.blocked_reason,
-        Some(crate::error::BlockedReason::EnvironmentMismatch)
-    );
-    let Some(bundle) = bundle.filter(|_| mismatch) else {
+    let Some(bundle) = bundle else {
         return Vec::new();
     };
     let open = |tool: &&crate::toolchain::versions::ToolId| {
@@ -464,39 +565,46 @@ async fn resolve_bundle(
     owner: &super::resident::Client,
     digest: &Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
-    frozen: Option<crate::toolchain::contract::FrozenBundle>,
+    bundle: crate::toolchain::contract::FrozenBundle,
     observed: &Observed,
-) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
-    let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
-    let toolchains = match frozen {
-        Some(bundle) if bundle.validate(digest).is_err() => {
-            let asked = bundle.frozen.describe_requirements();
-            match owner
-                .request(Operation::ResolveToolchains {
-                    bundle: bundle.clone(),
-                    requirements: requirements.clone(),
-                })
-                .await
-                .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
-            {
-                Reply::ResolvedToolchains { bundle } => {
-                    bundle.validate(digest).map_err(|e| invalid(e.into()))?;
-                    Some(bundle)
-                }
-                Reply::ControlError { error } => {
-                    Some(seal_after_refusal(bundle, observed, digest, error)?)
-                }
-                _ => {
-                    return Err(ApiError::blocked(
-                        crate::error::BlockedReason::EnvironmentMismatch,
-                        format!("toolchain resolve required ({asked})"),
-                    ))
-                }
-            }
-        }
-        other => other,
-    };
-    Ok(toolchains)
+) -> Result<crate::toolchain::contract::FrozenBundle, Refusal> {
+    if bundle.validate(digest).is_ok() {
+        return Ok(bundle);
+    }
+    let reply = owner
+        .request(Operation::ResolveToolchains {
+            bundle: bundle.clone(),
+            requirements: requirements.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))
+        .map_err(Refusal::Other)?;
+    resolved_reply(reply, bundle, observed, digest)
+}
+
+/// What the owner answered to the request to resolve `bundle`. Only its
+/// answer that the requirements could not be resolved is that refusal; an
+/// owner that is stopping, or any other reply, says nothing about them.
+fn resolved_reply(
+    reply: Reply,
+    bundle: crate::toolchain::contract::FrozenBundle,
+    observed: &Observed,
+    digest: &Digest,
+) -> Result<crate::toolchain::contract::FrozenBundle, Refusal> {
+    match reply {
+        Reply::ResolvedToolchains { bundle } => match bundle.validate(digest) {
+            Ok(()) => Ok(bundle),
+            Err(e) => Err(Refusal::Other(ApiError::new(ErrorCode::InvalidInput, e))),
+        },
+        Reply::ControlError { error } => seal_after_refusal(bundle, observed, digest, error),
+        _ => Err(Refusal::Other(ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            format!(
+                "toolchain resolve required ({})",
+                bundle.frozen.describe_requirements()
+            ),
+        ))),
+    }
 }
 
 /// What the owner's refusal to resolve leaves the submit with. Only the
@@ -511,15 +619,15 @@ fn seal_after_refusal(
     observed: &Observed,
     digest: &Digest,
     error: ApiError,
-) -> Result<crate::toolchain::contract::FrozenBundle, ApiError> {
+) -> Result<crate::toolchain::contract::FrozenBundle, Refusal> {
     if error.code != ErrorCode::Blocked
         || error.blocked_reason != Some(crate::error::BlockedReason::EnvironmentMismatch)
     {
-        return Err(error);
+        return Err(Refusal::Other(error));
     }
     let sealed = bundle.seal_observed(observed);
     if sealed.validate(digest).is_err() {
-        return Err(error);
+        return Err(Refusal::Unresolved(error));
     }
     Ok(sealed)
 }
@@ -692,7 +800,7 @@ fn freeze_prepared(
                     project,
                     &unresolved,
                 );
-                aliases.push(freeze.aliases());
+                aliases.push(freeze.aliases(&prepared.sources[index]));
                 notices.extend(freeze.notices);
                 let who = format!("task `{}` (job {}): ", task.id, task.jobs.join(", "));
                 sets.push((who, freeze.scope, freeze.declarations));
@@ -825,7 +933,7 @@ mod tests {
     /// nothing about them leaves the bundle unsealed and comes back unchanged.
     #[test]
     fn only_the_unresolved_requirements_refusal_seals_to_the_observed_version() {
-        use super::seal_after_refusal;
+        use super::{seal_after_refusal, Refusal};
         use crate::error::{ApiError, BlockedReason, ErrorCode};
         use crate::ids::Digest;
         use crate::toolchain::{contract::FrozenBundle, versions::*};
@@ -869,7 +977,7 @@ mod tests {
         // The observation does not answer the refusal: it stays the refusal.
         assert_eq!(
             seal_after_refusal(bundle.clone(), &seen("18.0.0"), &source, unresolved()),
-            Err(unresolved())
+            Err(Refusal::Unresolved(unresolved()))
         );
         for transient in [
             ApiError::new(ErrorCode::CommunicationUnknown, "resident is stopping"),
@@ -880,7 +988,7 @@ mod tests {
         ] {
             assert_eq!(
                 seal_after_refusal(bundle.clone(), &seen("20.11.1"), &source, transient.clone()),
-                Err(transient)
+                Err(Refusal::Other(transient))
             );
         }
     }
@@ -894,7 +1002,7 @@ mod tests {
     /// (the project file names it) keeps the refusal.
     #[test]
     fn a_refused_bundle_is_sealed_from_the_observation_before_step_aliases_are_left_out() {
-        use super::{seal_after_refusal, unresolved_aliases};
+        use super::{seal_after_refusal, unresolved_aliases, Refusal};
         use crate::error::{ApiError, BlockedReason};
         use crate::ids::Digest;
         use crate::toolchain::{contract::FrozenBundle, versions::*};
@@ -941,10 +1049,10 @@ mod tests {
         // the alias of the step, not the range, is what is left out.
         assert_eq!(
             seal_after_refusal(mixed.clone(), &seen, &source, refusal()),
-            Err(refusal())
+            Err(Refusal::Unresolved(refusal()))
         );
         let steps = [rust.clone()];
-        assert_eq!(unresolved_aliases(&refusal(), Some(&mixed), &steps), steps);
+        assert_eq!(unresolved_aliases(Some(&mixed), &steps), steps);
         // Asked again without the alias, the range is sealed.
         let sealed =
             seal_after_refusal(bundle(&[(&node, "20")]), &seen, &source, refusal()).unwrap();
@@ -954,14 +1062,13 @@ mod tests {
         let unmet = bundle(&[(&node, "18")]);
         assert_eq!(
             seal_after_refusal(unmet.clone(), &seen, &source, refusal()),
-            Err(refusal())
+            Err(Refusal::Unresolved(refusal()))
         );
-        assert!(unresolved_aliases(&refusal(), Some(&unmet), &[]).is_empty());
+        assert!(unresolved_aliases(Some(&unmet), &[]).is_empty());
         // An alias the project file wrote is no alias of a step.
-        assert!(unresolved_aliases(&refusal(), Some(&mixed), &[]).is_empty());
-        // Another error says nothing about the requirements.
-        let other = ApiError::blocked(BlockedReason::SecretUnavailable, "secret");
-        assert!(unresolved_aliases(&other, Some(&mixed), &steps).is_empty());
+        assert!(unresolved_aliases(Some(&mixed), &[]).is_empty());
+        // A task that requires nothing has no alias to leave out.
+        assert!(unresolved_aliases(None, &steps).is_empty());
     }
 
     #[test]
@@ -987,5 +1094,293 @@ mod tests {
         assert!(worker_inventory(&real, &profile).is_some());
         // No local worker state at all is not an inventory.
         assert!(worker_inventory(&root.join("absent"), &profile).is_none());
+    }
+
+    /// A bundle of the step aliases `declared` (tool and alias), unsealed.
+    fn alias_bundle(declared: &[(&str, &str)]) -> crate::toolchain::contract::FrozenBundle {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let source = crate::ids::Digest::of_bytes(b"source");
+        let scope = Scope::project("");
+        let declarations: Vec<Declaration> = declared
+            .iter()
+            .map(|(tool, constraint)| Declaration {
+                tool: ToolId::parse(tool).unwrap(),
+                constraint: Constraint::parse(constraint).unwrap(),
+                scope: scope.clone(),
+                location: Location {
+                    path: ".github/workflows/ci.yml".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            })
+            .collect();
+        let frozen = FrozenToolchains::freeze(
+            source.clone(),
+            crate::ids::Digest::of_bytes(b"parent"),
+            scope,
+            &declarations,
+            &[],
+            &Default::default(),
+            MatchPolicy::Exact,
+        );
+        FrozenBundle::seal_exact(frozen.unwrap()).unwrap()
+    }
+
+    fn refusal() -> crate::error::ApiError {
+        crate::error::ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "toolchain resolve required: no coherent worker proposal",
+        )
+    }
+
+    /// What the owner says of a bundle that holds exactly these tools.
+    type Verdict<'a> = dyn Fn(&[&str]) -> Option<super::Refusal> + 'a;
+
+    /// [`super::resolve_each`] for two tasks: the first has the setup-step
+    /// aliases `steps`, the second requires nothing. The owner answers by
+    /// `verdict`, and a freeze with something left out fails with `unfrozen`.
+    /// The result (the requirements of each task and the tools told as left
+    /// out), and what the owner was asked, in order.
+    #[allow(clippy::type_complexity)]
+    fn resolve_steps(
+        steps: &[(&str, &str)],
+        verdict: &Verdict<'_>,
+        unfrozen: Option<crate::error::ApiError>,
+    ) -> (
+        Result<(Vec<Option<String>>, Vec<String>), crate::error::ApiError>,
+        Vec<String>,
+    ) {
+        use crate::toolchain::versions::ToolId;
+        let asks = std::cell::RefCell::new(Vec::new());
+        let freeze = |dropped: Vec<Vec<ToolId>>| {
+            let unfrozen = unfrozen.clone();
+            async move {
+                assert_eq!(dropped.len(), 2);
+                assert!(dropped[1].is_empty());
+                if let Some(error) = unfrozen.filter(|_| !dropped[0].is_empty()) {
+                    return Err(error);
+                }
+                let left = |name: &str| dropped[0].iter().any(|tool| tool.as_str() == name);
+                let kept: Vec<(&str, &str)> = steps
+                    .iter()
+                    .filter(|(tool, _)| !left(tool))
+                    .cloned()
+                    .collect();
+                let aliases = kept.iter().map(|(tool, _)| ToolId::parse(tool).unwrap());
+                let notices = dropped[0].iter().map(|tool| crate::ci::toolchains::Notice {
+                    task: "build".into(),
+                    job: Some("build".into()),
+                    at: "ci.yml:1".into(),
+                    text: tool.as_str().into(),
+                });
+                let bundle = (!kept.is_empty()).then(|| alias_bundle(&kept));
+                let bundles: super::Bundles = (
+                    vec![bundle, None],
+                    vec![aliases.collect(), vec![]],
+                    notices.collect(),
+                    Default::default(),
+                );
+                Ok(bundles)
+            }
+        };
+        let ask = |bundle: crate::toolchain::contract::FrozenBundle, _: super::Observed| {
+            let asked = bundle.frozen.describe_requirements();
+            asks.borrow_mut().push(asked);
+            let tools: Vec<&str> = bundle
+                .frozen
+                .requirements
+                .iter()
+                .map(|r| r.tool.as_str())
+                .collect();
+            let answer = match verdict(&tools) {
+                Some(refused) => Err(refused),
+                None => Ok(bundle.clone()),
+            };
+            async move { answer }
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(super::resolve_each(2, freeze, ask));
+        let result = result.map(|(resolved, notices)| {
+            let described = |bundle: &Option<crate::toolchain::contract::FrozenBundle>| {
+                bundle
+                    .as_ref()
+                    .map(|bundle| bundle.frozen.describe_requirements())
+            };
+            (
+                resolved.iter().map(described).collect(),
+                notices.into_iter().map(|notice| notice.text).collect(),
+            )
+        });
+        (result, asks.into_inner())
+    }
+
+    /// Of several setup-step aliases in one refused bundle, only those the
+    /// owner refuses by themselves are left out: the one it resolves stays a
+    /// requirement of the task. A bundle the owner already resolved is not
+    /// asked for again in the next pass.
+    #[test]
+    fn only_the_aliases_refused_alone_are_left_out_and_no_bundle_is_asked_twice() {
+        use super::Refusal;
+        let strings = |all: &[&str]| -> Vec<String> { all.iter().map(|s| s.to_string()).collect() };
+        let no_rust: &Verdict<'_> = &|tools| {
+            tools
+                .contains(&"rust")
+                .then(|| Refusal::Unresolved(refusal()))
+        };
+        let both = [("node", "lts/*"), ("rust", "stable")];
+        let (result, asks) = resolve_steps(&both, no_rust, None);
+        assert_eq!(
+            result,
+            Ok((
+                vec![Some("node=lts/*".to_string()), None],
+                strings(&["rust"])
+            ))
+        );
+        // The bundle, then each alias without the other; the pass after that
+        // freezes to the bundle of the first probe and asks nothing.
+        assert_eq!(
+            asks,
+            ["node=lts/*, rust=stable", "node=lts/*", "rust=stable"]
+        );
+        // One alias: it is left out with no question about it alone.
+        let (result, asks) = resolve_steps(&[("rust", "stable")], no_rust, None);
+        assert_eq!(result, Ok((vec![None, None], strings(&["rust"]))));
+        assert_eq!(asks, ["rust=stable"]);
+        // Nothing resolves either alias: both are left out.
+        let nothing: &Verdict<'_> = &|_| Some(Refusal::Unresolved(refusal()));
+        let (result, asks) = resolve_steps(&both, nothing, None);
+        assert_eq!(result, Ok((vec![None, None], strings(&["node", "rust"]))));
+        assert_eq!(asks.len(), 3);
+        // Each resolves alone and the two do not together: nothing can be
+        // left out, and the refusal stands.
+        let apart: &Verdict<'_> =
+            &|tools| (tools.len() > 1).then(|| Refusal::Unresolved(refusal()));
+        let (result, asks) = resolve_steps(&both, apart, None);
+        assert_eq!(result, Err(refusal()));
+        assert_eq!(asks.len(), 3);
+        // Three aliases, one of them refused alone: the other two stay, and
+        // are asked for together once.
+        let three = [("go", "stable"), ("node", "lts/*"), ("rust", "stable")];
+        let (result, asks) = resolve_steps(&three, no_rust, None);
+        assert_eq!(
+            result,
+            Ok((
+                vec![Some("go=stable, node=lts/*".to_string()), None],
+                strings(&["rust"])
+            ))
+        );
+        assert_eq!(
+            asks,
+            [
+                "go=stable, node=lts/*, rust=stable",
+                "go=stable",
+                "node=lts/*",
+                "rust=stable",
+                "go=stable, node=lts/*"
+            ]
+        );
+    }
+
+    /// Only the answer that the requirements could not be resolved leaves an
+    /// alias out. An owner that did not answer the question is the error of
+    /// the submit, for the bundle and for an alias asked for alone; so is a
+    /// freeze that fails once an alias is left out, in place of the refusal
+    /// that came before it.
+    #[test]
+    fn no_alias_is_left_out_without_the_refusal_and_a_failed_freeze_is_its_own_error() {
+        use super::Refusal;
+        use crate::error::{ApiError, BlockedReason, ErrorCode};
+        let both = [("node", "lts/*"), ("rust", "stable")];
+        // The words of a refusal, from an owner that is stopping.
+        let stopping = || {
+            ApiError::blocked(
+                BlockedReason::EnvironmentMismatch,
+                "toolchain resolve required",
+            )
+        };
+        let unanswered: &Verdict<'_> = &|_| Some(Refusal::Other(stopping()));
+        let (result, asks) = resolve_steps(&both, unanswered, None);
+        assert_eq!(result, Err(stopping()));
+        assert_eq!(asks.len(), 1);
+        let lost = || ApiError::new(ErrorCode::CommunicationUnknown, "resident is stopping");
+        let alone: &Verdict<'_> = &|tools| {
+            Some(match tools.len() {
+                1 => Refusal::Other(lost()),
+                _ => Refusal::Unresolved(refusal()),
+            })
+        };
+        let (result, asks) = resolve_steps(&both, alone, None);
+        assert_eq!(result, Err(lost()));
+        assert_eq!(asks.len(), 2);
+        // The freeze without the alias contradicts itself: that is told, not
+        // the refusal of the alias.
+        let conflict =
+            || ApiError::blocked(BlockedReason::EnvironmentMismatch, "conflicting_versions");
+        let nothing: &Verdict<'_> = &|_| Some(Refusal::Unresolved(refusal()));
+        for steps in [&both[..], &both[1..]] {
+            let (result, _) = resolve_steps(steps, nothing, Some(conflict()));
+            assert_eq!(result, Err(conflict()));
+        }
+    }
+
+    /// What the owner's reply to the resolve request is to the submit: the
+    /// resolved bundle, the refusal that nothing resolves the requirements,
+    /// or no answer about them.
+    #[test]
+    fn only_the_owner_saying_so_is_the_refusal_that_nothing_resolves_the_bundle() {
+        use super::{resolved_reply, Refusal, Reply};
+        use crate::error::{ApiError, BlockedReason, ErrorCode};
+        let source = crate::ids::Digest::of_bytes(b"source");
+        let open = alias_bundle(&[("rust", "stable")]);
+        let pinned = alias_bundle(&[("rust", "1.89.0")]);
+        pinned.validate(&source).unwrap();
+        let seen = super::Observed::new();
+        let reply = |reply: Reply| resolved_reply(reply, open.clone(), &seen, &source);
+        assert_eq!(
+            reply(Reply::ResolvedToolchains {
+                bundle: pinned.clone()
+            }),
+            Ok(pinned)
+        );
+        // A bundle that is still open is no answer.
+        let unresolved = reply(Reply::ResolvedToolchains {
+            bundle: open.clone(),
+        });
+        assert!(
+            matches!(&unresolved, Err(Refusal::Other(e)) if e.code == ErrorCode::InvalidInput),
+            "{unresolved:?}"
+        );
+        assert_eq!(
+            reply(Reply::ControlError { error: refusal() }),
+            Err(Refusal::Unresolved(refusal()))
+        );
+        let internal = ApiError::new(ErrorCode::Internal, "storage");
+        assert_eq!(
+            reply(Reply::ControlError {
+                error: internal.clone()
+            }),
+            Err(Refusal::Other(internal))
+        );
+        // The owner is stopping: the same words as a refusal, and no answer.
+        assert_eq!(
+            reply(Reply::Stopping),
+            Err(Refusal::Other(ApiError::blocked(
+                BlockedReason::EnvironmentMismatch,
+                "toolchain resolve required (rust=stable)"
+            )))
+        );
+    }
+
+    #[test]
+    fn the_aliases_left_out_are_those_not_resolved_alone() {
+        use super::left_out;
+        let tool = |name: &str| crate::toolchain::versions::ToolId::parse(name).unwrap();
+        let open = || vec![tool("go"), tool("node"), tool("rust")];
+        assert_eq!(left_out(open(), &[true, false, true]), [tool("node")]);
+        assert_eq!(left_out(open(), &[false, false, false]), open());
+        assert_eq!(left_out(open(), &[true, true, true]), []);
+        assert_eq!(left_out(vec![tool("rust")], &[false]), [tool("rust")]);
     }
 }

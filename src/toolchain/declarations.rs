@@ -497,10 +497,8 @@ fn version_file(
                 Some(d) => (Ok(d.constraint), d.location),
                 None => at_step(Err("version_file_without_tool")),
             },
-            Err(unread) => {
-                let at = unread.locations.first().unwrap_or(here).clone();
-                (Err(unread.code), at)
-            }
+            // An error of the one file that was read says where in it.
+            Err(unread) => (Err(unread.code), unread.locations[0].clone()),
         };
     }
     if STRUCTURED.iter().any(|suffix| file.ends_with(suffix)) {
@@ -577,8 +575,10 @@ pub fn setup_version_files(doc: &Document) -> Vec<String> {
     paths.filter(named).collect()
 }
 
-// setup-node returns its nonempty direct input before it consults a file.
-// Share this decision with snapshot discovery, including unresolved expressions.
+// A setup action takes its direct version input before it consults a file:
+// with both, the file is not read. setup-node does so for a nonempty input
+// only. Share this decision with snapshot discovery, including unresolved
+// expressions.
 fn version_inputs<'a>(
     action: &str,
     key: &str,
@@ -594,11 +594,7 @@ fn version_inputs<'a>(
     if action == "actions/setup-node" {
         direct = direct.filter(|value| !value.trim().is_empty());
     }
-    let file = if action == "actions/setup-node" && direct.is_some() {
-        None
-    } else {
-        get(&format!("{key}-file"))
-    };
+    let file = get(&format!("{key}-file")).filter(|_| direct.is_none());
     (direct, file)
 }
 fn plain_version(text: &str) -> String {

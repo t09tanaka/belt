@@ -1886,6 +1886,27 @@ fn a_step_under_a_condition_and_a_skipped_input_require_nothing() {
     };
     let (_, _, skipped) = task_of(&conditional, "ci.yml", &["build"], &no_value);
     assert_eq!(skipped[0].code, "conditional_step");
+    // Also when the input is a reference the variant has a value for.
+    let reference = step_decl("node", "${{ matrix.node }}", "ci.yml", "build", 0);
+    let conditional = SetupRead {
+        declarations: vec![reference.clone()],
+        conditional: vec![reference.scope.clone()],
+        ..Default::default()
+    };
+    let known = |_: &Scope, _: &str, _: &str| Some("18.0.0".to_string());
+    assert_eq!(
+        task_of(&conditional, "ci.yml", &["build"], &known),
+        (
+            Scope::project(""),
+            vec![],
+            vec![skipped_of(
+                &reference,
+                "conditional_step",
+                "${{ matrix.node }}",
+                &reference.location
+            )]
+        )
+    );
     // The same step without the condition is a requirement, and stands before
     // the project's file.
     let unconditional = SetupRead {
@@ -2407,4 +2428,66 @@ fn the_freeze_asks_for_the_version_files_a_workflow_can_name() {
     );
     // A workflow that does not parse names none.
     assert!(setup_version_files(&documents["bad.yml"]).is_empty());
+}
+
+/// A setup action takes its direct version input and does not consult the
+/// version file beside it, in either order of the two: the file is not asked
+/// for and not read, so what it holds contradicts nothing.
+#[test]
+fn a_direct_version_precedes_the_version_file_of_every_setup_action() {
+    for (uses, key, version) in [
+        ("actions/setup-python@v5", "python-version", "3.12.1"),
+        ("actions/setup-go@v5", "go-version", "1.22.3"),
+        ("actions/setup-node@v4", "node-version", "20.1.0"),
+    ] {
+        let direct = format!("{key}: {version}");
+        let file = format!("{key}-file: pinned.txt");
+        let files: [&[(&str, &str)]; 2] = [&[], &[("pinned.txt", "9.9.9\n")]];
+        for inputs in [
+            format!("{direct}\n          {file}"),
+            format!("{file}\n          {direct}"),
+        ] {
+            let workflow = one_step(uses, &inputs);
+            let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+            assert_eq!(workflow_version_files(&document), Ok(vec![]), "{workflow}");
+            assert!(setup_version_files(&document).is_empty(), "{workflow}");
+            for files in files {
+                let read = setup_read(&workflow, files);
+                assert_eq!(read.skipped, [], "{workflow}");
+                assert_eq!(read.declarations.len(), 1, "{workflow}");
+                let got = &read.declarations[0];
+                assert_eq!(got.constraint, Constraint::parse(version).unwrap());
+                assert_eq!(got.location.path, "ci.yml");
+            }
+            let mut all = vec![("ci.yml", workflow.as_str())];
+            all.extend_from_slice(files[1]);
+            let got = read_project("", &docs(&all), &["ci.yml".into()]).unwrap();
+            assert_eq!(got.len(), 1, "{workflow}");
+        }
+        // The file alone is asked for and read, as before.
+        let workflow = one_step(uses, &file);
+        let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+        assert_eq!(
+            workflow_version_files(&document),
+            Ok(vec!["pinned.txt".to_string()])
+        );
+        assert_eq!(setup_version_files(&document), ["pinned.txt"]);
+        let read = setup_read(&workflow, files[1]);
+        assert_eq!(read.declarations.len(), 1, "{workflow}");
+        assert_eq!(read.declarations[0].location.path, "pinned.txt");
+        assert_eq!(
+            read.declarations[0].constraint,
+            Constraint::parse("9.9.9").unwrap()
+        );
+        // An empty direct input is no input for setup-node only: any other
+        // action is still given it, and its file is not asked for.
+        let workflow = one_step(uses, &format!("{key}: ''\n          {file}"));
+        let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+        let asked = setup_version_files(&document);
+        if uses.starts_with("actions/setup-node@") {
+            assert_eq!(asked, ["pinned.txt"]);
+        } else {
+            assert!(asked.is_empty(), "{workflow}");
+        }
+    }
 }

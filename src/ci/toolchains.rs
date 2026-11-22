@@ -53,12 +53,22 @@ pub struct TaskFreeze {
 impl TaskFreeze {
     /// The tools a setup step of the task requires by a channel or an alias
     /// (`stable`, `lts/*`): a requirement only while a concrete version is
-    /// known for it.
-    pub fn aliases(&self) -> Vec<ToolId> {
+    /// known for it. An alias the project's own version file in `source`
+    /// names as well is not one of them: without the step, the file requires
+    /// the same.
+    pub fn aliases(&self, source: &TaskSource) -> Vec<ToolId> {
+        let whole = Scope::project(&self.scope.project);
         let step = |d: &&Declaration| d.scope == self.scope && self.scope.job.is_some();
         let alias = |d: &&Declaration| matches!(d.constraint, Constraint::Resolve(_));
+        let in_file = |d: &&Declaration| {
+            let same = |p: &Declaration| {
+                p.scope == whole && p.tool == d.tool && p.constraint == d.constraint
+            };
+            source.0.declarations.iter().any(same)
+        };
+        let named = |d: &&Declaration| alias(d) && !in_file(d);
         let mut tools: Vec<ToolId> = Vec::new();
-        for d in self.declarations.iter().filter(step).filter(alias) {
+        for d in self.declarations.iter().filter(step).filter(named) {
             if !tools.contains(&d.tool) {
                 tools.push(d.tool.clone());
             }
@@ -711,14 +721,14 @@ jobs:
         assert_eq!(kept.scope, job_scope("build"));
         assert_eq!(lines(&kept), ["node=lts/*", "rust=stable"]);
         assert_eq!(kept.notices, []);
-        assert_eq!(kept.aliases(), [tool("rust"), tool("node")]);
+        assert_eq!(kept.aliases(&source), [tool("rust"), tool("node")]);
         // `stable` stays unresolved: the step requires nothing, the notice
         // says so, and the project's file is the requirement again.
         let no_rust = |tool: &ToolId, alias: &str| tool.as_str() == "rust" && alias == "stable";
         let dropped = task_declarations(&source, &f.plan, task, "", &no_rust);
         assert_eq!(dropped.scope, job_scope("build"));
         assert_eq!(lines(&dropped), ["node=lts/*", "rust=1.80.0"]);
-        assert_eq!(dropped.aliases(), [tool("node")]);
+        assert_eq!(dropped.aliases(&source), [tool("node")]);
         assert_eq!(
             render(&dropped.notices),
             [format!("task `{}` (job build, {FILE}:6): rust: `stable` names no concrete version; no rust version is required from this step", task.id)]
@@ -727,7 +737,7 @@ jobs:
         let none = task_declarations(&source, &f.plan, task, "", &unresolved);
         assert_eq!(none.scope, Scope::project(""));
         assert_eq!(lines(&none), ["rust=1.80.0"]);
-        assert_eq!(none.aliases(), []);
+        assert_eq!(none.aliases(&source), []);
         assert_eq!(none.notices.len(), 2);
         // The holder of a bundle reads which aliases were left out from the
         // bundle's own requirements, and so derives the bundle it was given.
@@ -776,6 +786,28 @@ jobs:
         other.requirements[1].tool = rust;
         let read = task_declarations_as_frozen(&source, &f.plan, task, "", &other.requirements);
         assert_eq!(read, none);
+    }
+
+    /// An alias a setup step names is one that can be left out, unless the
+    /// project's own version file names the same for the tool: without the
+    /// step the file still requires it.
+    #[test]
+    fn an_alias_the_project_file_names_as_well_is_not_one_of_the_step() {
+        let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - uses: actions/setup-node@v4\n        with:\n          node-version: lts/*\n      - run: echo build\n";
+        let tool = |name: &str| ToolId::parse(name).unwrap();
+        let aliases = |channel: &'static str, node: &'static str| {
+            let f = fixture_with(workflow, |project| {
+                std::fs::write(project.join("rust-toolchain"), channel).unwrap();
+                std::fs::write(project.join(".nvmrc"), node).unwrap();
+            });
+            let source = source(&f);
+            let task = tasks(&f, "build")[0];
+            task_declarations(&source, &f.plan, task, "", &resolved).aliases(&source)
+        };
+        assert_eq!(aliases("stable\n", "20.1.0\n"), [tool("node")]);
+        assert_eq!(aliases("beta\n", "lts/*\n"), [tool("rust")]);
+        // Another alias, or the same alias of another tool, is not the step's.
+        assert_eq!(aliases("beta\n", "stable\n"), [tool("rust"), tool("node")]);
     }
 
     #[test]

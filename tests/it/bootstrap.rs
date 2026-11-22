@@ -5822,6 +5822,61 @@ async fn ci_accepts_a_range_the_native_tool_satisfies_frozen_to_the_observed_ver
     shutdown(&load(&spec)).await;
 }
 
+/// Two setup steps of one job name an alias each: the one the registry
+/// resolves stays a requirement of the task, frozen to the resolved version,
+/// and the job runs on it. Only the one nothing resolves is no requirement,
+/// and only that one is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_accepts_an_alias_the_registry_resolves_beside_one_nothing_resolves() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0'");
+    // The operator maps the alias to a version of the inventory.
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    let registry = std::fs::read_to_string(&registry_file).unwrap();
+    std::fs::write(
+        &registry_file,
+        format!("{registry}resolved_inputs={{'lts/*'='20.0.0'}}\n"),
+    )
+    .unwrap();
+    // The rust step looks for `cargo`; no rust version is asked of it.
+    crate::common::write_executable(&host.join("cargo"), "#!/bin/sh\nprintf 'cargo 1.80.0\\n'\n");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - uses: actions/setup-node@v4\n        with:\n          node-version: lts/*\n      - run: node --version >> MARKS/build\n",
+    );
+    let output = ci_command(&spec, &input).output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    if output.status.code() != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(output.status.code(), Some(0), "{value} {stderr}");
+    assert_eq!(ci_marks(&marks, "build"), ["v20.0.0"]);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is required from this step"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(
+        notices[0].ends_with(
+            "rust: `stable` names no concrete version; no rust version is required from this step"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [(
+            Some("build".to_string()),
+            vec!["node=lts/*".to_string()],
+            vec!["20.0.0".to_string()]
+        )]
+    );
+    shutdown(&load(&spec)).await;
+}
+
 /// A range of a setup step that neither a registry resolves nor this host's
 /// own tool is in is refused when the run is submitted, with the words of a
 /// plain command, also when another job of the run names an alias: nothing is
