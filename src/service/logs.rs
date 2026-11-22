@@ -429,7 +429,7 @@ impl Observer {
     ) -> Result<(), ApiError> {
         if sink.json {
             sink.record(serde_json::json!({
-                "kind": "status", "run_id": run_id, "github_status": status
+                "kind": "github_status", "run_id": run_id, "github_status": status
             }))
             .await
         } else {
@@ -923,7 +923,7 @@ mod tests {
                     assert_eq!(
                         records.last().unwrap()["data"],
                         serde_json::json!({
-                            "kind": "status", "run_id": f.run, "github_status": record
+                            "kind": "github_status", "run_id": f.run, "github_status": record
                         })
                     );
                     assert_eq!(
