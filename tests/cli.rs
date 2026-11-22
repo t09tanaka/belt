@@ -1346,6 +1346,12 @@ fn cache_ls_and_prune() {
         .join("app-1234abcd/packages__web/bbbbbbbbbbbbbbbb-v20.0.0");
     fs::create_dir_all(&old).unwrap();
     fs::create_dir_all(&new).unwrap();
+    fs::write(
+        w.cache
+            .join("app-1234abcd/packages__web/bbbbbbbbbbbbbbbb-v20.0.0.ok"),
+        "",
+    )
+    .unwrap();
     fs::create_dir_all(w.cache.join("trash/1-1-1-x")).unwrap();
     let old_marker = w
         .cache
@@ -3579,6 +3585,11 @@ fn cache_ls_shows_an_older_layout_apart_and_prune_legacy_removes_it() {
     let key = "0123456789abcdef-v20.0.0";
     let current = w.cache.join("app-1234abcd/_root").join(key);
     fs::create_dir_all(&current).unwrap();
+    fs::write(
+        w.cache.join("app-1234abcd/_root").join(format!("{key}.ok")),
+        "",
+    )
+    .unwrap();
     // The older layout: no hash after the repository's name, and the root
     // project's entries right in it, holding packages.
     let old_root = w.cache.join("app").join(key);

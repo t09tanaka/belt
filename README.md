@@ -1076,12 +1076,13 @@ worktree (or with `discard_changes`), so it always deletes it:
     kept worktree, fetched into the main repository first (if that fails,
     it says so).
 
-  The refs are named in the output. Those older than 30 days are deleted
-  by the next `add`, `remove`, `hook remove` or library call in that
-  repository (at most once an hour; see [What is deleted by
-  itself](#what-is-deleted-by-itself)); `fast-worktree kept ls` lists them
-  and `fast-worktree kept prune [--older-than <days>]` deletes the old ones
-  at once (default: 30 days; `git update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
+  The refs are named in the output, with the day each is deleted. One
+  whose commit a branch or tag has is deleted after 25 hours; one that
+  holds its commit alone after 30 days, and its commits can then be dropped
+  by `git gc` (see [What is deleted by
+  itself](#what-is-deleted-by-itself)). `fast-worktree kept ls` lists them
+  and `fast-worktree kept prune [--older-than <days>]` applies the same
+  rules at once (default: 30 days; `git update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
   branch, but `git push --mirror` pushes every ref, these included.
 - Claude Code never deletes the branch of a worktree a hook created. `hook
   remove` deletes `worktree-<name>` only when its commit is on its
@@ -1119,7 +1120,7 @@ deleted branch worktree-demo
 fast-worktree: it had uncommitted changes; it is kept in ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo for at least 24 hours
 to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo refs/fast-worktree/kept/demo-20261026-130311/head && rsync -a --exclude=/.git ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo/ ~/monorepo/.claude/worktrees/demo/
 fast-worktree: its HEAD 50c46ff4cb8f is kept as refs/fast-worktree/kept/demo-20261026-130311/head
-fast-worktree: `fast-worktree kept ls` lists such refs, they are deleted by themselves after 30 days (`fast-worktree kept prune` does it at once)
+fast-worktree: `fast-worktree kept ls` lists such refs. Each is deleted by itself on 2026-11-25 (30 days from now), and what it holds can then be dropped by `git gc`; sooner only when a branch or tag has its commit. Make a branch of what you want to keep: git branch <name> <commit>
 ```
 
 `worktree-demo` was deleted because its commit is on `origin/main`. A
@@ -1178,38 +1179,79 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
 
 ## What is deleted by itself
 
-Nothing that fast-worktree keeps after a command has ended is kept for ever,
-and no command has to be run to clean up. The rules run from the commands
-that write to the same place (`add`, `remove`, `hook remove`, `install`,
-`pool fill`, and the library calls that do the same), not from a daemon.
-Things are deleted at the moment they stop being needed where that moment is
-known; the walk over everything is made at most once an hour, by whichever
-command comes first (the cache walk is stamped in
-`<cache>/.retention-stamp`, a repository's kept refs in
-`<cache>/<repo>-<hash>/.retention-stamp`). A sweep never fails the command
-that made it. `cache prune`, `kept prune` and `pool clear` apply the same
-rules at once.
+Nothing that fast-worktree keeps after a command has ended grows without
+bound, and no command has to be run to clean up. The rules run from the
+commands that write to the same place (`add`, `remove`, `hook remove`,
+`install`, `pool fill`, and the library calls that do the same), not from a
+daemon. `cache prune`, `kept prune` and `pool clear` apply the same rules at
+once.
+
+- **Every command** starts one background deleter for what an interrupted
+  one left in the trash (none while one is at work), and, in its own
+  repository, discards the spares beyond the pool size.
+- **At most once an hour, in its own repository** (stamped in
+  `<cache>/<repo>-<hash>/.retention-stamp`), a command deletes the kept refs
+  that are no longer needed and the pool's leftovers. This part runs git and
+  may wait for that repository's locks, so it is never done for another
+  repository.
+- **At most once an hour, for the whole cache** (stamped in
+  `<cache>/.retention-stamp`), whichever command comes first walks every
+  repository's directory. This walk must not delay the command that makes
+  it: it lists directories and renames into the trash, takes locks only
+  without waiting (a busy one is left for the next walk), runs no git, moves
+  at most 200 things, and starts one deleter for all of them. When work is
+  left, the next command goes on, not the next hour's.
+
+A sweep never fails the command that made it. A stamp that cannot be written
+is said once, and the walk is then made by every command.
 
 | What | Where | Kept | Deleted by |
 |---|---|---|---|
 | Cache entry, with its `.ok` and `.src` | `<cache>/<repo>/<project>/<key>` | until unused for 7 days (its modification time is its last use, set when it is cloned); the next install clones from it | the hourly walk (every project of every repository), `install` of that project, `cache prune` |
-| Half-made entry `<key>.tmp-<pid>-<n>` | the project directory | until its run is gone (the pid is not alive) and it is 10 minutes old, or 7 days old whatever the pid | the same |
-| Project directory and its `.store.lock` | `<cache>/<repo>/<project>` | until its last entry goes | with its last entry |
-| Repository directory, `lifecycle.lock`, stamp | `<cache>/<repo>` | until nothing is in it but those | the hourly walk |
-| Pool spare | `<cache>/<repo>/pool` | until used (the configured size at most) | `add`, `pool refresh`, `pool clear` |
-| Pool `.new-*`, `.claimed-*`, `.no-hooks-*` | the pool | until the fill that made them, or the `add` that took them, is gone | the start of the next `pool fill`, the hourly walk, `pool clear` |
-| `pool/misses` | the pool | the last 7 days: `pool status` shows how often an `add` found no spare | trimmed by each `add` that adds to it, and by the walk |
-| `pool/fill.log` | the pool | 7 days after the last fill wrote to it; started afresh when it passes 1 MiB | the walk |
-| Pool directory, `fill.lock` | `<cache>/<repo>/pool` | until nothing is in it but the lock | the hourly walk |
-| Trash | `<cache>/trash` | deleted at once in the background; a leftover of a killed deleter after 10 minutes, a `keep-` entry (a worktree `hook remove` kept) for 24 hours | any command above that sweeps: the trash is emptied by the next fast-worktree command after those times |
-| Trash directory and its `.lock` | `<cache>/trash` | until nothing is in it | the hourly walk |
-| Kept refs | `refs/fast-worktree/kept/*` of the repository | 30 days (the date in the ref's name; `kept prune` has always dropped them by age alone) | the hourly walk of that repository, `kept prune` |
-| Registration lock | `<git dir>/fast-worktree-registration.lock` | while a worktree is being registered | the end of that operation |
+| Half-made entry `<key>.tmp-<pid>-<n>` | the project directory | until its run is gone (the pid is not alive) and it was made 10 minutes ago, or 7 days ago whatever the pid. Its age is when its inode last changed: the modification time of a clone is that of its source | the same |
+| Pool spare | `<cache>/<repo>/pool/wt-*` | while its repository is there, the pool is on, and it is within `[pool] size` | `add` (it is used); the next command in the repository when the size was lowered or the pool turned off; the hourly walk when the repository is gone; `pool refresh`, `pool clear` |
+| Pool `.new-*`, `.no-hooks-*` | the pool | while the fill that makes them is alive (the pid in the name), a day at most | the start of the next `pool fill`, the repository's hourly sweep, `pool clear` |
+| Pool `.claimed-*` | the pool | while the `add` that took the spare is alive, a day at most | the same |
+| `pool/misses` | the pool | the last 7 days: `pool status` shows how often an `add` found no spare | trimmed by each `add` that adds to it, and by the repository's hourly sweep |
+| `pool/fill.log` | the pool | 7 days after the last fill wrote to it; started afresh when it passes 1 MiB | the repository's hourly sweep |
+| Trash entry | `<cache>/trash` | deleted at once in the background; a leftover of a killed deleter after 10 minutes, a `keep-` entry (a worktree `hook remove` kept) for 24 hours | the next fast-worktree command after those times |
+| Hidden sibling `.fast-worktree-trash-*` | next to a removed worktree on another volume than the cache | as a trash entry | the same, by the note the trash keeps of it; without a note, the next removal next to it and the repository's hourly sweep, by its name |
+| Kept ref whose commit a branch, a remote-tracking branch or a tag has | `refs/fast-worktree/kept/*` | 25 hours: it protects nothing, but the removal that made it may be running, and the restore command for a worktree kept in the trash names it | the repository's hourly sweep, `kept prune` |
+| Kept ref that holds its commit alone | the same | 30 days (the date in the ref's name) | the same, with a line on stderr that names the ref and the commit |
+| Lock files: `.store.lock` (one for each project), `lifecycle.lock`, `pool/fill.lock`; the directories they are in; `.main` and `.retention-stamp` | `<cache>/<repo>` | while the repository's main checkout is there: a few empty files and directories for a repository | the hourly walk, once the main checkout is gone: the whole `<cache>/<repo>` at once |
+| Registration lock | `<git dir>/fast-worktree-registration.lock` | one empty file, as long as the repository | deleting the repository |
+| `<cache>/trash/.lock`, `<cache>/.retention-stamp` | the cache | two empty files, for ever | nothing |
 
-The cache directory itself and its `.retention-stamp` stay: the stamp is what
-keeps the walk to once an hour. Lock files are unlinked with the directory or
-operation that owns them; everyone that takes one checks, after locking it,
-that the path still names the file it locked, and takes the new one if not.
+**Lock files are never unlinked while their repository is there.** Versions
+0.4.0 to 0.6.0 take each of these locks on the file they opened and do not
+look at the path again, and several versions can run on one machine. Had a
+newer one unlinked a lock file that an older one waited on, the older one
+and the next to come would both hold "the lock". So the lock files stay, and
+the directories that hold them: their number is fixed by the number of
+repositories and projects, and does not grow with use.
+
+**A repository that is gone** is told by `<cache>/<repo>/.main`, which
+records where its main checkout is (the directory's name has only a hash of
+that path): the checkout is missing while the directory it was in is still
+there. (When that directory is missing too, the volume may just not be
+mounted, and nothing is touched.) A directory of the cache that only older
+versions wrote to has no record and stays until a command of this version
+runs in its repository.
+
+**What a kept ref's deletion loses.** `hook remove` keeps in
+`refs/fast-worktree/kept/` what would otherwise go with the worktree: the
+`HEAD` of a worktree with uncommitted changes whose branch it deleted, a
+detached `HEAD` that no branch has, and the `HEAD` of each checked-out
+submodule, fetched into the main repository. The worktree's reflog is gone
+with the worktree. Once the ref of a commit that nothing else holds is
+deleted (30 days after the removal; the line that names the ref says the
+date), nothing refers to those commits any more and `git gc` can drop them
+at once. To keep them, make a branch before then: `git branch <name> <ref>`.
+
+Only names that fast-worktree makes are removed from the cache directory: a
+repository directory `<name>-<8 hex digits>`, in it a key `<16 hex
+digits>-<...>` with its `.ok` marker, or such a key followed by
+`.tmp-<pid>-<n>`. Anything else there is left alone and is not listed.
 
 ## What is safe to clone
 

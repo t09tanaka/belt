@@ -259,7 +259,7 @@ pub fn ls() -> Result<i32> {
         .collect();
     out!("{}", table(&["REF", "COMMIT", "KEPT (UTC)"], &rows));
     outln!(
-        "{}; `git push --mirror` pushes them too. Those older than {PRUNE_DAYS} days are dropped automatically (`fast-worktree kept prune` does it at once)",
+        "{}; `git push --mirror` pushes them too. Each is deleted by itself {PRUNE_DAYS} days after it was kept, sooner when a branch or tag has its commit (`fast-worktree kept prune` does it at once)",
         count(refs.len())
     );
     Ok(0)

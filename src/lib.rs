@@ -662,15 +662,21 @@ impl Repository {
 /// Finish deleting what earlier removals left in the trash, and expire what
 /// was kept for a day and is due, as every removal does before it moves its
 /// own worktree; and, at most once an hour, remove from the dependency
-/// cache what is unused for 7 days, half made by a killed run, or empty, in
-/// every project of every repository. Cheap when there is nothing to do.
-/// Sets a process-global embedded flag that is never reset.
+/// cache what is unused for 7 days or half made by a killed run, in every
+/// project of every repository, and the whole cache directory of a
+/// repository whose main checkout is gone. Cheap when there is nothing to
+/// do; it never waits for a repository's lock and runs no git. Sets a
+/// process-global embedded flag that is never reset.
 ///
 /// [`Repository::create_worktree`], [`Repository::remove_worktree`] and
 /// [`Repository::fill_pool`] make this sweep themselves, and, for their
-/// repository, also delete its kept refs older than 30 days and sweep its
-/// pool, so a program that calls them need call nothing else; call this
-/// from a maintenance job only when it may go long without any of them.
+/// repository, also discard the spares beyond the pool size and, at most
+/// once an hour, delete its kept refs that are no longer needed (one that
+/// held its commit alone, after 30 days, is named in the call's log) and
+/// the leftovers in its pool. So a program that calls them need call
+/// nothing else; call this from a maintenance job only when it may go long
+/// without any of them. A repository's own kept refs and pool are only
+/// ever cleaned by the calls made for that repository.
 pub fn sweep_trash() {
     util::set_embedded();
     retention::run(None);

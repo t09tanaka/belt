@@ -226,9 +226,14 @@ pub fn spawn_rm_many(paths: &[PathBuf]) -> usize {
     }
     let dir = paths::trash_dir();
     let lock = fs::create_dir_all(&dir).ok().map(|()| dir.join(".lock"));
+    spawn_rm_groups(paths, lock.as_deref())
+}
+
+/// [`spawn_rm_many`], queued on `lock`.
+fn spawn_rm_groups(paths: &[PathBuf], lock: Option<&Path>) -> usize {
     let groups = chunks(paths, ARGS_LIMIT);
     for group in &groups {
-        spawn_rm_queued(group, lock.as_deref());
+        spawn_rm_queued(group, lock);
     }
     groups.len()
 }
@@ -448,6 +453,28 @@ mod tests {
         let parents = [vol.clone(), base.join("missing")];
         assert!(stale_siblings(&parents, 200).is_empty(), "exactly due");
         assert_eq!(stale_siblings(&parents, 201), vec![due]);
+    }
+
+    #[test]
+    fn hundreds_of_entries_are_deleted_by_one_process() {
+        let t = tempfile::tempdir().unwrap();
+        let lock = t.path().join(".lock");
+        let dirs: Vec<PathBuf> = (0..300)
+            .map(|i| t.path().join(format!("1793000000-1-{i}-entry")))
+            .collect();
+        for d in &dirs {
+            fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        assert_eq!(spawn_rm_groups(&dirs, Some(&lock)), 1);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while dirs.iter().any(|d| d.exists()) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(dirs.iter().all(|d| !d.exists()));
+        assert!(
+            lock.is_file() || !cfg!(target_os = "macos"),
+            "the queue's lock stays"
+        );
     }
 
     #[test]

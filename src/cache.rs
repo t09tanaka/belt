@@ -472,7 +472,9 @@ fn is_key_name(name: &str) -> bool {
 }
 
 /// Every entry under the cache root `root`, sorted by repository, project
-/// and key. Directories of an older layout ([`legacy`]) are left out.
+/// and key: what the sweeps take for an entry ([`plan`]), a key with its
+/// `.ok` marker in a repository's directory. Directories of an older layout
+/// ([`legacy`]) are left out, and so is whatever else is there.
 pub fn list(root: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     for (repo, repo_path) in dirs(root) {
@@ -481,7 +483,7 @@ pub fn list(root: &Path) -> Vec<Entry> {
         }
         for (slug, project_path) in dirs(&repo_path) {
             for (key, path) in dirs(&project_path) {
-                if !is_key_name(&key) {
+                if !is_key_name(&key) || !is_checked(&path) {
                     continue;
                 }
                 let last_used = fs::metadata(&path)
@@ -717,6 +719,9 @@ mod tests {
             fs::create_dir_all(root.join(p)).unwrap();
         }
         mark_checked(&root.join("app-1234abcd/_root").join(k1));
+        mark_checked(&root.join("app-1234abcd/packages__web").join(k2));
+        // A directory named like a key that this tool did not store.
+        fs::create_dir_all(root.join("app-1234abcd/_root/aaaaaaaaaaaaaaaa-v20")).unwrap();
         let got: Vec<(String, String, String)> = list(root)
             .into_iter()
             .map(|e| (e.repo, e.dir, e.key))

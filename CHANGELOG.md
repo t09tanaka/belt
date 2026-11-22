@@ -13,31 +13,48 @@ change bumps the minor version).
   be run to clean up: `add`, `remove`, `hook remove`, `install`, `pool fill`
   and the library calls that do the same delete what is old, from the
   places they write to (see "What is deleted by itself" in the README).
-  - Kept refs under `refs/fast-worktree/kept/` older than 30 days (what `kept
-    prune` already dropped) are deleted by the next of those commands in the
-    repository, at most once an hour.
+  - Kept refs under `refs/fast-worktree/kept/` are deleted by the next of
+    those commands in the repository, at most once an hour. One that holds
+    its commit alone goes after 30 days (what `kept prune` already dropped),
+    and that is said on stderr, with the ref and the commit; the line
+    printed when a ref is made now says the day. One whose commit a branch,
+    a remote-tracking branch or a tag has protects nothing and goes after
+    25 hours. `kept prune` applies both rules.
   - Cache entries unused for 7 days are deleted in every project of every
     repository, not only in the project that is installed again; a
     half-made entry (`<key>.tmp-<pid>-<n>`) of a run that is gone is
-    deleted; a project directory goes with its last entry.
+    deleted. Only names that fast-worktree makes are touched (a key with
+    its `.ok` marker), so a cache directory shared with other things is
+    safe.
   - A pool's `.new-*`, `.claimed-*` and `.no-hooks-*` leftovers of killed
-    runs are deleted by the next `pool fill` (no more waiting for `pool
-    clear`); `pool/misses` keeps the last 7 days; `fill.log` goes 7 days
-    after the last fill wrote to it.
-  - The directories and lock files fast-worktree makes (`.store.lock`,
-    `lifecycle.lock`, `fill.lock`, the registration lock in `.git`, the
-    trash's `.lock`) are removed when nothing else is in their directory,
-    or, for the registration lock, when the operation ends; everyone that
-    takes such a lock checks after locking that the path still names the
-    file it locked.
+    runs are deleted by the next command in the repository (no more waiting
+    for `pool clear`), without taking the fill lock; `pool/misses` keeps
+    the last 7 days; `fill.log` goes 7 days after the last fill wrote to it.
+  - Spares beyond `[pool] size` are discarded by the next command in the
+    repository when the size was lowered or the pool turned off.
+  - The whole cache directory of a repository whose main checkout is gone
+    is deleted, spares included (`<cache>/<repo>/.main` records where the
+    checkout is).
   - `add`, `install` and `pool fill` also finish deleting the trash, as
-    `remove` did.
+    `remove` did, with one background deleter for everything a sweep moves.
+  - The walk over the whole cache never waits for another repository's
+    lock, runs no git, and moves at most 200 things at a time.
+- Lock files (`.store.lock`, `lifecycle.lock`, `fill.lock`, the
+  registration lock in `.git`, the trash's `.lock`) and the directories
+  that hold them are not deleted while their repository is there: versions
+  0.4.0 to 0.6.0 lock the same paths without looking at the path again
+  after locking, so unlinking one would let two processes hold the lock.
+  They are a few empty files for a repository. (This version does look
+  again when it takes one, except the trash's deleters, which queue with
+  `lockf -k`.)
 - `sweep_trash` also walks the cache (at most once an hour). The library
   calls `create_worktree`, `remove_worktree` and `fill_pool` make the
-  sweeps themselves; no new function is needed.
+  sweeps themselves; no new function is needed. What a sweep deletes of
+  the user's (a kept ref) is in the call's log.
 - `pool clear` removes the leftovers of killed runs at once, not only those
-  an hour old, but not while a fill is running or the process that claimed
-  a spare is alive.
+  an hour old, but not those of a fill or an `add` that is alive.
+- `pool/misses` is written under a lock on the file itself, so that `add`s
+  at the same time each leave their line.
 
 ## [0.6.0] - 2026-11-21
 
