@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-11-23
+
 ### Fixed
 
 - `exec` no longer starts the command with SIGINT and SIGQUIT ignored. While the command runs the wrapper used `SIG_IGN` for them (so the terminal's Ctrl-C does not kill the wrapper), and an ignored disposition survives `exec`, so a command without its own handler could not be interrupted. The wrapper now uses a handler that does nothing, which `exec` resets to the default; the wrapper's own behaviour is unchanged.
