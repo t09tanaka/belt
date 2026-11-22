@@ -73,6 +73,12 @@ fn forward_from_handler(sig: libc::c_int) {
     IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
+/// Does nothing. Used instead of `SIG_IGN` for the terminal's SIGINT and
+/// SIGQUIT while the command runs: an ignored disposition would survive
+/// `exec` and leave the command unable to be interrupted, whereas a handler
+/// is reset to the default by `exec`.
+extern "C" fn ignore_in_wrapper(_sig: libc::c_int) {}
+
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -102,9 +108,11 @@ impl Supervisor for ProcessSignals {
     fn running(&self) {
         // Terminal-originated signals reach the child directly (same
         // process group); a second copy from us would make test runners
-        // force-quit.
-        set_handler(libc::SIGINT, libc::SIG_IGN);
-        set_handler(libc::SIGQUIT, libc::SIG_IGN);
+        // force-quit. A no-op handler, not SIG_IGN, so the command does
+        // not inherit an ignored SIGINT/SIGQUIT across `exec`.
+        let noop = ignore_in_wrapper as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        set_handler(libc::SIGINT, noop);
+        set_handler(libc::SIGQUIT, noop);
         for sig in [libc::SIGTERM, libc::SIGHUP] {
             set_handler(sig, record());
         }

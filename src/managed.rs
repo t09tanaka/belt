@@ -1096,6 +1096,18 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
     run_command_with_tracker(ctx, guard, opts, limits, None)
 }
 
+/// [`run_command`] for a plain (not managed) command that must not start
+/// when a stop signal is already pending at the spawn.
+pub(crate) fn run_plain_command(
+    ctx: &Context,
+    guard: &OwnerGuard,
+    opts: &Opts,
+    limits: Limits,
+) -> Result<runner::Launch<Ran>> {
+    debug_assert!(!guard.managed);
+    launch_command(ctx, guard, opts, limits, None, true)
+}
+
 /// [`run_command`] with the recorder's start replaced (for tests that make
 /// it fail).
 #[doc(hidden)]
@@ -1106,6 +1118,20 @@ pub fn run_command_with_tracker(
     limits: Limits,
     start_tracker: Option<runner::StartTracker>,
 ) -> Result<Ran> {
+    match launch_command(ctx, guard, opts, limits, start_tracker, false)? {
+        runner::Launch::Ran(r) => Ok(r),
+        runner::Launch::Interrupted(_) => unreachable!("only reported when asked to check"),
+    }
+}
+
+fn launch_command(
+    ctx: &Context,
+    guard: &OwnerGuard,
+    opts: &Opts,
+    limits: Limits,
+    start_tracker: Option<runner::StartTracker>,
+    abort_if_pending: bool,
+) -> Result<runner::Launch<Ran>> {
     let id = guard.command_id();
     if guard.managed {
         // Only a command that never reached its launch may spawn. After a
@@ -1178,7 +1204,7 @@ pub fn run_command_with_tracker(
             }
         })
     };
-    let outcome = runner::run_with(
+    let outcome = runner::launch(
         ctx,
         &opts.argv,
         &opts.cwd,
@@ -1194,7 +1220,12 @@ pub fn run_command_with_tracker(
             stdout_log: opts.stdout_log.as_deref(),
             parent: opts.parent.as_deref(),
         },
+        abort_if_pending,
     )?;
+    let outcome = match outcome {
+        runner::Launch::Ran(o) => o,
+        runner::Launch::Interrupted(sig) => return Ok(runner::Launch::Interrupted(sig)),
+    };
     if let Some(at) = outcome.tracked_to_exit_at {
         // The tracker covered the child's whole life and the last look was
         // at `at`: close the hidden-orphan window there. Best effort: if
@@ -1212,11 +1243,11 @@ pub fn run_command_with_tracker(
             .tracker_unknown
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    Ok(Ran {
+    Ok(runner::Launch::Ran(Ran {
         outcome,
         started_at,
         contended,
-    })
+    }))
 }
 
 /// Record how the command ended, then release its ledger entry and lease.
