@@ -1,6 +1,6 @@
 # belt
 
-Run CI and development commands across your own Macs on the LAN: one coordinator, many workers, with uncommitted changes, durable queues, cancellation and crash recovery.
+Run CI and development commands on one machine or share work with other members of your LAN. Each initialized member can submit work. The resident manages queued runs, cancellation and crash recovery.
 
 Status: in development. The specification (Japanese) is in [docs/spec.md](docs/spec.md), with progress and remaining acceptance work in [docs/plan.md](docs/plan.md).
 
@@ -8,11 +8,31 @@ Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and 
 
 ## Install
 
-The crates.io package is `belt-cli` (the name `belt` is taken by an unrelated crate); it installs the `belt` command. Not yet published.
+Build the CLI from a checkout with the stable Rust toolchain. From the repository root, run:
 
 ```sh
-cargo install belt-cli
+cargo install --locked --path .
+belt --version
 ```
+
+Cargo installs the executable as `belt` (normally in `~/.cargo/bin`). The package name in this repository is `belt-cli`.
+
+## First run on one machine
+
+To use the durable queue, initialize the resident for your user, then check its status:
+
+```sh
+belt init
+belt doctor
+```
+
+From a Git project you want to run a command in, try:
+
+```sh
+belt exec -- pwd
+```
+
+With no remote workers configured, the local worker runs the command. Use `belt top` in a second terminal to follow longer jobs.
 
 ## Watch workers and tasks
 
