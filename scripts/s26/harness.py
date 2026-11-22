@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Docker/SSH acceptance driver; all belt calls use a private environment."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,10 @@ ROOT = Path(os.environ["S26_ROOT"])
 BASE = Path(os.environ["S26_BASE"])
 RUN = Path(os.environ["S26_RUN"])
 LABEL = "io.belt.s26.run"
+# w1 and w2 stay worker-only (installed by the host); m1 becomes an init member.
+HOSTS = ("w1", "w2", "m1")
+USER_BUS = ('export XDG_RUNTIME_DIR=/run/user/1000; '
+            'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; ')
 CONFIG = """schema_version=1
 [coordinator]
 heartbeat_seconds=1
@@ -52,10 +57,22 @@ def until(description, fn, seconds=90):
         time.sleep(1)
 
 
-def ssh(host, script, check=True):
+def ssh(host, script, check=True, timeout=30):
     # Always use our -F wrapper, never the caller's SSH configuration.
     return command([RUN / "bin/ssh", "-T", "--", host, script],
-                   timeout=30, check=check)
+                   timeout=timeout, check=check)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class Skip(Exception):
+    """A check that cannot run with this build; never counted as PASS."""
 
 
 def up():
@@ -64,7 +81,7 @@ def up():
     token = secrets.token_hex(16)
     prefix = "s26-" + os.environ["PORTOOL_WORKTREE_ID"][:12] + "-" + token[:8]
     manifest = {"token": token, "network": prefix,
-                "containers": [prefix + "-w1", prefix + "-w2"]}
+                "containers": [prefix + "-" + h for h in HOSTS]}
     # Written first so even a partial up is removable.
     save(RUN / "resources.json", manifest)
     command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
@@ -76,7 +93,7 @@ def up():
               "  IdentitiesOnly yes", "  IdentityAgent none", "  BatchMode yes",
               "  ConnectTimeout 5", "  ConnectionAttempts 1",
               "  ServerAliveInterval 5", "  ServerAliveCountMax 3"]
-    for host in ("w1", "w2"):
+    for host in HOSTS:
         config += [f"Host {host}", f"  Port {os.environ['S26_' + host.upper() + '_PORT']}"]
     (RUN / "ssh_config").write_text("\n".join(config) + "\n")
     wrapper = RUN / "bin/ssh"
@@ -84,7 +101,7 @@ def up():
                        + shlex.quote(str(RUN / "ssh_config")) + ' "$@"\n')
     wrapper.chmod(0o700)
     command(["docker", "network", "create", "--label", f"{LABEL}={token}", prefix])
-    for host, name in zip(("w1", "w2"), manifest["containers"]):
+    for host, name in zip(HOSTS, manifest["containers"]):
         port = os.environ["S26_" + host.upper() + "_PORT"]
         command(["docker", "run", "-d", "--platform", "linux/arm64",
                  "--privileged", "--cgroupns=host", "--tmpfs", "/run",
@@ -103,7 +120,7 @@ def up():
             host, 'test "$(cat /proc/1/comm)" = systemd && '
             'test "$(loginctl show-user 1000 -p Linger --value)" = yes && '
             'test -S /run/user/1000/bus', check=False).returncode == 0)
-    print(f"Workers ready. Evidence and private SSH files: {RUN}")
+    print(f"w1, w2 and m1 ready. Evidence and private SSH files: {RUN}")
 
 
 class Checks:
@@ -143,7 +160,10 @@ class Checks:
             command(["git", *args], env=self.env, cwd=self.project)
         (self.project / ".portool.toml").write_text("[ports]\nweb = 0\n")
         (self.project / "job.sh").write_text(
-            '#!/bin/sh\nset -eu\nprintf "s26 start %s\\n" "$(hostname)"\n'
+            '#!/bin/sh\nset -eu\n'
+            'if [ -n "${2:-}" ]; then mkdir -p "$HOME/s26-starts"; '
+            'hostname >> "$HOME/s26-starts/$2"; fi\n'
+            'printf "s26 start %s\\n" "$(hostname)"\n'
             'case "$(command -v portool)" in */tool-bin/*/portool) ;; *) exit 22;; esac\n'
             'fast-worktree --version && portool exec -- sh -ec \'test -n "$WEB_PORT"\'\n'
             'sleep "$1"\nprintf "s26 complete %s\\n" "$(hostname)"\n')
@@ -154,6 +174,8 @@ class Checks:
         self.tasks = []
         self.parent = None
         self.results = []
+        self.m1_ready = False
+        self.m1_state = None
 
     def belt(self, *args, timeout=120):
         if self.parent is not None and self.parent.poll() is not None:
@@ -212,10 +234,10 @@ class Checks:
                   str(BASE / "belt-linux-aarch64"), timeout=180)
         self.service(host, "active")
 
-    def service(self, host, expected):
-        script = ('export XDG_RUNTIME_DIR=/run/user/1000; '
-                  'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; '
-                  'set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.worker.*.service; '
+    def service(self, host, expected, kind="worker"):
+        # kind "worker": the --install worker unit; "local": the init resident.
+        script = (USER_BUS +
+                  f'set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.{kind}.*.service; '
                   '[ "$#" -eq 1 ] && [ -f "$1" ] || exit 90; '
                   'systemctl --user is-active "$(basename "$1")"')
 
@@ -223,12 +245,13 @@ class Checks:
             p = ssh(host, script, check=False)
             # Inactive is code 3; transport/missing-unit errors are never a pass.
             return p.stdout.strip() == expected and p.returncode == (0 if expected == "active" else 3)
-        until(f"{host} user service {expected}", state, 45)
+        until(f"{host} {kind} user service {expected}", state, 45)
 
-    def submit(self, seconds, count):
+    def submit(self, seconds, count, marker=None):
         tasks = []
         for _ in range(count):
-            receipt = self.belt("submit", "--", "sh", "job.sh", str(seconds))
+            receipt = self.belt("submit", "--", "sh", "job.sh", str(seconds),
+                                *([marker] if marker else []))
             tasks.append(receipt["task_id"])
             self.tasks.append(receipt["task_id"])
         return tasks
@@ -330,14 +353,409 @@ class Checks:
         self.service("w2", "active")
         return "workers stop/start changed w2 user service inactive -> active"
 
+    # m1: an init member. The host installs it as a worker, then `belt init`
+    # runs there as its user, so its one resident (parent and worker) is a
+    # lingering systemd user service in the host's group.
+
+    def m1_container(self):
+        manifest = json.loads((RUN / "resources.json").read_text())
+        (name,) = [c for c in manifest["containers"] if c.endswith("-m1")]
+        return name
+
+    # Root inside m1, for what its user cannot do: belt's processes are not
+    # dumpable, so only root reads their /proc/<pid>/exe and signals them.
+    # HOME names the belt user's home; the user manager is reached with -M.
+    def m1_root(self, script, *args):
+        return ["docker", "exec", "-e", "HOME=/home/belt", self.m1_container(),
+                "bash", "-c", script, "s26", *args]
+
+    def m1_exec(self, script, *args, timeout=60, check=True):
+        return command(self.m1_root(script, *args), timeout=timeout, check=check)
+
+    def m1_belt(self, *args, timeout=120, check=True):
+        """belt on m1 over SSH, through the resident's own link."""
+        self.count += 1
+        script = (USER_BUS + 'cd "$HOME/project" && exec "$HOME/.config/belt/bin/resident/belt" '
+                  '--json ' + " ".join(shlex.quote(str(a)) for a in args))
+        p = ssh("m1", script, check=False, timeout=timeout)
+        stem = RUN / "evidence" / f"{self.count:04d}-m1-{args[0]}"
+        stem.with_suffix(".stdout.json").write_text(p.stdout)
+        stem.with_suffix(".stderr.txt").write_text(p.stderr)
+        if not check:
+            return p
+        if p.returncode:
+            raise RuntimeError(f"m1 belt {' '.join(map(str, args))} exited {p.returncode}; "
+                               f"see {stem}*: " + (p.stderr + p.stdout)[-1800:])
+        value = json.loads(p.stdout)
+        if value.get("ok") is False:
+            raise RuntimeError(f"m1 belt returned an error: {value}")
+        return value.get("result", value.get("data", value))
+
+    def m1_link(self):
+        return ssh("m1", 'readlink "$HOME/.config/belt/bin/resident"').stdout.strip()
+
+    def m1_version_file(self, digest):
+        # Identity and content of one version directory's binary.
+        return ssh("m1", f'f="$HOME/.config/belt/bin/{digest}/belt"; '
+                   'stat -c "%i %Y %s %a" "$f" && sha256sum "$f"').stdout
+
+    def m1_main_exe(self):
+        p = self.m1_exec('set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service; '
+                         'pid=$(systemctl --user -M belt@ show -p MainPID --value "$(basename "$1")"); '
+                         '[ "$pid" -gt 1 ] && readlink "/proc/$pid/exe"', check=False)
+        return p.stdout.strip() if p.returncode == 0 else None
+
+    def m1_upgraded_away(self):
+        return ssh("m1", 'test -e "$HOME/.config/belt/upgrade/record.json"',
+                   check=False).returncode == 1
+
+    def starts(self, token):
+        # How often the fixture command started for this marker, per host.
+        counts = {}
+        local = RUN / "home/s26-starts" / token
+        if local.exists():
+            counts["local"] = len(local.read_text().splitlines())
+        for host in HOSTS:
+            lines = ssh(host, f'cat "$HOME/s26-starts/{token}" 2>/dev/null || true').stdout.splitlines()
+            if lines:
+                counts[host] = len(lines)
+        return counts
+
+    def place_on_m1(self, seconds, limit=5):
+        """Submit host-agnostic jobs one at a time until one is placed on m1
+        (the others fill the free workers first); wait until it runs."""
+        batch = []
+        for _ in range(limit):
+            token = secrets.token_hex(6)
+            (task,) = self.submit(seconds, 1, marker=token)
+            batch.append(task)
+
+            def placed():
+                items = self.belt("show", task, "--limit", "64")["attempts"]["items"]
+                return items[0] if items else None
+            attempt = until(f"{task} placed", placed, 60)
+            if attempt["worker_id"] == "m1":
+                until(f"{task} running on m1", lambda: self.belt(
+                    "show", task, "--limit", "64")["attempts"]["items"][0]["state"] == "active", 60)
+                return task, token, batch
+        raise RuntimeError(f"none of {limit} host submissions was placed on m1")
+
+    def finished_once_on_m1(self, task, token, batch):
+        views = self.finish(batch)
+        worker = views[task]["attempts"]["items"][0]["worker_id"]
+        if worker != "m1":
+            raise RuntimeError(f"{task} ran on {worker}, not m1")
+        counts = self.starts(token)
+        if counts != {"m1": 1}:
+            raise RuntimeError(f"{task}: the command started {counts}, expected once on m1")
+        return views
+
+    def m1(self):
+        n = BASE / "belt-linux-aarch64"
+        # The spec's order for a host that becomes a member: an existing
+        # member installs it as a worker, then `init` runs there.
+        self.install("m1")
+        name = self.m1_container()
+        command(["docker", "exec", name, "install", "-d", "-o", "belt", "-g", "belt", "-m", "700",
+                 "/home/belt/project", "/home/belt/s26-bin"])
+        command(["docker", "cp", self.project / "job.sh", f"{name}:/home/belt/project/job.sh"])
+        command(["docker", "exec", name, "chown", "belt:belt", "/home/belt/project/job.sh"])
+        ssh("m1", 'cd "$HOME/project" && git init -q && git add job.sh && '
+            'git -c user.name="S26 Harness" -c user.email=s26@example.invalid '
+            '-c commit.gpgsign=false commit -qm "S26 fixture"')
+        self.count += 1
+        p = ssh("m1", USER_BUS + 'exec "$HOME/.config/belt/bin/current/belt" --json init',
+                check=False, timeout=180)
+        stem = RUN / "evidence" / f"{self.count:04d}-m1-init"
+        stem.with_suffix(".stdout.json").write_text(p.stdout)
+        stem.with_suffix(".stderr.txt").write_text(p.stderr)
+        if p.returncode:
+            raise RuntimeError(f"belt init on m1 exited {p.returncode}: {(p.stderr + p.stdout)[-1800:]}")
+        self.service("m1", "active", kind="local")
+        p = ssh("m1", 'test "$(id -u)" = 1000 && test "$(cat /proc/1/comm)" = systemd && '
+                'test "$(loginctl show-user 1000 -p Linger --value)" = yes', check=False)
+        if p.returncode:
+            raise RuntimeError("m1: wrong user, PID 1, or lingering")
+        # One resident per member: no worker unit may still be active.
+        units = ssh("m1", USER_BUS + 'for u in "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.worker.*.service; do '
+                    '[ -e "$u" ] && systemctl --user is-active "$(basename "$u")"; done; true').stdout.split()
+        if "active" in units:
+            raise RuntimeError("m1 still runs its worker-only unit next to the init resident")
+        if self.m1_link() != sha256(n):
+            raise RuntimeError("m1 bin/resident does not name the installed binary's digest")
+        if self.m1_main_exe() != f"/home/belt/.config/belt/bin/{sha256(n)}/belt":
+            raise RuntimeError(f"m1 resident runs {self.m1_main_exe()}, not the installed version")
+        dbs = ssh("m1", 'find "$HOME" -name worker.db -not -path "*/upgrade/*"').stdout.split()
+        if len(dbs) != 1:
+            raise RuntimeError(f"expected one worker database on m1, found {dbs}")
+        self.m1_state = os.path.dirname(dbs[0])
+        cluster = json.loads(self.input.read_text())["expected_cluster"]
+        if cluster not in json.dumps(self.m1_belt("group")):
+            raise RuntimeError("m1 does not report the host's group")
+        task, token, batch = self.place_on_m1(15)
+        save(RUN / "evidence/m1.json", self.finished_once_on_m1(task, token, batch))
+        self.m1_ready = True
+        return ("m1 installed then initialized: one active init resident (user service, "
+                "lingering) on the host's group; a host submission ran there once")
+
+    # A57: `belt upgrade` on m1 (§24.8). These need a Linux build with the
+    # upgrade subcommand and the variants from `build-linux.sh --upgrade`.
+
+    VARIANTS = {"n": "belt-linux-aarch64", "n1": "belt-linux-aarch64-n1",
+                "broken": "belt-linux-aarch64-n1-broken"}
+
+    def a57_ready(self, *need):
+        if not self.m1_ready:
+            raise Skip("m1 is not an initialized member (M1 did not pass)")
+        p = ssh("m1", USER_BUS + '"$HOME/.config/belt/bin/resident/belt" upgrade --help', check=False)
+        if p.returncode:
+            raise Skip("the belt on m1 has no `upgrade` subcommand; build a branch that has it "
+                       "with build-linux.sh --upgrade <ref> (README)")
+        files = {k: BASE / v for k, v in self.VARIANTS.items()}
+        missing = [files[k].name for k in need if not files[k].is_file()]
+        if missing:
+            raise Skip(f"run build-linux.sh --upgrade <ref> first; missing {missing}")
+        digests = {k: sha256(f) for k, f in files.items() if f.is_file()}
+        if len(set(digests.values())) != len(digests):
+            raise RuntimeError(f"the variant binaries are not distinct versions: {digests}")
+        if not getattr(self, "copied", False):
+            name = self.m1_container()
+            for k in digests:
+                command(["docker", "cp", files[k], f"{name}:/home/belt/s26-bin/belt-{k}"])
+                command(["docker", "exec", name, "sh", "-ec",
+                         f"chown belt:belt /home/belt/s26-bin/belt-{k}; "
+                         f"chmod 755 /home/belt/s26-bin/belt-{k}"])
+            self.copied = True
+        return digests
+
+    def other(self, digests):
+        # Each upgrade needs a version other than the one m1 runs.
+        current = self.m1_link()
+        if current not in (digests["n"], digests["n1"]):
+            raise RuntimeError(f"m1 runs neither N nor N+1 ({current})")
+        return current, "n1" if current == digests["n"] else "n"
+
+    def m1_upgrade(self, key, direct=False):
+        """Start an upgrade on m1 in the background. The shell writes its own
+        pid, then execs belt, so the pid file names the upgrade CLI. With
+        `direct` the target binary runs `upgrade` itself, which is what
+        `--binary` delegates to; then the pid file names the process that
+        holds the trial."""
+        self.count += 1
+        stem = RUN / "evidence" / f"{self.count:04d}-m1-upgrade-{key}"
+        binary = f'"$HOME/s26-bin/belt-{key}"'
+        cli = (f"{binary} --json upgrade" if direct else
+               f'"$HOME/.config/belt/bin/resident/belt" --json upgrade --binary {binary}')
+        script = (USER_BUS + 'echo $$ > "$HOME/s26-bin/upgrade.pid"; exec ' + cli)
+        out = open(stem.with_suffix(".stdout.json"), "w")
+        err = open(stem.with_suffix(".stderr.txt"), "w")
+        proc = subprocess.Popen([str(RUN / "bin/ssh"), "-T", "--", "m1", script],
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+        out.close()
+        err.close()
+        return proc, stem
+
+    @staticmethod
+    def ended(proc, stem, seconds):
+        try:
+            code = proc.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            proc.terminate()  # our own ssh client, by its Popen handle
+            proc.wait(timeout=15)
+            raise RuntimeError(f"upgrade on m1 did not end within {seconds}s; see {stem}*")
+        text = stem.with_suffix(".stdout.json").read_text()
+        return code, (text + stem.with_suffix(".stderr.txt").read_text())[-1500:]
+
+    # Waits inside m1 until the trial marker exists and the resident's main
+    # process runs the target version, then signals the upgrade CLI named by
+    # the pid file: STOP holds the trial open, TERM ends the CLI so that only
+    # the guard can decide. The process is identified by its executable and
+    # argv first; with --binary the CLI is the one child of the named pid.
+    WATCH = r'''set -eu
+marker="$1/upgrade-trial.json"; want="$HOME/.config/belt/bin/$2/belt"
+sig=$3; exe=$4; child=$5; deadline=$((SECONDS + $6))
+set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service
+unit=$(basename "$1")
+while :; do
+  if [ -e "$marker" ]; then
+    main=$(systemctl --user -M belt@ show -p MainPID --value "$unit" 2>/dev/null || echo 0)
+    if [ "${main:-0}" -gt 1 ] && [ "$(readlink "/proc/$main/exe" 2>/dev/null)" = "$want" ]; then break; fi
+  fi
+  [ "$SECONDS" -lt "$deadline" ] || { echo "no trial of $want seen" >&2; exit 3; }
+  sleep 0.02
+done
+pid=$(cat "$HOME/s26-bin/upgrade.pid")
+if [ "$child" = yes ]; then pid=$(pgrep -P "$pid"); fi
+case "$pid" in ''|*[!0-9]*) echo "no single upgrade process: '$pid'" >&2; exit 4 ;; esac
+[ "$pid" -gt 1 ] || exit 4
+[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || { echo "pid $pid is not $exe" >&2; exit 4; }
+tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || { echo "pid $pid is not an upgrade" >&2; exit 4; }
+kill -s "$sig" "$pid"
+echo "$pid"
+'''
+
+    SIGNAL = r'''set -eu
+pid=$1; exe=$2
+case "$pid" in ''|*[!0-9]*) exit 4 ;; esac
+[ "$pid" -gt 1 ] || exit 4
+[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || exit 4
+tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || exit 4
+kill -s CONT "$pid"
+'''
+
+    def m1_watch(self, digest, sig, exe, child, seconds):
+        return subprocess.Popen(
+            self.m1_root(self.WATCH, self.m1_state, digest, sig, exe,
+                         "yes" if child else "no", str(seconds)),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    @staticmethod
+    def watched(watcher, seconds):
+        try:
+            out, err = watcher.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            watcher.terminate()  # our own docker client, by its Popen handle
+            watcher.communicate(timeout=15)
+            raise RuntimeError("the trial watcher on m1 did not finish")
+        if watcher.returncode:
+            raise RuntimeError(f"trial watcher on m1: {err.strip() or watcher.returncode}")
+        return out.strip()
+
+    def a57_rollback(self):
+        digests = self.a57_ready("n", "broken")
+        if self.m1_link() != digests["n"]:
+            raise RuntimeError("m1 must run N before the rollback check")
+        before = self.m1_version_file(digests["n"])
+        task, token, batch = self.place_on_m1(20)
+        broken = "/home/belt/s26-bin/belt-broken"
+        # The broken build's resident never answers health. The CLI is ended
+        # once the broken version runs, so only the guard can restore.
+        watcher = self.m1_watch(digests["broken"], "TERM", broken, True, 240)
+        proc, stem = self.m1_upgrade("broken")
+        self.watched(watcher, 260)
+        ended = time.monotonic()
+        code, tail = self.ended(proc, stem, 60)
+        if code == 0:
+            raise RuntimeError(f"the upgrade to the broken build reported success: {tail}")
+        until("guard restored N", lambda: self.m1_upgraded_away()
+              and self.m1_link() == digests["n"], 90)
+        took = time.monotonic() - ended
+        self.service("m1", "active", kind="local")
+        until("m1 resident runs N again", lambda: self.m1_main_exe()
+              == f"/home/belt/.config/belt/bin/{digests['n']}/belt", 45)
+        if self.m1_version_file(digests["n"]) != before:
+            raise RuntimeError("the N version directory changed")
+        self.m1_belt("ls")
+        save(RUN / "evidence/a57-rollback.json", self.finished_once_on_m1(task, token, batch))
+        return (f"broken N+1 not committed; with its CLI ended, the guard restored N "
+                f"{took:.0f}s later (deadline 45s from the start); N's directory untouched; "
+                "the host run on m1 finished, started once")
+
+    def a57_commit(self):
+        digests = self.a57_ready("n", "n1")
+        current, key = self.other(digests)
+        before = self.m1_version_file(current)
+        task, token, batch = self.place_on_m1(20)
+        proc, stem = self.m1_upgrade(key)
+        code, tail = self.ended(proc, stem, 300)
+        if code:
+            raise RuntimeError(f"belt upgrade --binary {key} exited {code}: {tail}")
+        if self.m1_link() != digests[key]:
+            raise RuntimeError(f"bin/resident is {self.m1_link()}, not {key}")
+        if self.m1_version_file(current) != before:
+            raise RuntimeError("the previous version directory changed")
+        if self.m1_main_exe() != f"/home/belt/.config/belt/bin/{digests[key]}/belt":
+            raise RuntimeError("m1 resident does not run the new version")
+        if not self.m1_upgraded_away():
+            raise RuntimeError("an upgrade record remains after the commit")
+        save(RUN / "evidence/a57-commit.json", self.finished_once_on_m1(task, token, batch))
+        return (f"committed {current[:12]} -> {digests[key][:12]} while a host run was on m1; "
+                "bin/resident switched, old directory untouched, the run finished, started once")
+
+    def a57_trial_refusal(self):
+        digests = self.a57_ready("n", "n1")
+        current, key = self.other(digests)
+        # The upgrade waits until m1's worker has no live attempt before it
+        # switches, and the hold keeps new ones off until the commit, so no
+        # attempt of the host's is on m1 during the trial and a cancel from
+        # the host has nothing there to reach. The cancel the trial refuses
+        # is m1's own, of its run: it requires macOS, so it stays unplaced.
+        own = self.m1_belt("submit", "--requires", "macos", "--", "sh", "job.sh", "5")["task_id"]
+        target = f"/home/belt/s26-bin/belt-{key}"
+        watcher = self.m1_watch(digests[key], "STOP", target, False, 240)
+        proc, stem = self.m1_upgrade(key, direct=True)
+        pid, answer = None, None
+        try:
+            pid = self.watched(watcher, 260)
+            held = time.monotonic()
+            if self.m1_upgraded_away():
+                raise RuntimeError("missed the trial window: no trial was held open (incomplete)")
+            while time.monotonic() - held < 8 and answer is None:
+                p = self.m1_belt("cancel", own, check=False, timeout=20)
+                try:
+                    value = json.loads(p.stdout)
+                except ValueError:
+                    time.sleep(0.3)  # the new version is not answering yet
+                    continue
+                if value.get("ok") is not False:
+                    raise RuntimeError(f"the version on trial accepted a cancel: {value}")
+                error = value.get("error") or {}
+                if error.get("code") == "OVERLOADED":
+                    answer = error.get("message", "")
+                else:
+                    time.sleep(0.3)
+            if answer is None:
+                raise RuntimeError("the version on trial gave no OVERLOADED answer within 8s")
+            held_for = time.monotonic() - held
+            if self.m1_belt("show", own)["task"]["cancel_requested_at_ms"] is not None:
+                raise RuntimeError("the refused cancel was saved")
+        finally:
+            if pid:
+                self.m1_exec(self.SIGNAL, pid, target)
+        code, tail = self.ended(proc, stem, 120)
+        if code:
+            raise RuntimeError(f"upgrade after the held trial exited {code}: {tail}")
+        if self.m1_link() != digests[key]:
+            raise RuntimeError("the held upgrade did not commit")
+        # The run was never placed, so the cancel settles it at once.
+        result = self.m1_belt("cancel", own)
+        task = self.m1_belt("show", own)
+        if not (result.get("cancel_requested") and result.get("stop_confirmed")
+                and task["task"]["cancel_requested_at_ms"] is not None
+                and not task["attempts"]["items"]):
+            raise RuntimeError(f"the cancel after the commit did not take effect: {result} {task}")
+        return (f"during a trial held open {held_for:.0f}s m1 refused its own cancel with "
+                f"OVERLOADED ({answer!r}) and saved nothing; "
+                "after the commit the same cancel took effect. A host cancel of a run on m1 "
+                "cannot arise during a trial (the upgrade drains m1 first)")
+
+    def a57_slow_drain(self):
+        digests = self.a57_ready("n", "n1")
+        current, key = self.other(digests)
+        task, token, batch = self.place_on_m1(75)
+        started = time.monotonic()
+        proc, stem = self.m1_upgrade(key)
+        code, tail = self.ended(proc, stem, 400)
+        took = time.monotonic() - started
+        if code:
+            raise RuntimeError(f"after a drain of {took:.0f}s (> the 45s deadline) the upgrade "
+                               f"exited {code}, not committed: {tail}")
+        if self.m1_link() != digests[key] or not self.m1_upgraded_away():
+            raise RuntimeError("the slow-drain upgrade did not stay committed")
+        save(RUN / "evidence/a57-slow-drain.json", self.finished_once_on_m1(task, token, batch))
+        return (f"upgrade waited {took:.0f}s for a 75s host run on m1, then committed "
+                f"{digests[key][:12]}; the run started once")
+
     def check(self, label, fn):
         try:
-            detail = fn()
-            passed = True
+            detail, status = fn(), "PASS"
+        except Skip as skip:
+            detail, status = str(skip), "SKIP"
         except Exception as error:
-            detail, passed = str(error), False
-        self.results.append({"check": label, "pass": passed, "reason": detail})
-        print(f"{'PASS' if passed else 'FAIL'} {label}: {detail}", flush=True)
+            detail, status = str(error), "FAIL"
+        self.results.append({"check": label, "status": status, "pass": status == "PASS",
+                             "reason": detail})
+        print(f"{status} {label}: {detail}", flush=True)
 
     def close(self):
         # Only our Popen handle is signalled; no PID files or broad process matching.
@@ -363,12 +781,71 @@ def run():
         checks.check("A45 (part)", checks.a45)
         checks.check("A01", checks.a01)
         checks.check("A34 (part)", checks.a34)
+        checks.check("M1 init member", checks.m1)
+        # A57 needs `belt upgrade` (R68); each check skips, with its reason,
+        # when the Linux belt on m1 has no such subcommand.
+        checks.check("A57 rollback", checks.a57_rollback)
+        checks.check("A57 commit", checks.a57_commit)
+        checks.check("A57 trial refusal", checks.a57_trial_refusal)
+        checks.check("A57 slow drain", checks.a57_slow_drain)
     finally:
         checks.close()
         save(RUN / "evidence/summary.json", checks.results)
-    passed = sum(r["pass"] for r in checks.results)
-    print(f"Summary: {passed}/4 PASS; evidence: {RUN / 'evidence'}")
-    return 0 if passed == 4 else 1
+    count = {k: sum(r["status"] == k for r in checks.results) for k in ("PASS", "SKIP", "FAIL")}
+    print(f"Summary: {count['PASS']} PASS, {count['SKIP']} SKIP, {count['FAIL']} FAIL "
+          f"of {len(checks.results)}; evidence: {RUN / 'evidence'}")
+    return 1 if count["FAIL"] else 0
+
+
+def variants():
+    """Export one Git ref three times for build-linux.sh --upgrade: N as it
+    is, N+1 with the next patch version, and a broken N+1 whose resident never
+    answers health. The patches exist only in these exports; nothing in the
+    product source is changed or committed."""
+    ref = sys.argv[2]
+    out = BASE / "linux-cache/src"
+    for q in [out, *out.parents]:
+        if q.is_symlink():
+            raise RuntimeError(f"refusing symlink: {q}")
+    if out.exists():
+        shutil.rmtree(out)
+    commit = command(["git", "-C", ROOT, "rev-parse", "--verify", ref + "^{commit}"]).stdout.strip()
+    for name in ("n", "n1", "n1-broken"):
+        (out / name).mkdir(parents=True)
+        archive = subprocess.run(["git", "-C", str(ROOT), "archive", "--format=tar", commit],
+                                 stdout=subprocess.PIPE, check=True).stdout
+        # tar would keep the commit time; Cargo compares mtimes with its last
+        # build, so an export of an older commit could look already built.
+        subprocess.run(["tar", "-x", "-m", "-C", str(out / name)], input=archive, check=True)
+
+    def patch(path, old, new):
+        text = path.read_text()
+        if text.count(old) != 1:
+            raise RuntimeError(f"{path.name}: expected one {old!r}, found {text.count(old)}")
+        path.write_text(text.replace(old, new))
+
+    manifest = (out / "n/Cargo.toml").read_text()
+    package = manifest.split("[package]", 1)[1].split("\n[", 1)[0]
+    (version,) = [line.split('"')[1] for line in package.splitlines()
+                  if line.startswith("version = ")]
+    major, minor, micro = version.split(".")
+    next_version = f"{major}.{minor}.{int(micro) + 1}"
+    for name in ("n1", "n1-broken"):
+        patch(out / name / "Cargo.toml", f'version = "{version}"', f'version = "{next_version}"')
+        patch(out / name / "Cargo.lock", f'name = "belt-cli"\nversion = "{version}"',
+              f'name = "belt-cli"\nversion = "{next_version}"')
+    # The resident (`belt daemon`) of the broken build starts and then never
+    # answers: the upgrade's health check fails while the process runs.
+    patch(out / "n1-broken/src/cli.rs",
+          "    if let Command::Daemon(args) = &cli.command {\n",
+          "    if let Command::Daemon(args) = &cli.command {\n"
+          "        // S26 harness export only: a resident that never becomes healthy.\n"
+          "        if std::env::var_os(\"S26_NEVER_SET\").is_none() {\n"
+          "            loop {\n"
+          "                std::thread::sleep(std::time::Duration::from_secs(3600));\n"
+          "            }\n"
+          "        }\n")
+    print(f"exported {commit[:12]} as N {version}, N+1 {next_version} and broken N+1")
 
 
 def down():
@@ -405,7 +882,7 @@ if __name__ == "__main__":
     with open(BASE / "harness.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            action = {"up": up, "run": run, "down": down}[sys.argv[1]]
+            action = {"up": up, "run": run, "down": down, "variants": variants}[sys.argv[1]]
             sys.exit(action() or 0)
         except (Exception, KeyboardInterrupt) as error:
             print(f"FAIL harness: {error}", file=sys.stderr)
