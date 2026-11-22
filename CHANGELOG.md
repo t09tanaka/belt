@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-11-23
+
 ### Fixed
 
 - `exec` no longer loses a stop signal: two different signals received before they were consumed are both delivered, and a signal arriving just before the blocking wait is forwarded to the command at once instead of on the next signal. The handler never signals a pid after it was reaped (in-flight counter), keeps `errno`, and an inherited `SIGCHLD = SIG_IGN` no longer auto-reaps the command while its pid is published.
