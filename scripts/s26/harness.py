@@ -882,7 +882,11 @@ if __name__ == "__main__":
     with open(BASE / "harness.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            action = {"up": up, "run": run, "down": down, "variants": variants}[sys.argv[1]]
+            action = {"up": up, "run": run, "down": down, "variants": variants}.get(sys.argv[1])
+            if sys.argv[1] == "a46":
+                from a46 import run as action
+            if action is None:
+                raise ValueError(f"unknown action: {sys.argv[1]}")
             sys.exit(action() or 0)
         except (Exception, KeyboardInterrupt) as error:
             print(f"FAIL harness: {error}", file=sys.stderr)

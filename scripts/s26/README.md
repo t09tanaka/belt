@@ -147,3 +147,9 @@ there is no fallback to a fake service or ephemeral worker.
 Authoring validation: Bash syntax, ShellCheck, and Python syntax can run without
 Docker. Real Docker/SSH/systemd acceptance must be run on the host; a sandbox
 that denies the Docker socket cannot establish those results.
+
+### A46 ephemeral worker over SSH
+
+Use a fresh `up.sh` run for `S26_BELT=/absolute/path/to/belt scripts/s26/run.sh --a46`. This check uses the run's disposable w1 guest as an ephemeral worker and connects through an OpenSSH local forward. It removes that forward while a task runs, observes one unknown attempt, runs `workers forget`, and reconnects the same live agent. The command must have started once, its original attempt must be interrupted, and the old agent must receive the retirement notice. A second worker start must have a new instance identity. See `run/evidence/a46.json` and the two agent logs before running `down.sh`.
+
+Verified on 2026-11-22 with a Mac coordinator and a Debian arm64 Docker guest. The command started once. The same attempt changed from unknown to interrupted on explicit forget, and the returning worker exited after receiving the retirement notice. A subsequent start produced a distinct instance ID. Native SHA-256: `ff6c2cdb4830838b7f79f4850764926b86c484df841ef623fa19efe67f7417d0`. Linux SHA-256: `40a16389ca2a4522657ee6823237f24e04e3b9f453453ca169578bc35fe3fa6e`.
