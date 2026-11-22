@@ -14,8 +14,7 @@ service-registration path is exercised on Linux only, by m1.
 Use a short checkout path on an Apple Silicon Mac: macOS Unix socket paths
 must fit in 104 bytes. Install/start Docker Desktop with privileged containers
 and writable cgroups allowed. Host tools: Bash, Python 3.9+, Git, `/usr/bin/ssh`,
-`ssh-keygen`, `portool` (repository baseline 0.10.2), `task-traffic-controller`, and native
-`fast-worktree` **0.4.0**. Scripts resolve the local CLIs from PATH, then
+`ssh-keygen`, `portool` (repository baseline 0.10.2), and `task-traffic-controller`. Scripts resolve the local CLIs from PATH, then
 `~/.cargo/bin`. Missing prerequisites fail explicitly.
 
 From the repository root, with Rust **1.93.0** already installed:
@@ -45,9 +44,8 @@ The Linux build uses the official `rust:1.93.0-bookworm` image, with Cargo
 downloads and artifacts in `target/s26/linux-cache/`; output is
 `target/s26/belt-linux-aarch64`. No host cross-compiler is used. The worker
 image uses `debian:12.9-slim`, real systemd PID 1, sshd/PAM, a lingering UID 1000
-`belt` user, Git, shell/core utilities and `fast-worktree` 0.4.0. The latter is
-required by `src/workspace/fastwt.rs`; Git and core utilities serve source and
-workspace operations. Rust/tool image tags and installed Rust tool versions
+`belt` user, Git and shell/core utilities. The app supplies fast-worktree and
+portool for workspace hooks and commands. Rust/tool image tags and installed Rust tool versions
 are pinned; Debian apt security packages are intentionally not snapshot-pinned.
 The harness has no Docker socket mount in workers.
 
@@ -63,7 +61,7 @@ Each `up` generates its own SSH key, config, known_hosts and `bin/ssh` wrapper.
 The wrapper places `-F` before belt's `--`. Global known_hosts and the SSH agent
 are disabled. No real `~/.ssh`, `~/.belt` or `~/.config/belt` is read or written.
 The parent gets an allowlisted environment with private HOME, XDG config/state,
-TMPDIR and PATH; its only non-system helper is the pinned fast-worktree binary.
+TMPDIR and PATH. Its submitted jobs run the embedded fast-worktree and portool commands.
 No host sudo is used. A tiny Git repository and fixture commit are generated
 inside the run directory; the product repository is never committed or pushed.
 
@@ -159,3 +157,9 @@ there is no fallback to a fake service or ephemeral worker.
 Authoring validation: Bash syntax, ShellCheck, and Python syntax can run without
 Docker. Real Docker/SSH/systemd acceptance must be run on the host; a sandbox
 that denies the Docker socket cannot establish those results.
+
+### A46 ephemeral worker over SSH
+
+Use a fresh `up.sh` run for `S26_BELT=/absolute/path/to/belt scripts/s26/run.sh --a46`. This check uses the run's disposable w1 guest as an ephemeral worker and connects through an OpenSSH local forward. It removes that forward while a task runs, observes one unknown attempt, runs `workers forget`, and reconnects the same live agent. The command must have started once, its original attempt must be interrupted, and the old agent must receive the retirement notice. A second worker start must have a new instance identity. See `run/evidence/a46.json` and the two agent logs before running `down.sh`.
+
+Verified on 2026-11-22 with a Mac coordinator and a Debian arm64 Docker guest. The command started once. The same attempt changed from unknown to interrupted on explicit forget, and the returning worker exited after receiving the retirement notice. A subsequent start produced a distinct instance ID. Native SHA-256: `ff6c2cdb4830838b7f79f4850764926b86c484df841ef623fa19efe67f7417d0`. Linux SHA-256: `40a16389ca2a4522657ee6823237f24e04e3b9f453453ca169578bc35fe3fa6e`.

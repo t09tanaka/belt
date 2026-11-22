@@ -2554,7 +2554,7 @@ fn a_run_goes_on_while_the_scope_holds_a_v3_ledger() {
 /// The installed `task-traffic-controller`. Without one the real-CLI test
 /// cannot run: that is a failure where it is required (`BELT_REQUIRE_TTC_CLI`,
 /// set in CI), and said aloud elsewhere.
-fn ttc_cli() -> Option<PathBuf> {
+pub(crate) fn ttc_cli() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let found = std::env::split_paths(&path)
         .map(|d| d.join("task-traffic-controller"))

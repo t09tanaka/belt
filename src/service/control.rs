@@ -198,13 +198,14 @@ pub async fn exec(
     command: Vec<String>,
     signals: &mut mpsc::UnboundedReceiver<()>,
 ) -> Result<Report, ApiError> {
-    exec_mode(context, command, false, signals).await
+    exec_mode(context, command, None, Default::default(), signals).await
 }
 
 pub async fn exec_mode(
     context: Context,
     command: Vec<String>,
-    in_place: bool,
+    revision: Option<String>,
+    mode: super::submit::Mode,
     signals: &mut mpsc::UnboundedReceiver<()>,
 ) -> Result<Report, ApiError> {
     let run_id = RunId::generate();
@@ -213,10 +214,10 @@ pub async fn exec_mode(
     let submitted = super::submit::command_with_mode(
         context.clone(),
         command,
-        None,
+        revision,
         run_id,
         task_id.clone(),
-        in_place,
+        mode,
     );
     let mut result = tokio::select! {biased;
         _=interrupted(signals)=>Ok(cancel_and_stop(&context.bootstrap,target.clone(),signals,Duration::from_secs(30)).await),

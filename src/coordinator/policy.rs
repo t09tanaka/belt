@@ -446,6 +446,7 @@ mod tests {
             outputs: Vec::new(),
             requirements: Default::default(),
             in_place: false,
+            local: false,
             setup: None,
             plan_digest: digest.clone(),
             manifest_digest: digest,

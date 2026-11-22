@@ -19,6 +19,11 @@ pub trait FastWorktree: Send + Sync {
     fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure>;
     /// Remove the clean worktree at `path` (`pre_remove` hooks run).
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure>;
+    /// Release this attempt's port reservation even after a previous cleanup
+    /// removed its worktree. Implementations without a port ledger need no work.
+    fn release_ports(&self, _repo: &Path, _path: &Path) -> Result<(), FwFailure> {
+        Ok(())
+    }
 }
 
 /// How long one call may run unless the caller says otherwise: a `post_add`
@@ -195,5 +200,13 @@ impl FastWorktree for CliFastWorktree {
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
         use std::ffi::OsStr;
         self.run(repo, &[OsStr::new("remove"), path.as_os_str()])
+    }
+    fn release_ports(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        portool::release_removed_in(&portool::Context::from_env(&self.env), repo, path)
+            .map(|_| ())
+            .map_err(|err| FwFailure::Failed {
+                code: None,
+                stderr: err.to_string(),
+            })
     }
 }

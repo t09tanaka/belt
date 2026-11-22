@@ -1,18 +1,56 @@
 # belt
 
-Run CI and development commands across your own Macs on the LAN: one coordinator, many workers, with uncommitted changes, durable queues, cancellation and crash recovery.
+Run CI and development commands on one machine or share work with other members of your LAN. Each initialized member can submit work. The resident manages queued runs, cancellation and crash recovery.
 
 Status: in development. The specification (Japanese) is in [docs/spec.md](docs/spec.md), with progress and remaining acceptance work in [docs/plan.md](docs/plan.md).
 
-Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission.
+Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
 
 ## Install
 
-The crates.io package is `belt-cli` (the name `belt` is taken by an unrelated crate); it installs the `belt` command. Not yet published.
+Build the CLI from a checkout with the stable Rust toolchain. From the repository root, run:
 
 ```sh
-cargo install belt-cli
+cargo install --locked --path .
+belt --version
 ```
+
+Cargo installs the executable as `belt` (normally in `~/.cargo/bin`). The package name in this repository is `belt-cli`.
+
+## First run on one machine
+
+### Run in the current directory
+
+On a Mac with no belt coordinator or worker agent running, run a command in your current directory:
+
+```sh
+belt exec -- /usr/bin/printf 'hello from belt\n'
+```
+
+This prints `hello from belt` on stdout. Belt reports direct execution on stderr and uses the same host admission budget as `task-traffic-controller exec`. A direct command creates no snapshot or run ID.
+
+```sh
+belt --json exec --local -- /usr/bin/true
+```
+
+The JSON result includes `"mode":"direct"` and `"exit_code":0`. Once a coordinator is running, `--local` pins execution to your own worker and the command follows the normal snapshot and run lifecycle.
+
+### Run with a durable queue
+
+To use the durable queue, initialize the resident for your user, then check its status:
+
+```sh
+belt init
+belt doctor
+```
+
+From a Git project you want to run a command in, try:
+
+```sh
+belt exec -- pwd
+```
+
+With no remote workers configured, the local worker runs the command. Use `belt top` in a second terminal to follow longer jobs.
 
 ## Watch workers and tasks
 
@@ -22,7 +60,7 @@ Run `belt top` in a terminal to see worker connections, active attempts, waiting
 
 The CLI surface is defined, but public orchestration commands remain under development. Unimplemented commands return `NOT_IMPLEMENTED` (exit code 70; with `--json`, an envelope with `schema_version` on stdout).
 
-Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workspace integration tests require fast-worktree 0.4.0 or newer and portool; resource admission uses task-traffic-controller 0.10.x (0.10.2 or newer in that minor: the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.10 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
+Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workers include fast-worktree and portool. Workspace hooks and commands use the versions shown by `belt workers diff`. The coexistence tests also exercise standalone installations. Resource admission uses task-traffic-controller 0.10.x (0.10.2 or newer in that minor: the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.10 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
 
 Run the configured CI against committed HEAD:
 

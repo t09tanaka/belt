@@ -22,6 +22,7 @@
 //! [`Workspaces::sweep_orphans`] (the worker's startup, S10) clears the
 //! directories no record names.
 
+pub mod embedded;
 mod fastwt;
 mod git;
 pub mod in_place;
@@ -641,6 +642,7 @@ impl Workspaces {
     /// are cleared, whether or not the directory was still there.
     fn teardown_worktree(&self, clone: &Path, attempt: &AttemptId) -> Result<(), ApiError> {
         let dir = plan::workspace_dir(&self.workspaces_root(), attempt);
+        let mut hook_result = Ok(());
         match std::fs::symlink_metadata(&dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err("cannot inspect the workspace", e)),
@@ -648,9 +650,10 @@ impl Workspaces {
                 if self.owned_worktree(clone, &dir) && self.clean_worktree(&dir) {
                     // shared: a prune of the clone's worktree list waits for us
                     let _shared = lock_shared(clone)?;
-                    self.fw
+                    hook_result = self
+                        .fw
                         .remove(clone, &dir)
-                        .map_err(|f| plan::fw_error("remove", &f))?;
+                        .map_err(|f| plan::fw_error("remove", &f));
                 } else {
                     remove_tree(&dir).map_err(|e| io_err("cannot remove the workspace", e))?;
                 }
@@ -658,6 +661,10 @@ impl Workspaces {
             Ok(_) => std::fs::remove_file(&dir)
                 .map_err(|e| io_err("cannot remove what is at the workspace's place", e))?,
         }
+        self.fw
+            .release_ports(clone, &dir)
+            .map_err(|f| plan::fw_error("release ports", &f))?;
+        hook_result?;
         self.settle(clone, attempt)
     }
 

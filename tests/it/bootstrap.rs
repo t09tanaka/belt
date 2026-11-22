@@ -909,6 +909,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     std::fs::create_dir_all(&configdir).unwrap();
     std::fs::set_permissions(&configdir, std::fs::Permissions::from_mode(0o700)).unwrap();
     write_input(&configdir.join("coordinator.json"), &spec).unwrap();
+    start_resident(&spec).await;
     let output=tokio::process::Command::new(&spec.executable).args(["--json","submit","--","/bin/sh","-c","set -e; sleep 1; test \"$(cat input.txt)\" = dirty-snapshot; test \"$(wc -c <private.env)\" -eq 40; cat private.env"])
         .current_dir(&repo).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile|("LLVM_PROFILE_FILE",profile))).envs(&spec.env).output().await.unwrap();
     assert!(
@@ -1372,6 +1373,13 @@ fn open_sources(state: &std::path::Path) -> belt::source::SourceStore {
         }
     }
 }
+/// Start the resident the CLI talks to. With none running, `exec` runs the
+/// command here (direct execution) and `submit` is refused.
+pub(super) async fn start_resident(spec: &Spec) {
+    belt::service::bootstrap::ensure(spec.clone())
+        .await
+        .expect("the fixture's resident starts");
+}
 pub(super) fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     control_fixture_with(|_| {})
 }
@@ -1395,9 +1403,48 @@ pub(super) fn control_fixture_with(
     std::fs::write(input.join("input.txt"), "snapshot").unwrap();
     (root, spec, input)
 }
+/// A50: with a resident running and no other worker, `exec` makes a run on
+/// the local worker, with `--local` as well; neither runs directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a50_with_a_resident_exec_runs_on_the_local_worker_with_or_without_local() {
+    let (_root, spec, input) = control_fixture();
+    start_resident(&spec).await;
+    for local in [false, true] {
+        let mut args = vec!["--json", "exec"];
+        if local {
+            args.push("--local");
+        }
+        args.extend(["--", "/bin/sh", "-c", "exit 0"]);
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&spec.executable)
+                .args(&args)
+                .env_clear()
+                .envs(
+                    std::env::var_os("LLVM_PROFILE_FILE")
+                        .map(|profile| ("LLVM_PROFILE_FILE", profile)),
+                )
+                .envs(&spec.env)
+                .current_dir(&input)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{local} {stderr}");
+        assert!(!stderr.contains(belt::service::direct::NOTICE), "{stderr}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["result"]["state"], "settled");
+        assert!(value["result"]["target"]["id"].is_string(), "{value}");
+        assert!(value["result"].get("mode").is_none(), "{value}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_control_exec_exit_and_offline_wait_ignore_current_project_and_git() {
     let (_root, spec, input) = control_fixture();
+    start_resident(&spec).await;
     let mut run = None;
     for (script, exit) in [("exit 0", 0), ("exit 23", 23), ("kill -TERM $$", 143)] {
         let output = tokio::time::timeout(
@@ -1607,6 +1654,7 @@ async fn in_place_real_exec_sigint_confirms_stop_and_preserves_original() {
 }
 async fn control_exec_sigint(in_place: bool) {
     let (_root, spec, input) = control_fixture();
+    start_resident(&spec).await;
     let script = crate::fixture_process::script("sleep 30");
     let mut child = tokio::process::Command::new(&spec.executable)
         .args(if in_place {
@@ -1808,6 +1856,7 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     use belt::ids::{RunId, TaskId};
     use belt::service::{completion::Target, control};
     let (_root, spec, input) = control_fixture();
+    start_resident(&spec).await;
     let output = tokio::process::Command::new(&spec.executable)
         .args([
             "--json",
@@ -2605,6 +2654,7 @@ async fn in_place_exec_updates_original_directory_and_retries_mutable_input_afte
         service::{completion::Target, control},
     };
     let (_root, spec, input) = control_fixture();
+    start_resident(&spec).await;
     let out = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::new(&spec.executable)
@@ -2720,6 +2770,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
     let secret = input.join(".env.test");
     std::fs::write(&secret, "TOKEN=initial-private-secret\n").unwrap();
     let original_mode = std::fs::metadata(&secret).unwrap().permissions().mode();
+    start_resident(&spec).await;
     let out = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::new(&spec.executable)
@@ -2827,7 +2878,11 @@ async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collecti
             "-c".into(),
             "cat prepared.txt > output.txt".into(),
         ],
-        true,
+        None,
+        belt::service::submit::Mode {
+            in_place: true,
+            local: false,
+        },
         &mut signals,
     )
     .await
@@ -2889,6 +2944,7 @@ async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symli
         .success());
     let secret = input.join(".env.test");
     std::fs::write(&secret, "TOKEN=private-original-secret\n").unwrap();
+    start_resident(&spec).await;
     let out = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::new(&spec.executable)
@@ -3100,6 +3156,7 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         input.join(".belt.toml"),
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
     ).unwrap();
+    start_resident(&spec).await;
     let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap_or_else(|elapsed| {
         diagnose_coordinator(&spec);
         diagnose_worker(&spec);
@@ -3236,6 +3293,7 @@ async fn public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place() 
     })
     .await
     .unwrap();
+    start_resident(&spec).await;
     let results = async {
         for in_place in [false, true] {
             let marker = if in_place { "nested-in-place" } else { "nested-snapshot" };
@@ -3399,6 +3457,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     })
     .await
     .unwrap();
+    start_resident(&spec).await;
     let mut successful_task = None;
     for _ in 0..2 {
         let output = tokio::time::timeout(
@@ -3762,6 +3821,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
     // A different snapshot requests Node22 without changing operator defaults.
     std::fs::write(input.join(".node-version"), "22.0.0\n").unwrap();
     let second_script = format!("test \"$(node --version)\" = v22.0.0 || exit 94; i=0; while [ ! -f '{}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 95; : > '{}'", ready.display(), ready.display(), release.display());
+    start_resident(&spec).await;
     let output = tokio::process::Command::new(&spec.executable)
         .args(["--json", "exec", "--", "/bin/sh", "-c", &second_script])
         .env_clear()
@@ -4966,6 +5026,7 @@ async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outco
     std::fs::create_dir(&temporary).unwrap();
     std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
     let profile = || std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v));
+    start_resident(&spec).await;
     for (code, stored, skipped) in [
         (23, ["both", "failed"], "passed"),
         (0, ["both", "passed"], "failed"),
@@ -5627,4 +5688,24 @@ async fn a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order() 
     );
     assert_eq!(attempts.values().sum::<usize>(), 5);
     shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_commands_find_the_embedded_helpers_before_standalone_tools() {
+    let (_root, spec, input) = control_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(45),
+        tokio::process::Command::new(&spec.executable)
+            .args(["--json", "exec", "--", "/bin/sh", "-ec",
+                r#"case "$(command -v fast-worktree)" in */tool-bin/*/fast-worktree) ;; *) exit 21;; esac
+                   case "$(command -v portool)" in */tool-bin/*/portool) ;; *) exit 22;; esac
+                   fast-worktree --version && portool --version"#])
+            .env_clear().envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    shutdown(&client).await;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

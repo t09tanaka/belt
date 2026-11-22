@@ -1544,7 +1544,7 @@ fn parent_report() -> EnvReport {
         )]),
         helpers: BTreeMap::from([(
             "belt".to_string(),
-            Some(env!("CARGO_PKG_VERSION").to_string()),
+            Some(crate::workspace::embedded::BUILD_ID.to_owned()),
         )]),
         docker: Docker::NotRunnable,
         disk_free_bytes: None,

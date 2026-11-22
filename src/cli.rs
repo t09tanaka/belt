@@ -176,9 +176,18 @@ pub enum CiSub {
 pub struct ExecArgs {
     #[command(flatten)]
     pub execution: ExecutionArgs,
-    /// Run in the current directory instead of a snapshot.
+    /// Run in the current directory instead of a snapshot (on this host's worker).
     #[arg(long)]
     pub in_place: bool,
+    /// Run on this host's own worker even when others could take it.
+    #[arg(long)]
+    pub local: bool,
+    /// Snapshot kind (for example `commit`).
+    #[arg(long)]
+    pub snapshot: Option<String>,
+    /// Git ref to run.
+    #[arg(long = "ref")]
+    pub git_ref: Option<String>,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -492,6 +501,14 @@ pub fn run(cli: Cli) -> i32 {
         return run_ci(&cli);
     }
 
+    if let Command::Exec(args) = &cli.command {
+        use crate::service::direct::Resident;
+        match crate::service::direct::resident_status(&process_env()) {
+            Ok(Resident::Stopped | Resident::Uninitialized) => return run_direct(cli.json, args),
+            Ok(Resident::Running) => (),
+            Err(error) => return direct_error(cli.json, error),
+        }
+    }
     if matches!(&cli.command, Command::Exec(_))
         || matches!(
             &cli.command,
@@ -608,11 +625,27 @@ pub fn run(cli: Cli) -> i32 {
             let env = std::env::vars_os()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                 .collect();
+            use crate::service::direct::Resident;
+            match crate::service::direct::resident_status(&env)? {
+                Resident::Running => (),
+                Resident::Stopped => {
+                    return Err(crate::service::direct::not_running(
+                        "submit needs a run, and no resident is running on this host",
+                    ))
+                }
+                Resident::Uninitialized => {
+                    return Err(crate::error::ApiError::new(
+                        ErrorCode::NotFound,
+                        "coordinator is not initialized; run belt init to start the resident",
+                    ))
+                }
+            }
             let cwd = std::env::current_dir()
                 .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
             let context = args
                 .execution
-                .apply(crate::service::context::Context::discover(env, cwd)?);
+                .apply(crate::service::context::Context::discover(env, cwd)?)
+                .require_existing_resident();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -661,35 +694,89 @@ pub fn run(cli: Cli) -> i32 {
     ErrorCode::NotImplemented.exit_code()
 }
 
-/// The context `ci` and `ci plan` capture and plan in: the snapshot kind and
-/// revision of the command line over the configuration.
-fn ci_context(args: &CiArgs) -> Result<crate::service::context::Context, crate::error::ApiError> {
-    use crate::{
-        config::{model::SourceMode, Overlay},
-        service::context::{runtime_spec, Context},
-    };
+/// This process's environment, as the commands read it.
+fn process_env() -> std::collections::BTreeMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
+/// The snapshot kind and revision of the command line over the configuration.
+fn source_overlay(
+    snapshot: Option<&str>,
+    git_ref: Option<&str>,
+) -> Result<crate::config::Overlay, crate::error::ApiError> {
+    use crate::config::{model::SourceMode, Overlay};
     let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
-    let source_mode = match args.snapshot.as_deref() {
+    let source_mode = match snapshot {
         None => None,
         Some("worktree") => Some(SourceMode::Worktree),
         Some("commit") => Some(SourceMode::Commit),
         Some(_) => return Err(invalid("unsupported snapshot kind")),
     };
-    if source_mode == Some(SourceMode::Worktree) && args.git_ref.is_some() {
+    if source_mode == Some(SourceMode::Worktree) && git_ref.is_some() {
         return Err(invalid("worktree snapshot does not accept a revision"));
     }
-    let env = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .collect();
+    Ok(Overlay {
+        source_mode,
+        ..Default::default()
+    })
+}
+
+/// The context `ci` and `ci plan` capture and plan in: the snapshot kind and
+/// revision of the command line over the configuration.
+fn ci_context(args: &CiArgs) -> Result<crate::service::context::Context, crate::error::ApiError> {
+    use crate::service::context::{runtime_spec, Context};
+    let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
+    let overlay = source_overlay(args.snapshot.as_deref(), args.git_ref.as_deref())?;
+    let env = process_env();
     let cwd = std::env::current_dir().map_err(|_| invalid("command directory is unavailable"))?;
     let spec = runtime_spec(&env)
         .map_err(|_| invalid("coordinator configuration is unavailable; initialize first"))?;
-    let overlay = Overlay {
-        source_mode,
-        ..Default::default()
-    };
     Context::load_with_overlay(env, cwd, spec, &overlay)
         .map_err(|_| invalid("planning configuration is invalid or unavailable"))
+}
+
+/// `exec` with no resident on this host: the command runs here (spec
+/// chapter 4 and 16). The exit code is the command's.
+fn run_direct(json: bool, args: &ExecArgs) -> i32 {
+    use crate::service::direct;
+    let result = (|| {
+        if let Some(refusal) = direct::refusal(direct::Flags {
+            snapshot: args.snapshot.is_some() || args.git_ref.is_some(),
+            in_place: args.in_place,
+            placement: args.execution.profile.is_some() || !args.execution.requires.is_empty(),
+        }) {
+            return Err(refusal);
+        }
+        let cwd = std::env::current_dir()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        direct::run(&process_env(), cwd, args.command.clone(), json)
+    })();
+    match result {
+        Ok(outcome) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":outcome.exit_code==0,"result":outcome})
+                );
+            }
+            outcome.exit_code
+        }
+        Err(error) => direct_error(json, error),
+    }
+}
+
+fn direct_error(json: bool, error: crate::error::ApiError) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"ok":false,"error":error})
+        );
+    } else {
+        eprintln!("error: {}", error.message);
+    }
+    error.code.exit_code()
 }
 
 /// `ci`: run the frozen plan of the captured input as one run and wait for
@@ -857,14 +944,23 @@ fn run_control(cli: &Cli) -> i32 {
             });
             let result = match &cli.command {
                 Command::Exec(args) => {
+                    let overlay =
+                        source_overlay(args.snapshot.as_deref(), args.git_ref.as_deref())?;
                     crate::service::control::exec_mode(
-                        args.execution.apply(crate::service::context::Context::load(
-                            env,
-                            cwd,
-                            spec.clone(),
-                        )?),
+                        args.execution
+                            .apply(crate::service::context::Context::load_with_overlay(
+                                env,
+                                cwd,
+                                spec.clone(),
+                                &overlay,
+                            )?)
+                            .require_existing_resident(),
                         args.command.clone(),
-                        args.in_place,
+                        args.git_ref.clone(),
+                        crate::service::submit::Mode {
+                            in_place: args.in_place,
+                            local: args.local,
+                        },
                         &mut receiver,
                     )
                     .await
