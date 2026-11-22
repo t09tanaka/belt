@@ -666,13 +666,19 @@ impl Workspaces {
             std::fs::symlink_metadata(&dir),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound
         );
-        if gone {
+        let released = if gone {
             self.fw
                 .release_ports(clone, &dir)
-                .map_err(|f| plan::fw_error("release ports", &f))?;
-        }
+                .map_err(|f| plan::fw_error("release ports", &f))
+        } else {
+            Ok(())
+        };
         hook_result?;
-        self.settle(clone, attempt)
+        // A release that cannot be done (a newer registry) must not keep the
+        // branch and the registration from being cleared, nor be lost.
+        let settled = self.settle(clone, attempt);
+        released?;
+        settled
     }
 
     /// Is `dir` a real directory (not a link) whose `.git` is a file that

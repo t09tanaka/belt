@@ -1693,3 +1693,86 @@ fn releasing_ports_refuses_a_newer_registry_without_rewriting_it() {
     );
     assert_eq!(std::fs::read_to_string(&ledger).unwrap(), body);
 }
+
+#[test]
+fn ports_are_released_when_someone_else_removed_the_directory_or_a_link_is_there() {
+    for link in [false, true] {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let spy = Arc::new(PortSpy {
+            inner: GitFw { env: f.env() },
+            remove_fails: false,
+            release: Ok(()),
+            released: Default::default(),
+        });
+        let fw: Arc<dyn FastWorktree> = spy.clone();
+        let ws = f.workspaces(&fw);
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m, Some(&repo))
+            .unwrap();
+        std::fs::remove_dir_all(&w.root).unwrap();
+        if link {
+            std::os::unix::fs::symlink(&f.dir, &w.root).unwrap();
+        }
+        ws.remove(&w).unwrap();
+        assert!(std::fs::symlink_metadata(&w.root).is_err());
+        assert_eq!(
+            spy.released.lock().unwrap().clone(),
+            vec![w.root.clone()],
+            "link: {link}"
+        );
+        assert!(branches(&f, repo.dir()).is_empty());
+    }
+}
+
+/// The ports go through the embedded portool, the worktree through Git.
+struct NewerRegistry {
+    inner: GitFw,
+    ports: CliFastWorktree,
+}
+
+impl FastWorktree for NewerRegistry {
+    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+        self.inner.add(repo, dest, branch, start)
+    }
+    fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        self.inner.remove(repo, path)
+    }
+    fn release_ports(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        self.ports.release_ports(repo, path)
+    }
+}
+
+#[test]
+fn a_registry_that_cannot_be_read_still_lets_the_gone_worktrees_branch_be_cleared() {
+    let f = fixture();
+    let state = f.root.join("xdg-state");
+    let ledger = state.join("portool/registry.json");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let body = r#"{"version":999}"#;
+    std::fs::write(&ledger, body).unwrap();
+    let mut env = f.env();
+    env.insert("XDG_STATE_HOME".into(), state.to_str().unwrap().into());
+    let store = f.store();
+    let m = f.capture_commit(&store, "HEAD");
+    let fw: Arc<dyn FastWorktree> = Arc::new(NewerRegistry {
+        inner: GitFw { env: f.env() },
+        ports: CliFastWorktree::new(env),
+    });
+    let ws = f.workspaces(&fw);
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &m);
+    let w = ws
+        .create(&AttemptId::generate(), &store, &m, Some(&repo))
+        .unwrap();
+    std::fs::remove_dir_all(&w.root).unwrap();
+    let e = ws.remove(&w).unwrap_err();
+    assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+    assert!(e.message.contains("v999"), "{}", e.message);
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), body);
+    assert!(branches(&f, repo.dir()).is_empty());
+    assert_eq!(worktrees(&f, repo.dir()).len(), 1);
+}

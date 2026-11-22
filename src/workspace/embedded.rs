@@ -115,6 +115,13 @@ pub(crate) fn install(state: &Path, executable: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn prepend(bin: &Path, path: &str) -> Result<String, String> {
+    // An empty PATH has no entries; one empty entry would mean the current directory.
+    if path.is_empty() {
+        return bin
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| "worker PATH must be UTF-8".into());
+    }
     std::env::join_paths(
         std::iter::once(bin.to_owned())
             .chain(std::env::split_paths(OsStr::new(path)).filter(|entry| entry != bin)),
@@ -132,9 +139,33 @@ pub(crate) fn activated(
     binding: &crate::toolchain::contract::ExecutionBinding,
     own: &std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
+    activated_with(bin, binding, own, true)
+}
+
+/// [`activated`] for CI tasks and setup steps, which ran with a binding that
+/// has no `PATH` before the tool-bin directory existed: there the directory
+/// alone becomes the `PATH`.
+pub(crate) fn activated_or_bare(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    activated_with(bin, binding, own, false)
+}
+
+fn activated_with(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+    require_path: bool,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut env = binding.environment(own).map_err(str::to_string)?;
     if let Some(bin) = bin {
-        let path = prepend(bin, env.get("PATH").ok_or("activation has no PATH")?)?;
+        let path = match env.get("PATH") {
+            Some(path) => prepend(bin, path)?,
+            None if require_path => return Err("activation has no PATH".into()),
+            None => prepend(bin, "")?,
+        };
         env.insert("PATH".into(), path);
     }
     Ok(env)
@@ -193,6 +224,15 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_path_becomes_the_tool_bin_alone() {
+        let bin = Path::new("/state/tool-bin/abc");
+        assert_eq!(prepend(bin, "").unwrap(), "/state/tool-bin/abc");
+        let empty = bound([("PATH".to_string(), String::new())].into());
+        let env = activated(Some(bin), &empty, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc");
+    }
+
+    #[test]
     fn a_bound_command_gets_the_tool_bin_first_and_is_refused_without_a_path() {
         let bin = Path::new("/state/tool-bin/abc");
         let with_path = bound([("PATH".to_string(), "/activated/bin".to_string())].into());
@@ -206,6 +246,11 @@ mod tests {
             Err("activation has no PATH".to_string())
         );
         assert!(activated(None, &no_path, &Default::default()).is_ok());
+        let env = activated_or_bare(Some(bin), &no_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc");
+        let env = activated_or_bare(Some(bin), &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
+        assert!(activated_or_bare(None, &no_path, &Default::default()).is_ok());
         let own = [("FLAG".to_string(), "1".to_string())].into();
         assert_eq!(activated(None, &no_path, &own).unwrap()["FLAG"], "1");
     }

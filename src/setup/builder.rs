@@ -1616,7 +1616,11 @@ impl Setups {
         binding: &ExecutionBinding,
         own: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>, String> {
-        crate::workspace::embedded::activated(self.cfg.embedded_bin.as_deref(), binding, own)
+        crate::workspace::embedded::activated_or_bare(
+            self.cfg.embedded_bin.as_deref(),
+            binding,
+            own,
+        )
     }
 
     /// Setup steps with the worker's scope variables on top of their
@@ -2506,8 +2510,49 @@ mod tool_validation_tests {
                 execution_fingerprint: d,
             },
         };
-        let env = setups.step_environment(&binding, &BTreeMap::new()).unwrap();
-        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
+        let spec = crate::wire::SetupSpec {
+            steps: vec![crate::wire::SetupStep {
+                id: "s".into(),
+                dir: String::new(),
+                run: "true".into(),
+                shell: None,
+                env: BTreeMap::new(),
+                unresolved_env: vec![],
+            }],
+            toolchain: vec![],
+            scope: crate::wire::ReuseScope::Persistent,
+            freshness_secs: None,
+            secrets: vec![],
+            no_cache: false,
+            step_timeout_ms: None,
+        };
+        let ws = Workspace {
+            root: temp.path().to_path_buf(),
+            cwd: temp.path().to_path_buf(),
+            kind: WorkspaceKind::Directory,
+            index_reproduced: true,
+            warnings: vec![],
+        };
+        let dir = temp.path().join("builder");
+        private_dir(&dir).unwrap();
+        let written = |binding: &ExecutionBinding| {
+            setups
+                .write_spec(&dir, &AttemptId::generate(), &spec, &ws, Some(binding))
+                .unwrap();
+            SuperviseSpec::from_file(&dir.join("spec.json"))
+                .unwrap()
+                .nodes[0]
+                .env
+                .clone()
+        };
+        assert_eq!(
+            written(&binding)["PATH"],
+            "/state/tool-bin/abc:/activated/bin"
+        );
+        // a binding without a PATH still works: the tool directory alone
+        let mut bare = binding.clone();
+        bare.activation.environment.clear();
+        assert_eq!(written(&bare)["PATH"], "/state/tool-bin/abc");
     }
 }
 

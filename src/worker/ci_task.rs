@@ -398,7 +398,7 @@ pub fn base_env(
     let none = BTreeMap::new();
     match (profile, binding) {
         (Some(profile), Some(binding)) => {
-            crate::workspace::embedded::activated(profile.embedded_bin(), binding, &none)
+            crate::workspace::embedded::activated_or_bare(profile.embedded_bin(), binding, &none)
         }
         (Some(profile), None) => profile.execution_environment(&none),
         (None, _) => Ok(["PATH", "HOME"]
@@ -1217,5 +1217,19 @@ mod tests {
         let env = base_env(Some(&profile), Some(&binding)).unwrap();
         assert_eq!(first(&env), bin);
         assert!(env["PATH"].ends_with(":/activated/bin"));
+        // a binding without a PATH used to work: the tool directory alone
+        let mut bare = binding.clone();
+        bare.activation.environment.clear();
+        assert_eq!(
+            base_env(Some(&profile), Some(&bare)).unwrap()["PATH"],
+            bin.to_str().unwrap()
+        );
+        bare.activation
+            .environment
+            .insert("PATH".into(), String::new());
+        assert_eq!(
+            base_env(Some(&profile), Some(&bare)).unwrap()["PATH"],
+            bin.to_str().unwrap()
+        );
     }
 }

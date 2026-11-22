@@ -57,6 +57,12 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         runtime.setup_config().supervisor_exe,
         runtime.agent_config().supervisor_exe
     );
+    assert!(runtime
+        .setup_config()
+        .embedded_bin
+        .as_deref()
+        .unwrap()
+        .starts_with(input.state_dir.join("tool-bin")));
     for (key, value) in &input.env {
         if key == "PATH" {
             let mut path = std::env::split_paths(&runtime.setup_config().env[key]);
