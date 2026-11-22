@@ -446,12 +446,22 @@ impl SourceStore {
             }
             let validated = cursor.validated.as_ref().unwrap();
             validated.check(&self.retention)?;
-            let Some((ended, binding)) = owner.input_retention_binding(
+            // A run whose record cannot be read keeps its inputs and is
+            // counted; the runs after it are still examined, and it is read
+            // again on the next pass.
+            let bound = match owner.input_retention_binding(
                 &parsed,
                 &source_id,
                 &validated.manifest.manifest_digest,
-            )?
-            else {
+            ) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    report.unknown += 1;
+                    report.errors.push(format!("{error:#}"));
+                    None
+                }
+            };
+            let Some((ended, binding)) = bound else {
                 cursor.run = Some(run);
                 cursor.object.clear();
                 cursor.validated = None;

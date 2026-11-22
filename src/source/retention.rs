@@ -1341,6 +1341,82 @@ mod tests {
             self.settle(&attempt, 3);
             (task, attempt)
         }
+        fn spare(&self, task: &TaskId, at: u64) -> AttemptId {
+            let attempt = AttemptId::generate();
+            self.owner
+                .create_attempt(
+                    NewAttempt {
+                        attempt_id: attempt.clone(),
+                        task_id: task.clone(),
+                        worker_id: WorkerId::parse("test").unwrap(),
+                        payload_hash: Digest::of_bytes(b"payload"),
+                        permit_id: None,
+                    },
+                    at,
+                )
+                .unwrap();
+            attempt
+        }
+        /// A second task of `run` whose first attempt was retired and
+        /// confirmed (through the storage API, so it has no termination) and
+        /// whose next attempt ended and was collected, at 13.
+        fn retired_then_ended(&self, run: &RunId) -> TaskId {
+            let task = TaskId::generate();
+            self.owner
+                .create_task(&task, run, &serde_json::json!({}), 6)
+                .unwrap();
+            let retired = self.spare(&task, 7);
+            self.owner.begin_retire(&retired, "lost_ack", 8).unwrap();
+            self.owner.confirm_retire(&retired, 9).unwrap();
+            let next = self.spare(&task, 10);
+            self.settle(&next, 11);
+            let record = self.owner.get_attempt(&retired).unwrap().unwrap();
+            assert!(record.retired_at_ms.is_some() && record.terminal_at_ms.is_none());
+            task
+        }
+        /// A second task of `run` whose only attempt was retired: requested
+        /// at 8 and confirmed at 20.
+        fn only_retired(&self, run: &RunId) -> (TaskId, AttemptId) {
+            let task = TaskId::generate();
+            self.owner
+                .create_task(&task, run, &serde_json::json!({}), 6)
+                .unwrap();
+            let lone = self.spare(&task, 7);
+            self.owner.begin_retire(&lone, "lost_ack", 8).unwrap();
+            (task, lone)
+        }
+        fn cancel_at(&self, task: &TaskId, at: u64) {
+            let task = task.to_string();
+            self.owner
+                .db
+                .call(move |c| {
+                    c.execute(
+                        "UPDATE task SET cancel_requested_at_ms=?1 WHERE task_id=?2",
+                        rusqlite::params![at as i64, task],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        fn expired(&self, run: &RunId) -> bool {
+            self.store
+                .retention
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_expiry WHERE run_id=?1)",
+                    [run.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+        fn source_end(&self, run: &RunId) -> Option<u64> {
+            let source = super::super::classify::source_id_of_ci(
+                &self.store.source_of_run(run).unwrap().unwrap(),
+            )
+            .unwrap();
+            self.owner.input_retention_end(run, &source).unwrap()
+        }
         fn preview(&self, cursor: &mut PreviewCursor, wall: u64, mono: u64) -> Preview {
             self.store
                 .retention_preview(&self.owner, cursor, wall, mono, Some("boot".into()), 10)
@@ -1556,47 +1632,66 @@ mod tests {
         );
         assert!(f.owner.get_attempt(&first).unwrap().is_some());
     }
-    /// A task cancelled after its only attempt was retired and confirmed
-    /// has nothing left that could read the inputs; the end is the retire.
+    /// A task whose only attempt was retired and confirmed has nothing left
+    /// that could read the inputs once it is cancelled or its run is closed.
+    /// The retention starts at the later of the two: cancelling (or closing)
+    /// days after the retire still leaves the whole retention to retry in.
     #[test]
-    fn a_cancelled_task_with_only_retired_attempts_ends_at_the_retire() {
+    fn a_task_with_only_retired_attempts_ends_at_the_later_of_the_retire_and_the_cancel() {
+        // (cancelled at, run closed at, expected end); the retire is confirmed at 20.
+        for (cancel, close, end) in [
+            (Some(21), None, 21),
+            (Some(20), None, 20),
+            (Some(19), None, 20),
+            (Some(90), None, 90),
+            (None, Some(21), 21),
+            (None, Some(19), 20),
+            (Some(30), Some(40), 40),
+            (Some(40), Some(30), 40),
+        ] {
+            let f = Fixture::new();
+            let run = RunId::generate();
+            f.bind(&run);
+            f.terminal(&run);
+            let (task, lone) = f.only_retired(&run);
+            // Before the retire is confirmed: neither a cancel nor a close ends the run.
+            if let Some(at) = cancel.filter(|at| *at < 20) {
+                f.cancel_at(&task, at);
+                assert_eq!(f.source_end(&run), None);
+            }
+            if let Some(at) = close.filter(|at| *at < 20) {
+                f.owner.close_run(&run, at).unwrap();
+                assert_eq!(f.source_end(&run), None);
+            }
+            f.owner.confirm_retire(&lone, 20).unwrap();
+            if cancel.is_none_or(|at| at >= 20) && close.is_none_or(|at| at >= 20) {
+                // Retired and neither cancelled nor closed: waiting for a new attempt.
+                assert_eq!(f.source_end(&run), None);
+            }
+            if let Some(at) = cancel.filter(|at| *at >= 20) {
+                f.cancel_at(&task, at);
+            }
+            if let Some(at) = close.filter(|at| *at >= 20) {
+                f.owner.close_run(&run, at).unwrap();
+            }
+            assert_eq!(f.source_end(&run), Some(end), "{cancel:?} {close:?}");
+        }
+    }
+    /// The cancel of a task that already ended moves the end too, as it does
+    /// for the files the jobs of a run hand to each other.
+    #[test]
+    fn a_cancel_after_every_attempt_ended_moves_the_input_end() {
         let f = Fixture::new();
         let run = RunId::generate();
         f.bind(&run);
-        let (_, _) = f.terminal(&run);
-        let source =
-            super::super::classify::source_id_of_ci(&f.store.source_of_run(&run).unwrap().unwrap())
-                .unwrap();
-        let other = TaskId::generate();
-        f.owner
-            .create_task(&other, &run, &serde_json::json!({}), 6)
-            .unwrap();
-        let lone = AttemptId::generate();
-        f.owner
-            .create_attempt(
-                NewAttempt {
-                    attempt_id: lone.clone(),
-                    task_id: other.clone(),
-                    worker_id: WorkerId::parse("test").unwrap(),
-                    payload_hash: Digest::of_bytes(b"payload"),
-                    permit_id: None,
-                },
-                7,
-            )
-            .unwrap();
-        f.owner.begin_retire(&lone, "lost_ack", 8).unwrap();
-        f.owner.confirm_retire(&lone, 20).unwrap();
-        f.owner
-            .db
-            .call(|c| {
-                c.execute("UPDATE task SET cancel_requested_at_ms=21", [])?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            f.owner.input_retention_end(&run, &source).unwrap(),
-            Some(20)
-        );
+        let (task, _) = f.terminal(&run);
+        assert_eq!(f.source_end(&run), Some(5));
+        f.cancel_at(&task, 4);
+        assert_eq!(f.source_end(&run), Some(5));
+        f.cancel_at(&task, 6);
+        assert_eq!(f.source_end(&run), Some(6));
+        f.owner.close_run(&run, 7).unwrap();
+        assert_eq!(f.source_end(&run), Some(7));
     }
     #[test]
     fn exclusive_preview_fences_enqueue_without_holding_coordinator_transaction() {
@@ -2847,6 +2942,122 @@ mod tests {
                 .is_err());
         }
     }
+    /// The real deletion of a run with a confirmed retired attempt (which has
+    /// no termination): the run is expired as the preview says, the run after
+    /// it in id order is reached too, and neither can be retried afterwards.
+    #[test]
+    fn deletion_expires_a_run_with_a_retired_attempt_and_the_run_after_it() {
+        let f = Fixture::new();
+        let (one, mut cursor) = deletion_ready(&f);
+        let two = RunId::generate();
+        f.bind(&two);
+        f.terminal(&two);
+        let (first, later) = if one.as_str() < two.as_str() {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        f.retired_then_ended(&first);
+        assert_eq!(f.source_end(&first), Some(13));
+        let source = f.store.source_of_run(&first).unwrap().unwrap();
+        f.preview(&mut PreviewCursor::default(), 100, 10);
+        let preview = f.preview(&mut PreviewCursor::default(), 120, 30);
+        assert_eq!(preview.run.as_ref(), Some(&first));
+        assert!(preview.eligible && !preview.held);
+        let page = deletion_tick(&f, &mut cursor);
+        assert_eq!(page.run.as_deref(), Some(first.as_str()));
+        assert!(page.errors.is_empty(), "{:?}", page.errors);
+        assert_eq!((page.shared, page.unknown), (2, 0));
+        assert!(f.expired(&first) && !f.expired(&later));
+        let mut removed = 0;
+        for _ in 0..4 {
+            let page = deletion_tick(&f, &mut cursor);
+            assert!(page.errors.is_empty(), "{:?}", page.errors);
+            removed += page.removed;
+        }
+        assert_eq!(removed, 2);
+        assert!(f.expired(&later));
+        assert!(!f
+            .store
+            .root()
+            .join("manifests")
+            .join(format!("{source}.json"))
+            .exists());
+        for run in [&first, &later] {
+            assert!(f
+                .store
+                .mutation_guard()
+                .unwrap()
+                .ensure_run_available(run)
+                .is_err());
+        }
+    }
+    /// A run whose record cannot be read keeps its inputs and is reported;
+    /// the runs after it are still examined, in this pass and the next.
+    #[test]
+    fn deletion_goes_on_past_a_run_whose_record_cannot_be_read() {
+        let f = Fixture::new();
+        let (one, mut cursor) = deletion_ready(&f);
+        let two = RunId::generate();
+        f.bind(&two);
+        f.terminal(&two);
+        let (first, later) = if one.as_str() < two.as_str() {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let broken = first.to_string();
+        f.owner
+            .db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE attempt SET terminal_at_ms='unreadable' WHERE task_id IN (SELECT task_id FROM task WHERE run_id=?1)",
+                    [broken],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let source = super::super::classify::source_id_of_ci(
+            &f.store.source_of_run(&first).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(f.owner.input_retention_end(&first, &source).is_err());
+        let preview = f.preview(&mut PreviewCursor::default(), 120, 30);
+        assert_eq!(preview.run.as_ref(), Some(&first));
+        assert!(!preview.eligible);
+        let page = deletion_tick(&f, &mut cursor);
+        assert_eq!(page.run.as_deref(), Some(first.as_str()));
+        assert_eq!((page.unknown, page.errors.len()), (1, 1));
+        assert_eq!((page.claimed, page.shared, page.removed), (0, 0, 0));
+        let page = deletion_tick(&f, &mut cursor);
+        assert_eq!(page.run.as_deref(), Some(later.as_str()));
+        assert!(page.errors.is_empty(), "{:?}", page.errors);
+        // The next passes report the unreadable run again and nothing else.
+        let mut again = 0;
+        for _ in 0..8 {
+            let page = deletion_tick(&f, &mut cursor);
+            if page.run.as_deref() == Some(first.as_str()) {
+                assert_eq!((page.unknown, page.errors.len()), (1, 1));
+                again += 1;
+            } else {
+                assert!(page.errors.is_empty(), "{:?}", page.errors);
+            }
+        }
+        assert!(again >= 2, "{again}");
+        assert!(f.expired(&later) && !f.expired(&first));
+        assert!(f
+            .store
+            .mutation_guard()
+            .unwrap()
+            .ensure_run_available(&first)
+            .is_ok());
+        assert!(f
+            .store
+            .mutation_guard()
+            .unwrap()
+            .ensure_run_available(&later)
+            .is_err());
+    }
     #[test]
     fn deletion_shared_source_survives_until_last_terminal_run() {
         let f = Fixture::new();
@@ -3607,6 +3818,39 @@ mod tests {
             b = RetentionCursor::default();
             assert!(deletion_tick(&f, &mut b).removed > 0);
             assert!(!f.state.join("secrets").join(format!("{r}.json")).exists());
+        }
+        /// A secret run with a confirmed retired attempt: its Vault copy
+        /// is claimed and erased, then the source is expired, and neither
+        /// store admits a retry afterwards.
+        #[test]
+        fn vault_and_source_gc_release_a_secret_run_with_a_retired_attempt() {
+            let (f, r, v, k) = prepared();
+            f.retired_then_ended(&r);
+            let mut b = RetentionCursor::default();
+            assert!(
+                f.store
+                    .retention_page(&f.owner, &mut b, 100, 10, Some("boot".into()), 10)
+                    .unwrap()
+                    .held
+            );
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            assert!(v.has(&r));
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert!(page.errors.is_empty(), "{:?}", page.errors);
+            assert_eq!((page.claimed, page.removed, page.unknown), (1, 1, 0));
+            assert!(!v.has(&r));
+            assert!(v.ensure_run_available(&r).is_err());
+            let page = deletion_tick(&f, &mut b);
+            assert!(page.errors.is_empty(), "{:?}", page.errors);
+            assert!(page.removed > 0);
+            assert!(f.expired(&r));
+            assert!(f
+                .store
+                .mutation_guard()
+                .unwrap()
+                .ensure_run_available(&r)
+                .is_err());
         }
         #[test]
         fn source_gc_shared_manifest_waits_for_each_secret_run_failure() {
