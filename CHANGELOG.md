@@ -7,6 +7,14 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- `exec` no longer loses a stop signal: two different signals received before they were consumed are both delivered, and a signal arriving just before the blocking wait is forwarded to the command at once instead of on the next signal.
+
+### Added
+
+- `Supervisor::child_started` and `Supervisor::child_exited` (default no-ops) so a supervisor can forward stop signals from its handlers; `take_pending` now returns one signal per call and is called until it returns 0.
+
 ## [0.10.4] - 2026-11-17
 
 ### Changed

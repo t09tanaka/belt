@@ -341,9 +341,10 @@ pub fn run_with(
             spawn.parent.map(str::to_string),
         )
     });
-    // A signal delivered between handler installation and spawn is
-    // forwarded now rather than waiting for the next EINTR.
-    let early = ctx.supervisor.take_pending();
+    // From here a supervisor may forward by itself; what arrived before
+    // that is forwarded now rather than waiting for the next EINTR.
+    ctx.supervisor
+        .child_started(child.id(), spawn.own_process_group);
     // A managed command leads its own group, so the signal goes to all of
     // it; a plain run keeps the terminal's own delivery and signals the
     // child alone.
@@ -354,26 +355,52 @@ pub fn run_with(
             libc::kill(pid, sig);
         }
     };
-    if early != 0 {
-        forward(early);
+    loop {
+        let sig = ctx.supervisor.take_pending();
+        if sig == 0 {
+            break;
+        }
+        forward(sig);
     }
 
     let mut status: libc::c_int = 0;
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // Wait for the exit without reaping, so the pid stays the child's own
+    // until the supervisor has stopped forwarding to it.
     loop {
-        let r = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
-        if r == pid {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 {
             break;
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
-            let sig = ctx.supervisor.take_pending();
-            if sig != 0 {
+            loop {
+                let sig = ctx.supervisor.take_pending();
+                if sig == 0 {
+                    break;
+                }
                 forward(sig);
             }
             continue;
         }
-        return Err(Error::Spawn(format!("wait4 failed: {err}")));
+        ctx.supervisor.child_exited();
+        return Err(Error::Spawn(format!("waitid failed: {err}")));
+    }
+    ctx.supervisor.child_exited();
+    let r = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+    if r != pid {
+        return Err(Error::Spawn(format!(
+            "wait4 failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
     // The leader is gone, but a managed command's descendants may not be:

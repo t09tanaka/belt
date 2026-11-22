@@ -1,13 +1,46 @@
 //! The CLI's [`Supervisor`]: process-global signal handlers, kept out of
 //! the library because they cannot be shared by concurrent runs.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use task_traffic_controller::Supervisor;
 
-static PENDING: AtomicI32 = AtomicI32::new(0);
+/// One bit per signal number received and not yet delivered to the child
+/// or taken: no signal replaces another.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+/// The running child, `(pid << 1) | leads_a_group`, or 0 for none: the
+/// handler forwards to it directly, so a signal that lands just before the
+/// blocking wait is not left for an EINTR that never comes.
+static CHILD: AtomicI64 = AtomicI64::new(0);
 
+/// Takes the bit for `sig` out of [`PENDING`]; true only for the one caller
+/// that cleared it, so a signal is delivered exactly once.
+fn claim(sig: libc::c_int) -> bool {
+    let bit = 1u64 << sig;
+    PENDING.fetch_and(!bit, Ordering::SeqCst) & bit != 0
+}
+
+/// Async-signal-safe: atomics and `kill` only. Records the signal first,
+/// then forwards it itself if a child is published. The runner publishes
+/// the child and only then drains [`PENDING`]; with both sides sequentially
+/// consistent, at least one of them sees the signal, and `claim` lets only
+/// one deliver it.
 extern "C" fn on_signal(sig: libc::c_int) {
-    PENDING.store(sig, Ordering::SeqCst);
+    if !(1..64).contains(&sig) {
+        return;
+    }
+    PENDING.fetch_or(1u64 << sig, Ordering::SeqCst);
+    let child = CHILD.load(Ordering::SeqCst);
+    let pid = child >> 1;
+    // Never 0 (own group), 1 (everything) or negative.
+    if pid > 1 && claim(sig) {
+        unsafe {
+            if child & 1 == 1 {
+                libc::killpg(pid as libc::pid_t, sig);
+            } else {
+                libc::kill(pid as libc::pid_t, sig);
+            }
+        }
+    }
 }
 
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
@@ -54,7 +87,26 @@ impl Supervisor for ProcessSignals {
     }
 
     fn take_pending(&self) -> i32 {
-        PENDING.swap(0, Ordering::SeqCst)
+        loop {
+            let bits = PENDING.load(Ordering::SeqCst);
+            if bits == 0 {
+                return 0;
+            }
+            let sig = bits.trailing_zeros() as i32;
+            if claim(sig) {
+                return sig;
+            }
+        }
+    }
+
+    fn child_started(&self, pid: u32, group: bool) {
+        if pid > 1 {
+            CHILD.store(((pid as i64) << 1) | i64::from(group), Ordering::SeqCst);
+        }
+    }
+
+    fn child_exited(&self) {
+        CHILD.store(0, Ordering::SeqCst);
     }
 }
 
@@ -76,4 +128,59 @@ pub fn reraise(sig: i32) -> ! {
         libc::raise(sig);
     }
     std::process::exit(128 + sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    // The statics are process-wide: one test at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn drain() {
+        while ProcessSignals.take_pending() != 0 {}
+    }
+
+    #[test]
+    fn two_signals_before_they_are_taken_are_both_kept() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        drain();
+        on_signal(libc::SIGTERM);
+        on_signal(libc::SIGINT);
+        on_signal(libc::SIGTERM);
+        let mut got = vec![ProcessSignals.take_pending(), ProcessSignals.take_pending()];
+        got.sort();
+        assert_eq!(got, vec![libc::SIGINT, libc::SIGTERM]);
+        assert_eq!(ProcessSignals.take_pending(), 0);
+    }
+
+    #[test]
+    fn a_signal_reaches_a_published_child_without_any_wait_interrupt() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        drain();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        ProcessSignals.child_started(child.id(), false);
+        on_signal(libc::SIGTERM);
+        let status = child.wait().unwrap();
+        ProcessSignals.child_exited();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        // Forwarded by the handler, so nothing is left to take.
+        assert_eq!(ProcessSignals.take_pending(), 0);
+    }
+
+    #[test]
+    fn nothing_is_signalled_without_a_published_child() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        drain();
+        for pid in [0u32, 1] {
+            ProcessSignals.child_started(pid, true);
+            assert_eq!(CHILD.load(Ordering::SeqCst), 0);
+        }
+        // Handler with no child only records.
+        on_signal(libc::SIGHUP);
+        assert_eq!(ProcessSignals.take_pending(), libc::SIGHUP);
+    }
 }

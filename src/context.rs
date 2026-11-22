@@ -218,10 +218,21 @@ pub trait Supervisor: Send + Sync {
     /// never calls it: restoring default dispositions earlier lets a second
     /// stop signal kill the process before the outcome is written down.
     fn finished(&self) {}
-    /// The last signal received since the previous call, or 0.
+    /// One signal received since it was last taken, or 0. Call it until it
+    /// returns 0: each distinct signal received is returned once.
     fn take_pending(&self) -> i32 {
         0
     }
+    /// The command was spawned (`group`: it leads its own process group, so
+    /// signals go to the whole group). From here the supervisor may forward
+    /// stop signals itself, straight from its handlers, which closes the
+    /// window between a last [`Supervisor::take_pending`] and blocking in
+    /// the wait. Whatever it forwards itself it must not also return from
+    /// `take_pending`.
+    fn child_started(&self, _pid: u32, _group: bool) {}
+    /// The command has exited (it is not yet reaped, so its pid is still
+    /// its own): stop forwarding.
+    fn child_exited(&self) {}
 }
 
 /// No signal handling at all.
