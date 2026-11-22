@@ -171,6 +171,30 @@ reported separately. The local worker keeps its cache when the other workers
 join. A distributed run must place work on at least two workers and return the
 same job outcomes as the local baseline. Copy the evidence before `down.sh`.
 
+### Project comparison measured on 2026-11-22
+
+The workload was the 15 pytest tests in `t09tanaka/project-backlog` at
+`f5fb10b75002ee16049296ead798cf78d93410cf`. Its checkout had no CI workflow.
+A private comparison commit (`7eae2c56abff378920798dfc8d39fc720e0895bf`)
+added four independent jobs, one per test module, and vendored pytest 7.4.4
+and its dependencies. All four runs below used that same commit. Each job
+ran `PYTHONPATH=vendor python3 -m pytest -q tests/test_<module>.py`.
+The parent was macOS and the w1/w2 workers were arm64 Linux containers on
+the same machine.
+
+| Configuration | Elapsed seconds | Sum of step seconds | Sum of resource wait seconds | Workers that ran jobs |
+| --- | ---: | ---: | ---: | --- |
+| Parent, first | 38.97 | 5.95 | 0.055 | local |
+| Parent, repeat | 22.21 | 7.22 | 0.067 | local |
+| Group, after reconnect | 12.10 | 4.85 | 0.140 | local, w2 |
+| Group, repeat | 11.51 | 5.17 | 0.189 | local, w1, w2 |
+
+All job outcomes matched. The repeat elapsed-time ratio was 1.93×.
+The group measurements retained existing caches and restarted the resident
+between runs during diagnosis. This sample has no cold-group or physical LAN
+measurement. The coordinator did not retain a transfer-duration sample for
+these runs; the elapsed totals include delivery and collection.
+
 ## Dedicated system service
 
 On a fresh allocation, set `S26_SYSTEM_WORKER=1` for both `up.sh` and
