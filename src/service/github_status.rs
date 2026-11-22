@@ -11,6 +11,7 @@ use crate::ci::status::{self, Lookup, Post, Posting, Record, RunEnd, Source};
 use crate::ids::RunId;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -77,8 +78,11 @@ impl Poster for Gh {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Its own group, so a time-out ends what gh started too.
+            .process_group(0)
             .spawn()
             .map_err(|e| format!("gh cannot be run: {e}"))?;
+        let pgid = child.id();
         // Both pipes are read while gh runs: output larger than a pipe
         // holds must not stop gh and look like a hang.
         fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
@@ -99,8 +103,11 @@ impl Poster for Gh {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 waited => {
-                    // Our own child, through its handle.
-                    let _ = child.kill();
+                    // The group of our own unreaped child: its number cannot
+                    // be reused, and the guarded helper refuses 0 and 1.
+                    if let Ok(group) = i32::try_from(pgid) {
+                        crate::platform::signal_process_group(group, libc::SIGKILL);
+                    }
                     let _ = child.wait();
                     return Err(match waited {
                         Err(e) => format!("gh cannot be waited for: {e}"),
@@ -306,6 +313,50 @@ mod tests {
         let started = Instant::now();
         assert_eq!(gh.post(&post()), Err("timed out".into()));
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    fn alive(pid: u32) -> bool {
+        crate::platform::signal_pid(pid, 0)
+    }
+
+    #[test]
+    fn a_timeout_ends_what_gh_started_as_well() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let script = format!("sleep 300 &\necho \"$$ $!\" > {pids:?}\nwait");
+        let gh = fake(root.path(), &script, Duration::from_secs(2));
+        assert_eq!(gh.post(&post()), Err("timed out".into()));
+        let text = std::fs::read_to_string(&pids).unwrap();
+        let ids: Vec<u32> = text
+            .split_whitespace()
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{text}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ids.iter().any(|&pid| alive(pid)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            ids.iter().map(|&p| alive(p)).collect::<Vec<_>>(),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn gh_runs_as_leader_of_a_group_of_its_own_and_a_normal_post_is_unchanged() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let seen = root.path().join("seen");
+        let script = format!(
+            "echo \"$$ $(ps -o pgid= -p $$) $([ -t 0 ] && echo tty || echo notty)\" > {seen:?}\necho out\necho err >&2"
+        );
+        let gh = fake(root.path(), &script, Duration::from_secs(20));
+        assert_eq!(gh.post(&post()), Ok(()));
+        let text = std::fs::read_to_string(&seen).unwrap();
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(parts[0], parts[1], "gh leads its own group: {text}");
+        assert_eq!(parts[2], "notty");
+        // SAFETY: plain syscall without arguments.
+        assert_ne!(parts[1], unsafe { libc::getpgrp() }.to_string());
     }
 
     #[test]
