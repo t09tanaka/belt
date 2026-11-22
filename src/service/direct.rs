@@ -461,7 +461,37 @@ fn running_signal(sig: libc::c_int, terminal_foreground: bool) {
     }
 }
 
+/// One bit per signal that was `SIG_IGN` when belt started the direct path.
+static STARTED_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the start-up dispositions once, before the first handler is
+/// installed. A signal ignored here (SIGINT/SIGQUIT in a background job of a
+/// non-interactive shell, SIGHUP under `nohup`) stays ignored for belt and,
+/// through `exec`, for the command, exactly as without belt.
+fn capture_started_ignored() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut bits = 0u64;
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: reads the current action without changing it.
+            let ignored = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, std::ptr::null(), &mut action) == 0
+                    && action.sa_sigaction == libc::SIG_IGN
+            };
+            if ignored {
+                bits |= 1u64 << sig;
+            }
+        }
+        STARTED_IGNORED.store(bits, Ordering::SeqCst);
+    });
+}
+
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
+    capture_started_ignored();
+    if STARTED_IGNORED.load(Ordering::SeqCst) & (1u64 << sig) != 0 {
+        return;
+    }
     // SAFETY: installs an async-signal-safe handler.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
