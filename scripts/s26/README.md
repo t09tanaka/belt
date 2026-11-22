@@ -31,6 +31,16 @@ S26_BELT="$PWD/target/s26/native/release/belt" scripts/s26/run.sh
 scripts/s26/down.sh
 ```
 
+For the two-submitter and group-key checks, use a fresh `up.sh` and pass
+`--peers` to `run.sh`. The host and m1 submit concurrently and verify the
+run listings on each parent. While m1's service is stopped, the host finishes
+work on the same w1 worker. After restarting, m1 collects its original attempt
+with a single command start. Group rotation then keeps an active attempt
+running, restarts a receiving-only worker with its new key, and restores a
+skipped peer with `send-key`. Finally, `--remove w2` checks the removal guidance
+and the remaining SSH access notices from both `group` and `doctor`.
+The per-check results are in `run/evidence/peer-summary.json`.
+
 The Linux build uses the official `rust:1.93.0-bookworm` image, with Cargo
 downloads and artifacts in `target/s26/linux-cache/`; output is
 `target/s26/belt-linux-aarch64`. No host cross-compiler is used. The worker

@@ -3,6 +3,15 @@ set -euo pipefail
 # shellcheck source=scripts/s26/common.sh
 source "$(dirname "$0")/common.sh"
 safe_paths
+case "${1:-}" in
+    "") driver=("$S26_ROOT/scripts/s26/harness.py" run) ;;
+    --peers) driver=("$S26_ROOT/scripts/s26/peers.py") ;;
+    *) echo "usage: scripts/s26/run.sh [--peers]" >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then
+    echo "usage: scripts/s26/run.sh [--peers]" >&2
+    exit 2
+fi
 TTC=$(tool task-traffic-controller)
 PORTOOL=$(tool portool)
 # Resolve host tools before giving the parent its private HOME.
@@ -12,4 +21,4 @@ S26_FAST_WORKTREE=$(tool fast-worktree)
 cd "$S26_BASE/resources"
 "$PORTOOL" sync --quiet
 "$PORTOOL" check
-exec "$TTC" exec -- "$PORTOOL" exec -- python3 "$S26_ROOT/scripts/s26/harness.py" run
+exec "$TTC" exec -- "$PORTOOL" exec -- python3 "${driver[@]}"
