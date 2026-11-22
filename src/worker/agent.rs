@@ -2033,6 +2033,9 @@ impl Agent {
         // served by `serve_local_connection` and stays open.
         self.apply_rekey();
         self.refresh_group_key();
+        // The init resident runs this pass and not `tick`: a warm-up nobody
+        // asks about must be let go here too, or its install is never stopped.
+        self.reap_warmups();
         self.supervise_attempts();
         self.cleanup_terminal(32);
     }
