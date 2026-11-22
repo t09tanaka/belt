@@ -648,13 +648,15 @@ mod tests {
         while CHILD.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
-        assert!(
-            done_rx.try_recv().is_err(),
-            "returned with a handler in flight"
-        );
+        // Judged after the counter is lowered: a failed assertion with the
+        // counter still raised would leave every later `child_exited` waiting.
+        let returned_early = done_rx.try_recv().is_ok();
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        done_rx.recv().unwrap();
+        if !returned_early {
+            done_rx.recv().unwrap();
+        }
         t.join().unwrap();
+        assert!(!returned_early, "returned with a handler in flight");
         assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0);
     }
 
