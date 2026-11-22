@@ -16,7 +16,12 @@ path = "src/lib.rs"
 name = "belt"
 path = "src/main.rs"
 
+[build-dependencies]
+toml = "0.8"
+
 [dependencies]
+fast-worktree = { git = "https://github.com/t09tanaka/fast-worktree", rev = "7b1e389035e3443c48172049094ca38afd2b957f", features = ["cli"] }
+portool = { git = "https://github.com/t09tanaka/portool", rev = "e454e37fab365db13217dd36bab9de1331412ef7" }
 anyhow = "1"
 base64 = "0.22"
 getrandom = "0.3"

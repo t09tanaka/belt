@@ -407,7 +407,7 @@ mod a44 {
             ]),
             helpers: BTreeMap::from([(
                 "belt".to_string(),
-                Some(env!("CARGO_PKG_VERSION").to_string()),
+                Some(belt::workspace::embedded::BUILD_ID.to_owned()),
             )]),
             docker: Docker::NotRunnable,
             disk_free_bytes: Some(100 << 30),

@@ -9,7 +9,7 @@ case "$S26_ARCH" in
     amd64) S26_MACHINE=x86_64; default_base="$S26_ROOT/target/s26-amd64" ;;
     *) echo "Unsupported S26_ARCH: $S26_ARCH (expected arm64 or amd64)" >&2; exit 2 ;;
 esac
-S26_IMAGE="belt-s26-worker:debian12.9-fw0.4.0-$S26_ARCH"
+S26_IMAGE="belt-s26-worker:debian12.9-embedded-$S26_ARCH"
 export S26_ARCH S26_MACHINE S26_IMAGE
 S26_BASE="${S26_BASE:-$default_base}"
 S26_RUN="$S26_BASE/run"

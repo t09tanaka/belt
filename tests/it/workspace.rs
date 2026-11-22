@@ -413,13 +413,20 @@ fn add_and_remove_a_commit_workspace() {
 #[test]
 fn removing_an_attempt_releases_only_its_portool_allocation() {
     let f = fixture();
+    let bin = f.root.join("embedded-bin");
+    std::fs::create_dir(&bin).unwrap();
+    for tool in ["portool", "fast-worktree"] {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_belt"), bin.join(tool)).unwrap();
+    }
+    let mut embedded_env = f.env();
+    embedded_env.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
     // The attempts belong to the worker clone. The capture repository has
     // a different portool project, but both use this fixture's private HOME.
     let allocations = || {
         let out = Command::new("portool")
             .args(["ls", "--all", "--json"])
             .env_clear()
-            .envs(f.env())
+            .envs(&embedded_env)
             .current_dir(&f.dir)
             .output()
             .unwrap();
@@ -436,25 +443,13 @@ fn removing_an_attempt_releases_only_its_portool_allocation() {
             .map(|entry| PathBuf::from(entry["path"].as_str().unwrap()))
             .collect::<std::collections::BTreeSet<_>>()
     };
-    let portool = Command::new("portool")
-        .arg("--version")
-        .env_clear()
-        .envs(f.env())
-        .output();
-    if !real_available(&f.root.join("home")) || !portool.is_ok_and(|out| out.status.success()) {
-        assert!(
-            std::env::var_os("BELT_REQUIRE_FAST_WORKTREE").is_none(),
-            "A48 needs fast-worktree and portool"
-        );
-        return;
-    }
     f.commit(".portool.toml", "[ports]\nweb = 0\n");
     // The release hook is part of the uncommitted snapshot used at admission.
     std::fs::write(f.dir.join(".fast-worktree.toml"), "[[post_add]]\nrun = \"portool sync --quiet && portool check\"\n[[pre_remove]]\nrun = \"portool release\"\n").unwrap();
     assert!(allocations().is_empty());
     let store = f.store();
     let manifest = dirty_capture(&f, &store);
-    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(embedded_env.clone()));
     let ws = f.workspaces(&fw);
     let repo = f.clone_of(&ws);
     f.deliver(&store, &repo, &manifest);
@@ -469,10 +464,73 @@ fn removing_an_attempt_releases_only_its_portool_allocation() {
         second.root.canonicalize().unwrap(),
     ];
     assert_eq!(allocations(), roots.clone().into_iter().collect());
+    let command = Command::new("portool")
+        .args(["exec", "--", "/bin/sh", "-c", "test -n \"$WEB_PORT\""])
+        .current_dir(&first.root)
+        .env_clear()
+        .envs(&embedded_env)
+        .status()
+        .unwrap();
+    assert!(command.success());
     ws.remove(&first).unwrap();
     assert!(!first.root.exists());
     assert_eq!(allocations(), [roots[1].clone()].into_iter().collect());
     ws.remove(&second).unwrap();
+    assert!(allocations().is_empty());
+
+    // A standalone installation, when available, uses the very same
+    // registry. It must receive a disjoint block and survive attempt cleanup.
+    let standalone = |args: &[&str]| {
+        Command::new("portool")
+            .args(args)
+            .env_clear()
+            .envs(f.env())
+            .current_dir(&f.dir)
+            .output()
+    };
+    let has_standalone = standalone(&["--version"]).is_ok_and(|out| out.status.success());
+    // The final release belongs to the worker even without a pre_remove hook.
+    std::fs::write(
+        f.dir.join(".fast-worktree.toml"),
+        "[[post_add]]\nrun = \"portool sync --quiet\"\n",
+    )
+    .unwrap();
+    let manifest = dirty_capture(&f, &store);
+    f.deliver(&store, &repo, &manifest);
+    let no_hook = std::thread::scope(|scope| {
+        let side = scope.spawn(|| {
+            if has_standalone {
+                assert!(standalone(&["sync", "--quiet"]).unwrap().status.success());
+            }
+        });
+        let attempt = ws
+            .create(&AttemptId::generate(), &store, &manifest, Some(&repo))
+            .unwrap();
+        side.join().unwrap();
+        attempt
+    });
+    assert!(allocations().contains(&no_hook.root));
+    if has_standalone {
+        assert_eq!(allocations().len(), 2);
+        assert!(standalone(&["check"]).unwrap().status.success());
+        let read = |dir: &Path| {
+            std::fs::read_to_string(dir.join(".env.portool"))
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("WEB_PORT="))
+                .unwrap()
+                .to_owned()
+        };
+        assert_ne!(read(&no_hook.root), read(&f.dir));
+    }
+    ws.remove(&no_hook).unwrap();
+    if has_standalone {
+        assert_eq!(
+            allocations(),
+            [f.dir.canonicalize().unwrap()].into_iter().collect()
+        );
+        assert!(standalone(&["release"]).unwrap().status.success());
+    }
     assert!(allocations().is_empty());
 }
 

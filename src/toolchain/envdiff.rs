@@ -11,10 +11,6 @@ pub const MIN_DISK_BYTES: u64 = 2 << 30;
 /// Tools that are never installed automatically (administrator rights, a
 /// license acceptance or a GUI is involved).
 const MANUAL_TOOLS: &[&str] = &["xcode", "docker"];
-/// Separately distributed tools: automatic only when the worker's version
-/// manager lists the wanted version, which means a distribution path is
-/// configured. Without one, a person installs them.
-const DISTRIBUTED_TOOLS: &[&str] = &["portool", "fast-worktree"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,10 +52,7 @@ pub struct EnvReport {
     pub arch: String,
     pub tools: BTreeMap<String, ToolFact>,
     /// Build identity of what is built into this binary. The
-    /// task-traffic-controller runtime and local-ci core are part of the
-    /// belt binary (spec 22.4), so the version of that binary
-    /// stands for all three and no external `--version` is asked. Separately
-    /// distributed helpers (portool, fast-worktree) are in `tools`.
+    /// belt row names the embedded dependencies and their resolved versions.
     pub helpers: BTreeMap<String, Option<String>>,
     pub docker: Docker,
     pub disk_free_bytes: Option<u64>,
@@ -191,8 +184,6 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
         Class::ManualRequired
     } else if listed(|m| &m.inventory) {
         Class::AutoInstallable
-    } else if DISTRIBUTED_TOOLS.contains(&name) {
-        Class::ManualRequired
     } else if present {
         Class::Differs
     } else {
@@ -309,12 +300,32 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
         )
     });
     for (name, fact) in &want.tools {
-        if name == "docker" {
+        if name == "docker" || crate::workspace::embedded::version(name).is_some() {
             continue;
         }
         items.extend(tool_item(name, fact, have.tools.get(name)));
     }
+    if want.helpers.contains_key("portool_registry")
+        || have.helpers.contains_key("portool_registry")
+    {
+        let version = |report: &EnvReport| {
+            report
+                .helpers
+                .get("portool_registry")
+                .and_then(|s| s.clone())
+        };
+        items.push(item(
+            "portool_registry",
+            Class::ManualRequired,
+            version(want).as_deref(),
+            version(have).as_deref(),
+            Some("upgrade belt to read the shared portool registry".into()),
+        ));
+    }
     for (name, version) in &want.helpers {
+        if name == "portool_registry" {
+            continue;
+        }
         let Some(version) = version else { continue };
         let found = have.helpers.get(name).and_then(|v| v.as_deref());
         items.extend(value_item(name, Some(version), found));
@@ -655,37 +666,49 @@ mod tests {
     }
 
     #[test]
-    fn distributed_tools_are_manual_unless_a_distribution_path_lists_them() {
-        for name in ["portool", "fast-worktree"] {
-            let mut parent = report();
+    fn standalone_helpers_do_not_contribute_a_diff() {
+        let mut parent = report();
+        let mut worker = report();
+        for name in crate::workspace::embedded::NAMES {
             parent.tools.insert(name.into(), avail("0.5.0"));
-            let find = |worker: &EnvReport| {
-                diff(&parent, worker)
-                    .into_iter()
-                    .find(|i| i.subject == name)
-                    .unwrap()
-            };
-            // Absent and another version: no automatic path is configured.
+            worker.tools.insert(name.into(), avail("8.9.0"));
+        }
+        assert!(diff(&parent, &worker)
+            .iter()
+            .all(|row| !crate::workspace::embedded::NAMES.contains(&row.subject.as_str())));
+    }
+
+    #[test]
+    fn either_incompatible_registry_requires_a_manual_upgrade() {
+        for (local, remote) in [
+            (None, None),
+            (Some("a"), None),
+            (None, Some("b")),
+            (Some("a"), Some("b")),
+        ] {
+            let mut parent = report();
             let mut worker = report();
-            worker
-                .tools
-                .insert(name.into(), fact(Observed::Unavailable, None));
-            let item = find(&worker);
-            assert_eq!(item.class, Class::ManualRequired);
-            assert!(item
-                .steps
-                .unwrap()
-                .contains(&format!("install {name} 0.5.0 on the worker")),);
-            worker.tools.insert(name.into(), avail("0.4.0"));
-            assert_eq!(find(&worker).class, Class::ManualRequired);
-            // A configured distribution path lists the version.
-            let mut have = fact(Observed::Unavailable, None);
-            have.managed = managed(&["0.5.0"], &[]);
-            worker.tools.insert(name.into(), have);
-            assert_eq!(find(&worker).class, Class::AutoInstallable);
-            // Same version is same.
-            worker.tools.insert(name.into(), avail("0.5.0"));
-            assert_eq!(find(&worker).class, Class::Same);
+            for (report, why) in [(&mut parent, local), (&mut worker, remote)] {
+                if let Some(why) = why {
+                    report
+                        .helpers
+                        .insert("portool_registry".into(), Some(why.into()));
+                }
+            }
+            let rows: Vec<_> = diff(&parent, &worker)
+                .into_iter()
+                .filter(|i| i.subject == "portool_registry")
+                .collect();
+            if local.is_none() && remote.is_none() {
+                assert!(rows.is_empty());
+            } else {
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.class, Class::ManualRequired);
+                assert_eq!(row.parent.as_deref(), local);
+                assert_eq!(row.worker.as_deref(), remote);
+                assert!(row.steps.as_ref().unwrap().contains("upgrade belt"));
+            }
         }
     }
 

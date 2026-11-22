@@ -1,6 +1,3 @@
-FROM rust:1.93.0-bookworm AS tools
-RUN cargo install fast-worktree --locked --version 0.4.0
-
 FROM debian:12.9-slim
 ENV container=docker
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -18,7 +15,6 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && systemctl enable ssh \
     && rm -f /etc/ssh/ssh_host_* /etc/machine-id \
     && touch /etc/machine-id
-COPY --from=tools /usr/local/cargo/bin/fast-worktree /usr/local/bin/fast-worktree
 COPY worker-entrypoint.sh /usr/local/sbin/s26-entrypoint
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/usr/local/sbin/s26-entrypoint"]

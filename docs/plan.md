@@ -1793,3 +1793,5 @@ WP24c の実装メモ（2026-11-21）:
 鍵の配布・切替・送り直しは SSH 越しの固定 helper で行い、worker protocol の操作にはしない（WP24d）。仕様 §22.3 が定めているのは secret bundle の HMAC であり、hello の認証は §24.2 が新しく定める。鍵そのものは同じ file を使う。
 
 R68 と R96 は backlog の番号をそのまま行の名前にした。R68（resident が自分を更新する）は、どのメンバーも投入する側になることで全員に要るようになったため、初回リリースの範囲に含める（仕様 §24.8）。R96 は、2026-11-20 時点で coordinator の tick が応答しない worker 1 台につき `worker_budget_ms`（既定 15 秒）のあいだ actor を持ち続け、CLI の要求が時間切れになる問題で、仕様 §24.7 を完了条件とする。WP21 の残り（退役した identity の worker へ伝える wire の message。S24 の残り 5）は WP24b が担当する。
+
+WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含むマージコミットに固定する。beltをcrates.ioに公開する前に、対応する両ライブラリを公開してからregistryの固定版に切り替え、A48・A55を再検証する。

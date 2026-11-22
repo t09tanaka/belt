@@ -58,7 +58,16 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         runtime.agent_config().supervisor_exe
     );
     for (key, value) in &input.env {
-        assert_eq!(runtime.setup_config().env.get(key), Some(value));
+        if key == "PATH" {
+            let mut path = std::env::split_paths(&runtime.setup_config().env[key]);
+            assert!(path
+                .next()
+                .unwrap()
+                .starts_with(input.state_dir.join("tool-bin")));
+            assert!(path.eq(std::env::split_paths(value)));
+        } else {
+            assert_eq!(runtime.setup_config().env.get(key), Some(value));
+        }
     }
     assert_eq!(runtime.agent_config().profile, "default");
     assert!(runtime

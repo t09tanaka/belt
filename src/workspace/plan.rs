@@ -300,7 +300,7 @@ pub enum FwFailure {
 pub fn fw_error(op: &str, f: &FwFailure) -> ApiError {
     let msg = match f {
         FwFailure::Missing => format!(
-            "fast-worktree {op}: the command is not installed on this worker (cargo install fast-worktree)"
+            "fast-worktree {op}: the worker helper link is not installed; repair the belt worker installation"
         ),
         FwFailure::Failed { code, stderr } => {
             let tail: String = stderr.trim().chars().take(MAX_STDERR_CHARS).collect();

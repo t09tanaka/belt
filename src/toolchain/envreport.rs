@@ -226,6 +226,7 @@ fn measure(
     };
     let tools = TOOLS
         .iter()
+        .filter(|name| crate::workspace::embedded::version(name).is_none())
         .map(|name| {
             let (state, version) = report
                 .tools
@@ -248,10 +249,38 @@ fn measure(
     // task-traffic-controller and local-ci are built into this binary (spec
     // 22.4): its build identity stands for them, and no external `--version`
     // is run.
-    let helpers = BTreeMap::from([(
+    let mut helpers = BTreeMap::from([(
         "belt".to_string(),
-        Some(env!("CARGO_PKG_VERSION").to_string()),
+        Some(crate::workspace::embedded::BUILD_ID.to_owned()),
     )]);
+    if let Some(why) =
+        crate::workspace::embedded::incompatible_registry(&profile.host_environment())
+    {
+        // A standalone CLI version is relevant only to an incompatible
+        // registry. A normal report never probes or compares that executable.
+        let standalone = match run_fixed(
+            profile.path_dirs(),
+            "portool",
+            &["--version"],
+            &profile.host_environment(),
+            docker_timeout,
+        ) {
+            Run::Output(text) => text
+                .trim()
+                .strip_prefix("portool ")
+                .filter(|v| super::capability::valid_version(v))
+                .map(str::to_owned),
+            _ => None,
+        };
+        helpers.insert(
+            "portool_registry".into(),
+            Some(format!(
+                "{why}; belt {}, standalone portool {}",
+                env!("CARGO_PKG_VERSION"),
+                standalone.as_deref().unwrap_or("unknown")
+            )),
+        );
+    }
     let docker = docker_state(profile.path_dirs(), profile, env, docker_timeout);
     EnvReport {
         schema_version: SCHEMA,
@@ -406,6 +435,32 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_registry_is_reported_with_both_versions_and_is_preserved() {
+        let (root, state, bin) = state();
+        let home = root.path().canonicalize().unwrap();
+        let env = policy_env(&home, None);
+        let profile = Profile::load(&state, &env).unwrap();
+        let state_home = home.join(".local/state");
+        let dir = state_home.join("portool");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("registry.json");
+        let contents = br#"{"version":999,"range":[3000,9999],"projects":{},"reservations":[]}"#;
+        std::fs::write(&file, contents).unwrap();
+        shim(&bin, "portool", "echo portool 9.1.0");
+        let report = measure(&state, &profile, &env, SHORT * 10);
+        let detail = report.helpers["portool_registry"].as_deref().unwrap();
+        for expected in [
+            "v999",
+            env!("BELT_PORTOOL_VERSION"),
+            env!("CARGO_PKG_VERSION"),
+            "standalone portool 9.1.0",
+        ] {
+            assert!(detail.contains(expected), "{detail}");
+        }
+        assert_eq!(std::fs::read(file).unwrap(), contents);
+    }
+
+    #[test]
     fn collect_measures_with_the_profile_path() {
         let (_t, state, bin) = state();
         shim(&bin, "node", "echo v20.1.0");
@@ -420,10 +475,14 @@ mod tests {
         assert_eq!(report.tools["cargo"].observed, Observed::Unavailable);
         assert_eq!(report.tools["node"].managed, None);
         assert_eq!(report.helpers.keys().collect::<Vec<_>>(), ["belt"]);
-        assert_eq!(
-            report.helpers["belt"].as_deref(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
+        let build = report.helpers["belt"].as_deref().unwrap();
+        for name in crate::workspace::embedded::NAMES {
+            assert!(build.contains(&format!(
+                "{name} {}",
+                crate::workspace::embedded::version(name).unwrap()
+            )));
+            assert!(!report.tools.contains_key(name));
+        }
         assert_eq!(report.docker, Docker::Runnable);
         assert!(report.disk_free_bytes.is_some_and(|b| b > 0));
         assert_eq!(report.profile, "t");

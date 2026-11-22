@@ -1,3 +1,3 @@
 fn main() {
-    std::process::exit(belt::cli::main());
+    std::process::exit(belt::workspace::embedded::dispatch().unwrap_or_else(belt::cli::main));
 }

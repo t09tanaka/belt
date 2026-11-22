@@ -4,7 +4,7 @@ Run CI and development commands on one machine or share work with other members 
 
 Status: in development. The specification (Japanese) is in [docs/spec.md](docs/spec.md), with progress and remaining acceptance work in [docs/plan.md](docs/plan.md).
 
-Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission.
+Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
 
 ## Install
 
@@ -60,7 +60,7 @@ Run `belt top` in a terminal to see worker connections, active attempts, waiting
 
 The CLI surface is defined, but public orchestration commands remain under development. Unimplemented commands return `NOT_IMPLEMENTED` (exit code 70; with `--json`, an envelope with `schema_version` on stdout).
 
-Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workspace integration tests require fast-worktree 0.4.0 or newer and portool; resource admission uses task-traffic-controller 0.10.x (0.10.2 or newer in that minor: the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.10 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
+Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workers include fast-worktree and portool. Workspace hooks and commands use the versions shown by `belt workers diff`. The coexistence tests also exercise standalone installations. Resource admission uses task-traffic-controller 0.10.x (0.10.2 or newer in that minor: the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.10 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
 
 Run the configured CI against committed HEAD:
 

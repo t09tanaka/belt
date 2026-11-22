@@ -1942,7 +1942,7 @@ async fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> io
 fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
-pub(super) fn private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     validate_components(path)?;
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && m.uid() == uid() && m.permissions().mode() & 0o077 == 0 => Ok(()),
@@ -2026,7 +2026,7 @@ pub(crate) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
     }
     Ok(file)
 }
-pub(super) fn check_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn check_private_dir(path: &Path) -> io::Result<()> {
     validate_components(path)?;
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.uid() != uid() || meta.mode() & 0o077 != 0 {
