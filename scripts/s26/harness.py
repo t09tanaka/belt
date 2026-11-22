@@ -465,6 +465,9 @@ class Checks:
             'git -c user.name="S26 Harness" -c user.email=s26@example.invalid '
             '-c commit.gpgsign=false commit -qm "S26 fixture"')
         self.count += 1
+        config = "schema_version=1\n[coordinator]\nlocal_worker_priority=-100\nheartbeat_seconds=1\n"
+        ssh("m1", 'umask 077; test ! -e "$HOME/.config/belt/config.toml" && printf %s '
+            + shlex.quote(config) + ' > "$HOME/.config/belt/config.toml"')
         p = ssh("m1", USER_BUS + 'exec "$HOME/.config/belt/bin/current/belt" --json init',
                 check=False, timeout=180)
         stem = RUN / "evidence" / f"{self.count:04d}-m1-init"
@@ -640,17 +643,18 @@ kill -s CONT "$pid"
         token = secrets.token_hex(8)
         script = ('set -eu; mkdir -p "$HOME/s26-starts"; hostname >> "$HOME/s26-starts/$1"; '
                   'for i in $(seq 1 420); do test ! -e "$HOME/s26-release-$1" || exit 0; sleep 1; done; exit 1')
-        # The host registered m1; its drain applies to every submitter.
-        self.belt("workers", "drain", "m1")
-        try:
-            task = self.m1_belt("submit", "--", "sh", "-c", script, "s26", token)["task_id"]
-            until("m1 submission started on w1", lambda: self.starts(token) == {"w1": 1}, 90)
-            before = self.m1_belt("show", task)["attempts"]["items"]
-            if len(before) != 1 or before[0]["worker_id"] != "w1":
-                raise RuntimeError(f"unexpected remote attempt before upgrade: {before}")
-            return task, token, before[0]["attempt_id"]
-        finally:
-            self.belt("workers", "resume", "m1")
+        until("w1 connected to m1", lambda: any(
+            w["id"] == "w1" and w["connection"] == "connected" for w in self.m1_belt("workers")["workers"]))
+        task = self.m1_belt("submit", "--", "sh", "-c", script, "s26", token)["task_id"]
+        def started():
+            items = self.m1_belt("show", task)["attempts"]["items"]
+            if not items:
+                return False
+            if len(items) != 1 or items[0]["worker_id"] != "w1":
+                raise RuntimeError(f"unexpected remote attempt before upgrade: {items}")
+            return items[0]["attempt_id"] if self.starts(token) == {"w1": 1} else False
+        attempt_id = until("m1 submission started on w1", started, 90)
+        return task, token, attempt_id
 
     def finish_remote_attempt(self, remote, evidence):
         task, token, attempt_id = remote
@@ -690,9 +694,9 @@ kill -s CONT "$pid"
         if self.m1_link() != digests["n"]:
             raise RuntimeError("m1 must run N before the rollback check")
         before = self.m1_version_file(digests["n"])
-        task, token, batch = self.place_on_m1(20)
         self.connect_m1_to_w1()
         remote = self.start_remote_attempt()
+        task, token, batch = self.place_on_m1(20)
         dbs = self.rollback_databases()
         read = "SELECT value FROM s26_upgrade_probe;"
         prior = self.database_marker(dbs, "CREATE TABLE s26_upgrade_probe(value TEXT NOT NULL); "
