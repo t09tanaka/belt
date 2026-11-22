@@ -1240,7 +1240,7 @@ on the same repository and state directories at the same time.
 ```toml
 [dependencies]
 # `default-features = false` leaves the command-line parser (clap) out.
-fast-worktree = { version = "0.5", default-features = false }
+fast-worktree = { version = "0.6", default-features = false }
 ```
 
 ```rust
@@ -1279,6 +1279,26 @@ let cfg = repo.config()?;
 - Errors are one `Error` enum (`Refused`, `BranchNotMerged`, `Config`, `Git`,
   `Io`, `Failed`). Progress lines go where `Output` says: the terminal (as the
   command), nowhere, or the `log` of the result.
+
+A program can also embed the whole command, for example one binary that acts
+as `fast-worktree` when it is started through a link of that name. It runs
+the command line with `fast_worktree::cli::run_with_helper(args, helper)`
+(the `cli` feature), which returns the exit code. The background work that
+`add`, `hook create` and `install` start (`pool fill`, `install --changed
+--deferred`) re-execs `helper`, which must behave as the command: pass the
+link. With `None` it re-execs the running binary, as the command does; on
+Linux that is the real binary behind the link, not the link.
+
+```rust
+use std::path::PathBuf;
+
+fn main() {
+    let args: Vec<_> = std::env::args_os().collect();
+    let link = PathBuf::from("/usr/local/bin/fast-worktree");
+    // ... when started as `fast-worktree`:
+    std::process::exit(fast_worktree::cli::run_with_helper(args, Some(link)));
+}
+```
 
 The API is documented on [docs.rs](https://docs.rs/fast-worktree).
 

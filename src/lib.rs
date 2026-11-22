@@ -63,6 +63,12 @@
 //! refilled automatically; [`Repository::fill_pool`] fills them in the
 //! calling thread.
 //!
+//! A program that embeds the whole command (for example, one binary that
+//! acts as `fast-worktree` when started through a link of that name) runs
+//! it with `cli::run_with_helper(args, Some(path))`, so that the
+//! background work re-execs `path` and not whatever
+//! [`std::env::current_exe`] resolves to.
+//!
 //! # Process-wide effects
 //!
 //! Removal is refused when the process cwd is inside the worktree; the
@@ -86,7 +92,6 @@
 
 mod cache;
 #[cfg(feature = "cli")]
-#[doc(hidden)]
 pub mod cli;
 mod clone;
 mod cmd;

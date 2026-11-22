@@ -5,6 +5,25 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [0.6.0] - 2026-11-21
+
+### Added
+
+- `fast_worktree::cli::run_with_helper(args, helper)` runs the command line
+  for a program that embeds the command, returns its exit code, and makes
+  the background work it starts (`pool fill`, `install --changed
+  --deferred`) re-exec `helper` instead of the running binary. An embedding
+  binary started through a link named `fast-worktree` passes the link: on
+  Linux the running binary resolves to the embedding program itself, which
+  does not understand `pool fill`, and the pool was never refilled. The
+  `cli` module is now documented.
+
+### Changed
+
+- `cli::run` returns the exit code of a usage error, `--help` and
+  `--version` instead of exiting in clap; the `fast-worktree` command
+  prints and exits as before.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added
