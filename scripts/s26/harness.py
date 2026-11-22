@@ -485,9 +485,11 @@ class Checks:
         name = self.m1_container()
         command(["docker", "exec", name, "install", "-d", "-o", "belt", "-g", "belt", "-m", "700",
                  "/home/belt/project", "/home/belt/s26-bin"])
-        command(["docker", "cp", self.project / "job.sh", f"{name}:/home/belt/project/job.sh"])
-        command(["docker", "exec", name, "chown", "belt:belt", "/home/belt/project/job.sh"])
-        ssh("m1", 'cd "$HOME/project" && git init -q && git add job.sh && '
+        for filename in ("job.sh", ".portool.toml"):
+            command(["docker", "cp", self.project / filename, f"{name}:/home/belt/project/{filename}"])
+        command(["docker", "exec", name, "chown", "belt:belt",
+                 "/home/belt/project/job.sh", "/home/belt/project/.portool.toml"])
+        ssh("m1", 'cd "$HOME/project" && git init -q && git add job.sh .portool.toml && '
             'git -c user.name="S26 Harness" -c user.email=s26@example.invalid '
             '-c commit.gpgsign=false commit -qm "S26 fixture"')
         self.count += 1
