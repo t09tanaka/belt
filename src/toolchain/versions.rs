@@ -65,6 +65,17 @@ pub enum Constraint {
     },
 }
 impl Constraint {
+    /// The constraint as a person reads it in a message.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Range(range) => range.to_string(),
+            Self::Pub(range) => range.describe(),
+            Self::Resolve(value) | Self::Expression(value) | Self::VersionFileExpression(value) => {
+                value.clone()
+            }
+            Self::Distribution { version, .. } => version.to_string(),
+        }
+    }
     pub fn parse(value: &str) -> Result<Self, &'static str> {
         let value = value.trim();
         if value.len() > 512 || value.contains(['\n', '\r', '\0']) {
@@ -267,6 +278,13 @@ pub struct EffectiveRequirement {
     pub constraints: Vec<Constraint>,
     pub provenance: Vec<Location>,
 }
+impl EffectiveRequirement {
+    /// `tool=version`, as the refusals name what could not be provided.
+    pub fn describe(&self) -> String {
+        let versions: Vec<String> = self.constraints.iter().map(Constraint::describe).collect();
+        format!("{}={}", self.tool.as_str(), versions.join(","))
+    }
+}
 /// The scopes a worker has to serve for `declarations`: each project as a
 /// whole, and every narrower scope (workflow, job, step) a declaration names.
 /// A requirement of a narrow scope is taken together with the project's own.
@@ -386,6 +404,12 @@ pub struct FrozenToolchains {
     pub policy: MatchPolicy,
 }
 impl FrozenToolchains {
+    /// `tool=version` of every requirement, for messages that say what could
+    /// not be provided.
+    pub fn describe_requirements(&self) -> String {
+        let all: Vec<String> = self.requirements.iter().map(|r| r.describe()).collect();
+        all.join(", ")
+    }
     /// Caller supplies already captured observations. No env/files/probes are
     /// consulted here; retry serializes/reuses this exact contract.
     #[allow(clippy::too_many_arguments)]
@@ -635,6 +659,22 @@ enum PubOp {
     Lt,
 }
 impl PubRange {
+    fn describe(&self) -> String {
+        if self.bounds.is_empty() {
+            return "any".into();
+        }
+        let bound = |(op, version): &(PubOp, Version)| {
+            let op = match op {
+                PubOp::Eq => "",
+                PubOp::Ge => ">=",
+                PubOp::Gt => ">",
+                PubOp::Le => "<=",
+                PubOp::Lt => "<",
+            };
+            format!("{op}{version}")
+        };
+        self.bounds.iter().map(bound).collect::<Vec<_>>().join(" ")
+    }
     pub fn parse(raw: &str) -> Result<Self, &'static str> {
         let raw = raw.trim();
         if raw.is_empty() || raw.len() > 512 {

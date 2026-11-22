@@ -229,6 +229,16 @@ pub fn task_specs(
         .collect()
 }
 
+/// Every task of the run carries the run's frozen toolchain selection.
+pub(crate) fn with_toolchains(
+    specs: &mut [(String, TaskSpec)],
+    toolchains: Option<&crate::toolchain::contract::FrozenBundle>,
+) {
+    for (_, spec) in specs {
+        spec.toolchains = toolchains.cloned();
+    }
+}
+
 pub async fn submit(
     context: Context,
     revision: Option<String>,
@@ -264,7 +274,7 @@ pub async fn submit(
             ));
         }
         let manifest = super::input::source_manifest(&context, &run_id)?;
-        let (store, _guard) = crate::source::SourceStore::open_foreground(context.state_dir())
+        let (store, guard) = crate::source::SourceStore::open_foreground(context.state_dir())
             .map_err(|error| {
                 if error.is::<crate::source::retention::ForegroundBusy>() {
                     crate::source::classify::api_error_of(&error)
@@ -275,11 +285,11 @@ pub async fn submit(
         let (plan, policies) = super::planning::freeze_with_policies(&store, &manifest)?;
         let (plan_digest, _) = crate::ci::advance::keep_plan(context.state_dir(), &plan)
             .map_err(|e| invalid(format!("cannot keep the frozen plan: {e}")))?;
-        Ok((captured, plan, plan_digest, policies))
+        Ok((captured, plan, plan_digest, policies, guard))
     })
     .await
     .map_err(|e| invalid(e.to_string()))?;
-    let (captured, plan, plan_digest, policies) = frozen?;
+    let (captured, plan, plan_digest, policies, guard) = frozen?;
     let source_id = captured.manifest.source_id.clone();
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
@@ -291,6 +301,19 @@ pub async fn submit(
         &requirements,
         timeout,
     )?;
+    // Frozen once for the run, from the same declarations a plain command of
+    // this source would freeze; every task carries it, and the worker
+    // activates it before the job's steps.
+    let toolchains = super::submit::freeze_resolved(
+        &context,
+        &owner,
+        &captured.manifest,
+        &manifest_digest,
+        &requirements,
+        guard,
+    )
+    .await?;
+    with_toolchains(&mut specs, toolchains.as_ref());
     let capacity = context.config.workers.len() + usize::from(context.config.local_worker.value);
     let capacity = capacity.saturating_mul(context.config.max_active_task.value as usize);
     if capacity > 1 {
@@ -649,6 +672,51 @@ mod tests {
         let ci = test.ci.as_ref().unwrap();
         assert!(ci.hold);
         assert_eq!(ci.steps, 1);
+    }
+
+    #[test]
+    fn every_task_of_a_run_carries_the_one_frozen_toolchain_or_none() {
+        use crate::toolchain::{
+            contract::FrozenBundle,
+            versions::{
+                Constraint, Declaration, FrozenToolchains, Location, MatchPolicy, Scope, ToolId,
+            },
+        };
+        let f = fixture(WORKFLOW);
+        let digest = Digest::of_bytes(b"plan bytes");
+        let manifest = Digest::of_bytes(b"manifest");
+        let mut specs = task_specs(&f.plan, &digest, &manifest, &Default::default(), None).unwrap();
+        assert!(specs.iter().all(|(_, spec)| spec.toolchains.is_none()));
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            manifest.clone(),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("20.0.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &Default::default(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let bundle = FrozenBundle::seal_exact(frozen).unwrap();
+        with_toolchains(&mut specs, Some(&bundle));
+        assert_eq!(specs.len(), 2);
+        for (_, spec) in &specs {
+            assert_eq!(spec.toolchains.as_ref(), Some(&bundle));
+            // The bundle is bound to the same source the task is.
+            bundle.validate_partial(&spec.manifest_digest).unwrap();
+        }
+        with_toolchains(&mut specs, None);
+        assert!(specs.iter().all(|(_, spec)| spec.toolchains.is_none()));
     }
 
     #[test]
