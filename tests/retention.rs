@@ -500,7 +500,11 @@ fn pool_leftovers_of_killed_runs_and_old_misses_are_removed() {
     age(&log, 8 * DAY);
     w.forget_stamps();
 
+    // A fill may be running (its lock is held): the sweep does not need
+    // the lock to tell a leftover, and does not take it.
+    let fill = hold(&pool.join("fill.lock"));
     w.add("wt2");
+    drop(fill);
 
     wait_gone(&building);
     wait_gone(&claimed);
@@ -557,6 +561,16 @@ fn a_sweep_starts_no_second_deleter_while_one_is_at_work() {
     w.add("wt1");
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(orphan.is_dir(), "left for the sweep of a later command");
+    // Not one more process that waits in the queue for each command.
+    let ps = Command::new("ps")
+        .args(["-axo", "command"])
+        .output()
+        .unwrap();
+    let waiting = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| l.contains(orphan.to_str().unwrap()))
+        .count();
+    assert_eq!(waiting, 0, "a deleter was started behind the one at work");
     drop(deleter);
     w.add("wt2");
     wait_gone(&orphan);

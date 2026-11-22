@@ -211,8 +211,10 @@ fast-worktree kept prune [--older-than <days>]
 you are in, where `hook remove` keeps commits that would be lost (see
 [Claude Code hooks](#claude-code-hooks)), with their commit and when they
 were kept. `prune` deletes those kept `<days>` (default 30) ago or more,
-going by the date in the ref's name; refs whose name has no date are left
-alone.
+going by the date in the ref's name, and those kept more than 25 hours ago
+whose commit a branch, a remote-tracking branch or a tag has; refs whose
+name has no date are left alone. The same is done by itself (see [What is
+deleted by itself](#what-is-deleted-by-itself)).
 
 ```sh
 fast-worktree pool status | fill | refresh | clear
@@ -1251,7 +1253,8 @@ at once. To keep them, make a branch before then: `git branch <name> <ref>`.
 Only names that fast-worktree makes are removed from the cache directory: a
 repository directory `<name>-<8 hex digits>`, in it a key `<16 hex
 digits>-<...>` with its `.ok` marker, or such a key followed by
-`.tmp-<pid>-<n>`. Anything else there is left alone and is not listed.
+`.tmp-<pid>-<n>`. Anything else there is left alone and is not listed by
+`cache ls`.
 
 ## What is safe to clone
 

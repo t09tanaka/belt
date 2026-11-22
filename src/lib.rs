@@ -646,7 +646,11 @@ impl Repository {
     }
 
     /// Delete the kept refs that are `older_than_days` days old or older
-    /// (the command's default is 30). Returns how many were deleted.
+    /// (the command's default is 30), and those more than 25 hours old
+    /// whose commit a branch, a remote-tracking branch or a tag has: what
+    /// `fast-worktree kept prune` does, and what the calls that create and
+    /// remove worktrees do by themselves with 30 days. Returns how many
+    /// were deleted.
     pub fn prune_kept_refs(&self, older_than_days: u64) -> Result<usize> {
         let (done, _log) = self.call(|| cmd::kept::prune_in(&self.main, older_than_days));
         let (pruned, failed) = done?;

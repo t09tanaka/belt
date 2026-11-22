@@ -166,7 +166,8 @@ enum HookCmd {
 enum KeptCmd {
     /// List the kept refs with their commit and when they were kept
     Ls,
-    /// Delete the kept refs older than a number of days
+    /// Delete the kept refs older than a number of days, and those a
+    /// branch or tag has made needless
     Prune {
         /// Days since they were kept (default: 30)
         #[arg(long, value_name = "DAYS")]

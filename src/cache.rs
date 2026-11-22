@@ -50,13 +50,13 @@ fn store_lock(dir: &Path) -> Option<fs::File> {
         .flatten()
 }
 
-/// [`store_lock`] without waiting, for the sweeps: `None` also when a run
-/// that stores an entry holds it, and then the sweep leaves that directory's
-/// records for the next time.
-fn try_store_lock(dir: &Path) -> Option<fs::File> {
+/// [`store_lock`] without waiting, for the sweeps: `Ok(None)` when a run
+/// that stores an entry holds it, and then the sweep leaves that
+/// directory's records for the next time. An error is a lock that cannot be
+/// taken at all (a file system without locks), which nothing else holds
+/// either.
+fn try_store_lock(dir: &Path) -> std::io::Result<Option<fs::File>> {
     crate::util::lock_path(&dir.join(STORE_LOCK), false, false)
-        .ok()
-        .flatten()
 }
 
 /// Where the "checked" marker of `entry` lives.
@@ -402,15 +402,17 @@ fn prune_into(
         // Under the lock, so that the records a run has just written for
         // the entry it is about to rename into place are not taken; and
         // looked at again once it is held.
+        // (A lock that cannot be taken at all is not waited for, as when
+        // an entry is stored; only one that a run holds leaves work.)
         match try_store_lock(project_dir) {
-            Some(_lock) => {
+            Ok(None) => complete = false,
+            _lock => {
                 for (p, key) in &records {
                     if !project_dir.join(key).is_dir() {
                         let _ = fs::remove_file(p);
                     }
                 }
             }
-            None => complete = false,
         }
     }
     (removed, complete)
@@ -474,7 +476,10 @@ fn is_key_name(name: &str) -> bool {
 /// Every entry under the cache root `root`, sorted by repository, project
 /// and key: what the sweeps take for an entry ([`plan`]), a key with its
 /// `.ok` marker in a repository's directory. Directories of an older layout
-/// ([`legacy`]) are left out, and so is whatever else is there.
+/// ([`legacy`]) are left out, and so is whatever else is there. (Every
+/// version from 0.3.0 on writes the marker before the entry is in place;
+/// 0.2 wrote it right after, so only a run of 0.2 killed in between left
+/// an entry without one.)
 pub fn list(root: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     for (repo, repo_path) in dirs(root) {
@@ -1095,6 +1100,21 @@ mod tests {
             prune_into(&proj, ttl, TMP_MIN_AGE, usize::MAX, &mut moved);
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn a_store_lock_that_cannot_be_taken_at_all_is_not_work_left_for_ever() {
+        let t = tempfile::tempdir().unwrap();
+        let proj = t.path().join("repo-0123abcd/app");
+        // Where the lock file would be there is a directory: no lock.
+        fs::create_dir_all(proj.join(STORE_LOCK)).unwrap();
+        let orphan = proj.join(format!("{KEY}.ok"));
+        fs::write(&orphan, "").unwrap();
+        let mut moved = Vec::new();
+        let ttl = Duration::from_secs(1);
+        let (_, complete) = prune_into(&proj, ttl, TMP_MIN_AGE, usize::MAX, &mut moved);
+        assert!(complete, "or every command would walk the cache again");
         assert!(!orphan.exists());
     }
 }

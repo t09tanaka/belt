@@ -305,20 +305,18 @@ fn spawn_detached(mut cmd: Command) -> io::Result<std::process::Child> {
 /// and the hidden siblings that the trash's notes point to: with one
 /// deleter for all of it, and none while one is at work (what is stale
 /// then is taken by the sweep of a later command), so that a slow deletion
-/// is not started again by every command. Returns how many deleters were
-/// started.
+/// is not started again by every command.
 ///
 /// The trash directory and its `.lock` are never removed: every released
 /// version queues its deleters on that path (`lockf -k`), and one that
 /// waited on a file that was unlinked would delete side by side with the
 /// next.
-pub fn sweep() -> usize {
+pub fn sweep() {
     let dir = paths::trash_dir();
     let stale = stale(&dir, now_secs());
-    if stale.is_empty() || deleter_running(&dir) {
-        return 0;
+    if !stale.is_empty() && !deleter_running(&dir) {
+        spawn_rm_many(&stale);
     }
-    spawn_rm_many(&stale)
 }
 
 /// What [`sweep`] deletes, for the trash directory `dir` at time `now`. A
