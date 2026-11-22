@@ -424,3 +424,264 @@ fn a50_uninitialized_submit_explains_how_to_start_a_resident_before_project_pref
         .contains("belt init"));
     assert_eq!(std::fs::read_dir(home).unwrap().count(), 0);
 }
+
+/// Every file and directory under `dir` with its kind and size, so a run can
+/// be compared with what was there before it.
+fn tree(dir: &Path) -> Vec<(PathBuf, bool, u64)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, bool, u64)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            out.push((
+                relative,
+                meta.is_dir(),
+                if meta.is_dir() { 0 } else { meta.len() },
+            ));
+            if meta.is_dir() {
+                walk(root, &entry.path(), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+fn state_dir(fx: &Fx) -> PathBuf {
+    fx.path("coordinator")
+}
+
+fn run_json(fx: &Fx, cwd: &Path, command: &[&str]) -> Output {
+    let mut args = vec!["--json", "exec", "--"];
+    args.extend_from_slice(command);
+    belt(fx, cwd, &args).output().unwrap()
+}
+
+/// Hold an exclusive `flock` on `name` in the coordinator's state directory,
+/// as a resident does while it starts or runs. The file is created here.
+fn hold(fx: &Fx, name: &str) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state_dir(fx).join(name))
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+/// A resident that is starting (or still holds ownership) but does not
+/// answer is not "no resident": the command is not run outside the queue,
+/// and nothing is created.
+#[test]
+fn a_starting_or_unresponsive_resident_prevents_direct_execution() {
+    for name in ["startup.lock", "coordinator.lock"] {
+        let fx = host(2);
+        let cwd = fx.path("project");
+        let held = hold(&fx, name);
+        let before = tree(&state_dir(&fx));
+        let out = run_json(&fx, &cwd, &["/usr/bin/touch", "ran"]);
+        assert_eq!(
+            out.status.code(),
+            Some(belt::error::ErrorCode::CommunicationUnknown.exit_code()),
+            "{name}: {out:?}"
+        );
+        let error = &last_json(&out)["error"];
+        assert_eq!(error["code"], "COMMUNICATION_UNKNOWN", "{name}");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("starting or not answering"),
+            "{name}: {message}"
+        );
+        assert_eq!(notices(&out), 0, "{name}");
+        assert!(!cwd.join("ran").exists(), "{name}");
+        assert_eq!(tree(&state_dir(&fx)), before, "{name}");
+        // Once the holder is gone nothing keeps the command from running.
+        drop(held);
+        let out = run_json(&fx, &cwd, &["/usr/bin/touch", "ran"]);
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+        assert!(cwd.join("ran").exists(), "{name}");
+    }
+}
+
+/// A socket file nobody listens on (left by a resident that died) is not a
+/// resident: the command runs here, and nothing is created or removed.
+#[test]
+fn a_stale_socket_file_means_no_resident_and_nothing_is_created() {
+    let fx = host(2);
+    let cwd = fx.path("project");
+    let parent = state_dir(&fx).join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(parent.join("request.sock")).unwrap());
+    assert!(parent.join("request.sock").exists());
+    let before = tree(&state_dir(&fx));
+    let before_worker = tree(&fx.path("local-worker"));
+    let out = run_json(&fx, &cwd, &["/usr/bin/touch", "ran"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(notices(&out), 1, "{out:?}");
+    assert!(cwd.join("ran").exists());
+    assert_eq!(tree(&state_dir(&fx)), before);
+    assert_eq!(tree(&fx.path("local-worker")), before_worker);
+}
+
+/// Direct execution creates nothing in the state directory, whatever the
+/// command's outcome.
+#[test]
+fn direct_execution_creates_nothing_in_the_state_directory() {
+    let fx = host(2);
+    let cwd = fx.path("project");
+    let before = tree(&state_dir(&fx));
+    let before_worker = tree(&fx.path("local-worker"));
+    for code in ["0", "5"] {
+        let out = run_json(&fx, &cwd, &["/bin/sh", "-c", &format!("exit {code}")]);
+        assert_eq!(out.status.code(), code.parse().ok(), "{out:?}");
+        assert_eq!(tree(&state_dir(&fx)), before);
+        assert_eq!(tree(&fx.path("local-worker")), before_worker);
+    }
+}
+
+/// No `init` yet: the real binary still runs the command, and does not
+/// create the coordinator's configuration or state.
+#[test]
+fn an_uninitialized_home_runs_the_command_here() {
+    let fx = Fx::new();
+    let home = fx.path("home");
+    let out = belt(
+        &fx,
+        &home,
+        &["exec", "--", "/bin/sh", "-c", "echo hello; exit 3"],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+    assert_eq!(notices(&out), 1, "{out:?}");
+    assert!(!home.join(".config/belt").exists());
+    assert!(!home.join(".belt").exists());
+}
+
+#[test]
+fn every_option_that_needs_a_run_is_refused_by_name() {
+    let fx = host(2);
+    let cwd = fx.path("project");
+    let before = tree(&state_dir(&fx));
+    for (args, flag) in [
+        (&["--ref", "main"][..], "--ref"),
+        (&["--snapshot", "commit"], "--snapshot"),
+        (&["--in-place"], "--in-place"),
+        (&["--profile", "p"], "--profile"),
+        (&["--requires", "node"], "--requires"),
+    ] {
+        let mut all = vec!["--json", "exec"];
+        all.extend_from_slice(args);
+        all.extend(["--", "/usr/bin/touch", "ran"]);
+        let out = belt(&fx, &cwd, &all).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(belt::error::ErrorCode::Blocked.exit_code()),
+            "{args:?} {out:?}"
+        );
+        let message = last_json(&out)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.starts_with(flag), "{args:?}: {message}");
+        assert!(message.contains("belt init"), "{message}");
+        assert!(!cwd.join("ran").exists(), "{args:?}");
+    }
+    assert_eq!(tree(&state_dir(&fx)), before);
+}
+
+/// The exit of a belt the test started, or a kill of that same child and a
+/// failure when it does not end.
+fn finish(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("belt did not end after the signal");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A command that records the signal it gets and exits with a code that
+/// names it, once the marker says its handlers are installed.
+fn signal_script() -> &'static str {
+    "trap 'echo TERM > got; exit 41' TERM; trap 'echo INT > got; exit 42' INT; \
+     trap 'echo HUP > got; exit 43' HUP; : > started; while :; do sleep 0.05; done"
+}
+
+/// A signal sent to belt alone (not to a process group) is forwarded to the
+/// command, which ends the way it chooses; belt exits with that code and the
+/// ledger entry is gone.
+#[test]
+fn sigint_sigterm_and_sighup_sent_to_belt_reach_the_command() {
+    for (signal, name, code) in [
+        (libc::SIGTERM, "TERM", 41),
+        (libc::SIGINT, "INT", 42),
+        (libc::SIGHUP, "HUP", 43),
+    ] {
+        let fx = host(2);
+        let cwd = fx.path("project");
+        let mut child = belt(&fx, &cwd, &["exec", "--", "/bin/sh", "-c", signal_script()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for("the command to start", || cwd.join("started").exists());
+        // Only the process this test started, never a group.
+        assert!(child.id() > 1);
+        assert!(belt::platform::process::signal_pid(child.id(), signal));
+        let status = finish(&mut child);
+        assert_eq!(status.code(), Some(code), "{name}: {status:?}");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("got")).unwrap().trim(),
+            name
+        );
+        assert!(entries(&fx).is_empty(), "{name}");
+    }
+}
+
+/// A stop signal while belt waits for admission ends it cleanly: the command
+/// never starts, the entry is removed, and the exit code is 128 + N.
+#[test]
+fn a_signal_while_waiting_for_admission_ends_belt_without_starting_the_command() {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        let fx = host(1);
+        let held = fx.path("held");
+        let release = fx.path("release");
+        let cwd = fx.path("project");
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "");
+            }
+        }
+        let _guard = Release(release.clone());
+        let holder = hold_with_library(&fx, &held, &release);
+        wait_for("the holder to start", || held.exists());
+        let mut child = belt(&fx, &cwd, &["exec", "--", "/usr/bin/touch", "ran"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for("belt exec to queue behind it", || entries(&fx).len() == 2);
+        assert!(child.id() > 1);
+        assert!(belt::platform::process::signal_pid(child.id(), signal));
+        let status = finish(&mut child);
+        assert_eq!(status.code(), Some(128 + signal), "{status:?}");
+        assert!(!cwd.join("ran").exists());
+        wait_for("belt's entry to go", || entries(&fx).len() == 1);
+        std::fs::write(&release, "").unwrap();
+        holder.join().unwrap();
+        assert!(entries(&fx).is_empty());
+    }
+}

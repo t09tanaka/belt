@@ -743,9 +743,11 @@ fn run_direct(json: bool, args: &ExecArgs) -> i32 {
     use crate::service::direct;
     let result = (|| {
         if let Some(refusal) = direct::refusal(direct::Flags {
-            snapshot: args.snapshot.is_some() || args.git_ref.is_some(),
+            snapshot: args.snapshot.is_some(),
+            git_ref: args.git_ref.is_some(),
             in_place: args.in_place,
-            placement: args.execution.profile.is_some() || !args.execution.requires.is_empty(),
+            profile: args.execution.profile.is_some(),
+            requires: !args.execution.requires.is_empty(),
         }) {
             return Err(refusal);
         }
