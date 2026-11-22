@@ -67,6 +67,10 @@ impl CoordinatorStore {
                 RunId::generate().to_string(),
                 at_ms,
             )?;
+            tx.execute(
+                "UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?2) WHERE task_id=?1",
+                params![task.as_str(), reason],
+            )?;
             common::append_event(
                 tx,
                 Some(&run),
