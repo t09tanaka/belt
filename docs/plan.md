@@ -1796,6 +1796,8 @@ R68 と R96 は backlog の番号をそのまま行の名前にした。R68（re
 
 WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含むマージコミットに固定する。beltをcrates.ioに公開する前に、対応する両ライブラリを公開してからregistryの固定版に切り替え、A48・A55を再検証する。
 
+2026-11-22 に fast-worktree 0.6.0 と portool 0.13.0 を crates.io に公開し、依存を registry の固定版（`=0.6.0`・`=0.13.0`）へ切り替えた。portool 0.13.0 は固定していたコミットに CHANGELOG の記述だけを足したもので、コードは同じである。
+
 ## 仕様1.5とS26の非実機受入
 
 検証対象は統合版 `6c3a304` の製品コード（`belt-cli 0.0.0`、release profile）と、`627274d` の A57 追加試験。親は macOS 27.0.1 arm64、Linux は Debian 12 の arm64・amd64。両アーキテクチャで基本の Docker 受入は各9件合格した。組み込みは local-ci 0.18.3、task-traffic-controller 0.10.2、fast-worktree 0.6.0、portool 0.13.0。初回利用は [README](../README.md)、受入環境の起動・更新・撤収は [S26 手順](../scripts/s26/README.md) に従う。
