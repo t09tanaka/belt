@@ -127,8 +127,21 @@ async fn the_idle_release_stops_the_install_and_a_later_sync_installs_once() {
     let client = ensure(spec.clone()).await.unwrap();
     std::fs::write(host.join("hold"), "").unwrap();
     let first = RequestId::generate();
-    assert_eq!(warm(&client, &spec, &first).await, SyncOutcome::Pending);
-    until("the manager to run", 20, || recorded(&host).len() == 2).await;
+    // The coordinator keeps asking while it waits, and each ask restarts the
+    // idle time of the warm-up: the install may take longer than that time
+    // to reach the manager (a slow host) without being let go meanwhile. Only
+    // once the manager runs does nobody ask any more.
+    let end = Instant::now() + Duration::from_secs(20);
+    while recorded(&host).len() != 2 {
+        assert_eq!(warm(&client, &spec, &first).await, SyncOutcome::Pending);
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the manager to run; calls {}, pids {:?}",
+            calls(&host),
+            recorded(&host)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let pids = recorded(&host);
     // Nobody asks again: the warm-up is let go after one second, and the
     // install it alone waited for is stopped, descendants included.
