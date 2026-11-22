@@ -358,6 +358,9 @@ struct Round {
     open: Vec<Reached>,
     out: BTreeMap<WorkerId, Exclusion>,
     deadline: Instant,
+    /// Whether a worker can provide a frozen toolchain, by the question
+    /// (bundle digest, requirements) and the worker; answered once per tick.
+    toolchain_eligible: BTreeMap<((crate::ids::Digest, String), WorkerId), bool>,
 }
 
 impl Round {
@@ -369,6 +372,7 @@ impl Round {
             open: Vec::new(),
             known,
             deadline,
+            toolchain_eligible: BTreeMap::new(),
         };
         let answered: BTreeSet<WorkerId> = reached.iter().map(|w| w.worker_id.clone()).collect();
         for missing in round.known.difference(&answered) {
@@ -771,7 +775,10 @@ impl Coordinator {
         }
         Err(crate::error::ApiError::blocked(
             crate::error::BlockedReason::EnvironmentMismatch,
-            "toolchain resolve required: no coherent worker proposal",
+            format!(
+                "toolchain resolve required: no coherent worker proposal ({})",
+                bundle.frozen.describe_requirements()
+            ),
         ))
     }
 
@@ -2083,12 +2090,27 @@ impl Coordinator {
         }
         let mut toolchain_eligible = BTreeSet::new();
         if let Some(bundle) = &spec.toolchains {
-            for worker in round
+            // The same question of the same worker is asked once a tick: the
+            // tasks of a run share one bundle.
+            let asked = (
+                bundle.digest(),
+                serde_json::to_string(&spec.requirements).unwrap_or_default(),
+            );
+            let workers: Vec<(WorkerId, Arc<dyn WorkerLink>)> = round
                 .open
                 .iter()
                 .filter(|w| ready(w))
                 .chain(round.open.iter().filter(|w| !ready(w) && measured_cold(w)))
-            {
+                .map(|w| (w.worker_id.clone(), Arc::clone(&w.link)))
+                .collect();
+            for (worker_id, link) in workers {
+                let key = (asked.clone(), worker_id.clone());
+                if let Some(eligible) = round.toolchain_eligible.get(&key) {
+                    if *eligible {
+                        toolchain_eligible.insert(worker_id);
+                    }
+                    continue;
+                }
                 let remaining = round.deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -2100,11 +2122,14 @@ impl Coordinator {
                     bundle: bundle.clone(),
                     requirements: spec.requirements.clone(),
                 });
+                // Only an answer is kept; a silent worker is asked again.
                 if let Ok(Ok(Response::ResolveToolchains(response))) =
-                    tokio::time::timeout(wait, worker.link.read_only_call(request)).await
+                    tokio::time::timeout(wait, link.read_only_call(request)).await
                 {
-                    if response.bundle == *bundle {
-                        toolchain_eligible.insert(worker.worker_id.clone());
+                    let eligible = response.bundle == *bundle;
+                    round.toolchain_eligible.insert(key, eligible);
+                    if eligible {
+                        toolchain_eligible.insert(worker_id);
                     }
                 }
             }
@@ -2188,14 +2213,28 @@ impl Coordinator {
                 unmet: if let Some(why) = unmet_ci(w) {
                     vec![why.to_string()]
                 } else {
-                    crate::toolchain::envdiff::with_steps(
+                    let mut unmet = crate::toolchain::envdiff::with_steps(
                         crate::toolchain::capability::missing(
                             &spec.requirements,
                             w.capabilities.as_ref(),
                         ),
                         &spec.requirements.requires,
                         w.capabilities.as_ref(),
-                    )
+                    );
+                    // Excluded by the frozen toolchain alone: name what it
+                    // asks for.
+                    if unmet.is_empty() && !toolchain_eligible.contains(&w.worker_id) {
+                        if let Some(bundle) = &spec.toolchains {
+                            unmet.extend(
+                                bundle
+                                    .frozen
+                                    .requirements
+                                    .iter()
+                                    .map(|r| format!("toolchain {} unavailable", r.describe())),
+                            );
+                        }
+                    }
+                    unmet
                 },
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,

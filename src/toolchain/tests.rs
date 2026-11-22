@@ -1486,3 +1486,61 @@ fn a_requirement_is_made_for_the_project_and_for_each_narrower_scope() {
     };
     assert_eq!(requirement_scopes(&[other]).len(), 1);
 }
+
+#[test]
+fn every_constraint_describes_itself_the_way_a_message_names_it() {
+    let describe = |raw: &str| Constraint::parse(raw).unwrap().describe();
+    assert_eq!(describe("20.0.0"), "20.0.0");
+    assert_eq!(describe("lts/iron"), "lts/iron");
+    assert_eq!(describe("stable"), "stable");
+    assert_eq!(describe("${{ matrix.node }}"), "${{ matrix.node }}");
+    let hash = "a".repeat(64);
+    assert_eq!(describe(&format!("20.1.2+sha256.{hash}")), "20.1.2");
+    assert_eq!(
+        Constraint::VersionFileExpression("${{ env.FILE }}".into()).describe(),
+        "${{ env.FILE }}"
+    );
+    let pubs = |raw: &str| Constraint::Pub(PubRange::parse(raw).unwrap()).describe();
+    assert_eq!(pubs("any"), "any");
+    assert_eq!(pubs("1.2.3"), "1.2.3");
+    assert_eq!(pubs(">=1.0.0 <2.0.0"), ">=1.0.0 <2.0.0-0");
+    assert_eq!(pubs(">1.0.0 <=2.0.0"), ">1.0.0 <=2.0.0");
+}
+
+#[test]
+fn requirements_name_tool_and_version_in_order() {
+    let requirement = |tool: &str, raws: &[&str]| EffectiveRequirement {
+        tool: ToolId::parse(tool).unwrap(),
+        constraints: raws.iter().map(|r| Constraint::parse(r).unwrap()).collect(),
+        provenance: vec![loc()],
+    };
+    assert_eq!(requirement("node", &["20.0.0"]).describe(), "node=20.0.0");
+    assert_eq!(
+        requirement("node", &["20.0.0", "stable"]).describe(),
+        "node=20.0.0,stable"
+    );
+    assert_eq!(requirement("node", &[]).describe(), "node=");
+    let frozen = |requirements: Vec<EffectiveRequirement>| FrozenToolchains {
+        schema_version: 1,
+        source_manifest: crate::ids::Digest::of_bytes(b"source"),
+        profile_definition: crate::ids::Digest::of_bytes(b"profile"),
+        scope: Scope::project(""),
+        requirements,
+        baseline: vec![],
+        selections: vec![],
+        policy: MatchPolicy::Exact,
+    };
+    assert_eq!(frozen(vec![]).describe_requirements(), "");
+    assert_eq!(
+        frozen(vec![requirement("node", &["20.0.0"])]).describe_requirements(),
+        "node=20.0.0"
+    );
+    assert_eq!(
+        frozen(vec![
+            requirement("node", &["20.0.0"]),
+            requirement("rust", &["1.80.0"])
+        ])
+        .describe_requirements(),
+        "node=20.0.0, rust=1.80.0"
+    );
+}

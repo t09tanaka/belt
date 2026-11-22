@@ -5239,6 +5239,141 @@ async fn ci_runs_a_chain_of_needs_with_outputs_and_every_job_once() {
     shutdown(&load(&spec)).await;
 }
 
+/// A worker whose base PATH has Node 22 and whose operator inventory allows
+/// Nodenv to install the versions in `inventory`; the manager logs each
+/// install to `<returned dir>/calls`.
+fn node_toolchain_worker(
+    root: &std::path::Path,
+    spec: &Spec,
+    inventory: &str,
+) -> std::path::PathBuf {
+    use belt::toolchain::profile::Profile;
+    let host = root.join("private-managers");
+    let stubs = root.join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let profile = Profile::load(&spec.worker_state_dir, &spec.env).unwrap();
+    let manager = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> '{host}/calls'
+version="$1"
+bin="$NODENV_ROOT/versions/$version/bin"
+/bin/mkdir -p "$bin"
+/usr/bin/printf '#!/bin/sh\necho v%s\n' "$version" > "$bin/node"
+/bin/chmod 700 "$bin/node"
+"#,
+        host = host.display()
+    );
+    crate::common::write_executable(&host.join("manager"), &manager);
+    crate::common::write_executable(&host.join("node-build"), &manager);
+    let registry = format!("schema_version=1\nactive_profile='base22'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?}{}]\ninventory=[{inventory}]\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap(), crate::common::system_search_path_toml());
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    std::fs::write(&registry_file, registry).unwrap();
+    std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    host
+}
+
+/// A CI task carries the frozen toolchain a plain task of the same source
+/// would: the worker lacks the Node version the project declares, activates it
+/// (through the same adapters `exec` uses) before the job's steps, and the job
+/// sees that version and not the one on the base PATH.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_gets_the_declared_toolchain_activated_on_the_worker_before_its_steps() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0','22.0.0'");
+    // The project declares Node 20; the worker's base PATH has Node 22.
+    std::fs::write(input.join(".node-version"), "20.0.0\n").unwrap();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/build\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    if code != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_jobs(&value)["build"].0, "success", "{value}");
+    assert_eq!(ci_marks(&marks, "build"), ["v20.0.0"]);
+    // The manager ran once, for the declared version, on the worker.
+    let calls = std::fs::read_to_string(host.join("calls")).unwrap();
+    assert_eq!(calls.lines().collect::<Vec<_>>(), ["20.0.0"], "{calls}");
+    // The task carries the frozen bundle that was activated.
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    assert!(
+        rows.iter().all(|row| !row.spec["toolchains"].is_null()),
+        "every CI task of the run carries the frozen toolchain"
+    );
+    shutdown(&load(&spec)).await;
+}
+
+/// The refusal half: a version the operator never authorized leaves no
+/// compatible worker for a CI task, as for a plain command. No step runs, no
+/// manager runs, and the job does not fall back to the Node on the PATH.
+///
+/// The block is at placement, not at submit: the run is accepted (its
+/// `task_waiting` event exists, and `ci` is still waiting on it when the
+/// events are read), and the worker is left out with `capability_mismatch`
+/// whose `unmet` line names `node=21.0.0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_needing_an_unauthorized_toolchain_is_blocked_and_runs_with_no_other_version() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0'");
+    std::fs::write(input.join(".node-version"), "21.0.0\n").unwrap();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/build\n",
+    );
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await });
+    let started = std::time::Instant::now();
+    let waiting = loop {
+        let found = CoordinatorStore::open_read_only(&spec.state_dir)
+            .ok()
+            .and_then(|store| store.events_after(0, 10_000).ok())
+            .and_then(|events| events.into_iter().find(|e| e.kind == "task_waiting"));
+        if let Some(event) = found {
+            break event;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the CI task was not reported as blocked");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(waiting.payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(
+        waiting.payload["decision"]["excluded"][0]["why"], "capability_mismatch",
+        "{}",
+        waiting.payload
+    );
+    assert_eq!(
+        waiting.payload["decision"]["excluded"][0]["unmet"],
+        serde_json::json!(["toolchain node=21.0.0 unavailable"]),
+        "{}",
+        waiting.payload
+    );
+    assert!(
+        !running.is_finished(),
+        "ci ended: the block was not at placement"
+    );
+    assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    running.abort();
+    shutdown(&load(&spec)).await;
+}
+
 /// A worker that holds as many frozen plans as it may does not take one
 /// more. The run does not wait without a word: it gets the event
 /// `ci_plan_refused` once, the worker is left out of the placement by name
