@@ -53,7 +53,12 @@ image uses `debian:12.9-slim`, real systemd PID 1, sshd/PAM, a lingering UID 100
 `belt` user, Git and shell/core utilities. The app supplies fast-worktree and
 portool for workspace hooks and commands. Rust/tool image tags and installed Rust tool versions
 are pinned; Debian apt security packages are intentionally not snapshot-pinned.
-The harness has no Docker socket mount in workers.
+Workers run with privileged systemd and share the Docker VM kernel. The worker
+image masks `systemd-binfmt.service` and its automount so that shutting down a
+worker preserves the VM's cross-architecture executable handlers. If an amd64
+build fails before the first Dockerfile command, check the runtime separately
+with `docker run --rm --platform linux/amd64 debian:12.9-slim dpkg --print-architecture`.
+It should print `amd64`. The harness has no Docker socket mount in workers.
 
 `up.sh` uses portool sync/check/exec against a harness-owned Git resource root
 under `target/s26/resources/`. It keeps generated configuration there and uses
