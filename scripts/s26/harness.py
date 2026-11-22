@@ -640,21 +640,34 @@ kill -s CONT "$pid"
         self.m1_belt("workers", "add", "w1", "--ssh", "w1")
 
     def start_remote_attempt(self):
-        token = secrets.token_hex(8)
         script = ('set -eu; mkdir -p "$HOME/s26-starts"; hostname >> "$HOME/s26-starts/$1"; '
                   'for i in $(seq 1 420); do test ! -e "$HOME/s26-release-$1" || exit 0; sleep 1; done; exit 1')
         until("w1 connected to m1", lambda: any(
             w["id"] == "w1" and w["connection"] == "connected" for w in self.m1_belt("workers")["workers"]))
-        task = self.m1_belt("submit", "--", "sh", "-c", script, "s26", token)["task_id"]
-        def started():
-            items = self.m1_belt("show", task)["attempts"]["items"]
-            if not items:
-                return False
-            if len(items) != 1 or items[0]["worker_id"] != "w1":
-                raise RuntimeError(f"unexpected remote attempt before upgrade: {items}")
-            return items[0]["attempt_id"] if self.starts(token) == {"w1": 1} else False
-        attempt_id = until("m1 submission started on w1", started, 90)
-        return task, token, attempt_id
+        # A newly connected worker may still be staging the source. Let the
+        # local worker take its available slots while w1 becomes ready.
+        local = []
+        try:
+            for _ in range(4):
+                token = secrets.token_hex(8)
+                task = self.m1_belt("submit", "--", "sh", "-c", script, "s26", token)["task_id"]
+                def placed():
+                    attempts = self.m1_belt("show", task)["attempts"]["items"]
+                    if len(attempts) > 1:
+                        raise RuntimeError(f"expected one attempt for {task}: {attempts}")
+                    return attempts[0] if attempts else None
+                attempt = until(f"remote fixture {task} placed", placed, 60)
+                if attempt["worker_id"] == "w1":
+                    until("m1 command running on w1", lambda: self.starts(token) == {"w1": 1}, 60)
+                    return task, token, attempt["attempt_id"]
+                if attempt["worker_id"] != "m1":
+                    raise RuntimeError(f"unexpected worker for {task}: {attempt}")
+                local.append((task, token))
+            raise RuntimeError("no m1 submission reached w1")
+        finally:
+            for task, token in local:
+                ssh("m1", f'touch "$HOME/s26-release-{token}"')
+                self.m1_belt("wait", task, timeout=90)
 
     def finish_remote_attempt(self, remote, evidence):
         task, token, attempt_id = remote
