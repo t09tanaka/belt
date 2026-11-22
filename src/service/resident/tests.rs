@@ -2204,3 +2204,32 @@ async fn a57_a_resident_on_trial_saves_no_cancel_retry_or_status_and_says_send_a
     ));
     runner.await.unwrap().unwrap();
 }
+
+/// The local worker link ending for any reason but a key change ends the
+/// resident with that reason (`local worker connection ended: ...`). It is
+/// not reconnected: only `IdentityChanged` is, and `run` returns at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_worker_link_that_ends_for_another_reason_ends_the_resident_without_reconnecting() {
+    type Ended = Result<crate::worker::serve::ConnectionEnd, crate::worker::serve::ServeError>;
+    for (name, expected) in [
+        ("closed", "local worker connection ended: Ok(Ok(Closed))"),
+        ("aborted", "local worker connection ended: Err("),
+    ] {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let mut resident = delivery_resident_on(root.path(), "/usr/bin:/bin").await;
+        resident.worker_connection.abort();
+        resident.worker_connection = if name == "closed" {
+            tokio::spawn(async { Ended::Ok(crate::worker::serve::ConnectionEnd::Closed) })
+        } else {
+            let handle = tokio::spawn(std::future::pending::<Ended>());
+            handle.abort();
+            handle
+        };
+        let error = tokio::time::timeout(Duration::from_secs(30), resident.run())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the resident kept running or reconnecting"))
+            .expect_err(name);
+        let message = error.to_string();
+        assert!(message.starts_with(expected), "{name}: {message}");
+    }
+}
