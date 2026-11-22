@@ -114,6 +114,28 @@ fn bridge(home: &Path, parent: u32) -> Option<(u32, String)> {
     }
     Some((pid, process.start.identity()?.to_string()))
 }
+/// The open is nonblocking by design and the daemon takes the exclusive source
+/// guard for its retention passes, so a test that opens the store while the
+/// daemon is up sees a transient `WouldBlock`; only a guard that stays held
+/// for 30 seconds fails it (the same bound as `open_sources` in bootstrap.rs).
+fn open_sources(state: &Path) -> belt::source::SourceStore {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match belt::source::SourceStore::open(state) {
+            Err(error)
+                if std::time::Instant::now() < deadline
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::WouldBlock)
+                    }) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other.unwrap(),
+        }
+    }
+}
 async fn submit(
     client: &Client,
     state: &Path,
@@ -128,7 +150,7 @@ async fn submit(
     std::fs::write(dir.join("ordinary"), name).unwrap();
     std::fs::write(dir.join(".env"), format!("TOKEN={name}-private\n")).unwrap();
     let run = RunId::generate();
-    let source_store = belt::source::SourceStore::open(state).unwrap();
+    let source_store = open_sources(state);
     let vault = belt::secrets::vault::Vault::open(state).unwrap();
     let key = belt::secrets::key::load(key).unwrap();
     let capture = belt::secrets::capture::capture_run(
