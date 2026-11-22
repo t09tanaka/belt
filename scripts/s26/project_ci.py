@@ -57,7 +57,26 @@ def measure(checks, commit, state):
         transfers = [r[0] for r in db.execute(
             "SELECT duration FROM costs WHERE receipt GLOB ? ORDER BY receipt",
             (f"transfer:{run_id}:*",))]
-    return {"transfer_samples_ms": transfers, "elapsed_seconds": elapsed, "outcomes": sorted(outcomes),
+    with sqlite3.connect((state / "coordinator.db").as_uri() + "?mode=ro", uri=True) as db:
+        deliveries = [json.loads(row[0]) for row in db.execute(
+            "SELECT payload_json FROM event WHERE run_id = ? AND kind = 'ci_input_delivered' ORDER BY seq",
+            (run_id,))]
+    remote_workers = {a["worker"] for a in attempts} - {"local"}
+    if remote_workers - {d["worker"] for d in deliveries}:
+        raise RuntimeError("missing verified input-delivery timings for a remote worker")
+    preparation_ms = sum(a["receipts"]["command_registered_at_ms"] - a["receipts"]["worker_accepted_at_ms"]
+                         for a in attempts)
+    collection_ms = sum(a["collected_ms"] - a["terminal_ms"] for a in attempts)
+    timings = [step["timing"] for a in attempts for step in a["steps"]]
+    phases = {"worker_accept_to_registration_ms": preparation_ms,
+              "source_forwarding_ms": sum(d["source_ms"] for d in deliveries),
+              "plan_forwarding_ms": sum(d["plan_ms"] for d in deliveries),
+              "resource_wait_seconds": sum(t["wait_queue_secs"] for t in timings),
+              "work_seconds": sum(t["work_secs"] for t in timings),
+              "terminal_to_collection_ms": collection_ms}
+    if any(value < 0 for value in phases.values()):
+        raise RuntimeError("inconsistent phase clocks in the project CI receipts")
+    return {"phases": phases, "input_deliveries": deliveries, "transfer_samples_ms": transfers, "elapsed_seconds": elapsed, "outcomes": sorted(outcomes),
             "attempts": attempts, "plan_digest": result["plan_digest"],
             "run_id": run_id}
 
