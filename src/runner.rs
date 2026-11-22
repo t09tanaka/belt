@@ -341,9 +341,10 @@ pub fn run_with(
             spawn.parent.map(str::to_string),
         )
     });
-    // A signal delivered between handler installation and spawn is
-    // forwarded now rather than waiting for the next EINTR.
-    let early = ctx.supervisor.take_pending();
+    // From here a supervisor may forward by itself; what arrived before
+    // that is forwarded now rather than waiting for the next EINTR.
+    ctx.supervisor
+        .child_started(child.id(), spawn.own_process_group);
     // A managed command leads its own group, so the signal goes to all of
     // it; a plain run keeps the terminal's own delivery and signals the
     // child alone.
@@ -354,26 +355,52 @@ pub fn run_with(
             libc::kill(pid, sig);
         }
     };
-    if early != 0 {
-        forward(early);
+    for _ in 0..MAX_DRAIN {
+        let sig = ctx.supervisor.take_pending();
+        if sig == 0 {
+            break;
+        }
+        forward(sig);
     }
 
     let mut status: libc::c_int = 0;
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // Wait for the exit without reaping, so the pid stays the child's own
+    // until the supervisor has stopped forwarding to it.
     loop {
-        let r = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
-        if r == pid {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 {
             break;
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
-            let sig = ctx.supervisor.take_pending();
-            if sig != 0 {
+            for _ in 0..MAX_DRAIN {
+                let sig = ctx.supervisor.take_pending();
+                if sig == 0 {
+                    break;
+                }
                 forward(sig);
             }
             continue;
         }
-        return Err(Error::Spawn(format!("wait4 failed: {err}")));
+        ctx.supervisor.child_exited();
+        return Err(Error::Spawn(format!("waitid failed: {err}")));
+    }
+    ctx.supervisor.child_exited();
+    let r = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+    if r != pid {
+        return Err(Error::Spawn(format!(
+            "wait4 failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
     // The leader is gone, but a managed command's descendants may not be:
@@ -439,6 +466,10 @@ pub fn run_with(
 
 /// `task-traffic-controller exec -- "npm run x"` looks for a program named `npm run x`.
 /// When that is the likely mistake, say how to write it instead.
+/// Upper bound on `take_pending` calls per drain, so an embedder that
+/// breaks the one-shot contract cannot spin the runner forever.
+const MAX_DRAIN: usize = 64;
+
 fn spawn_hint(argv: &[String], e: &std::io::Error) -> String {
     match argv {
         [one] if e.kind() == std::io::ErrorKind::NotFound && one.contains(char::is_whitespace) => {
