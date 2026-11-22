@@ -119,6 +119,94 @@ impl Fx {
     }
 }
 
+#[tokio::test]
+async fn running_shard_fail_fast_reason_is_visible_and_not_overwritten() {
+    let f = fx();
+    let a = f.attempt('a').unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+    ] {
+        f.store
+            .transition_attempt(&a.attempt_id, state, 20)
+            .unwrap();
+    }
+    let reason = crate::ci::shards::FAIL_FAST_REASON;
+    assert!(!f
+        .store
+        .stop_ci_attempt(&f.run, &f.task, &AttemptId::generate(), reason, 21)
+        .unwrap());
+    assert_eq!(
+        f.store
+            .query_task(f.task.clone())
+            .unwrap()
+            .unwrap()
+            .unrunnable,
+        None
+    );
+    assert!(f
+        .store
+        .stop_ci_attempt(&f.run, &f.task, &a.attempt_id, reason, 22)
+        .unwrap());
+    assert!(!f
+        .store
+        .stop_ci_attempt(&f.run, &f.task, &a.attempt_id, "different reason", 23)
+        .unwrap());
+    f.store
+        .transition_attempt(&a.attempt_id, AttemptState::Finalizing, 24)
+        .unwrap();
+    f.store
+        .finalize_attempt(&a.attempt_id, done(Outcome::Cancelled), 25)
+        .unwrap();
+    let shown = f.store.query_tasks(f.run.clone(), 64, None).unwrap();
+    assert_eq!(shown.items[0].unrunnable.as_deref(), Some(reason));
+    assert_eq!(shown.items[0].cancel_requested_at_ms, Some(22));
+    assert_eq!(
+        f.store
+            .query_task(f.task.clone())
+            .unwrap()
+            .unwrap()
+            .unrunnable
+            .as_deref(),
+        Some(reason)
+    );
+    let reader = crate::service::query::Reader::Offline(std::sync::Arc::new(f.store));
+    let shown = reader.show(f.run.as_str(), 64, None).await.unwrap();
+    let shown = serde_json::to_value(shown).unwrap();
+    assert_eq!(shown["tasks"]["items"][0]["unrunnable"], reason);
+}
+
+#[test]
+fn retry_clears_a_running_shards_fail_fast_reason() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Cancelled);
+    let task = f.task.to_string();
+    f.store.db.write(move |tx| {
+        tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?1) WHERE task_id=?2",
+            rusqlite::params![crate::ci::shards::FAIL_FAST_REASON, task])?;
+        Ok(())
+    }).unwrap();
+    f.store
+        .retry(
+            Target::Task(f.task.clone()),
+            0,
+            "retry-shard".into(),
+            40,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    assert_eq!(
+        f.store
+            .query_task(f.task.clone())
+            .unwrap()
+            .unwrap()
+            .unrunnable,
+        None
+    );
+}
+
 #[test]
 fn each_open_starts_a_new_epoch_and_a_second_open_is_locked_out() {
     let dir = crate::test_tmp::tempdir().unwrap();

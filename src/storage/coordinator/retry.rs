@@ -432,7 +432,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                 boundary = Some(to_u64(next)?);
             }
             if let Some(revision) = authorize {
-                c.execute("UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL WHERE task_id=?3",
+                c.execute("UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL,spec_json=json_remove(spec_json,'$.ci.unrunnable') WHERE task_id=?3",
                     params![next, to_i64(revision)?, row.task])?;
                 unjoined.extend(row.shard_group);
             }
