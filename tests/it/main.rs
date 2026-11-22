@@ -40,6 +40,7 @@ mod status_repost;
 
 mod init;
 
+mod ephemeral_stop;
 mod warmup_stop;
 mod worker_ephemeral;
 mod worker_role;
