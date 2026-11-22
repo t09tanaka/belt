@@ -808,12 +808,15 @@ fn a_unit_that_uploads_is_reused_with_its_artifacts() {
     assert!(!is_cached(&first, "build"));
     let kept = kept_files(&tmp.path().join("cache3"));
     assert_eq!(kept.len(), 1, "{kept:?}");
+    // read now: a run keeps only the last run of its worktree
+    let a = receipt(&first, "bundle", 1);
 
     let second = run_cached(&tmp, &dir, &[]);
     assert_eq!(second.state, "success", "{second:?}");
     assert!(is_cached(&second, "build"));
+    assert!(!first.run_dir.exists(), "the first run is kept");
     // the artifact is in this run's area, under this run's plan and attempt
-    let (a, b) = (receipt(&first, "bundle", 1), receipt(&second, "bundle", 1));
+    let b = receipt(&second, "bundle", 1);
     assert_eq!(a.restored_from, None);
     assert_eq!(b.restored_from.as_deref(), Some(a.attempt_id.as_str()));
     assert_ne!(b.attempt_id, a.attempt_id);
