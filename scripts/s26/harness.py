@@ -781,6 +781,11 @@ kill -s CONT "$pid"
 def run():
     checks = Checks()
     try:
+        if repo := os.environ.get("S26_PROJECT_CI"):
+            from project_ci import compare
+            checks.check("A37 Docker project comparison",
+                         lambda: compare(checks, repo, RUN, command, save))
+            return 0 if checks.results[-1]["pass"] else 1
         checks.start()
         checks.check("A02", checks.a02)
         checks.check("A45 (part)", checks.a45)

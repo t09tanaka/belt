@@ -155,3 +155,18 @@ there is no fallback to a fake service or ephemeral worker.
 Authoring validation: Bash syntax, ShellCheck, and Python syntax can run without
 Docker. Real Docker/SSH/systemd acceptance must be run on the host; a sandbox
 that denies the Docker socket cannot establish those results.
+
+## Compare a project's CI on one and multiple workers
+
+On a fresh `up.sh` allocation, set `S26_PROJECT_CI` to the absolute path of a
+trusted local Git checkout and use the normal `run.sh` entry. This mode clones
+its committed HEAD into the private harness directory. It executes that commit's
+CI twice on the local worker, installs w1 and w2, then executes it twice more.
+The project must have independent jobs that can run on both platforms, with
+their tools available in the harness environments.
+
+Use `run/evidence/project-ci.json` to compare elapsed time, placement and
+collection timestamps. The first and repeat measurements on each topology are
+reported separately. The local worker keeps its cache when the other workers
+join. A distributed run must place work on at least two workers and return the
+same job outcomes as the local baseline. Copy the evidence before `down.sh`.
