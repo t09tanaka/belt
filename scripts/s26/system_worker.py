@@ -3,7 +3,7 @@ import json
 from pathlib import PurePosixPath
 
 
-def verify(checks, run, binary, command, save):
+def verify(checks, run, binary, command, save, until):
     config = run / "config/belt/config.toml"
     text = config.read_text().replace("[coordinator]\n", "[coordinator]\nlocal_worker=false\n")
     config.write_text(text + '\n[[workers]]\nid="w1"\nssh="w1"\nservice_mode="system-user"\n')
@@ -37,10 +37,28 @@ def verify(checks, run, binary, command, save):
     owner = root("ps", "-o", "user=", "-p", pid)
     if owner != "belt" or root("systemctl", "is-enabled", unit.name) != "enabled":
         raise RuntimeError(f"system worker is not enabled and running as belt (user={owner})")
+    root("systemctl", "restart", unit.name)
+    new_pid = root("systemctl", "show", "-p", "MainPID", "--value", unit.name)
+    if new_pid == pid or not new_pid.isdigit() or int(new_pid) <= 1:
+        raise RuntimeError("systemd did not start a new worker process")
+    until("restarted system worker connected", lambda:
+          checks.belt("top")["workers"].get("w1") == "connected", 60)
+    probe = command([checks.binary, "--json", "doctor"], env=checks.env, cwd=checks.project,
+                    timeout=180, check=False)
+    report = json.loads(probe.stdout)["result"]
+    worker_checks = {c["id"]: c for c in report["checks"] if c["host"] == "w1"}
+    for required in ("reachable", "service_profile"):
+        if worker_checks.get(required, {}).get("level") != "ok":
+            raise RuntimeError(f"doctor did not validate w1 {required}: {worker_checks.get(required)}")
+    failures = [c for key, c in worker_checks.items()
+                if key != "environment_diff" and c["level"] == "fail"]
+    if failures:
+        raise RuntimeError(f"doctor failed on the system worker: {failures}")
     tasks = checks.submit(1, 1)
     views = checks.finish(tasks)
     if views[tasks[0]]["attempts"]["items"][0]["worker_id"] != "w1":
         raise RuntimeError("system worker did not execute the submitted task")
     save(run / "evidence/system-worker.json",
-         {"unit": str(unit), "user": owner, "tasks": views})
+         {"unit": str(unit), "user": owner, "pid_before": pid, "pid_after": new_pid,
+          "doctor": worker_checks, "tasks": views})
     return f"{unit.name} enabled, serving work as {owner}"

@@ -788,7 +788,7 @@ def run():
         if os.environ.get("S26_SYSTEM_WORKER") == "1":
             from system_worker import verify
             checks.check("A35 Docker system worker",
-                         lambda: verify(checks, RUN, BASE / LINUX_BINARY, command, save))
+                         lambda: verify(checks, RUN, BASE / LINUX_BINARY, command, save, until))
             return 0 if checks.results[-1]["pass"] else 1
         if repo := os.environ.get("S26_PROJECT_CI"):
             from project_ci import compare
