@@ -130,6 +130,14 @@ pub enum CoordinatorError {
 
 type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 
+impl TaskSpec {
+    /// Only the submitting member's own local worker may take it: an
+    /// in-place task (which includes `--local`) or an `exec --local` one.
+    pub fn pinned_local(&self) -> bool {
+        self.in_place || self.local
+    }
+}
+
 /// What a task runs, as it is queued. The payload of each attempt is built
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +156,9 @@ pub struct TaskSpec {
     /// Mutable local workspace; source is a comparison baseline only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_place: bool,
+    /// Placed only on the submitting member's own local worker (`exec --local`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
     #[serde(default)]
     pub setup: Option<crate::wire::SetupSpec>,
     pub plan_digest: PlanDigest,
@@ -2033,7 +2044,7 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let readiness = |w: &Reached| {
-            if spec.in_place && parent_local.as_ref() != Some(&w.worker_id) {
+            if spec.pinned_local() && parent_local.as_ref() != Some(&w.worker_id) {
                 return None;
             }
             match w.link.placement_inputs() {

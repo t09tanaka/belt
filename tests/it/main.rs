@@ -11,6 +11,7 @@ mod bridge;
 mod collection;
 mod config;
 mod coordinator;
+mod direct_exec;
 mod doctor;
 mod forecast;
 mod not_implemented;

@@ -9,7 +9,12 @@ PORTOOL=$(tool portool)
 export S26_FAST_WORKTREE
 S26_FAST_WORKTREE=$(tool fast-worktree)
 : "${S26_BELT:?Set S26_BELT to an absolute path to the native Mac belt binary}"
+case "${1:-}" in
+    "") action=run ;;
+    --a46) action=a46 ;;
+    *) echo "usage: run.sh [--a46]" >&2; exit 2 ;;
+esac
 cd "$S26_BASE/resources"
 "$PORTOOL" sync --quiet
 "$PORTOOL" check
-exec "$TTC" exec -- "$PORTOOL" exec -- python3 "$S26_ROOT/scripts/s26/harness.py" run
+exec "$TTC" exec -- "$PORTOOL" exec -- python3 "$S26_ROOT/scripts/s26/harness.py" "$action"

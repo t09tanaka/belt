@@ -31,6 +31,7 @@ fn spec() -> TaskSpec {
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,
+        local: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
