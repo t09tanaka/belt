@@ -624,16 +624,17 @@ pub fn run(cli: Cli) -> i32 {
             let env = std::env::vars_os()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                 .collect();
-            let cwd = std::env::current_dir()
-                .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-            let context = args
-                .execution
-                .apply(crate::service::context::Context::discover(env, cwd)?);
-            if !crate::service::direct::resident_running(&context.env)? {
+            if !crate::service::direct::resident_running(&env)? {
                 return Err(crate::service::direct::not_running(
                     "submit needs a run, and no resident is running on this host",
                 ));
             }
+            let cwd = std::env::current_dir()
+                .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            let context = args
+                .execution
+                .apply(crate::service::context::Context::discover(env, cwd)?)
+                .require_existing_resident();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -941,7 +942,8 @@ fn run_control(cli: &Cli) -> i32 {
                                 cwd,
                                 spec.clone(),
                                 &overlay,
-                            )?),
+                            )?)
+                            .require_existing_resident(),
                         args.command.clone(),
                         args.git_ref.clone(),
                         crate::service::submit::Mode {

@@ -395,3 +395,18 @@ fn a50_a_worker_without_a_coordinator_prevents_direct_execution() {
         .contains("worker agent"));
     assert!(!cwd.join("ran").exists());
 }
+
+#[test]
+fn a50_uninitialized_submit_explains_how_to_start_a_resident_before_project_preflight() {
+    let fx = Fx::new();
+    let home = fx.path("home");
+    let out = belt(&fx, &home, &["--json", "submit", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("belt init"));
+    assert_eq!(std::fs::read_dir(home).unwrap().count(), 0);
+}
