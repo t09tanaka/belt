@@ -89,6 +89,7 @@ pub struct Created {
 pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<Created> {
     let start = Instant::now();
     let main = install::main_checkout(here)?;
+    crate::retention::run(Some(&main));
     // Relative to the current directory, also for the git commands the
     // pool runs in the main checkout.
     let path = &std::env::current_dir()?.join(path);

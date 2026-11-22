@@ -242,7 +242,7 @@ pub fn ls() -> Result<i32> {
         .collect();
     out!("{}", table(&["REF", "COMMIT", "KEPT (UTC)"], &rows));
     outln!(
-        "{}; `git push --mirror` pushes them too. `fast-worktree kept prune` drops those older than {PRUNE_DAYS} days",
+        "{}; `git push --mirror` pushes them too. Those older than {PRUNE_DAYS} days are dropped automatically (`fast-worktree kept prune` does it at once)",
         count(refs.len())
     );
     Ok(0)
@@ -260,6 +260,17 @@ pub fn prune(older_than_days: Option<u64>) -> Result<i32> {
 /// [`prune`] for the repository at `dir`, without the summary line.
 /// Returns how many refs were pruned and how many could not be.
 pub fn prune_in(dir: &Path, days: u64) -> Result<(usize, usize)> {
+    prune_with(dir, days, true)
+}
+
+/// The same rule, run by the sweep that every `add`, `remove` and library
+/// call makes: nothing is printed. Returns how many refs could not be
+/// deleted.
+pub fn prune_quiet(dir: &Path, days: u64) -> Result<usize> {
+    Ok(prune_with(dir, days, false)?.1)
+}
+
+fn prune_with(dir: &Path, days: u64, say: bool) -> Result<(usize, usize)> {
     let now = now_secs();
     let mut pruned = 0;
     let mut failed = 0;
@@ -272,11 +283,15 @@ pub fn prune_in(dir: &Path, days: u64) -> Result<(usize, usize)> {
         }
         match git::output(dir, &["update-ref", "-d", &r, &o]) {
             Ok(_) => {
-                outln!("pruned {r}");
+                if say {
+                    outln!("pruned {r}");
+                }
                 pruned += 1;
             }
             Err(e) => {
-                errln!("fast-worktree: {e}");
+                if say {
+                    errln!("fast-worktree: {e}");
+                }
                 failed += 1;
             }
         }

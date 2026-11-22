@@ -37,24 +37,14 @@ const STORE_LOCK: &str = ".store.lock";
 
 /// An exclusive `flock` on the [`STORE_LOCK`] of `dir`, held while the
 /// value lives. `None` when it cannot be taken (a file system without
-/// locks), and then nothing waits.
+/// locks), and then nothing waits. The lock file is unlinked together with
+/// an empty project directory ([`remove_if_empty`]), so after taking the
+/// lock it is checked that the path still names the file that was locked,
+/// and otherwise taken again on the new one.
 fn store_lock(dir: &Path) -> Option<fs::File> {
-    use std::os::unix::io::AsRawFd;
-    let f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(STORE_LOCK))
-        .ok()?;
-    loop {
-        // SAFETY: a valid open descriptor; the lock goes when it is closed.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Some(f);
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return None;
-        }
-    }
+    crate::util::lock_path(&dir.join(STORE_LOCK), true, true)
+        .ok()
+        .flatten()
 }
 
 /// Where the "checked" marker of `entry` lives.
@@ -132,7 +122,11 @@ pub fn store(
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    clone::clone_dir(node_modules, &tmp).map_err(|e| e.to_string())?;
+    // A sweep may have removed the directory (it was empty) just now.
+    if clone::clone_dir(node_modules, &tmp).is_err() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        clone::clone_dir(node_modules, &tmp).map_err(|e| e.to_string())?;
+    }
     let _ = fs::remove_dir_all(tmp.join(".cache"));
     touch(&tmp);
     let _lock = store_lock(parent);
@@ -208,26 +202,91 @@ pub fn latest(project_dir: &Path, node_version: &str, except: &Path) -> Option<P
         .map(|(_, p)| p)
 }
 
+/// How old a half-made entry (`<key>.tmp-<pid>-<n>`) must be, with its
+/// owner gone, before it is removed: a run that was killed while cloning
+/// leaves a whole copy of `node_modules`.
+pub const TMP_MIN_AGE: Duration = Duration::from_secs(600);
+
+/// What [`prune`] does to the names in one project directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Plan {
+    /// Entries not used for longer than the time to live.
+    entries: Vec<String>,
+    /// Half-made entries whose run is gone.
+    half_made: Vec<String>,
+}
+
+/// One name in a project directory: whether it is a directory, and how old
+/// it is.
+struct Item {
+    name: String,
+    is_dir: bool,
+    age: Duration,
+}
+
+/// The pid in the name of a half-made entry, `<key>.tmp-<pid>-<n>`.
+fn tmp_owner(name: &str) -> Option<u32> {
+    let (_, rest) = name.rsplit_once(TMP_INFIX)?;
+    let (pid, n) = rest.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether a process with this pid exists. A pid that cannot be one of ours
+/// to ask about (0, 1, or beyond what `kill` takes) counts as alive: it is
+/// never signalled, and what it owns is left alone.
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return true;
+    };
+    if pid <= 1 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What to remove from a project directory holding `items`. An entry goes
+/// when it is older than `ttl`. A half-made entry goes when its owner is
+/// gone (`alive`) and it is at least [`TMP_MIN_AGE`] old, or when it is
+/// older than `ttl` whatever its pid says (the pid may have been reused).
+/// Any other name is left alone.
+fn plan(items: &[Item], ttl: Duration, alive: &dyn Fn(u32) -> bool) -> Plan {
+    let mut p = Plan::default();
+    for i in items.iter().filter(|i| i.is_dir) {
+        if i.name.contains(TMP_INFIX) {
+            let Some(pid) = tmp_owner(&i.name) else {
+                continue;
+            };
+            if i.age > ttl || (i.age >= TMP_MIN_AGE && !alive(pid)) {
+                p.half_made.push(i.name.clone());
+            }
+        } else if is_entry_name(&i.name) && i.age > ttl {
+            p.entries.push(i.name.clone());
+        }
+    }
+    p
+}
+
 /// Remove the entries in `project_dir` not used for longer than `ttl`, with
-/// their markers, and markers left without an entry. Returns the removed
-/// entries.
+/// their markers, markers left without an entry, and the half-made entries
+/// of runs that are gone ([`plan`]); then the directory itself when nothing
+/// else is left in it. Returns the removed entries.
 pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(project_dir) else {
         return Vec::new();
     };
     let now = SystemTime::now();
-    let mut removed = Vec::new();
     let mut markers = Vec::new();
+    let mut items = Vec::new();
     for e in entries.flatten() {
         let Ok(meta) = e.metadata() else { continue };
+        let name = e.file_name().to_string_lossy().into_owned();
         if !meta.is_dir() {
-            let name = e.file_name().to_string_lossy().into_owned();
             if name.ends_with(MARKER_SUFFIX) || name.ends_with(SOURCE_SUFFIX) {
                 markers.push(e.path());
             }
-            continue;
-        }
-        if !is_entry_name(&e.file_name().to_string_lossy()) {
             continue;
         }
         let age = meta
@@ -235,23 +294,64 @@ pub fn prune(project_dir: &Path, ttl: Duration) -> Vec<PathBuf> {
             .ok()
             .and_then(|m| now.duration_since(m).ok())
             .unwrap_or_default();
-        if age > ttl && trash::trash(&e.path()).is_ok() {
-            removed.push(e.path());
+        items.push(Item {
+            name,
+            is_dir: true,
+            age,
+        });
+    }
+    let plan = plan(&items, ttl, &pid_alive);
+    let mut removed = Vec::new();
+    for name in &plan.entries {
+        let path = project_dir.join(name);
+        if trash::trash(&path).is_ok() {
+            removed.push(path);
         }
     }
-    let _lock = (!markers.is_empty()).then(|| store_lock(project_dir));
-    for m in markers {
-        let s = m.to_string_lossy();
-        let entry = Path::new(
-            s.strip_suffix(MARKER_SUFFIX)
-                .or_else(|| s.strip_suffix(SOURCE_SUFFIX))
-                .unwrap_or(&s),
-        );
-        if !entry.is_dir() {
-            let _ = fs::remove_file(&m);
+    for name in &plan.half_made {
+        let _ = trash::trash(&project_dir.join(name));
+    }
+    {
+        let _lock = (!markers.is_empty()).then(|| store_lock(project_dir));
+        for m in markers {
+            let s = m.to_string_lossy();
+            let entry = Path::new(
+                s.strip_suffix(MARKER_SUFFIX)
+                    .or_else(|| s.strip_suffix(SOURCE_SUFFIX))
+                    .unwrap_or(&s),
+            );
+            if !entry.is_dir() {
+                let _ = fs::remove_file(&m);
+            }
         }
     }
+    remove_if_empty(project_dir);
     removed
+}
+
+/// Remove the project directory `dir` when the only thing in it is its
+/// [`STORE_LOCK`]. Done holding that lock; the lock file goes first, and a
+/// run that waits on it takes it again on a new file ([`store_lock`]).
+/// `rmdir` refuses a directory that got something in the meantime.
+fn remove_if_empty(dir: &Path) {
+    let only_lock = |dir: &Path| {
+        fs::read_dir(dir).is_ok_and(|mut d| {
+            d.all(|e| e.is_ok_and(|e| e.file_name().to_string_lossy() == STORE_LOCK))
+        })
+    };
+    // Without the lock first: a directory that holds anything else (the
+    // pool's, say) is not given a lock file here.
+    if !only_lock(dir) {
+        return;
+    }
+    let Some(lock) = store_lock(dir) else { return };
+    if only_lock(dir) && fs::remove_file(dir.join(STORE_LOCK)).is_ok() {
+        // `rmdir` refuses a directory that got something in the meantime.
+        if fs::remove_dir(dir).is_err() {
+            let _ = fs::write(dir.join(STORE_LOCK), b"");
+        }
+    }
+    drop(lock);
 }
 
 /// Set a directory's modification time to now: the cache's "last used".
@@ -376,16 +476,33 @@ pub fn prune_legacy(root: &Path) -> Vec<Legacy> {
         .collect()
 }
 
-/// Remove every entry under `root` not used for longer than `ttl`.
+/// The directories of the repositories under `root`.
+pub fn repo_dirs(root: &Path) -> Vec<PathBuf> {
+    dirs(root)
+        .into_iter()
+        .filter(|(repo, _)| is_repo_name(repo))
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// The project directories of every repository under `root`, including
+/// those with no entry left.
+fn project_dirs(root: &Path) -> Vec<PathBuf> {
+    dirs(root)
+        .into_iter()
+        .filter(|(repo, _)| is_repo_name(repo))
+        .flat_map(|(_, repo_path)| dirs(&repo_path))
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// Remove every entry under `root` not used for longer than `ttl`, and
+/// what [`prune`] removes with them, in every project of every repository,
+/// whether or not it is still installed. Returns the entries removed.
 pub fn prune_all(root: &Path, ttl: Duration) -> Vec<Entry> {
     let entries = list(root);
-    let mut projects: Vec<PathBuf> = entries
-        .iter()
-        .filter_map(|e| e.path.parent().map(Path::to_path_buf))
-        .collect();
-    projects.dedup();
     let mut removed = Vec::new();
-    for p in projects {
+    for p in project_dirs(root) {
         removed.extend(prune(&p, ttl));
     }
     entries
@@ -698,5 +815,112 @@ mod tests {
         let dt = |s: u64| datetime(UNIX_EPOCH + Duration::from_secs(s));
         assert_eq!(dt(1_709_251_199), "2024-02-29 23:59");
         assert_eq!(dt(0), "1970-01-01 00:00");
+    }
+
+    fn item(name: &str, is_dir: bool, age_secs: u64) -> Item {
+        Item {
+            name: name.to_string(),
+            is_dir,
+            age: Duration::from_secs(age_secs),
+        }
+    }
+
+    #[test]
+    fn plan_removes_an_entry_only_past_the_ttl() {
+        let ttl = Duration::from_secs(1_000);
+        let items = [
+            item("aaaa-v20", true, 1_000),
+            item("bbbb-v20", true, 1_001),
+            item("cccc-v20", false, 5_000),
+            item("wt-1-1-0", true, 5_000),
+            item(".hidden", true, 5_000),
+        ];
+        let p = plan(&items, ttl, &|_| true);
+        assert_eq!(p.entries, vec!["bbbb-v20".to_string()]);
+        assert!(p.half_made.is_empty());
+    }
+
+    #[test]
+    fn plan_removes_a_half_made_entry_when_its_owner_is_gone_and_it_is_old() {
+        let ttl = Duration::from_secs(7 * 86_400);
+        let min = TMP_MIN_AGE.as_secs();
+        let dead = |_: u32| false;
+        let alive = |_: u32| true;
+        let name = "aaaa-v20.tmp-42-3";
+        let removes = |age: u64, a: &dyn Fn(u32) -> bool| {
+            !plan(&[item(name, true, age)], ttl, a).half_made.is_empty()
+        };
+        assert!(!removes(min - 1, &dead), "too young");
+        assert!(removes(min, &dead), "exactly the minimum age");
+        assert!(!removes(min, &alive), "its owner is alive");
+        assert!(!removes(7 * 86_400, &alive), "alive, at the ttl exactly");
+        assert!(
+            removes(7 * 86_400 + 1, &alive),
+            "a reused pid cannot keep it"
+        );
+        // Names that are not ours are left alone.
+        for n in ["aaaa-v20.tmp-x-3", "aaaa-v20.tmp-42", "aaaa-v20.tmp-42-x"] {
+            assert!(plan(&[item(n, true, u64::MAX / 4)], ttl, &dead)
+                .half_made
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn the_owner_of_a_half_made_entry_is_read_from_its_name() {
+        assert_eq!(tmp_owner("k-v20.tmp-123-4"), Some(123));
+        assert_eq!(tmp_owner("k.tmp-1.tmp-77-0"), Some(77));
+        assert_eq!(tmp_owner("k-v20"), None);
+    }
+
+    #[test]
+    fn pids_that_are_not_ours_to_ask_about_count_as_alive() {
+        assert!(pid_alive(0) && pid_alive(1) && pid_alive(u32::MAX));
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(2_000_000_000));
+    }
+
+    #[test]
+    fn prune_removes_half_made_entries_and_then_the_empty_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let proj = t.path().join("repo/app");
+        fs::create_dir_all(proj.join("k-v20.tmp-2000000000-0")).unwrap();
+        fs::write(proj.join(STORE_LOCK), "").unwrap();
+        // Too young: stays, and the directory with it.
+        assert!(prune(&proj, Duration::from_secs(86_400)).is_empty());
+        assert!(proj.join("k-v20.tmp-2000000000-0").is_dir());
+        assert!(proj.is_dir());
+    }
+
+    #[test]
+    fn an_empty_project_directory_goes_with_its_lock_and_a_waiter_locks_the_new_file() {
+        let t = tempfile::tempdir().unwrap();
+        let proj = t.path().join("repo/app");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join(STORE_LOCK), "").unwrap();
+        remove_if_empty(&proj);
+        assert!(!proj.exists());
+        // A directory with anything else in it stays, with no lock added.
+        let other = t.path().join("repo/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("fill.lock"), "").unwrap();
+        remove_if_empty(&other);
+        assert!(other.join("fill.lock").is_file() && !other.join(STORE_LOCK).exists());
+        // Taking the lock of a directory that is gone makes it again.
+        let lock = store_lock(&proj).expect("a lock");
+        assert!(proj.join(STORE_LOCK).is_file());
+        drop(lock);
+        // A lock taken on a file that was unlinked in the meantime is
+        // given up for the new one.
+        let first = store_lock(&proj).unwrap();
+        let waiter = {
+            let proj = proj.clone();
+            std::thread::spawn(move || store_lock(&proj).is_some())
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        fs::remove_file(proj.join(STORE_LOCK)).unwrap();
+        drop(first);
+        assert!(waiter.join().unwrap());
+        assert!(proj.join(STORE_LOCK).is_file());
     }
 }

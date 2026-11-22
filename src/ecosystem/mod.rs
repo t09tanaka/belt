@@ -21,7 +21,6 @@ use crate::paths::hex;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -427,28 +426,12 @@ pub struct LifecycleLock {
 /// not waited for.
 pub fn lifecycle_lock(cache_repo: &Path) -> LifecycleLock {
     let start = Instant::now();
-    let file = fs::create_dir_all(cache_repo).and_then(|()| {
-        fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(cache_repo.join(LIFECYCLE_LOCK))
-    });
-    let held = |file| LifecycleLock {
+    let file = crate::util::lock_path(&cache_repo.join(LIFECYCLE_LOCK), true, true)
+        .ok()
+        .flatten();
+    LifecycleLock {
         _file: file,
         waited: start.elapsed(),
-    };
-    let Ok(f) = file else {
-        return held(None);
-    };
-    loop {
-        // SAFETY: a valid open descriptor; the lock goes when it is closed.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return held(Some(f));
-        }
-        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return held(None);
-        }
     }
 }
 

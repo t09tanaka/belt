@@ -82,7 +82,16 @@ fn move_away(path: &Path, name: &str) -> io::Result<PathBuf> {
     let dest = match fs::create_dir_all(&dir) {
         Ok(()) => {
             let d = dir.join(name);
-            match fs::rename(path, &d) {
+            let moved = fs::rename(path, &d).or_else(|e| {
+                // The trash was empty and a sweep removed it just now.
+                if e.kind() == io::ErrorKind::NotFound && path.exists() {
+                    fs::create_dir_all(&dir)?;
+                    fs::rename(path, &d)
+                } else {
+                    Err(e)
+                }
+            });
+            match moved {
                 Ok(()) => Some(d),
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => None,
                 Err(e) => return Err(e),
@@ -187,6 +196,28 @@ fn spawn_detached(mut cmd: Command) -> io::Result<std::process::Child> {
 pub fn sweep() {
     for p in stale(&paths::trash_dir(), now_secs()) {
         spawn_rm(&p);
+    }
+}
+
+/// Remove the trash directory when nothing is in it but its `.lock` (and
+/// it had not been changed for a minute: a removal that has just made it
+/// is about to put something in it). The `.lock` is the deleters' queue
+/// (`lockf`); one that waits on it while it goes only loses its place in
+/// the queue.
+pub fn remove_if_empty() {
+    let dir = paths::trash_dir();
+    let idle = fs::metadata(&dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .is_some_and(|age| age.as_secs() >= 60);
+    let only_lock = fs::read_dir(&dir).is_ok_and(|d| {
+        d.flatten()
+            .all(|e| e.file_name().to_string_lossy() == ".lock")
+    });
+    if idle && only_lock {
+        let _ = fs::remove_file(dir.join(".lock"));
+        let _ = fs::remove_dir(&dir);
     }
 }
 

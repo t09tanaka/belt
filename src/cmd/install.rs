@@ -4,7 +4,7 @@ use crate::ecosystem::{target, Ctx, Mode, Report, Target};
 use crate::error::{bail, Result};
 use crate::hooks::{self, Config, Stage};
 use crate::util::outln;
-use crate::{git, paths, pending, trash, util};
+use crate::{git, paths, pending, util};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -134,7 +134,7 @@ pub fn install_projects(
     cfg: &Config,
     mode: Mode,
 ) -> Result<Vec<std::result::Result<Report, String>>> {
-    trash::sweep();
+    crate::retention::run(None);
     let ctx = context(root, cfg)?;
     let mut results: Vec<Option<std::result::Result<Report, String>>> = vec![None; projects.len()];
     for phase in [true, false] {

@@ -1076,10 +1076,12 @@ worktree (or with `discard_changes`), so it always deletes it:
     kept worktree, fetched into the main repository first (if that fails,
     it says so).
 
-  The refs are named in the output. They stay until you delete them:
-  `fast-worktree kept ls` lists them and `fast-worktree kept prune
-  [--older-than <days>]` deletes the old ones (default: 30 days; `git
-  update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
+  The refs are named in the output. Those older than 30 days are deleted
+  by the next `add`, `remove`, `hook remove` or library call in that
+  repository (at most once an hour; see [What is deleted by
+  itself](#what-is-deleted-by-itself)); `fast-worktree kept ls` lists them
+  and `fast-worktree kept prune [--older-than <days>]` deletes the old ones
+  at once (default: 30 days; `git update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
   branch, but `git push --mirror` pushes every ref, these included.
 - Claude Code never deletes the branch of a worktree a hook created. `hook
   remove` deletes `worktree-<name>` only when its commit is on its
@@ -1117,7 +1119,7 @@ deleted branch worktree-demo
 fast-worktree: it had uncommitted changes; it is kept in ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo for at least 24 hours
 to restore them: git -C ~/monorepo worktree add ~/monorepo/.claude/worktrees/demo refs/fast-worktree/kept/demo-20261026-130311/head && rsync -a --exclude=/.git ~/Library/Caches/fast-worktree/trash/keep-1793106191-1793019791-61112-0116067000-demo/ ~/monorepo/.claude/worktrees/demo/
 fast-worktree: its HEAD 50c46ff4cb8f is kept as refs/fast-worktree/kept/demo-20261026-130311/head
-fast-worktree: `fast-worktree kept ls` lists such refs, `fast-worktree kept prune` drops those older than 30 days
+fast-worktree: `fast-worktree kept ls` lists such refs, they are deleted by themselves after 30 days (`fast-worktree kept prune` does it at once)
 ```
 
 `worktree-demo` was deleted because its commit is on `origin/main`. A
@@ -1145,7 +1147,9 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
   `<repo>-<hash>/<path, with / as __>/<key files sha256, 16 digits>-<key
   commands' output sha256, 8 digits>`, and `<entry>.src` records the
   worktree an entry was made in, for `rewrite_paths`.
-  Entries unused for 7 days are removed; `cache prune` does it on demand.
+  Entries unused for 7 days are removed, in every project of every
+  repository, whether or not it is installed again; `cache prune` does it
+  on demand (see [What is deleted by itself](#what-is-deleted-by-itself)).
   Clones share blocks with their source, so the cache costs almost no disk
   while worktrees made from it exist.
 - `node_modules/.fast-worktree-key`, `.dart_tool/fast-worktree-key` and,
@@ -1156,20 +1160,56 @@ fast-worktree: kept branch worktree-work: commit 21f7c601e324 is not on its upst
 - Trash: `<cache>/trash`. When the trash is on another volume than the
   directory being deleted, that directory is renamed to a hidden
   `.fast-worktree-trash-*` sibling instead, and a note in the trash records
-  where. Each run deletes again whatever an interrupted background deletion
-  left in the trash or in a sibling it has a note for. Entries named
+  where. Every `add`, `remove`, `install`, `pool fill` and library call
+  deletes again whatever an interrupted background deletion left in the
+  trash or in a sibling it has a note for. Entries named
   `keep-<unix time>-...`
   (worktrees `hook remove` kept) are left alone until that time.
 - `refs/fast-worktree/kept/*` in the repository: commits `hook remove`
-  kept (above); `kept ls` and `kept prune` manage them. `git push --mirror`
-  pushes them.
+  kept (above); `kept ls` and `kept prune` list and delete them. `git push
+  --mirror` pushes them.
 - Pool: `<cache>/<repo>-<hash>/pool`, with one directory per spare
   (`wt-<unix time>-<pid>-<n>`), `fill.log`, `fill.lock` and `misses` (one
-  line per `add` that found no spare).
+  line per `add` that found no spare, the last 7 days).
 - The background install of `hook create` keeps its marker
   (`fast-worktree-installing`), lock, log and result in the worktree's own git
   directory (`.git/worktrees/<name>/` of the repository), not in the
   worktree, where `git status` would show them.
+
+## What is deleted by itself
+
+Nothing that fast-worktree keeps after a command has ended is kept for ever,
+and no command has to be run to clean up. The rules run from the commands
+that write to the same place (`add`, `remove`, `hook remove`, `install`,
+`pool fill`, and the library calls that do the same), not from a daemon.
+Things are deleted at the moment they stop being needed where that moment is
+known; the walk over everything is made at most once an hour, by whichever
+command comes first (the cache walk is stamped in
+`<cache>/.retention-stamp`, a repository's kept refs in
+`<cache>/<repo>-<hash>/.retention-stamp`). A sweep never fails the command
+that made it. `cache prune`, `kept prune` and `pool clear` apply the same
+rules at once.
+
+| What | Where | Kept | Deleted by |
+|---|---|---|---|
+| Cache entry, with its `.ok` and `.src` | `<cache>/<repo>/<project>/<key>` | until unused for 7 days (its modification time is its last use, set when it is cloned); the next install clones from it | the hourly walk (every project of every repository), `install` of that project, `cache prune` |
+| Half-made entry `<key>.tmp-<pid>-<n>` | the project directory | until its run is gone (the pid is not alive) and it is 10 minutes old, or 7 days old whatever the pid | the same |
+| Project directory and its `.store.lock` | `<cache>/<repo>/<project>` | until its last entry goes | with its last entry |
+| Repository directory, `lifecycle.lock`, stamp | `<cache>/<repo>` | until nothing is in it but those | the hourly walk |
+| Pool spare | `<cache>/<repo>/pool` | until used (the configured size at most) | `add`, `pool refresh`, `pool clear` |
+| Pool `.new-*`, `.claimed-*`, `.no-hooks-*` | the pool | until the fill that made them, or the `add` that took them, is gone | the start of the next `pool fill`, the hourly walk, `pool clear` |
+| `pool/misses` | the pool | the last 7 days: `pool status` shows how often an `add` found no spare | trimmed by each `add` that adds to it, and by the walk |
+| `pool/fill.log` | the pool | 7 days after the last fill wrote to it; started afresh when it passes 1 MiB | the walk |
+| Pool directory, `fill.lock` | `<cache>/<repo>/pool` | until nothing is in it but the lock | the hourly walk |
+| Trash | `<cache>/trash` | deleted at once in the background; a leftover of a killed deleter after 10 minutes, a `keep-` entry (a worktree `hook remove` kept) for 24 hours | any command above that sweeps: the trash is emptied by the next fast-worktree command after those times |
+| Trash directory and its `.lock` | `<cache>/trash` | until nothing is in it | the hourly walk |
+| Kept refs | `refs/fast-worktree/kept/*` of the repository | 30 days (the date in the ref's name; `kept prune` has always dropped them by age alone) | the hourly walk of that repository, `kept prune` |
+| Registration lock | `<git dir>/fast-worktree-registration.lock` | while a worktree is being registered | the end of that operation |
+
+The cache directory itself and its `.retention-stamp` stay: the stamp is what
+keeps the walk to once an hour. Lock files are unlinked with the directory or
+operation that owns them; everyone that takes one checks, after locking it,
+that the path still names the file it locked, and takes the new one if not.
 
 ## What is safe to clone
 
@@ -1270,7 +1310,11 @@ let cfg = repo.config()?;
   refuses a dirty worktree) or `hook remove` (`RemoveMode::Discard`, which
   keeps what has changes in the trash for a day and its `HEAD` in
   `refs/fast-worktree/kept/`). `kept_refs`, `prune_kept_refs` and
-  `sweep_trash` manage what removals leave.
+  `sweep_trash` manage what removals leave. A program that creates and
+  removes worktrees through these calls need call nothing else to keep the
+  state bounded: they make the same sweeps as the commands (see [What is
+  deleted by itself](#what-is-deleted-by-itself)); `sweep_trash` runs the
+  trash and cache part alone.
 - `Repository::fill_pool` fills the pool in the calling thread. After a
   worktree is created, the command refills the pool in the background with
   `fast-worktree pool fill`; the library does so with the `fast-worktree`

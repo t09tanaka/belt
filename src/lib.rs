@@ -103,6 +103,7 @@ mod include;
 mod paths;
 mod pending;
 mod pool;
+mod retention;
 mod submodules;
 mod trash;
 mod util;
@@ -660,9 +661,17 @@ impl Repository {
 
 /// Finish deleting what earlier removals left in the trash, and expire what
 /// was kept for a day and is due, as every removal does before it moves its
-/// own worktree. Cheap when the trash is empty.
+/// own worktree; and, at most once an hour, remove from the dependency
+/// cache what is unused for 7 days, half made by a killed run, or empty, in
+/// every project of every repository. Cheap when there is nothing to do.
 /// Sets a process-global embedded flag that is never reset.
+///
+/// [`Repository::create_worktree`], [`Repository::remove_worktree`] and
+/// [`Repository::fill_pool`] make this sweep themselves, and, for their
+/// repository, also delete its kept refs older than 30 days and sweep its
+/// pool, so a program that calls them need call nothing else; call this
+/// from a maintenance job only when it may go long without any of them.
 pub fn sweep_trash() {
     util::set_embedded();
-    trash::sweep();
+    retention::run(None);
 }

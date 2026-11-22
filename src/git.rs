@@ -1,8 +1,7 @@
 //! Thin wrappers around the `git` CLI.
 
 use crate::error::{bail, Error, Kind, Result};
-use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -93,28 +92,31 @@ fn registration_lock(dir: &Path) -> Result<RegistrationLock> {
     ))
 }
 
+const REGISTRATION_LOCK: &str = "fast-worktree-registration.lock";
+
+impl Drop for RegistrationLock {
+    /// The lock file is not kept: it goes with the lock, and whoever
+    /// waited on it takes the next one on a new file
+    /// ([`crate::util::lock_path`]).
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.key.join(REGISTRATION_LOCK));
+    }
+}
+
 fn lock_common(common: &Path) -> Result<RegistrationLock> {
     let key = common.canonicalize()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(key.join("fast-worktree-registration.lock"))?;
-    // SAFETY: a valid descriptor; closing it releases the process-shared lock.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(error.into());
+    let path = key.join(REGISTRATION_LOCK);
+    let file = match crate::util::lock_path(&path, false, false)? {
+        Some(f) => f,
+        None => {
+            if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
+                bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
+            }
+            // A separate operation waits; only inherited same-repository reentry
+            // fails. The marker is never permission to access incomplete metadata.
+            crate::util::lock_path(&path, true, false)?.ok_or_else(|| Error::msg("lock"))?
         }
-        if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
-            bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
-        }
-        // A separate operation waits; only inherited same-repository reentry
-        // fails. The marker is never permission to access incomplete metadata.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
+    };
     Ok(RegistrationLock { _file: file, key })
 }
 

@@ -382,7 +382,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
             "{e}; the worktree is still there and still registered"
         ))
     })?;
-    trash::sweep();
+    crate::retention::run(Some(&main));
     let moved = if keep {
         trash::keep(&path, KEEP_SECS)
     } else {
@@ -509,7 +509,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
     if kept_ref.is_some() || !sub_refs.is_empty() {
         errln!(
             "fast-worktree: `fast-worktree kept ls` lists such refs, \
-             `fast-worktree kept prune` drops those older than {} days",
+             they are deleted by themselves after {} days (`fast-worktree kept prune` does it at once)",
             kept::PRUNE_DAYS
         );
     }

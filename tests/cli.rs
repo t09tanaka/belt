@@ -525,7 +525,7 @@ fn a_lockfile_at_the_repository_root_is_a_project() {
         let from_cache = fs::read_dir(&w.cache)
             .unwrap()
             .flatten()
-            .find(|e| e.file_name() != "trash")
+            .find(|e| e.file_name() != "trash" && e.path().is_dir())
             .unwrap()
             .path();
         assert!(
@@ -1012,7 +1012,7 @@ impl World {
             .into_iter()
             .flatten()
             .flatten()
-            .find(|e| e.file_name() != "trash")
+            .find(|e| e.file_name() != "trash" && e.path().is_dir())
         else {
             return Vec::new();
         };
@@ -4164,7 +4164,7 @@ impl World {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_name() != "trash")
+            .filter(|e| e.file_name() != "trash" && e.path().is_dir())
             .flat_map(|repo| {
                 fs::read_dir(repo.path().join(slug))
                     .into_iter()

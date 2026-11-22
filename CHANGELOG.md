@@ -5,6 +5,40 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [Unreleased]
+
+### Changed
+
+- Nothing fast-worktree keeps is kept without bound, and no command has to
+  be run to clean up: `add`, `remove`, `hook remove`, `install`, `pool fill`
+  and the library calls that do the same delete what is old, from the
+  places they write to (see "What is deleted by itself" in the README).
+  - Kept refs under `refs/fast-worktree/kept/` older than 30 days (what `kept
+    prune` already dropped) are deleted by the next of those commands in the
+    repository, at most once an hour.
+  - Cache entries unused for 7 days are deleted in every project of every
+    repository, not only in the project that is installed again; a
+    half-made entry (`<key>.tmp-<pid>-<n>`) of a run that is gone is
+    deleted; a project directory goes with its last entry.
+  - A pool's `.new-*`, `.claimed-*` and `.no-hooks-*` leftovers of killed
+    runs are deleted by the next `pool fill` (no more waiting for `pool
+    clear`); `pool/misses` keeps the last 7 days; `fill.log` goes 7 days
+    after the last fill wrote to it.
+  - The directories and lock files fast-worktree makes (`.store.lock`,
+    `lifecycle.lock`, `fill.lock`, the registration lock in `.git`, the
+    trash's `.lock`) are removed when nothing else is in their directory,
+    or, for the registration lock, when the operation ends; everyone that
+    takes such a lock checks after locking that the path still names the
+    file it locked.
+  - `add`, `install` and `pool fill` also finish deleting the trash, as
+    `remove` did.
+- `sweep_trash` also walks the cache (at most once an hour). The library
+  calls `create_worktree`, `remove_worktree` and `fill_pool` make the
+  sweeps themselves; no new function is needed.
+- `pool clear` removes the leftovers of killed runs at once, not only those
+  an hour old, but not while a fill is running or the process that claimed
+  a spare is alive.
+
 ## [0.6.0] - 2026-11-21
 
 ### Added
