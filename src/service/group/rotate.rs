@@ -159,6 +159,7 @@ fn switch(spec: &Spec, generation: &Generation) -> Result<(), ApiError> {
             "requested next key is missing; rerun distribution",
         ));
     }
+    crate::service::init::finish_key_change(spec).map_err(internal)?;
     store(spec)?
         .observe_group_key(&generation.fingerprint)
         .map_err(internal)?;

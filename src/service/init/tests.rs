@@ -1306,6 +1306,14 @@ async fn a_crash_during_managed_key_rotation_accepts_only_the_recorded_files() {
     managed_journal(&j.spec).unwrap();
     fs::rename(staged, &paths.key).unwrap();
     managed_journal(&j.spec).unwrap();
+    finish_key_change(&j.spec).unwrap();
+    let disk = fs::read_to_string(&paths.journal).unwrap();
+    assert!(!disk.contains("switching_key"));
+    read_raw_journal(&paths.journal)
+        .unwrap()
+        .files
+        .iter()
+        .for_each(|p| p.verify().unwrap());
     let bytes = fs::read(&paths.key).unwrap();
     let mut replacement = tempfile::NamedTempFile::new_in(&paths.config).unwrap();
     replacement.write_all(&bytes).unwrap();

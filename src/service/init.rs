@@ -229,13 +229,16 @@ impl Journal {
         }
     }
 }
-fn read_journal(path: &Path) -> anyhow::Result<Journal> {
+fn read_raw_journal(path: &Path) -> anyhow::Result<Journal> {
     let mut bytes = Vec::new();
     resident::secure_file(path, false)?
         .take(LIMIT + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
-    let mut journal: Journal = serde_json::from_slice(&bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn read_journal(path: &Path) -> anyhow::Result<Journal> {
+    let mut journal = read_raw_journal(path)?;
     if let Some(next) = &journal.switching_key {
         ensure!(
             next.path == journal.spec.cluster_key_path,
@@ -1476,7 +1479,7 @@ mod tests;
 
 mod key_change;
 mod membership_undo;
-pub(crate) use key_change::install_key;
+pub(crate) use key_change::{finish_key_change, install_key};
 mod takeover;
 pub mod upgrade;
 
