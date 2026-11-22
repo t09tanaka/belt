@@ -145,6 +145,8 @@ belt workers forget colab-1
 belt estimate --json -- pnpm test
 ```
 
+`belt workers` は登録したworkerを1行ずつ出す。形式は `id  ssh  ephemeral|persistent  connection  identity|-` とし、列は空白2つで区切る。`connection` は `connected`・`disconnected`・`unknown` のどれかで、residentが実際に観測できたときだけ前の2つになり、residentが動いていないとき、または観測できなかったときは `unknown` とする。`identity` は観測した現在のidentityで、無ければ `-` とする。登録が1つも無いときは `no registered workers` と出す。`--json` は `workers` の配列に `id`・`ssh`・`ephemeral`・`connection`・`identity` を入れる。residentが動いていなくても登録の一覧は出せる。
+
 相手のマシンは他のメンバーの仕事も受け、自分でも投入する（第24章）。`drain`・`resume` はそのworker全体に働く。`stop` はそのマシンのresident（両方の役割）を止める操作なので、相手が他のメンバーの仕事か、自分で投げた非terminalのrunを持つときは、理由を示して断る。`stop --all-submitters` を明示したときだけ、drainの後に止める（そのマシンが投げたrunは、process停止と同じ扱いになる。24.6）。`stop --cancel-running` も同じ条件で `--all-submitters` を要する。`start` はresidentを起動し、両方の役割が戻る。`forget` は、一時workerのほか、鍵の更新で外したメンバーにも使える（24.2）。
 
 `drain` は新規配置を止め、受理済みの仕事は完了させる。通常の `stop` はdrainして終了を待ってから停止する。即時停止は `stop --cancel-running` で明示し、停止確認まで追跡する。到達不能なら停止済みにはしない。`upgrade` は `workers upgrade <worker> --binary <path>` で、親とOS・archの違うworker向けのbuildを指定できる。`diff`／`sync` は第22章で定める。`forget` は、到達できなくなった一時workerの消滅を利用者が宣言する操作で、第15章で定める。一時workerは `workers add <worker> --ssh <dest> --ephemeral` で登録する。
@@ -267,7 +269,7 @@ liveness設定は、heartbeat < lease、stale ≥ heartbeat × 2、lease > stale
 
 workerが申告する能力には、OS・arch・実行user・有効なprofile、tool version、Docker実行可否、利用可能disk、資源予算、protocol、feature flagsを含める。profileは実行PATH、shell、必要tool、許可するenv・secret参照、cache条件を定義し、内容のdigestで識別する。ラベルだけで実際のtool検査を代用しない。
 
-配置前に能力を絞る。候補がないときは `blocked: no_compatible_worker` とし、不足能力を表示する。同じリポジトリであってもarm64用の依存cacheをx86_64で使わない。Rosetta等の別実行環境は別profileとする。自動導入で解消できる不足は、第22章の手順で導入してから候補に含める。
+配置前に能力を絞る。候補がないときは `blocked: no_compatible_worker` とし、不足能力を表示する。ただし、提出時に版を測れないtoolの要求は、配置の前に `environment_mismatch` で拒否する（22.1）。同じリポジトリであってもarm64用の依存cacheをx86_64で使わない。Rosetta等の別実行環境は別profileとする。自動導入で解消できる不足は、第22章の手順で導入してから候補に含める。
 
 ## 5.1 worker-local profile と generic requirements の実行契約
 
@@ -379,6 +381,16 @@ Shardの結果は `job_id / shard_id / test_identity` で集約し、assertion�
 
 beltの親の実装（S18）: split済みのShardGroupを持つFrozenPlanのShardを、依存を持たないtaskとして並べて配置する。全Shardが終わると `local_ci::complete::aggregate_shard_group` とoutputの一致でJobのoutcomeを1つ作り、後続taskのinputsにはそれだけを渡す（Shardの順で作り、到着順は使わない）。receiptはtaskとJobの名前が合うものだけを数える。全Shardが成功でも、欠落・重複・不一致が有ればJobはfailureになる。`fail_fast` のShardGroupでは、失敗したShardを見つけた進行のpassが、終わっていないShardのcancelを1回だけ要求する（未配置は理由付きのcancel、配置済みは対象attemptと理由を `ci_fail_fast_requested` に記録し、coordinatorがcancelを届ける）。retryは既存の `retry` で、成功したShardのattemptと結果を残し、それ以外だけを新attemptにする。retry対象の後続taskは再び保留し、親Jobの新しい集約結果をneedsに渡してから配置する。run単位のretryでは成功済みの後続taskも保持する。fail-fastで一度も配置されないままcancelされたShardはattemptを持たないが、retryの対象とし、cancelを外してqueueへ戻す。Jobのoutcomeは集約した時点でShardの行に残し、runの結果はこれを読む。集約前のrunは確定せず、集約がfailureならattemptが全部成功でもrunは失敗（exit code 1）になる。`ci`・`wait`・`show`・statusは同じ結果を読む。task単位の結果（`wait <task>` など）はShard自身のattemptの結果で、Jobの集約を待たず、集約のfailureも反映しない。runの失敗の原因は、fail-fastで止められただけのShardではなく実際に失敗したtaskとする。単独でcancelされた別Jobのtaskも原因にせず、止められたShardやそのtaskのIDが先に並んでも、runは失敗したShardのexit codeを返す。run全体をユーザーがcancelし、そのcancelがまだ終わっていないShardを止めた場合は、Shardのreceiptに失敗したtestが有っても（attemptが失敗でも成功でも）、Jobの集約がfailureになっても、taskのIDの並びに関わらずrunはcancelled（exit code 130）で終わる。fail-fastが残りを止めてrunが失敗で確定した後に届いたcancelは、結果を変えない（cancelの要求時刻をrunのcancelの時刻と比べる。同じミリ秒ならrunのcancelが止めたものとして扱う）。completionの `cancel_requested`、最初の失敗、exit codeは同じ結果を示す。retryは、attemptが成功でも単独で通過と言えないShard（receipt無し、testの失敗、渡されたtestの報告の過不足）をやり直す。この印はretryがrunの全taskを読み終えてからJobのoutcomeと一緒に外すので、taskの数が走査の1ページを超えても同じShardを選ぶ。`ci` はShardごとの行とJobの行を出す。複数の実行枠がある場合、本番の `ci` は候補Jobの通常taskを保留し、`ci_discovery_v1` を交渉したworkerでsetup・runner version確認・列挙を行う。`needs` を持つJobの探索には、上流Jobの集約後に得たoutputを渡す。親は列挙結果と元planの対応を検証し、同じsnapshotを参照する確定済みの分割を永続化する。列挙不能、または応答した候補workerがすべて探索機能に非対応なら元のJobを実行する。matrixを含むrunでは、SDKの再生可能なjournalを開始する前に、独立したJobの列挙結果を確定する。確定したShardの実行workerは、setup後の実行ディレクトリでrunner versionを再照合する。不一致・取得失敗時はテストを開始せず、stepログに理由を残して失敗させる。`ci plan --run <run-id>` は保存済みplanの分割と件数を示す。
 
+fail-fastで、すでに動いているShardを止めたときは、止める理由（`ci.unrunnable`）をそのtaskのspecに、cancelの要求と同じtransactionで残す。理由は `show <run>` のtaskの `unrunnable` に出る。配置前にcancelしたShardと同じ形である。retryでtaskを開き直すと、理由は消える。止める要求を出した直後にそのShardが成功した場合も、理由は残る（既知の制限）。
+
+retryは、失敗したJobだけでなく、その失敗のために `skipped` になった後続のJobも開き直す（runのretryでも同じ）。規則は次のとおりとする。
+- 後続のtaskが、stepを1つも実行せずに終わっていた（Jobがすべて `skipped`）ときは、入力にした結果が古くなるので、そのtaskを開き直す（generationを上げて保留にする）。進行が、新しい結果で走らせるか、改めて決める。そのtaskを必要とする後続も同じ見方でたどる。
+- 後続のtaskが、始まる前に系によってcancelされていた（`ci.unrunnable` の理由が付いている）ときも、開き直して保留に戻す。利用者がcancelしたtaskは、cancelのままにする。
+- 後続のtaskが実際に走っていた（実行中、またはstepを実行して終わった）ときは、Job 1つだけのretryを拒否する。入力が古くなるためで、エラーの文言で、その後続taskも含めるか、runのretryにするよう案内する。runのretryでは、走ったtaskは残す。
+- 結果を読めない後続taskは、走っていないと言い切れないので、走ったものと同じに扱う（Job 1つのretryは拒否し、runのretryでは残す）。
+- 開き直したtaskは、retryの `task_count` に数える。
+- discoveryで適用したtaskと、動的に生まれたtaskは、この対象にしない。Shardの開き直しは、方針がretryを許すときだけ行い、許さないときはretryを拒否する。
+
 履歴はプロジェクト、workflow、Job、作業ディレクトリ、runner versionと実行設定で区別する。成功かつ全テストを確認できたShardのreceiptから、実行workerと各テストの実測ミリ秒を保存する。同一テストを複数workerで実行した観測があれば実行時間の比の中央値を使い、基準workerでの時間に正規化してから分割する。分割時に想定したworkerは配置比較の最終同点で優先する。転送時間と繰り返すsetupの実測下限を固定費に使う。ブラウザーrunnerでは、対象Jobの隔離宣言と明示的なretry許可をcaptured configから読む。coverageを安全に統合できないJobは単一taskになる。coverageとJUnitの集約の範囲は次のとおりとする。assertion数の集約は未実装。
 
 - **coverage**: 分割したJobで、Shardがcoverageを出す場合、親はShardGroupの集約（`aggregate_shard_group`）と同じ時点で、local-ciが公開するrunner対応のmergeを呼んで1つに合算し、Jobのcoverageとして後続のinputsと `outputs` に渡す。形式はlocal-ciのrunner adapterが定める。1つのShardでもcoverageが欠けている、またはmergeが失敗した場合は、全Shardが成功でもJobをfailureにする。mergeを持たないrunnerのJobは分割しない（上記）。
@@ -412,6 +424,8 @@ supervisorは、coreがstepの外で作業している間（workspaceの照合�
 cancelした理由は、`show`・`ls` のtaskの `unrunnable`、`logs` のそのtaskのstatus（`reason`。followの途中でcancelされた場合も、理由が付いたstatusをもう一度出す）、`ci` のJobごとの結果（`reason`、textでは `no_result (理由)`）に出す。
 
 workerがFrozenPlanを受け取らなかった場合（保持できるplanの件数・合計bytesの上限、途中のfileの上限に達していて `blob_put` を断った。workerがerrorを答えた場合に限り、接続の失敗は含めない）は、そのworkerではrunの入力がreadyにならない。親はそのworkerを、runのtaskの配置から理由付きで外す（`input_refused`、理由は `unmet`）。ほかのworkerがplanを受け取っていれば、そこへ配置する。外したことは配置の判断に残り、どのworkerにも配置できない間は `task_waiting` に残るので、`show` のtaskの `placement` と、`logs` のそのtaskのstatus（`placement`。followの途中で変わったらもう一度出す）に出る。runにはevent `ci_plan_refused`（`worker`、`reason`）を、接続ごと・理由ごとに1回残す。配送は同じworkerへ繰り返し試し、workerが受け取った時点（GCで空きができた後など）で除外は終わる。workerが別のboot・agent epochになったときも終わる。この除外は一時的なもので、`worker_cannot_run` の記録は作らず、`blocked_reason` も付けない。
+
+CI taskの入力（sourceとFrozenPlan）をworkerへ届けるたび、配送が成功した場合に、親はrunのeventとして `ci_input_delivered` を記録する（payload: `worker`、`source_was_ready`、`source_ms`、`plan_ms`）。配送が失敗したとき、配送の途中で停止を受けたとき、試行用（trial）の状態では書かない。eventの書き込みに失敗した場合は、`event ci_input_delivered not written: <原因>` の1行をstderrに出す。書き込みの失敗は配送の成否に影響しない。
 
 進行の状態は親のprocessに持たない。runのtaskの行、FrozenPlanのfile、回収済みの結果のartifactから毎回組み立て直すので、親が再起動しても同じところから続き、同じtaskを二度作ることも二度配置することもない。進行の規則は、local-ci-coreの共有driverと同じ形（入力を渡し、保留中のactionを実行して確認する）のtraitの後ろに置く。matrixの展開・permit・max-parallel・fail-fast・集約は共有driverに置き換えてから扱い、それまで、matrixのvariant・式のmatrix・shard・service containerを持つplanと、secret_filesを持つsourceのCI runは、提出の時点で理由を付けて断る。
 
@@ -491,6 +505,7 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 - forecastが時刻を返さず `fallback` のranking（`target.ranking.finish_in_ms`）だけを返したworkerは、その値で比べる。`measured` の時刻と `fallback` のrankingは同じ尺度で比べ、配置理由にはどちらであるかを残す。rankingを時刻として表示しない。
 - 数値をまったく得られなかったworker（forecastの時刻もrankingも `null`、errorの答え、期限切れ、boot／agent epochの変化、聞いたものと違うworker／planへの答え）は `unknown` とする。`unknown` を空きとは扱わない。数値のあるworkerが1台でもあれば、`unknown` のworkerは選ばない。全員が `unknown` のときに限り、上の同点規則だけで選ぶ（配置は止めない）。task-traffic-controllerは、登録済みのnodeを持つworkerについて数値を返せないことがあり、そのworkerはこの `unknown` になる。
 - 親の側の見積（転送・setup・回収）がworkerによって不明のときは、その部分について候補の中で最も大きい既知の値を仮に入れて比べ、仮の値であることを配置理由に残す。全員が不明の部分は比較に入れない。
+- workerへ渡す「readyになるまでの遅れ」は、転送の見積とsetupの見積の和とする。上の補完のあとでも、候補のどのworkerについても転送かsetupのどちらか一方が不明のときは、不明の方を0として和を取る（setupの所要が未知なら、そのsetupは0として扱う）。両方が不明のときに限り、遅れを渡さず（`external_delay_ms` を付けず）、不明のままにする。
 - forecastを制限時間（1秒。設定fileのkeyではなく実装の定数で、`forecast_ttl_ms` より短くなければならない。短くない組み合わせではschedulerを起動しない）までに答えなかったworkerは、そのtickの残りの配置から外す。他のworkerの配置はそれを待たない。
 - tickの途中でattachされたworkerは、次の1件の決定の前にほかのworkerと同じ確認（`inspect` と、そのworker上のattemptの確認）を受け、その決定から候補に入る。
 - 決定ごとの配置理由（比べたworker、それぞれの予測と内訳・出所・補正量、勝った理由、外したworkerとその理由）は、配置と同じtransactionで親DBに記録する。どのworkerも選べなかったときの理由は、runのevent `task_waiting` に記録する。同じtaskについて書き直すのは、結論か、tickをまたいで続く除外（そのtaskを断ったworker、drain中のworker、能力が合わないworker、runの入力を受け取らなかったworker）が変わったときだけとする。そのtickだけの事情（満杯、forecastやsubmitに答えなかった、確認できなかった）が入れ替わっても書き直さない。決定に付ける番号 `decision_seq` は親processの中での順番で、再起動すると1から数え直す（DB上の識別子ではない）。
@@ -970,7 +985,7 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 - **グループ**: 起動時にグループのIDと鍵を受け取るので、鍵を持つどのメンバーも使える。identityの退役と `workers forget` は、それを行ったメンバーの記録の中だけで働く（24.3）。鍵が更新されたら、新しい鍵で起動し直す。
 - **identity**: 起動ごとに新しいworker identityを発行する。以前のidentityの再接続として扱わない。親は最後に見たidentityを記録する。同じ名前で別のidentityが接続を試みた場合、利用者が旧identityを `workers forget` するまで新しい接続を拒否する。以前の起動のattemptを新しい起動へ送らない。
 - **到達不能**: 一時workerへ配置したattemptは、接続が切れてもunknownのまま保持する。時間の経過や推測で別workerへ再投入しない（第11章・第12章）。
-- **`workers forget`**: 利用者が `belt workers forget <worker>` で消滅を宣言したときだけ、そのworkerのunknownのattemptをinterruptedに確定し、そのidentityを退役させる。退役したidentityはtombstoneを永続保持し、遅れて戻った同じidentityは接続させない（親はsubmitもrenewも送らず、退役を通知する。workerはそのメンバーのattemptをすぐに止める。通知が届かなければ、worker側のattemptはleaseが切れて止まる。24.3）。確定したattemptの回収は断念として閉じる（消えたworkerからは回収できない）。確定後の再実行は、プロジェクトの明示retry policyまたは利用者の明示retryによる。forgetは、接続中のworkerや通常のworkerには使えない（拒否する）。
+- **`workers forget`**: 利用者が `belt workers forget <worker>` で消滅を宣言したときだけ、そのworkerのunknownのattemptをinterruptedに確定し、そのidentityを退役させる。退役したidentityはtombstoneを永続保持し、遅れて戻った同じidentityは接続させない（親はsubmitもrenewも送らず、退役を通知する。workerはそのメンバーのattemptをすぐに止める。通知が届かなければ、worker側のattemptはleaseが切れて止まる。24.3）。確定したattemptの回収は断念として閉じる（消えたworkerからは回収できない）。確定後の再実行は、プロジェクトの明示retry policyまたは利用者の明示retryによる。forgetは、接続中のworkerや通常のworkerには使えない（拒否する）。forgetが退役させるのはidentityだけで、workerの登録は一覧に残る。登録を一覧から外すのは `group rotate-key --remove` である。
 
 親が送るバイナリは、workerのOSとarchが親と同じときだけ親自身のものとする。違うときは `--binary <path>` で指定されたbuildを送り、指定が無ければ必要なtarget triple（例: `x86_64-unknown-linux-gnu`）を示して何も送らずに断る。releaseの成果物を自動で取得することはしない。送ったバイナリは、導入・切替の前にworker上で `--version` を実行させ、親と同じversionであることを確かめる。違う場合は送ったcopyを消して断り、導入済みのversionには触れない。
 
@@ -1073,7 +1088,12 @@ residentが動いていないときの `belt exec`（直接実行、第4章）�
 
 - **台帳・scope・policy**: 単独CLIと同じ規則でstate scopeとconfigを決め、同じ台帳（ledger）・lock・履歴を使う。belt用の別の台帳や別のscopeを作らない。同じhostで単独CLIと同時に動かしても、admissionの合計は1つの予算に収まる（A05と同じ考え方）。
 - **待ちと表示**: 待ちの理由、進捗の表示、nestedなlease（`TASK_TRAFFIC_CONTROLLER_LEASE` の継承）の扱いは単独CLIの `exec` と同じとする。表示はstderrに出す。
-- **終了と中断**: commandのexit codeをそのまま返し、signalで終わった場合は128にsignal番号を足した値を返す。Ctrl-Cはcommandのprocess groupへ送り、終了を確かめてから台帳のentryを外す。
+- **終了と中断**: commandのexit codeをそのまま返し、signalで終わった場合は128にsignal番号を足した値を返す。Ctrl-Cはcommandのprocess groupへ送り、終了を確かめてから台帳のentryを外す。ただしbeltが端末のforeground process groupにいるとき（`tcgetpgrp(tty) == getpgrp()`）は、SIGINTを子へ転送しない。端末がforeground groupの全員へSIGINTを直接届けるので、転送すると子が2回受けて強制終了と見なし、後始末を飛ばすためである。`kill` で送られたSIGINTは、この場合でも転送する。
+- **直接実行で使えないoption**: `--snapshot`・`--ref`・`--in-place`・`--profile`・`--requires` はrunを要するので、residentが動いていないときは拒否する。拒否の文言はそのoption名を挙げ、residentを起動するか、optionを外すよう案内する。
+- **`--json`**: commandのstdoutをstderrへ流し、stdoutは最後のJSON文書のために空けておく。
+- **nested**: `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` のときはadmissionを取らず、親のleaseを引き継いで実行する。`admit` と `inherit` 以外の値は拒否する。
+- **residentの有無の判定**: socketへの問い合わせに加え、state dirの `startup.lock` と `coordinator.lock` を、共有・非ブロッキングのflockで調べる。調べるためにfileを作らず、取った共有lockはすぐ外す。どちらかが他のprocessに保持されていれば、residentが起動中か動作中と見なし、commandは実行しない。launchdやsystemdが起動したresidentには、process開始からcoordinator storeを開いてlockを取るまでの短い隙間があり、その間に調べると停止中と判定される（既知の制限）。
+- **`ProcessLock` の取得**: WouldBlockのときは10 ms間隔で最大10回試し、それでも取れなければ `Locked` で失敗する。
 - **版の違い**: 単独CLIのtask-traffic-controllerと組み込みcoreの版が違っても、台帳の形式が互換なら共存する。組み込みcoreが読めない台帳の版（新しい単独CLIが書いたもの）は書き換えずに断り、`doctor` が理由を示す。下の「既存stateとの互換」の規則（未修正binaryは不適合）はここでも同じである。
 
 residentが動いているときの `exec` は、自分のlocal workerでも他のworkerでも、attemptのsupervisorが同じ台帳・scopeでadmissionを取る（「登録と終了の順序」）。直接実行・単独CLIは呼び出したshellの環境から、residentは保持したserviceの環境から（22.2）scopeを決める。両者のscopeが同じなら、直接実行と、residentの中のattemptと、単独CLIの3つが同じhostで同時に動いても、予算は1つである。scopeが違えば予算は別になるので、`doctor` がtraffic scopeの比較でその差を示す。
@@ -1082,7 +1102,7 @@ residentが動いているときの `exec` は、自分のlocal workerでも他�
 
 旧 `status --json` と既存CLIの契約を維持する。既存ledger v1へ、旧binaryの保存処理で消える重要な新fieldを混在させない。correlation、accepted、managed ownership、event、log offsetはbelt storeのsidecarとして管理し、更新後のreaperが参照する。
 
-CLIの互換維持と、未修正binaryとの同時互換は分ける。v0.4.2のreaperはmanaged ownershipを理解しないため、共有scopeでは修正版への更新を必須とする。doctorとbootstrapは実行中process、解決されるtask-traffic-controller binary、scopeのruntime compatibilityを検査し、未対応ならdrain・更新の必要を表示してmanaged dispatchを開始しない。旧単独jobを動かしたままstateを破壊する移行は行わない。
+CLIの互換維持と、未修正binaryとの同時互換は分ける。v0.4.2のreaperはmanaged ownershipを理解しないため、共有scopeでは修正版への更新を必須とする。doctorとbootstrapは実行中process、解決されるtask-traffic-controller binary、scopeのruntime compatibilityを検査し、未対応ならdrain・更新の必要を表示してmanaged dispatchを開始しない。`doctor` の `traffic_processes` は、単独CLIのscopeの台帳にある、CLIが起動したjobを数える。belt自身が登録したentryと、beltのattempt内で `exec` を入れ子で呼んで登録されたentry（親をたどるとbeltのentryに行き着くもの）は数えない。ownerのleaseが生きているjobは `live`、生きていないentryは `stale` とする。`live` があれば、CLIが管理entryを知らない版のときは `fail`、そうでなければ `notice` とする。`stale` だけのときは `notice`、どちらも無ければ `ok` とする。単独CLIも台帳も無いhost、初期化済みで何も動いていないhostは `ok` で、exit 0である。台帳を読めないとき、workerのhelperが古くて報告しないときは `not_checked` とする。旧単独jobを動かしたままstateを破壊する移行は行わない。
 
 snapshot digestはcanonical ledger・policy・参照履歴・overlayから計算し、後付けrevision fieldだけには依存しない。旧entryのUTCから推定したageは `legacy_clock` と明記する。旧task-traffic-controllerと同じuser・state scopeで同じlock／leaseを使い、別budgetによる過剰実行を避ける。
 
@@ -1129,10 +1149,13 @@ runの結果にはsource digestと元HEADを併記する。入力が一致する
 - 投稿するのは親の `belt ci` のprocessだけで、waitが終わり、runの結果と親が回収した結果から計算結果を決めた後に1回だけ行う。再試行はしない。`--no-status` で投稿せず、`--status-context <name>` でcontextを変える。
 - 計算結果は `success`／`failure`／`error`／`cancelled`／`pending` のいずれかとする。`success` は、runがsettleし、cancelされず、回収が全て閉じ、終了コードが0で、提出したplanの全taskに結果の行があり、全ての行が `success` か `skipped` のときに限る。runの結果（`ci` の終了コード、`wait`、`show` が読むもの）を判定し直さない: Jobが失敗したrun（commandが0以外のcodeで終わった、testが失敗した、Shardの集約がfailure）は `failure`、Jobの失敗ではないもの（timeout、signal、失われたattempt、回収の失敗など）は `error` とする（local-ciのstatusの対応と同じ）。fail-fastが残りのShardを止めただけのrunを `cancelled` にしない。Shardを持たないrunでも同じで、Jobが先に失敗した後にrun全体をcancelしても、結果は `failure` のままにする（先に起きた失敗を `error` や `cancelled` に書き換えない）。cancelで終わったrunは `cancelled` とする。`cancelled` と `pending` は最終状態ではないため投稿しない。descriptionの件数（`pass`・`fail`・`error`・`skip`）は、分割したJobを1件として数える（Jobの行を数え、そのShardの行は数えない。Jobの行がまだ無いShardだけ、その行を数える）。
 - 宛先は入力をcaptureしたcommit（manifestの `original_head`）だけとし、そのcommitのtreeと検査した入力のtree（`worktree_tree`）が一致するときに限る。一致しないdirty worktree、未追跡fileを含むsnapshot、directory、dirtyなsubmoduleは、`success` に限らずどのstateも投稿しない。
-- 投稿は `gh api repos/<owner>/<name>/statuses/<sha>` に `state`・`context`・`description` を渡す。credentialは親の `gh` のものだけを使い、task、plan、residentへの要求に含めない。`gh` はPATHの絶対pathのentryからだけ探し、repositoryの外をcwdにして実行し、30秒で打ち切る（`failed`、`timed out`）。
+- 投稿は `gh api repos/<owner>/<name>/statuses/<sha>` に `state`・`context`・`description` を渡す。credentialは親の `gh` のものだけを使い、task、plan、residentへの要求に含めない。`gh` はPATHの絶対pathのentryからだけ探し、repositoryの外をcwdにして実行し、30秒で打ち切る（`failed`、`timed out`）。`gh` は自分専用のprocess groupで動かし、時間切れでは `gh` が起こしたprocessごとgroup全体をSIGKILLで止める。stdoutとstderrは動いている間に読み続け、pipeの容量を超える出力でも止めない。
 - 投稿先のrepositoryは、GitHubのhost（`github.com`、`GH_HOST` があればそのhost）にあるoriginで、入力をcaptureしたときのrepository（manifestの `repository_id`）と同じものに限る。違えば投稿しない（`skipped`）。
 - 結果は計算結果（`computed`）と投稿（`posting`: `posted`／`skipped`／`failed`）に分け、`source_digest` と `original_head` を併記する。`ci` の出力（textの `status:` 行、`--json` の `result.github_status`）と `show <run>` の `run.github_status` に出す。`failed` と `skipped` は `ci` の終了コードとrunの状態を変えない。
-- 後から投稿し直すcommand（待たずに終わったrun、push前で `failed` になったrun、`retry` 後）は未実装である。
+- 後から投稿し直すcommandは `belt ci status <run> [--post] [--status-context <name>]` とする。`--post` なしは表示だけで、何も投稿せず、何も記録しない。run に最後に記録された投稿（なければ `none recorded`）と、今の状態で投稿するもの（`would post: <context>=<state> to <sha> (<description>)`）、または投稿しない理由（`would not post: <理由>`）を出す。`--post` は、親が記録したrunの結果から、`ci` の終了時と同じ関数で状態を決め直し、GitHubのcommit statusとして投稿する。投稿できなかった場合（`failed`・`skipped`）は終了コード1で終わる。`--json` は `result` に同じ内容を入れる。
+  - 拒否する場合: `ci` のrunでない（`NOT_FOUND`）、まだ終わっていない、cancelされた、結果の回収が閉じていない、結果を読めない、`--snapshot`・`--ref`・`--no-status` を併用した。拒否では何も投稿せず、何も記録しない。
+  - contextは、`--status-context` があればそれ、なければ最後に投稿した（失敗を含む）ときのcontext、それもなければ `local-ci` とする。投稿を `skipped` で終えた記録はcontextを持たないので、決め手にならない。
+  - 記録: 投稿した結果と、投稿に失敗した結果は、runの記録（`github_status`）に残る。この呼び出し自体が原因で投稿しなかった場合（例: 入力を読めない、source storeが使用中）は、GitHubに何が載っているかを表さず、最後の本物の試みを隠すので、runの記録に残さず、表示だけにする。記録できなかったときは、stderrに警告を出し、結果の `recorded`・`record_error` に示す。
 
 ## workflow互換性
 
@@ -1298,6 +1321,10 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
+`ci` のtaskも、通常のtaskと同じく、提出時に固定したtoolchain（`FrozenBundle`）を持つ。宣言した版を用意できるworkerが無ければ、そのtaskは配置されない。配置の判断に残る理由の行は、`toolchain <tool>=<version> unavailable` の形（例: `toolchain node=20.0.0 unavailable`）とする。
+
+baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
+
 公開 command submit は検証済み capture から版指定・必要 baseline を固定し、完全な resolution evidence とともに `FrozenBundle` として保持する。worker-local registry・既存 setup admission/singleflight・attempt ごとの activation 経路は [private adapter API](toolchain-adapters.md) に記録する。実 manager による受入確認と installed-version 一覧・diff/sync は別の検証範囲とする。
 
 workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（task-traffic-controllerのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
@@ -1358,9 +1385,9 @@ task-traffic-controller runtime、local-ci core、fast-worktree（0.5.0）、por
 workerのattempt workspaceは、beltに組み込んだfast-worktreeのライブラリで作り、消す（2026-11-10の決定。組み込みは2026-11-20の決定）。canonical cloneからattemptごとのworktreeを作る操作と、terminal後の削除に、fast-worktreeのadd・removeとpool・hookを使う。workerにfast-worktreeとportoolの単独CLIは要らない。
 
 - **設定の源泉**: プロジェクトの `.fast-worktree.toml`（`[[clone]]`、`post_add`、`pre_remove` のportool release）と `.worktreeinclude` をそのまま使い、worker用の準備設定を別に持たない。`[[clone]]` と `post_add` が依存の準備を担う（第6章・第8章）。
-- **hookとcommandが呼ぶ `portool`・`fast-worktree`**: `.fast-worktree.toml` のhook（例: `pre_remove` の `portool release`）や、commandの中の `portool exec` は、その名前のcommandを呼ぶ。beltだけを入れたworkerでも動くように、workerはstate directoryの中の私用のbin directoryに、belt自身を指す `portool` と `fast-worktree` のlinkを置き、hookとattemptのcommandのPATHの先頭に足す。beltは起動名（argv[0]）がこの2つのどちらかのとき、組み込んだライブラリの単独CLIの入口として動く。引数・出力・終了コードは同じ版の単独CLIと同じである。hookの中身をbeltが解釈することはしない。beltのsubcommand（`belt port` など）にもしない。workerのPATHに単独CLIがあっても、attemptの中では組み込みの版が先に見つかるので、`workers diff` が示す版と実際に動く版が一致する。linkは第15章のversion別directoryごとに置き、そのversionのbeltを指す。更新とrollback（24.8）ではversion別directoryと一緒に切り替わり、動いているattemptは開始したときのversionのlinkを使い続ける。
-- **割当の解放**: terminal後の削除では、`pre_remove` のhookを通常どおり実行し、その後で、そのworkspaceに紐づくportoolの割当を組み込みのportoolで解放する（解放済みなら何もしない）。hookがportool releaseを書いていないプロジェクトや、hookが失敗した場合も割当を残さないためである。解放に失敗したら、workspaceの削除の失敗と同じくcleanupのeventに残し、workerの起動時のreconcileでやり直す。
-- **単独CLIとの共存**: 同じhostで単独のfast-worktree・portoolを使っていても、組み込みの版は同じstate directory、lock、registry（portoolの割当表、fast-worktreeのcache・pool・trash・kept ref）を、単独CLIと同じ規則で使う。どちらが割り当てたポートも他方から見え、同じポートを二重に割り当てない。組み込みの版が読めない形式（新しい単独CLIが書いたもの）は書き換えずに断り、そのworkerを `blocked: environment_mismatch` にして、`doctor` と `workers diff` が単独CLIとbeltの版を示す。beltのcanonical cloneとattempt workspaceはworkerのstate directoryの中にあり、利用者が単独のfast-worktreeで作ったworktreeとは混ざらない。
+- **hookとcommandが呼ぶ `portool`・`fast-worktree`**: `.fast-worktree.toml` のhook（例: `pre_remove` の `portool release`）や、commandの中の `portool exec` は、その名前のcommandを呼ぶ。beltだけを入れたworkerでも動くように、workerはstate directoryの中の私用のbin directoryに、belt自身を指す `portool` と `fast-worktree` のlinkを置き、hookとattemptのcommand、CI taskのstep、setupのstepのPATHの先頭に足す（PATHが無い、または空のときは、このbin directoryだけにする。空のentryはcurrent directoryを意味するので作らない）。beltは起動名（argv[0]）がこの2つのどちらかのとき、組み込んだライブラリの単独CLIの入口として動く。引数・出力・終了コードは同じ版の単独CLIと同じである。hookの中身をbeltが解釈することはしない。beltのsubcommand（`belt port` など）にもしない。workerのPATHに単独CLIがあっても、attemptの中では組み込みの版が先に見つかるので、`workers diff` が示す版と実際に動く版が一致する。linkは第15章のversion別directoryごとに置き、そのversionのbeltを指す。更新とrollback（24.8）ではversion別directoryと一緒に切り替わり、動いているattemptは開始したときのversionのlinkを使い続ける。
+- **割当の解放**: terminal後の削除では、`pre_remove` のhookを通常どおり実行し、その後で、そのworkspaceに紐づくportoolの割当を組み込みのportoolで解放する（解放済みなら何もしない）。hookがportool releaseを書いていないプロジェクトや、hookが失敗した場合も割当を残さないためである。解放するのは、workspaceのdirectoryが実際に無くなったときだけで、まだ残っているworkspaceの割当は残す。解放に失敗したら、workspaceの削除の失敗と同じくcleanupのeventに残し、workerの起動時のreconcileでやり直す。
+- **単独CLIとの共存**: 同じhostで単独のfast-worktree・portoolを使っていても、組み込みの版は同じstate directory、lock、registry（portoolの割当表、fast-worktreeのcache・pool・trash・kept ref）を、単独CLIと同じ規則で使う。どちらが割り当てたポートも他方から見え、同じポートを二重に割り当てない。組み込みの版が読めない形式（新しい単独CLIが書いたもの）は書き換えずに断り、そのworkerを `blocked: environment_mismatch` にして（portoolのregistryの版が組み込みの版で読めないときに限る。attemptの準備でも、workspaceの割当の解放でも同じ）、`doctor` と `workers diff` が単独CLIとbeltの版を示す。beltのcanonical cloneとattempt workspaceはworkerのstate directoryの中にあり、利用者が単独のfast-worktreeで作ったworktreeとは混ざらない。
 - **`.worktreeinclude`**: 一致するignoredファイルは、親でcaptureして22.3の経路で送る。workerがcanonical cloneからコピーすることはしない。
 - **Linux**: clonefileが効かないため、npmの依存は毎回 `npm ci` になる。add・remove・pool・hookは同じく動く。組み込みなので、Linuxでも別のバイナリは要らない。
 - **手元の開発環境**: 編集を続けるworktree、devサーバー、Composeのポート分離には、従来どおり単独のfast-worktreeとportoolを使う。beltはこれらを扱わない（第3章）。
@@ -1390,6 +1417,8 @@ chunk は run_id / task_id / attempt_id / generation / stream / offset / next_of
 bytes_base64 を持ち、生 bytes は JSON stdout に混ぜない。chunk は最大 64 KiB、
 run は最大 32 task のページで走査する。final は件数・bytes・pending / failure の集計であり、
 全 task の配列を保持しない。読み取りエラーは既存の error envelope を返す。
+
+`ci` のrunを対象にしたときは、commandの出力のあとに、記録されたGitHub statusを、`ci` のtext出力の `status:` 行と同じ文言の1行（例: `status: <context>=<state> posted to <sha>`）としてstderrに出す。`--json` ではstatus recordの代わりに `kind` が `github_status` のrecord（`run_id`、`github_status`）を出す。statusの投稿が記録されていないrun、およびtaskを対象にしたときは何も足さない。`--follow` では、runが終わって回収が閉じたときに1回だけ出す。
 
 follow は invocation 専用の mode-0700 一時ディレクトリ / mode-0600 SQLite cursor に
 配信 offset を保存し、メモリは task 数やログ量によらず制限する。終了時に削除し、
@@ -1615,6 +1644,15 @@ carry an opaque lease through queued Outgoing and write/flush/cut, even after ca
 failure or abort drops queued frames; writer-owned buffers die before the in-flight lease. Last-lease drop explicitly
 unlocks. Initial direct adoption uses atomic no-replace publication, preserving the first durable bundle.
 
+The permanent lock file doubles as the classification pin of the registration: it is written and synced before the
+marker `parent-retention.json` is published, and the marker must equal it. A first registration that died between
+linking the marker and unlinking its temporary name leaves the marker with two names. With a pin, that exact shape is
+read (the only other name must be the marker's own publication temporary `.parent-retention.json.<ulid>.tmp`, the same
+inode) and a later sweep repairs it; nothing is unlinked on the read. Without a pin, with another second name, or with
+a pin that is unsafe (not private, over 64 KiB), changed while read, for another source path, or different from the
+marker, `Vault::open` is refused (fail closed) until the operator repairs the state by hand; the resident and the
+command line do not start meanwhile.
+
 Only exact private owned regular nlink=1 mode0600 run.json targets are deletable. Claims pin Vault root identity,
 leaf inode/metadata and content digest; held NOFOLLOW descriptors and current anchors are rechecked before FD-relative
 unlink. Durable claimed absence still requires parent fsync before completion. Changed/recreated/unsafe targets are
@@ -1739,6 +1777,8 @@ belt group                                # グループのID、鍵の世代、�
 - `--remove <name>` は、実行したメンバーの一覧からそのメンバーを消し、鍵を渡さない。他のメンバーの一覧に残っている行は、そのメンバーの `doctor` と `group` が `group_key_mismatch` として示すので、それぞれで消す。
 - 次の鍵を受け取っていないまま取り残されたメンバー（skipしたもの）は、古い鍵のままなので断られる。残るメンバーの1台から `group send-key <member>` で今の鍵を渡すと戻る。止まっていた間にleaseが切れたattemptは、通常の規則どおりworkerが止めて `interrupted` と答える。
 - 2〜5台を想定し、渡す順は一覧の順、同時には行わない。鍵の更新の間、新しい投入と配置は止めない。
+- **鍵の切り替えの後始末**: 管理されたservice（`belt init` が登録したもの）では、鍵を切り替える前に、新しい鍵のproofを `init.json` の `switching_key` に記録し、切り替えのrenameのあとで消す。renameの前後のどこで止まっても、読み手は記録した2つのinodeのどちらか一方だけを受け入れる。止まったまま残った `switching_key` は、daemonの起動時、`upgrade` の開始時、`init` で、`init.json` から消して書き戻す。これで、`upgrade` の巻き戻しで古いbinaryが `init.json` を読める。切り替えの途中の別のprocessが `init.lock` を持っているときは、起動時の後始末はそのprocessに任せて何もしない。
+- **workerが受け取る新しい鍵**: workerは、新しい鍵を `<key>.installing` に置いてから切り替える。置くときは新規作成のみ（既にあるfileやsymlinkを開かない）、mode 0600、symlinkを辿らない。前回の途中で止まって残った `<key>.installing` は、symlinkのときはリンクとして外し、リンク先には触れず、新しく作り直す。
 
 **外したメンバーに関わる仕事**。
 
