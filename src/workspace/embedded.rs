@@ -35,10 +35,17 @@ pub(crate) fn incompatible_registry(
     env: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
     match portool::check_registry_in(&portool::Context::from_env(env)) {
-        Err(portool::Error::UnsupportedRegistryVersion { found, supported, .. }) =>
-            Some(format!("portool {} reads registry through v{supported}; registry written by standalone portool is v{found}", env!("BELT_PORTOOL_VERSION"))),
+        Err(portool::Error::UnsupportedRegistryVersion {
+            found, supported, ..
+        }) => Some(registry_diagnostic(found, supported)),
         _ => None,
     }
+}
+
+/// The refusal for a registry the embedded portool cannot read (written by a
+/// newer standalone one); it is never rewritten.
+pub(crate) fn registry_diagnostic(found: u32, supported: u32) -> String {
+    format!("portool {} reads registry through v{supported}; registry written by standalone portool is v{found}", env!("BELT_PORTOOL_VERSION"))
 }
 
 pub fn dispatch() -> Option<i32> {
@@ -108,6 +115,13 @@ pub(crate) fn install(state: &Path, executable: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn prepend(bin: &Path, path: &str) -> Result<String, String> {
+    // An empty PATH has no entries; one empty entry would mean the current directory.
+    if path.is_empty() {
+        return bin
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| "worker PATH must be UTF-8".into());
+    }
     std::env::join_paths(
         std::iter::once(bin.to_owned())
             .chain(std::env::split_paths(OsStr::new(path)).filter(|entry| entry != bin)),
@@ -115,6 +129,46 @@ pub(crate) fn prepend(bin: &Path, path: &str) -> Result<String, String> {
     .map_err(|e| e.to_string())?
     .into_string()
     .map_err(|_| "worker PATH must be UTF-8".into())
+}
+
+/// The environment of a command run under an execution binding: the
+/// activation and `own`, with the tool-bin directory (when there is one) first
+/// on its `PATH` as it is for every other worker command.
+pub(crate) fn activated(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    activated_with(bin, binding, own, true)
+}
+
+/// [`activated`] for CI tasks and setup steps, which ran with a binding that
+/// has no `PATH` before the tool-bin directory existed: there the directory
+/// alone becomes the `PATH`.
+pub(crate) fn activated_or_bare(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    activated_with(bin, binding, own, false)
+}
+
+fn activated_with(
+    bin: Option<&Path>,
+    binding: &crate::toolchain::contract::ExecutionBinding,
+    own: &std::collections::BTreeMap<String, String>,
+    require_path: bool,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut env = binding.environment(own).map_err(str::to_string)?;
+    if let Some(bin) = bin {
+        let path = match env.get("PATH") {
+            Some(path) => prepend(bin, path)?,
+            None if require_path => return Err("activation has no PATH".into()),
+            None => prepend(bin, "")?,
+        };
+        env.insert("PATH".into(), path);
+    }
+    Ok(env)
 }
 
 #[cfg(test)]
@@ -143,5 +197,61 @@ mod tests {
         std::fs::write(&replaced, "preserve").unwrap();
         assert!(install(&state, &old).is_err());
         assert_eq!(std::fs::read(&replaced).unwrap(), b"preserve");
+    }
+
+    fn bound(
+        environment: std::collections::BTreeMap<String, String>,
+    ) -> crate::toolchain::contract::ExecutionBinding {
+        let activated = environment;
+        let d = Digest::of_bytes(b"x");
+        crate::toolchain::contract::ExecutionBinding {
+            activation: crate::toolchain::adapters::ActivationReceipt {
+                base_profile: d.clone(),
+                frozen: d.clone(),
+                setup_policy: d.clone(),
+                installation: d.clone(),
+                environment: activated,
+                shell: crate::toolchain::adapters::FileIdentity {
+                    path: "/bin/sh".into(),
+                    digest: d.clone(),
+                    size: 1,
+                    executable: true,
+                },
+                binding_digest: d.clone(),
+                execution_fingerprint: d,
+            },
+        }
+    }
+
+    #[test]
+    fn an_empty_path_becomes_the_tool_bin_alone() {
+        let bin = Path::new("/state/tool-bin/abc");
+        assert_eq!(prepend(bin, "").unwrap(), "/state/tool-bin/abc");
+        let empty = bound([("PATH".to_string(), String::new())].into());
+        let env = activated(Some(bin), &empty, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc");
+    }
+
+    #[test]
+    fn a_bound_command_gets_the_tool_bin_first_and_is_refused_without_a_path() {
+        let bin = Path::new("/state/tool-bin/abc");
+        let with_path = bound([("PATH".to_string(), "/activated/bin".to_string())].into());
+        let env = activated(Some(bin), &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
+        let env = activated(None, &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/activated/bin");
+        let no_path = bound([("HOME".to_string(), "/h".to_string())].into());
+        assert_eq!(
+            activated(Some(bin), &no_path, &Default::default()),
+            Err("activation has no PATH".to_string())
+        );
+        assert!(activated(None, &no_path, &Default::default()).is_ok());
+        let env = activated_or_bare(Some(bin), &no_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc");
+        let env = activated_or_bare(Some(bin), &with_path, &Default::default()).unwrap();
+        assert_eq!(env["PATH"], "/state/tool-bin/abc:/activated/bin");
+        assert!(activated_or_bare(None, &no_path, &Default::default()).is_ok());
+        let own = [("FLAG".to_string(), "1".to_string())].into();
+        assert_eq!(activated(None, &no_path, &own).unwrap()["FLAG"], "1");
     }
 }
