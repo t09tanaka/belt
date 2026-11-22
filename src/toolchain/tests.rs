@@ -1544,3 +1544,950 @@ fn requirements_name_tool_and_version_in_order() {
         "node=20.0.0, rust=1.80.0"
     );
 }
+
+#[test]
+fn one_context_reference_is_read_and_nothing_else_is() {
+    let reference = |text: &str| context_reference(text).map(|(c, k)| (c, k.to_string()));
+    let pair = |context: &str, key: &str| Some((context.to_string(), key.to_string()));
+    assert_eq!(reference("${{ matrix.node }}"), pair("matrix", "node"));
+    // Spaces do not matter; a key may hold letters, digits, `_` and `-`.
+    assert_eq!(reference("  ${{env.NODE_v-1}} "), pair("env", "NODE_v-1"));
+    assert_eq!(reference("${{ my-ctx_2.k }}"), pair("my-ctx_2", "k"));
+    // A context name is not case sensitive; the key is kept as written.
+    assert_eq!(reference("${{ Matrix.Node }}"), pair("matrix", "Node"));
+    assert_eq!(reference("${{ ENV.NODE }}"), pair("env", "NODE"));
+    for other in [
+        "matrix.node",
+        "${{ matrix.node",
+        "matrix.node }}",
+        "${{ matrix }}",
+        "${{ .node }}",
+        "${{ matrix. }}",
+        "${{ matrix.a.b }}",
+        "${{ matrix.node || 20 }}",
+        "${{ ma trix.node }}",
+        "${{ matrix.no de }}",
+        "v${{ matrix.node }}",
+        "${{ matrix.node }}.x",
+        "${{ fromJSON(matrix.node) }}",
+    ] {
+        assert_eq!(context_reference(other), None, "{other}");
+    }
+}
+
+fn step_scope(workflow: &str, job: &str, step: usize) -> Scope {
+    Scope {
+        project: "".into(),
+        workflow: Some(workflow.into()),
+        job: Some(job.into()),
+        step: Some(step),
+    }
+}
+fn step_decl(tool: &str, raw: &str, workflow: &str, job: &str, step: usize) -> Declaration {
+    Declaration {
+        tool: ToolId::parse(tool).unwrap(),
+        constraint: Constraint::parse(raw).unwrap(),
+        scope: step_scope(workflow, job, step),
+        location: Location {
+            path: workflow.into(),
+            first_line: step + 5,
+            last_line: step + 5,
+        },
+    }
+}
+fn task_scope(workflow: &str, job: &str) -> Scope {
+    Scope {
+        project: "".into(),
+        workflow: Some(workflow.into()),
+        job: Some(job.into()),
+        step: None,
+    }
+}
+fn read_of(declarations: &[Declaration]) -> SetupRead {
+    SetupRead {
+        declarations: declarations.to_vec(),
+        ..Default::default()
+    }
+}
+fn no_value(_: &Scope, _: &str, _: &str) -> Option<String> {
+    None
+}
+fn resolved(_: &ToolId, _: &str) -> bool {
+    false
+}
+/// `task_declarations` of the root project with no alias left unresolved.
+fn task_of(
+    read: &SetupRead,
+    workflow: &str,
+    jobs: &[&str],
+    lookup: &dyn Fn(&Scope, &str, &str) -> Option<String>,
+) -> (Scope, Vec<Declaration>, Vec<Skipped>) {
+    let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
+    task_declarations(read, "", workflow, &jobs, lookup, &resolved)
+}
+fn narrowed(d: &Declaration, workflow: &str, job: &str) -> Declaration {
+    Declaration {
+        scope: task_scope(workflow, job),
+        ..d.clone()
+    }
+}
+
+#[test]
+fn a_task_takes_the_project_declarations_and_those_of_its_own_jobs() {
+    let mut elsewhere = decl("18.0.0");
+    elsewhere.scope = Scope::project("sub");
+    let all = [
+        decl("20.0.0"),
+        elsewhere,
+        step_decl("python", "3.12.0", "ci.yml", "build", 0),
+        step_decl("go", "1.22.0", "ci.yml", "other", 2),
+        step_decl("ruby", "3.3.0", "other.yml", "build", 0),
+    ];
+    let read = read_of(&all);
+    // One job: the project file and that job only, in the order they were read.
+    let (scope, got, skipped) = task_of(&read, "ci.yml", &["build"], &no_value);
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(got, [all[0].clone(), narrowed(&all[2], "ci.yml", "build")]);
+    assert_eq!(skipped, []);
+    let required = effective(&got, &scope).unwrap();
+    let tools: Vec<&str> = required.iter().map(|r| r.tool.as_str()).collect();
+    assert_eq!(tools, ["node", "python"]);
+    // Jobs grouped into one task: the union, in one scope that names them all.
+    let (scope, got, _) = task_of(&read, "ci.yml", &["build", "other"], &no_value);
+    assert_eq!(scope, task_scope("ci.yml", "build,other"));
+    assert_eq!(
+        got,
+        [
+            all[0].clone(),
+            narrowed(&all[2], "ci.yml", "build,other"),
+            narrowed(&all[3], "ci.yml", "build,other")
+        ]
+    );
+    // A task without a setup declaration is frozen exactly as the project is.
+    let (scope, got, skipped) = task_of(&read, "ci.yml", &["lint"], &no_value);
+    assert_eq!(scope, Scope::project(""));
+    assert_eq!(got, [all[0].clone()]);
+    assert_eq!(skipped, []);
+    assert_eq!(
+        effective(&got, &scope).unwrap(),
+        effective(&all, &Scope::project("")).unwrap()
+    );
+    // The same job id in another workflow is another job.
+    let (scope, got, _) = task_of(&read, "other.yml", &["build"], &no_value);
+    assert_eq!(scope, task_scope("other.yml", "build"));
+    assert_eq!(
+        got,
+        [all[0].clone(), narrowed(&all[4], "other.yml", "build")]
+    );
+    // Another project is another scope: its own files, and the same steps.
+    let jobs = ["build".to_string()];
+    let (scope, got, _) = task_declarations(&read, "sub", "ci.yml", &jobs, &no_value, &resolved);
+    assert_eq!(scope.project, "sub");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0], all[1]);
+    assert_eq!(got[1].scope, scope);
+}
+
+#[test]
+fn two_steps_of_one_task_contradict_and_a_step_stands_before_the_project_file() {
+    let all = [
+        step_decl("node", "18.0.0", "ci.yml", "a", 0),
+        step_decl("node", "20.0.0", "ci.yml", "b", 3),
+    ];
+    // Each step alone is consistent, as `workers sync` reads them.
+    for d in &all {
+        assert!(effective(&all, &d.scope).is_ok());
+    }
+    let (scope, got, skipped) = task_of(&read_of(&all), "ci.yml", &["a", "b"], &no_value);
+    assert_eq!(skipped, []);
+    let conflict = effective(&got, &scope).unwrap_err();
+    assert_eq!(conflict.code, "conflicting_versions");
+    assert_eq!(
+        conflict.locations,
+        [all[0].location.clone(), all[1].location.clone()]
+    );
+    // A project file and a step that disagree: the step installs its version
+    // for the job, so the file is no requirement of this task. The file of
+    // another tool stays one.
+    let mut rust = decl("1.80.0");
+    rust.tool = ToolId::parse("rust").unwrap();
+    let all = [
+        decl("22.0.0"),
+        rust.clone(),
+        step_decl("node", "20.0.0", "ci.yml", "a", 0),
+    ];
+    let read = read_of(&all);
+    let (scope, got, skipped) = task_of(&read, "ci.yml", &["a"], &no_value);
+    assert_eq!(scope, task_scope("ci.yml", "a"));
+    assert_eq!(got, [rust.clone(), narrowed(&all[2], "ci.yml", "a")]);
+    assert_eq!(skipped, []);
+    let lines: Vec<String> = effective(&got, &scope)
+        .unwrap()
+        .iter()
+        .map(|r| r.describe())
+        .collect();
+    assert_eq!(lines, ["node=20.0.0", "rust=1.80.0"]);
+    // A task that does not run the step keeps the file.
+    let (scope, got, _) = task_of(&read, "ci.yml", &["b"], &no_value);
+    assert_eq!(scope, Scope::project(""));
+    assert_eq!(got, [all[0].clone(), rust]);
+}
+
+fn skipped_of(d: &Declaration, code: &str, value: &str, step: &Location) -> Skipped {
+    Skipped {
+        tool: d.tool.clone(),
+        scope: d.scope.clone(),
+        code: code.into(),
+        value: value.into(),
+        location: d.location.clone(),
+        step: step.clone(),
+    }
+}
+
+#[test]
+fn a_reference_takes_the_value_of_its_step_and_anything_else_is_skipped() {
+    let reference = step_decl("node", "${{ matrix.node }}", "ci.yml", "build", 1);
+    let read = read_of(std::slice::from_ref(&reference));
+    // The lookup is asked with the step the input is written in.
+    let variant = |scope: &Scope, context: &str, key: &str| {
+        (scope.step == Some(1) && scope.job.as_deref() == Some("build"))
+            .then(|| format!("{context}.{key}"))
+            .filter(|asked| asked == "matrix.node")
+            .map(|_| "18.0.0".to_string())
+    };
+    let (scope, got, skipped) = task_of(&read, "ci.yml", &["build"], &variant);
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(skipped, []);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].constraint, Constraint::parse("18.0.0").unwrap());
+    assert_eq!(got[0].location, reference.location);
+    assert_eq!(
+        effective(&got, &scope).unwrap()[0].describe(),
+        "node=18.0.0"
+    );
+    // The context arrives in lower case, however it is written.
+    let shouted = step_decl("node", "${{ MATRIX.node }}", "ci.yml", "build", 1);
+    let (_, got, skipped) = task_of(
+        &read_of(std::slice::from_ref(&shouted)),
+        "ci.yml",
+        &["build"],
+        &variant,
+    );
+    assert_eq!((got.len(), skipped.len()), (1, 0));
+    // What is no requirement: nothing is declared, the project scope stays,
+    // and the notice names the input. Without a known step it points at the
+    // declaration itself.
+    let unresolved = |d: &Declaration, code: &str, value: &str| {
+        (
+            Scope::project(""),
+            vec![],
+            vec![skipped_of(d, code, value, &d.location)],
+        )
+    };
+    // A key the variant lacks.
+    assert_eq!(
+        task_of(&read, "ci.yml", &["build"], &no_value),
+        unresolved(&reference, "unresolved_expression", "${{ matrix.node }}")
+    );
+    // A value that is no version, or is an expression again.
+    for value in ["a\nb", "${{ matrix.other }}"] {
+        let bad = |_: &Scope, _: &str, _: &str| Some(value.to_string());
+        assert_eq!(
+            task_of(&read, "ci.yml", &["build"], &bad),
+            unresolved(&reference, "unresolved_expression", "${{ matrix.node }}"),
+            "{value}"
+        );
+    }
+    // Any other expression is not looked up at all.
+    let any = |_: &Scope, _: &str, _: &str| Some("18.0.0".to_string());
+    let other = step_decl("node", "${{ matrix.node || 20 }}", "ci.yml", "build", 0);
+    assert_eq!(
+        task_of(
+            &read_of(std::slice::from_ref(&other)),
+            "ci.yml",
+            &["build"],
+            &any
+        ),
+        unresolved(&other, "unresolved_expression", "${{ matrix.node || 20 }}")
+    );
+    // A version file whose path is an expression names no file to read.
+    let mut file = reference.clone();
+    file.constraint = Constraint::VersionFileExpression("${{ matrix.file }}".into());
+    assert_eq!(
+        task_of(
+            &read_of(std::slice::from_ref(&file)),
+            "ci.yml",
+            &["build"],
+            &any
+        ),
+        unresolved(&file, "version_file_expression", "${{ matrix.file }}")
+    );
+    // An expression of a job the task does not run does not concern it.
+    assert_eq!(
+        task_of(&read, "ci.yml", &["lint"], &no_value),
+        (Scope::project(""), vec![], vec![])
+    );
+}
+
+#[test]
+fn a_step_under_a_condition_and_a_skipped_input_require_nothing() {
+    let project = decl("22.0.0");
+    let pinned = step_decl("node", "20.0.0", "ci.yml", "build", 0);
+    // The version of the second step was read from a file: the notice still
+    // points at the step in its workflow.
+    let mut filed = step_decl("python", "3.12.0", "ci.yml", "build", 1);
+    filed.location.path = ".python-version".into();
+    let at = |line: usize| Location {
+        path: "ci.yml".into(),
+        first_line: line,
+        last_line: line,
+    };
+    let reader_skipped = |workflow: &str, job: &str| Skipped {
+        tool: ToolId::parse("go").unwrap(),
+        scope: step_scope(workflow, job, 2),
+        code: "structured_version_file".into(),
+        value: "go.mod".into(),
+        location: at(31),
+        step: at(30),
+    };
+    let read = SetupRead {
+        declarations: vec![project.clone(), pinned.clone(), filed.clone()],
+        skipped: vec![
+            reader_skipped("ci.yml", "build"),
+            reader_skipped("ci.yml", "other"),
+            reader_skipped("other.yml", "build"),
+        ],
+        conditional: vec![pinned.scope.clone(), filed.scope.clone()],
+        steps: vec![
+            (step_scope("ci.yml", "other", 0), at(3)),
+            (pinned.scope.clone(), at(10)),
+            (filed.scope.clone(), at(20)),
+        ],
+    };
+    let (scope, got, skipped) = task_of(&read, "ci.yml", &["build"], &no_value);
+    // Nothing of the steps is required: the project's file is, as before.
+    assert_eq!(scope, Scope::project(""));
+    assert_eq!(got, std::slice::from_ref(&project));
+    assert_eq!(
+        skipped,
+        [
+            reader_skipped("ci.yml", "build"),
+            skipped_of(&pinned, "conditional_step", "20.0.0", &at(10)),
+            skipped_of(&filed, "conditional_step", "3.12.0", &at(20)),
+        ]
+    );
+    // The condition is the reason whatever the input is.
+    let mut expression = pinned.clone();
+    expression.constraint = Constraint::VersionFileExpression("${{ x }}".into());
+    let conditional = SetupRead {
+        declarations: vec![expression.clone()],
+        conditional: vec![pinned.scope.clone()],
+        ..Default::default()
+    };
+    let (_, _, skipped) = task_of(&conditional, "ci.yml", &["build"], &no_value);
+    assert_eq!(skipped[0].code, "conditional_step");
+    // Also when the input is a reference the variant has a value for.
+    let reference = step_decl("node", "${{ matrix.node }}", "ci.yml", "build", 0);
+    let conditional = SetupRead {
+        declarations: vec![reference.clone()],
+        conditional: vec![reference.scope.clone()],
+        ..Default::default()
+    };
+    let known = |_: &Scope, _: &str, _: &str| Some("18.0.0".to_string());
+    assert_eq!(
+        task_of(&conditional, "ci.yml", &["build"], &known),
+        (
+            Scope::project(""),
+            vec![],
+            vec![skipped_of(
+                &reference,
+                "conditional_step",
+                "${{ matrix.node }}",
+                &reference.location
+            )]
+        )
+    );
+    // The same step without the condition is a requirement, and stands before
+    // the project's file.
+    let unconditional = SetupRead {
+        conditional: vec![filed.scope.clone()],
+        ..read.clone()
+    };
+    let (scope, got, skipped) = task_of(&unconditional, "ci.yml", &["build"], &no_value);
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(got, [narrowed(&pinned, "ci.yml", "build")]);
+    assert_eq!(skipped.len(), 2);
+    // The other job and the other workflow have their own skipped input only.
+    let (_, _, skipped) = task_of(&read, "ci.yml", &["other"], &no_value);
+    assert_eq!(skipped, [reader_skipped("ci.yml", "other")]);
+    let (_, _, skipped) = task_of(&read, "other.yml", &["build"], &no_value);
+    assert_eq!(skipped, [reader_skipped("other.yml", "build")]);
+    let (_, _, skipped) = task_of(&read, "ci.yml", &["lint"], &no_value);
+    assert_eq!(skipped, []);
+}
+
+#[test]
+fn an_alias_of_a_setup_step_is_a_requirement_only_while_it_resolves() {
+    let mut project = decl("1.80.0");
+    project.tool = ToolId::parse("rust").unwrap();
+    let rust = step_decl("rust", "stable", "ci.yml", "build", 0);
+    let node = step_decl("node", "lts/*", "ci.yml", "build", 1);
+    let step = Location {
+        path: "ci.yml".into(),
+        first_line: 40,
+        last_line: 40,
+    };
+    let read = SetupRead {
+        declarations: vec![project.clone(), rust.clone(), node.clone()],
+        steps: vec![(rust.scope.clone(), step.clone())],
+        ..Default::default()
+    };
+    let jobs = ["build".to_string()];
+    let task = |unresolved: &dyn Fn(&ToolId, &str) -> bool| {
+        task_declarations(&read, "", "ci.yml", &jobs, &no_value, unresolved)
+    };
+    // Resolved: both are requirements, and the step stands before the file.
+    let (scope, got, skipped) = task(&resolved);
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(
+        got,
+        [
+            narrowed(&rust, "ci.yml", "build"),
+            narrowed(&node, "ci.yml", "build")
+        ]
+    );
+    assert_eq!(skipped, []);
+    // `stable` of rust stays unresolved: the step requires nothing, the
+    // project's file is the requirement again, and the other alias stays.
+    let stable = |tool: &ToolId, alias: &str| tool.as_str() == "rust" && alias == "stable";
+    let (scope, got, skipped) = task(&stable);
+    assert_eq!(scope, task_scope("ci.yml", "build"));
+    assert_eq!(got, [project.clone(), narrowed(&node, "ci.yml", "build")]);
+    assert_eq!(
+        skipped,
+        [skipped_of(&rust, "unresolved_alias", "stable", &step)]
+    );
+    // Every alias unresolved: the task is frozen as the project is.
+    let all = |_: &ToolId, _: &str| true;
+    let (scope, got, skipped) = task(&all);
+    assert_eq!(scope, Scope::project(""));
+    assert_eq!(got, [project.clone()]);
+    assert_eq!(skipped.len(), 2);
+    assert_eq!(skipped[1].code, "unresolved_alias");
+    assert_eq!(skipped[1].value, "lts/*");
+    // A version is never asked about, and neither is a skipped input.
+    let pinned = step_decl("node", "20.0.0", "ci.yml", "build", 0);
+    let (_, got, skipped) = task_declarations(
+        &read_of(std::slice::from_ref(&pinned)),
+        "",
+        "ci.yml",
+        &jobs,
+        &no_value,
+        &all,
+    );
+    assert_eq!((got.len(), skipped.len()), (1, 0));
+    // A reference whose value is an alias is asked about as the alias.
+    let reference = step_decl("rust", "${{ matrix.rust }}", "ci.yml", "build", 0);
+    let nightly = |_: &Scope, _: &str, _: &str| Some("nightly".to_string());
+    let asked = |_: &ToolId, alias: &str| alias == "nightly";
+    let (_, got, skipped) = task_declarations(
+        &read_of(std::slice::from_ref(&reference)),
+        "",
+        "ci.yml",
+        &jobs,
+        &nightly,
+        &asked,
+    );
+    assert_eq!(got, []);
+    assert_eq!(skipped[0].code, "unresolved_alias");
+    assert_eq!(skipped[0].value, "${{ matrix.rust }}");
+}
+
+/// The setup steps of one workflow `ci.yml`, read as the freeze reads them.
+fn setup_read(workflow: &str, files: &[(&str, &str)]) -> SetupRead {
+    let mut all = vec![("ci.yml", workflow)];
+    all.extend_from_slice(files);
+    let documents = docs(&all);
+    let mut read = SetupRead::default();
+    read_workflow(
+        &documents["ci.yml"],
+        &Scope::project(""),
+        &documents,
+        &mut read,
+    )
+    .unwrap();
+    read
+}
+/// One job `a` with one setup step: `uses:` is line 4, its input line 6.
+fn one_step(uses: &str, input: &str) -> String {
+    let with = if input.is_empty() {
+        String::new()
+    } else {
+        format!("        with:\n          {input}\n")
+    };
+    format!("jobs:\n  a:\n    steps:\n      - uses: {uses}\n{with}")
+}
+fn line(path: &str, line: usize) -> Location {
+    Location {
+        path: path.into(),
+        first_line: line,
+        last_line: line,
+    }
+}
+
+#[test]
+fn the_reader_records_each_setup_step_and_what_it_could_not_read() {
+    let workflow = "jobs:\n  zeta:\n    steps:\n      - uses: actions/checkout@v4\n      - name: node\n        uses: actions/setup-node@v4\n        with:\n          node-version: 20.0.0\n  alpha:\n    steps:\n      - uses: actions/setup-python@v5\n        if: runner.os == 'Linux'\n        with:\n          python-version: pypy3.10\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n";
+    let read = setup_read(workflow, &[("go.mod", "module x\n\ngo 1.22\n")]);
+    // Jobs are read in the order they are written, so each step is found on
+    // its own line: the step is its `uses:` line.
+    let zeta = step_scope("ci.yml", "zeta", 1);
+    let python = step_scope("ci.yml", "alpha", 0);
+    let go = step_scope("ci.yml", "alpha", 1);
+    assert_eq!(
+        read.steps,
+        [
+            (zeta.clone(), line("ci.yml", 6)),
+            (python.clone(), line("ci.yml", 11)),
+            (go.clone(), line("ci.yml", 15)),
+        ]
+    );
+    assert_eq!(read.conditional, std::slice::from_ref(&python));
+    assert_eq!(read.declarations.len(), 1);
+    assert_eq!(read.declarations[0].scope, zeta);
+    assert_eq!(read.declarations[0].location, line("ci.yml", 8));
+    // A version belt does not read, and a file in a format of its own: each
+    // with its own step and the line of its input.
+    assert_eq!(
+        read.skipped,
+        [
+            Skipped {
+                tool: ToolId::parse("python").unwrap(),
+                scope: python,
+                code: "invalid_version".into(),
+                value: "pypy3.10".into(),
+                location: line("ci.yml", 14),
+                step: line("ci.yml", 11),
+            },
+            Skipped {
+                tool: ToolId::parse("go").unwrap(),
+                scope: go,
+                code: "structured_version_file".into(),
+                value: "go.mod".into(),
+                location: line("ci.yml", 17),
+                step: line("ci.yml", 15),
+            },
+        ]
+    );
+    // A workflow that does not parse is the only error.
+    let documents = docs(&[("ci.yml", "[bad")]);
+    let mut read = SetupRead::default();
+    let unread = read_workflow(
+        &documents["ci.yml"],
+        &Scope::project(""),
+        &documents,
+        &mut read,
+    )
+    .unwrap_err();
+    assert_eq!(unread.code, "invalid_workflow");
+    assert_eq!(read, SetupRead::default());
+}
+
+#[test]
+fn a_version_belt_does_not_read_is_skipped_with_what_was_written() {
+    for raw in ["pypy3.10", "3.13t", "oldstable", "graalpy-24"] {
+        let workflow = one_step("actions/setup-python@v5", &format!("python-version: {raw}"));
+        let read = setup_read(&workflow, &[]);
+        assert_eq!(read.declarations, [], "{raw}");
+        assert_eq!(read.skipped.len(), 1, "{raw}");
+        assert_eq!(read.skipped[0].code, "invalid_version", "{raw}");
+        assert_eq!(read.skipped[0].value, raw);
+        assert_eq!(read.skipped[0].location, line("ci.yml", 6));
+        assert_eq!(read.skipped[0].step, line("ci.yml", 4));
+    }
+    // What was written is cut at 80 characters.
+    let long = "x".repeat(81);
+    let workflow = one_step(
+        "actions/setup-python@v5",
+        &format!("python-version: {long}"),
+    );
+    assert_eq!(setup_read(&workflow, &[]).skipped[0].value, "x".repeat(80));
+    let exact = "x".repeat(80);
+    let workflow = one_step(
+        "actions/setup-python@v5",
+        &format!("python-version: {exact}"),
+    );
+    assert_eq!(setup_read(&workflow, &[]).skipped[0].value, exact);
+}
+
+#[test]
+fn a_version_file_is_read_by_its_format_or_skipped() {
+    let python = |file: &str| {
+        one_step(
+            "actions/setup-python@v5",
+            &format!("python-version-file: {file}"),
+        )
+    };
+    let one = |read: &SetupRead| {
+        assert_eq!(read.skipped, [], "{read:?}");
+        assert_eq!(read.declarations.len(), 1, "{read:?}");
+        read.declarations[0].clone()
+    };
+    let skipped = |read: &SetupRead| {
+        assert_eq!(read.declarations, [], "{read:?}");
+        assert_eq!(read.skipped.len(), 1, "{read:?}");
+        assert_eq!(read.skipped[0].step, line("ci.yml", 4));
+        (
+            read.skipped[0].code.clone(),
+            read.skipped[0].location.clone(),
+        )
+    };
+    let at_step = |code: &str| (code.to_string(), line("ci.yml", 6));
+    // A plain version file: its content, at the file.
+    let got = one(&setup_read(
+        &python(".python-version"),
+        &[(".python-version", "# pin\n3.12.1\n")],
+    ));
+    assert_eq!(got.tool.as_str(), "python");
+    assert_eq!(got.constraint, Constraint::parse("3.12.1").unwrap());
+    assert_eq!(got.location, line(".python-version", 1));
+    assert_eq!(got.scope, step_scope("ci.yml", "a", 0));
+    // Its content is no version: skipped, at the file.
+    assert_eq!(
+        skipped(&setup_read(
+            &python(".python-version"),
+            &[(".python-version", "pypy3.10\n")]
+        )),
+        ("invalid_version".to_string(), line(".python-version", 1))
+    );
+    // A file the source does not hold, and a path outside the project.
+    assert_eq!(
+        skipped(&setup_read(&python(".python-version"), &[])),
+        at_step("missing_version_file")
+    );
+    assert_eq!(
+        skipped(&setup_read(&python("../outside"), &[])),
+        at_step("invalid_version_file")
+    );
+    // A path that is an expression waits for the run; half an expression is
+    // nothing belt reads.
+    let got = one(&setup_read(&python("${{ matrix.file }}"), &[]));
+    assert_eq!(
+        got.constraint,
+        Constraint::VersionFileExpression("${{ matrix.file }}".into())
+    );
+    assert_eq!(got.location, line("ci.yml", 6));
+    assert_eq!(
+        skipped(&setup_read(&python("'${{ matrix.file'"), &[])),
+        at_step("invalid_expression")
+    );
+    // A file in a format of its own is never read as a plain version.
+    for file in [
+        "go.mod",
+        "go.work",
+        "pyproject.toml",
+        "global.json",
+        "versions.yaml",
+        "versions.yml",
+        "poetry.lock",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    ] {
+        let read = setup_read(&python(file), &[(file, "3.12.1\n")]);
+        assert_eq!(skipped(&read), at_step("structured_version_file"), "{file}");
+        assert_eq!(read.skipped[0].value, file);
+    }
+    // A format the project's own reader knows is read by it for the tool of
+    // the step, at the root or in a directory.
+    for file in [".tool-versions", "meta/.tool-versions"] {
+        let content = "nodejs 20.1.0\npython 3.12.1\n";
+        let got = one(&setup_read(&python(file), &[(file, content)]));
+        assert_eq!(got.tool.as_str(), "python", "{file}");
+        assert_eq!(got.constraint, Constraint::parse("3.12.1").unwrap());
+        assert_eq!(got.location, line(file, 2));
+        assert_eq!(got.scope, step_scope("ci.yml", "a", 0));
+    }
+    let got = one(&setup_read(
+        &python("mise.toml"),
+        &[("mise.toml", "[tools]\npython = '3.11.2'\n")],
+    ));
+    assert_eq!(got.constraint, Constraint::parse("3.11.2").unwrap());
+    let rust = one_step(
+        "actions-rust-lang/setup-rust-toolchain@v1",
+        "toolchain-file: rust-toolchain.toml",
+    );
+    let got = one(&setup_read(
+        &rust,
+        &[("rust-toolchain.toml", "[toolchain]\nchannel = '1.80.0'\n")],
+    ));
+    assert_eq!(got.tool.as_str(), "rust");
+    assert_eq!(got.constraint, Constraint::parse("1.80.0").unwrap());
+    // It names no version of the tool: skipped at the step.
+    assert_eq!(
+        skipped(&setup_read(
+            &python(".tool-versions"),
+            &[(".tool-versions", "nodejs 20.1.0\n")]
+        )),
+        at_step("version_file_without_tool")
+    );
+    // It does not read: skipped where the reader says.
+    assert_eq!(
+        skipped(&setup_read(
+            &python("meta/.tool-versions"),
+            &[("meta/.tool-versions", "nodejs 20.1.0\npython\n")]
+        )),
+        (
+            "missing_version".to_string(),
+            line("meta/.tool-versions", 2)
+        )
+    );
+    // Only the whole name is the format: another file ending the same way is
+    // a plain version file.
+    let got = one(&setup_read(
+        &python("my.nvmrc"),
+        &[("my.nvmrc", "3.12.1\n")],
+    ));
+    assert_eq!(got.tool.as_str(), "python");
+    assert_eq!(got.location, line("my.nvmrc", 1));
+    // setup-node keeps its own reading of a file, with its own errors.
+    let node = one_step("actions/setup-node@v4", "node-version-file: package.json");
+    let got = one(&setup_read(
+        &node,
+        &[("package.json", r#"{"engines":{"node":"20.1.0"}}"#)],
+    ));
+    assert_eq!(got.constraint, Constraint::parse("20.1.0").unwrap());
+    assert_eq!(
+        skipped(&setup_read(&node, &[("package.json", "{}")])),
+        (
+            "node_version_file_requires_resolution".to_string(),
+            line("package.json", 1)
+        )
+    );
+}
+
+#[test]
+fn the_reference_of_the_rust_toolchain_action_is_the_version_when_it_is_one() {
+    let declared = |uses: &str, input: &str| {
+        let read = setup_read(&one_step(uses, input), &[]);
+        assert_eq!(read.skipped, [], "{uses}");
+        assert_eq!(read.steps.len(), 1, "{uses}");
+        let lines: Vec<String> = read
+            .declarations
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}={}@{}",
+                    d.tool.as_str(),
+                    d.constraint.describe(),
+                    d.location.first_line
+                )
+            })
+            .collect();
+        lines.join(" ")
+    };
+    let range = |raw: &str| Constraint::parse(raw).unwrap().describe();
+    assert_eq!(
+        declared("dtolnay/rust-toolchain@1.89", ""),
+        format!("rust={}@4", range("1.89"))
+    );
+    assert_eq!(
+        declared("dtolnay/rust-toolchain@1.89.0", ""),
+        "rust=1.89.0@4"
+    );
+    for channel in ["stable", "beta", "nightly"] {
+        assert_eq!(
+            declared(&format!("dtolnay/rust-toolchain@{channel}"), ""),
+            format!("rust={channel}@4")
+        );
+    }
+    // A branch, a tag of the action, a commit, and what is no version.
+    for reference in ["master", "1", "v1.89", "1.2.3.4", "012345", "1.x9", "v1"] {
+        assert_eq!(
+            declared(&format!("dtolnay/rust-toolchain@{reference}"), ""),
+            "",
+            "{reference}"
+        );
+    }
+    assert_eq!(declared("dtolnay/rust-toolchain", ""), "");
+    // The `toolchain` input is the version when it is given (its line is
+    // found by the input's name, which the action's own name holds too);
+    // another input does not stand in for it.
+    assert_eq!(
+        declared("dtolnay/rust-toolchain@1.89.0", "toolchain: 1.70.0"),
+        "rust=1.70.0@4"
+    );
+    assert_eq!(
+        declared("dtolnay/rust-toolchain@1.89.0", "components: clippy"),
+        "rust=1.89.0@4"
+    );
+    // The reference of another action is never a version.
+    assert_eq!(declared("actions/setup-node@1.89.0", ""), "");
+    assert_eq!(
+        declared("actions-rust-lang/setup-rust-toolchain@1.89.0", ""),
+        ""
+    );
+}
+
+#[test]
+fn sync_reads_every_step_and_only_skips_a_structured_version_file() {
+    let go = one_step("actions/setup-go@v5", "go-version-file: go.mod");
+    let bad = one_step("actions/setup-python@v5", "python-version: pypy3.10");
+    let missing = one_step(
+        "actions/setup-python@v5",
+        "python-version-file: .python-version",
+    );
+    let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    // A structured file is skipped, and says so; nothing is declared from it.
+    let read = read_setup(
+        "",
+        &docs(&[
+            ("a.yml", &go),
+            ("go.mod", "go 1.22\n"),
+            (".node-version", "20.1.0"),
+        ]),
+        &names(&["a.yml"]),
+    )
+    .unwrap();
+    assert_eq!(read.declarations, [decl("20.1.0")]);
+    assert_eq!(read.skipped.len(), 1);
+    assert_eq!(read.skipped[0].code, "structured_version_file");
+    assert_eq!(read.skipped[0].step, line("a.yml", 4));
+    assert_eq!(
+        read_project(
+            "",
+            &docs(&[("a.yml", &go), ("go.mod", "go 1.22\n")]),
+            &names(&["a.yml"])
+        ),
+        Ok(vec![])
+    );
+    // Anything else that is not read is the error it was, where it is written.
+    let error = |workflows: &[(&str, &str)], order: &[&str]| {
+        let mut all = workflows.to_vec();
+        all.push(("go.mod", "go 1.22\n"));
+        read_setup("", &docs(&all), &names(order)).unwrap_err()
+    };
+    let invalid = Diagnostic::at("invalid_version", line("b.yml", 6));
+    assert_eq!(error(&[("b.yml", &bad)], &["b.yml"]), invalid);
+    assert_eq!(
+        error(&[("c.yml", &missing)], &["c.yml"]),
+        Diagnostic::at("missing_version_file", line("c.yml", 6))
+    );
+    // The first workflow that is not read is the error, in the order given,
+    // and a skipped structured file before it is none.
+    let all = [
+        ("a.yml", go.as_str()),
+        ("b.yml", bad.as_str()),
+        ("c.yml", missing.as_str()),
+    ];
+    assert_eq!(error(&all, &["a.yml", "b.yml", "c.yml"]), invalid);
+    assert_eq!(
+        error(&all, &["a.yml", "c.yml", "b.yml"]).code,
+        "missing_version_file"
+    );
+    // A step under a condition is read as any other.
+    let conditional = "jobs:\n  a:\n    steps:\n      - uses: actions/setup-node@v4\n        if: always()\n        with:\n          node-version: 20.1.0\n";
+    let read = read_setup("", &docs(&[("a.yml", conditional)]), &names(&["a.yml"])).unwrap();
+    assert_eq!(read.declarations.len(), 1);
+    assert_eq!(read.conditional.len(), 1);
+    // A workflow that is not among the documents, and one that does not parse.
+    assert_eq!(
+        read_setup("", &docs(&[("a.yml", &go)]), &names(&["z.yml"])).unwrap_err(),
+        Diagnostic::at("missing_workflow", line("z.yml", 1))
+    );
+    assert_eq!(
+        read_setup("", &docs(&[("a.yml", "[bad")]), &names(&["a.yml"]))
+            .unwrap_err()
+            .code,
+        "invalid_workflow"
+    );
+    // Project files that contradict are an error once every workflow is read.
+    let files = docs(&[
+        (".node-version", "20.1.0"),
+        (".nvmrc", "22.1.0"),
+        ("b.yml", &bad),
+    ]);
+    assert_eq!(
+        read_setup("", &files, &names(&["b.yml"])).unwrap_err().code,
+        "invalid_version"
+    );
+    assert_eq!(
+        read_setup("", &files, &[]).unwrap_err().code,
+        "conflicting_versions"
+    );
+    assert_eq!(read_files("", &files).unwrap().len(), 2);
+}
+
+#[test]
+fn the_freeze_asks_for_the_version_files_a_workflow_can_name() {
+    let workflow = "jobs:\n  a:\n    steps:\n      - uses: actions/setup-python@v5\n        with:\n          python-version-file: meta/.python-version\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: ../outside\n      - uses: actions/setup-node@v4\n        with:\n          node-version-file: ${{ matrix.file }}\n      - uses: unknown/setup@v1\n        with:\n          node-version-file: ignored\n";
+    let documents = docs(&[("ci.yml", workflow), ("bad.yml", "[bad")]);
+    assert_eq!(
+        setup_version_files(&documents["ci.yml"]),
+        ["meta/.python-version"]
+    );
+    // A workflow that does not parse names none.
+    assert!(setup_version_files(&documents["bad.yml"]).is_empty());
+}
+
+/// A setup action takes its direct version input and does not consult the
+/// version file beside it, in either order of the two: the file is not asked
+/// for and not read, so what it holds contradicts nothing.
+#[test]
+fn a_direct_version_precedes_the_version_file_of_every_setup_action() {
+    for (uses, key, version) in [
+        ("actions/setup-python@v5", "python-version", "3.12.1"),
+        ("actions/setup-go@v5", "go-version", "1.22.3"),
+        ("actions/setup-node@v4", "node-version", "20.1.0"),
+    ] {
+        let direct = format!("{key}: {version}");
+        let file = format!("{key}-file: pinned.txt");
+        let files: [&[(&str, &str)]; 2] = [&[], &[("pinned.txt", "9.9.9\n")]];
+        for inputs in [
+            format!("{direct}\n          {file}"),
+            format!("{file}\n          {direct}"),
+        ] {
+            let workflow = one_step(uses, &inputs);
+            let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+            assert_eq!(workflow_version_files(&document), Ok(vec![]), "{workflow}");
+            assert!(setup_version_files(&document).is_empty(), "{workflow}");
+            for files in files {
+                let read = setup_read(&workflow, files);
+                assert_eq!(read.skipped, [], "{workflow}");
+                assert_eq!(read.declarations.len(), 1, "{workflow}");
+                let got = &read.declarations[0];
+                assert_eq!(got.constraint, Constraint::parse(version).unwrap());
+                assert_eq!(got.location.path, "ci.yml");
+            }
+            let mut all = vec![("ci.yml", workflow.as_str())];
+            all.extend_from_slice(files[1]);
+            let got = read_project("", &docs(&all), &["ci.yml".into()]).unwrap();
+            assert_eq!(got.len(), 1, "{workflow}");
+        }
+        // The file alone is asked for and read, as before.
+        let workflow = one_step(uses, &file);
+        let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+        assert_eq!(
+            workflow_version_files(&document),
+            Ok(vec!["pinned.txt".to_string()])
+        );
+        assert_eq!(setup_version_files(&document), ["pinned.txt"]);
+        let read = setup_read(&workflow, files[1]);
+        assert_eq!(read.declarations.len(), 1, "{workflow}");
+        assert_eq!(read.declarations[0].location.path, "pinned.txt");
+        assert_eq!(
+            read.declarations[0].constraint,
+            Constraint::parse("9.9.9").unwrap()
+        );
+        // An empty direct input is no input for setup-node only: any other
+        // action is still given it, and its file is not asked for.
+        let workflow = one_step(uses, &format!("{key}: ''\n          {file}"));
+        let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+        let asked = setup_version_files(&document);
+        if uses.starts_with("actions/setup-node@") {
+            assert_eq!(asked, ["pinned.txt"]);
+        } else {
+            assert!(asked.is_empty(), "{workflow}");
+        }
+    }
+}

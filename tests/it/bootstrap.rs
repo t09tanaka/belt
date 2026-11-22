@@ -5423,6 +5423,541 @@ async fn ci_task_needing_an_unauthorized_toolchain_is_blocked_and_runs_with_no_o
     shutdown(&load(&spec)).await;
 }
 
+/// The frozen toolchain of each CI task of the run, by the task of the plan:
+/// the scope it was frozen in and its requirements as `tool=version`.
+fn ci_task_toolchains(
+    spec: &Spec,
+    value: &serde_json::Value,
+) -> BTreeMap<String, (serde_json::Value, Vec<String>)> {
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    rows.into_iter()
+        .map(|row| {
+            let task = row.spec["ci"]["task"]["task_id"].as_str().unwrap();
+            let bundle: belt::toolchain::contract::FrozenBundle =
+                serde_json::from_value(row.spec["toolchains"].clone())
+                    .unwrap_or_else(|e| panic!("task {task} carries no bundle: {e}"));
+            let lines = bundle.frozen.requirements.iter().map(|r| r.describe());
+            (
+                task.to_string(),
+                (
+                    serde_json::to_value(&bundle.frozen.scope).unwrap(),
+                    lines.collect(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Spec 22.1: the `*-version` input of a `setup-*` step is a declaration of
+/// the job it is written in. No version file exists here. The job with the
+/// step runs under the version the step names, each leg of a matrix under
+/// its own value, and a job without a setup step is frozen and run exactly as
+/// before (the project scope, the Node of the base PATH).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_runs_under_the_version_its_own_setup_step_declares() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'18.0.0','20.0.0'");
+    let setup = |version: &str| {
+        format!("      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n")
+    };
+    let jobs = format!(
+        "  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/plain\n  build:\n    runs-on: ubuntu-latest\n    steps:\n{}      - run: node --version >> MARKS/build\n  legs:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: ['18.0.0', '20.0.0']\n    steps:\n{}      - run: node --version >> MARKS/legs-${{{{ matrix.node }}}}\n",
+        setup("20.0.0"),
+        setup("${{ matrix.node }}"),
+    );
+    let marks = ci_project(root.path(), &input, &jobs);
+    let (code, value) = ci_output(&spec, &input).await;
+    if code != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "plain"), ["v22.0.0"]);
+    assert_eq!(ci_marks(&marks, "build"), ["v20.0.0"]);
+    assert_eq!(ci_marks(&marks, "legs-18.0.0"), ["v18.0.0"]);
+    assert_eq!(ci_marks(&marks, "legs-20.0.0"), ["v20.0.0"]);
+    // What each task carries: the job's own requirement in the job's scope.
+    let file = ".github/workflows/ci.yml";
+    let project = serde_json::json!({"project": "", "workflow": null, "job": null, "step": null});
+    let job =
+        |id: &str| serde_json::json!({"project": "", "workflow": file, "job": id, "step": null});
+    let mut carried: Vec<(serde_json::Value, Vec<String>)> =
+        ci_task_toolchains(&spec, &value).into_values().collect();
+    carried.sort_by_key(|(scope, lines)| format!("{scope} {lines:?}"));
+    let mut expected = vec![
+        (project, vec![]),
+        (job("build"), vec!["node=20.0.0".to_string()]),
+        (job("legs"), vec!["node=18.0.0".to_string()]),
+        (job("legs"), vec!["node=20.0.0".to_string()]),
+    ];
+    expected.sort_by_key(|(scope, lines)| format!("{scope} {lines:?}"));
+    assert_eq!(carried, expected);
+    // The managers ran for the declared versions only.
+    let calls = std::fs::read_to_string(host.join("calls")).unwrap();
+    let mut calls: Vec<&str> = calls.lines().collect();
+    calls.sort();
+    calls.dedup();
+    assert_eq!(calls, ["18.0.0", "20.0.0"]);
+    shutdown(&load(&spec)).await;
+}
+
+/// The version only a `setup-*` step names is a requirement of placement as
+/// a version file is: a worker that may not provide it is left out with the
+/// same `unmet` line, no step runs and no other version is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_task_whose_setup_step_needs_an_unauthorized_version_is_not_placed() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0'");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 21.0.0\n      - run: node --version >> MARKS/build\n",
+    );
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await });
+    let started = std::time::Instant::now();
+    let waiting = loop {
+        let found = CoordinatorStore::open_read_only(&spec.state_dir)
+            .ok()
+            .and_then(|store| store.events_after(0, 10_000).ok())
+            .and_then(|events| events.into_iter().find(|e| e.kind == "task_waiting"));
+        if let Some(event) = found {
+            break event;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the CI task was not reported as blocked");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(waiting.payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(
+        waiting.payload["decision"]["excluded"][0]["unmet"],
+        serde_json::json!(["toolchain node=21.0.0 unavailable"]),
+        "{}",
+        waiting.payload
+    );
+    assert!(
+        !running.is_finished(),
+        "ci ended: the block was not at placement"
+    );
+    assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    running.abort();
+    shutdown(&load(&spec)).await;
+}
+
+/// Two steps of one job that ask, without a condition, for different
+/// versions of one tool are refused when the run is submitted: nothing is
+/// queued, nothing is installed, no step runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_refuses_two_setup_versions_of_one_tool_in_one_job() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'18.0.0','20.0.0'");
+    let setup = |version: &str| {
+        format!("      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n")
+    };
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &format!(
+            "  build:\n    runs-on: ubuntu-latest\n    steps:\n{}{}      - run: node --version >> MARKS/build\n",
+            setup("18.0.0"),
+            setup("20.0.0")
+        ),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = value.to_string();
+    assert_eq!(value["ok"], false, "{text}");
+    assert!(text.contains("environment_mismatch"), "{text}");
+    // Both places are named.
+    assert!(
+        text.contains(
+            "(job build): conflicting_versions at .github/workflows/ci.yml:8 and .github/workflows/ci.yml:11"
+        ),
+        "{text}"
+    );
+    // A channel the project's own version file names is refused as it was,
+    // also when a setup step names the same channel.
+    std::fs::write(input.join("rust-toolchain"), "stable\n").unwrap();
+    ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - run: node --version >> MARKS/build\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = value.to_string();
+    assert!(text.contains("environment_mismatch"), "{text}");
+    assert!(text.contains("toolchain resolve required"), "{text}");
+    assert!(text.contains("rust=stable"), "{text}");
+    assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    shutdown(&load(&spec)).await;
+}
+
+/// Spec 22.1: an input of a setup step belt does not interpret requires
+/// nothing. The run is accepted, each such step is told once on stderr, and
+/// every job runs on the worker as it did before setup steps were read: the
+/// worker reads the same from the source and takes the bundle. What is read
+/// of the same job is still required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agrees() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'18.0.0','20.0.0'");
+    // The steps themselves only look for their tool on the PATH, so the
+    // forms are written for tools this host has.
+    let project = "[project]\nrequires-python = '>=3.12'\n";
+    std::fs::write(input.join("pyproject.toml"), project).unwrap();
+    let job = |id: &str, more: &str, step: &str| {
+        format!("  {id}:\n    runs-on: ubuntu-latest\n{more}    steps:\n{step}      - run: node --version >> MARKS/{id}\n")
+    };
+    let node = |version: &str| {
+        format!("      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n")
+    };
+    let python_file = |file: &str| {
+        format!(
+            "      - uses: actions/setup-python@v5\n        with:\n          python-version-file: {file}\n"
+        )
+    };
+    let jobs = [
+        // An expression that is not one matrix or env reference.
+        job("expr", "", &node("${{ github.ref_name }}")),
+        // A version string belt does not read.
+        job(
+            "unknown",
+            "",
+            "      - uses: actions/setup-python@v5\n        with:\n          python-version: pypy3.10\n",
+        ),
+        // A version file in a format of its own, and one the source lacks.
+        job("structured", "", &python_file("pyproject.toml")),
+        job("missing", "", &python_file("absent.txt")),
+        // A step under a condition.
+        job(
+            "cond",
+            "",
+            "      - uses: actions/setup-node@v4\n        if: always()\n        with:\n          node-version: 18.0.0\n",
+        ),
+        // A channel nothing here resolves to a version, of a tool with a
+        // recipe and of one without.
+        job("channel", "", "      - uses: dtolnay/rust-toolchain@stable\n"),
+        job("alias", "", &node("lts/*")),
+        // A matrix key the legs do not have.
+        job(
+            "legs",
+            "    strategy:\n      matrix:\n        os: [a, b]\n",
+            &node("${{ matrix.node }}"),
+        ),
+        // What is read of a job is required; what is not is told.
+        job("mixed", "", &format!("{}{}", node("20.0.0"), python_file("pyproject.toml"))),
+    ]
+    .concat();
+    let marks = ci_project(root.path(), &input, &jobs);
+    // The rust step looks for `cargo`; no rust version is asked of it.
+    crate::common::write_executable(&host.join("cargo"), "#!/bin/sh\nprintf 'cargo 1.80.0\\n'\n");
+    let output = ci_command(&spec, &input).output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    if output.status.code() != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(output.status.code(), Some(0), "{value} {stderr}");
+    // Every job ran: under the Node of the base PATH, or the one its step pins.
+    for id in [
+        "expr",
+        "unknown",
+        "structured",
+        "missing",
+        "cond",
+        "alias",
+        "channel",
+        "legs",
+    ] {
+        let ran = ci_marks(&marks, id);
+        assert!(!ran.is_empty(), "{id} did not run: {stderr}");
+        assert!(ran.iter().all(|line| line == "v22.0.0"), "{id}: {ran:?}");
+    }
+    assert_eq!(ci_marks(&marks, "legs").len(), 2);
+    assert_eq!(ci_marks(&marks, "mixed"), ["v20.0.0"]);
+    // One notice for each step, with the job and the step's line; the legs of
+    // the matrix are one line.
+    let workflow = std::fs::read_to_string(input.join(".github/workflows/ci.yml")).unwrap();
+    let step_line = |id: &str, nth: usize| {
+        let lines: Vec<&str> = workflow.lines().collect();
+        let start = lines.iter().position(|l| *l == format!("  {id}:")).unwrap();
+        let uses = lines.iter().enumerate().skip(start);
+        let mut uses = uses.filter(|(_, l)| l.contains("uses:"));
+        uses.nth(nth).unwrap().0 + 1
+    };
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is required from this step"))
+        .collect();
+    let told = |id: &str, nth: usize, text: &str| {
+        let at = format!(".github/workflows/ci.yml:{}): {text}", step_line(id, nth));
+        let found: Vec<&&str> = notices.iter().filter(|l| l.ends_with(&at)).collect();
+        assert_eq!(found.len(), 1, "{at}: {stderr}");
+        assert!(found[0].starts_with("warning: "), "{}", found[0]);
+        assert!(found[0].contains(&format!("job {id}")), "{}", found[0]);
+        found[0].to_string()
+    };
+    told("expr", 0, "node: the version is the expression ${{ github.ref_name }}, which is not known until the run; no node version is required from this step");
+    told("unknown", 0, "python: `pypy3.10` is not a version belt reads (invalid_version); no python version is required from this step");
+    told("structured", 0, "python: the version file pyproject.toml is not a plain version file; no python version is required from this step");
+    told("missing", 0, "python: the version file absent.txt is not a readable file of the captured source; no python version is required from this step");
+    told(
+        "cond",
+        0,
+        "node: the step has an `if:` condition; no node version is required from this step",
+    );
+    told(
+        "alias",
+        0,
+        "node: `lts/*` names no concrete version; no node version is required from this step",
+    );
+    let legs = told("legs", 0, "node: the version is the expression ${{ matrix.node }}, which is not known until the run; no node version is required from this step");
+    assert!(legs.starts_with("warning: job legs, 2 tasks ("), "{legs}");
+    told("mixed", 1, "python: the version file pyproject.toml is not a plain version file; no python version is required from this step");
+    told(
+        "channel",
+        0,
+        "rust: `stable` names no concrete version; no rust version is required from this step",
+    );
+    assert_eq!(notices.len(), 9, "{stderr}");
+    // What each task carries: nothing of a step that was not interpreted, in
+    // the project's scope; the pinned Node in the job's scope.
+    let file = ".github/workflows/ci.yml";
+    let project = serde_json::json!({"project": "", "workflow": null, "job": null, "step": null});
+    let mixed = serde_json::json!({"project": "", "workflow": file, "job": "mixed", "step": null});
+    let carried: Vec<(serde_json::Value, Vec<String>)> =
+        ci_task_toolchains(&spec, &value).into_values().collect();
+    assert_eq!(carried.len(), 10);
+    let pinned = (mixed, vec!["node=20.0.0".to_string()]);
+    assert_eq!(carried.iter().filter(|c| **c == pinned).count(), 1);
+    let none = (project, vec![]);
+    assert_eq!(
+        carried.iter().filter(|c| **c == none).count(),
+        9,
+        "{carried:?}"
+    );
+    // The manager ran for the pinned version only.
+    let calls = std::fs::read_to_string(host.join("calls")).unwrap();
+    let mut calls: Vec<&str> = calls.lines().collect();
+    calls.dedup();
+    assert_eq!(calls, ["20.0.0"]);
+    shutdown(&load(&spec)).await;
+}
+
+/// What each task of the run carries: the job of its bundle's scope, its
+/// requirements, and the versions its bundle was frozen to.
+fn ci_task_selections(
+    spec: &Spec,
+    value: &serde_json::Value,
+) -> Vec<(Option<String>, Vec<String>, Vec<String>)> {
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    let mut carried: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let bundle: belt::toolchain::contract::FrozenBundle =
+                serde_json::from_value(row.spec["toolchains"].clone()).unwrap();
+            let frozen = &bundle.frozen;
+            let scope = serde_json::to_value(&frozen.scope).unwrap();
+            (
+                scope["job"].as_str().map(String::from),
+                frozen.requirements.iter().map(|r| r.describe()).collect(),
+                frozen
+                    .selections
+                    .iter()
+                    .map(|s| s.concrete.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    carried.sort();
+    carried
+}
+
+/// A range no registry resolves is frozen, for the task that asks for it, to
+/// the version this host's own tool reports when that version is in the
+/// range: the range of a setup step, and the range of the project's version
+/// file. The worker reads the same from the source, takes the bundle and
+/// runs the job on its own tool of exactly that version. An alias of a setup
+/// step in another job of the same run is no requirement, as before: that job
+/// is told so and runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_accepts_a_range_the_native_tool_satisfies_frozen_to_the_observed_version() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let job = |id: &str, version: &str| {
+        format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
+    };
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[job("range", "20"), job("alias", "lts/*")].concat(),
+    );
+    let output = ci_command(&spec, &input).output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    if output.status.code() != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(output.status.code(), Some(0), "{value} {stderr}");
+    assert_eq!(ci_marks(&marks, "range"), ["v20.11.1"]);
+    assert_eq!(ci_marks(&marks, "alias"), ["v20.11.1"]);
+    // The alias is told once; the range is a requirement and is not.
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is required from this step"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(notices[0].contains("job alias"), "{stderr}");
+    assert!(
+        notices[0].ends_with(
+            "node: `lts/*` names no concrete version; no node version is required from this step"
+        ),
+        "{stderr}"
+    );
+    let range = "node=>=20.0.0 <21.0.0-0".to_string();
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [
+            (None, Vec::<String>::new(), Vec::<String>::new()),
+            (
+                Some("range".to_string()),
+                vec![range.clone()],
+                vec!["20.11.1".to_string()]
+            ),
+        ]
+    );
+    // The same range written in the project's version file, for a job with
+    // no setup step.
+    std::fs::write(input.join(".nvmrc"), "20\n").unwrap();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/plain\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    if code != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "plain"), ["v20.11.1"]);
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [(None, vec![range], vec!["20.11.1".to_string()])]
+    );
+    assert!(
+        !spec.worker_state_dir.join("toolchains").exists()
+            || std::fs::read_dir(spec.worker_state_dir.join("toolchains"))
+                .unwrap()
+                .count()
+                == 0,
+        "something was installed"
+    );
+    shutdown(&load(&spec)).await;
+}
+
+/// Two setup steps of one job name an alias each: the one the registry
+/// resolves stays a requirement of the task, frozen to the resolved version,
+/// and the job runs on it. Only the one nothing resolves is no requirement,
+/// and only that one is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_accepts_an_alias_the_registry_resolves_beside_one_nothing_resolves() {
+    let (root, spec, input) = control_fixture();
+    let host = node_toolchain_worker(root.path(), &spec, "'20.0.0'");
+    // The operator maps the alias to a version of the inventory.
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    let registry = std::fs::read_to_string(&registry_file).unwrap();
+    std::fs::write(
+        &registry_file,
+        format!("{registry}resolved_inputs={{'lts/*'='20.0.0'}}\n"),
+    )
+    .unwrap();
+    // The rust step looks for `cargo`; no rust version is asked of it.
+    crate::common::write_executable(&host.join("cargo"), "#!/bin/sh\nprintf 'cargo 1.80.0\\n'\n");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - uses: actions/setup-node@v4\n        with:\n          node-version: lts/*\n      - run: node --version >> MARKS/build\n",
+    );
+    let output = ci_command(&spec, &input).output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    if output.status.code() != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(output.status.code(), Some(0), "{value} {stderr}");
+    assert_eq!(ci_marks(&marks, "build"), ["v20.0.0"]);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is required from this step"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(
+        notices[0].ends_with(
+            "rust: `stable` names no concrete version; no rust version is required from this step"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [(
+            Some("build".to_string()),
+            vec!["node=lts/*".to_string()],
+            vec!["20.0.0".to_string()]
+        )]
+    );
+    shutdown(&load(&spec)).await;
+}
+
+/// A range of a setup step that neither a registry resolves nor this host's
+/// own tool is in is refused when the run is submitted, with the words of a
+/// plain command, also when another job of the run names an alias: nothing is
+/// queued and no step runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_refuses_a_range_the_native_tool_does_not_satisfy() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let job = |id: &str, version: &str| {
+        format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
+    };
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[job("range", "18"), job("alias", "lts/*")].concat(),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = value.to_string();
+    assert_eq!(value["ok"], false, "{text}");
+    assert!(text.contains("environment_mismatch"), "{text}");
+    assert!(
+        text.contains(
+            "toolchain resolve required: no coherent worker proposal (node=>=18.0.0 <19.0.0-0)"
+        ),
+        "{text}"
+    );
+    assert!(ci_marks(&marks, "range").is_empty(), "a step ran anyway");
+    assert!(ci_marks(&marks, "alias").is_empty(), "a step ran anyway");
+    shutdown(&load(&spec)).await;
+}
+
 /// A worker that holds as many frozen plans as it may does not take one
 /// more. The run does not wait without a word: it gets the event
 /// `ci_plan_refused` once, the worker is left out of the placement by name
@@ -5983,6 +6518,24 @@ async fn worker_commands_find_the_embedded_helpers_before_standalone_tools() {
 }
 
 /// A worker with no toolchain registry whose profile has a `node` that reports
+/// `reported`. Returns the directory of that `node`.
+fn native_node_profile(root: &std::path::Path, spec: &Spec, reported: &str) -> std::path::PathBuf {
+    let host = root.join("native-tools");
+    let stubs = root.join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(
+        &host.join("node"),
+        &format!("#!/bin/sh\nprintf 'v{reported}\\n'\n"),
+    );
+    let profile_text = format!("schema_version=1\nactive='native'\n[profiles.native]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='native'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!spec.worker_state_dir.join("toolchains.toml").exists());
+    host
+}
+
+/// A worker with no toolchain registry whose profile has a `node` that reports
 /// `reported`, and a project whose only declaration is `.nvmrc` = `declared`.
 /// The project has a prepare command that records the version setup saw.
 /// Returns the outcome of the public submit of a command that checks that
@@ -5999,18 +6552,7 @@ async fn submit_with_native_node(
     std::path::PathBuf,
 ) {
     let (root, spec, input) = control_fixture();
-    let host = root.path().join("native-tools");
-    let stubs = root.path().join("tool-stubs");
-    std::fs::create_dir(&host).unwrap();
-    crate::common::write_executable(
-        &host.join("node"),
-        &format!("#!/bin/sh\nprintf 'v{reported}\\n'\n"),
-    );
-    let profile_text = format!("schema_version=1\nactive='native'\n[profiles.native]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='native'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
-    let profile_file = spec.worker_state_dir.join("profiles.toml");
-    std::fs::write(&profile_file, &profile_text).unwrap();
-    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(!spec.worker_state_dir.join("toolchains.toml").exists());
+    let host = native_node_profile(root.path(), &spec, reported);
     std::fs::write(input.join(".nvmrc"), format!("{declared}\n")).unwrap();
     let ran = host.join("ran-on");
     let script = format!(

@@ -155,6 +155,48 @@ impl Machine {
     }
 }
 
+/// A frozen bundle is taken only when it is what this worker reads from the
+/// captured source itself: the scope, and the requirements in it.
+pub fn check_toolchain_source(
+    store: &SourceStore,
+    state_dir: &Path,
+    m: &CiManifest,
+    payload: &AttemptPayload,
+) -> Result<(), ApiError> {
+    let Some(bundle) = &payload.toolchains else {
+        return Ok(());
+    };
+    let invalid = |e: &str| ApiError::new(crate::error::ErrorCode::InvalidInput, e);
+    bundle.validate(&payload.manifest_digest).map_err(invalid)?;
+    let project =
+        std::str::from_utf8(&m.cwd_relative.0).map_err(|_| invalid("toolchain project scope"))?;
+    // A plain command is frozen from the project's version files. A
+    // CI task is frozen from those and the setup steps of its own
+    // jobs: which jobs, and the values of its matrix variant, come
+    // from the delivered plan, never from the bundle being checked.
+    let Some(ci) = &payload.ci_task else {
+        if bundle.frozen.scope != crate::toolchain::versions::Scope::project(project) {
+            return Err(invalid("toolchain source scope mismatch"));
+        }
+        let declarations = crate::toolchain::snapshot::read_captured(store, m, project, &[])
+            .map_err(|e| invalid(&e.code))?;
+        let effective = crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
+            .map_err(|e| invalid(&e.code))?;
+        if effective != bundle.frozen.requirements {
+            return Err(invalid("toolchain source declarations mismatch"));
+        }
+        return Ok(());
+    };
+    let (plan, task) = super::ci_task::plan_task(state_dir, ci)?;
+    // The function the parent froze with, and the check the parent made of
+    // its own bundle: what it left out as not interpreted is left out here
+    // as well.
+    let source = crate::ci::toolchains::read_task(store, m, project, &task.workflow)
+        .map_err(|e| invalid(&e.code))?;
+    crate::ci::toolchains::check_frozen(&source, &plan, &task, project, &bundle.frozen)
+        .map_err(|e| invalid(&e))
+}
+
 /// The manifest of the source the payload names, and only if it is the
 /// manifest the payload names.
 fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
@@ -349,24 +391,7 @@ impl Host for Machine {
             ));
         }
         let m = self.manifest(attempt)?;
-        if let Some(bundle) = &payload.toolchains {
-            let invalid = |e: &str| ApiError::new(crate::error::ErrorCode::InvalidInput, e);
-            bundle.validate(&payload.manifest_digest).map_err(invalid)?;
-            let project = std::str::from_utf8(&m.cwd_relative.0)
-                .map_err(|_| invalid("toolchain project scope"))?;
-            if bundle.frozen.scope != crate::toolchain::versions::Scope::project(project) {
-                return Err(invalid("toolchain source scope mismatch"));
-            }
-            let declarations =
-                crate::toolchain::snapshot::read_captured(&self.store, &m, project, &[])
-                    .map_err(|e| invalid(&e.code))?;
-            let effective =
-                crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
-                    .map_err(|e| invalid(&e.code))?;
-            if effective != bundle.frozen.requirements {
-                return Err(invalid("toolchain source declarations mismatch"));
-            }
-        }
+        check_toolchain_source(&self.store, &self.state_dir, &m, payload)?;
 
         if payload.in_place {
             let root = self.original(payload)?;

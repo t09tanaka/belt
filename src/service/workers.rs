@@ -1818,6 +1818,21 @@ fn workflow_files(root: &Path) -> Result<Vec<String>, ApiError> {
 pub fn read_project_requirements(
     dir: &Path,
 ) -> Result<Vec<crate::toolchain::versions::EffectiveRequirement>, ApiError> {
+    read_project_setup(dir).map(|(requirements, _)| requirements)
+}
+
+/// [`read_project_requirements`] with what was left out: one line for each
+/// version file of a setup step that is in a format of its own (`go.mod`,
+/// `pyproject.toml`) and so is not read as a version.
+pub fn read_project_setup(
+    dir: &Path,
+) -> Result<
+    (
+        Vec<crate::toolchain::versions::EffectiveRequirement>,
+        Vec<String>,
+    ),
+    ApiError,
+> {
     use crate::toolchain::{declarations, versions};
     let bad = |what: &str| invalid(format!("project version files: {what}"));
     // Resolved once, so that nothing below follows a link the project holds.
@@ -1866,7 +1881,7 @@ pub fn read_project_requirements(
             dir.display()
         )));
     }
-    let found = declarations::read_project("", &documents, &workflows).map_err(|d| {
+    let read = declarations::read_setup("", &documents, &workflows).map_err(|d| {
         bad(&format!(
             "{}{}",
             d.code,
@@ -1876,6 +1891,15 @@ pub fn read_project_requirements(
                 .unwrap_or_default()
         ))
     })?;
+    let mut skipped: Vec<String> = Vec::new();
+    for s in &read.skipped {
+        let tool = s.tool.as_str();
+        skipped.push(format!(
+            "{}:{}: {tool}: the version file {} is not a plain version file; no {tool} version is taken from this step",
+            s.step.path, s.step.first_line, s.value
+        ));
+    }
+    let found = read.declarations;
     let scopes = versions::requirement_scopes(&found);
     let mut out: Vec<versions::EffectiveRequirement> = Vec::new();
     for scope in scopes {
@@ -1888,7 +1912,7 @@ pub fn read_project_requirements(
             }
         }
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 fn blocked_error(name: &str, installed: &[InstallStep], blocked: &[Blocked]) -> ApiError {
@@ -2371,10 +2395,14 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     .as_ref()
                     .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
                 let spec = super::context::runtime_spec(&env)?;
-                let requirements = project
+                let read = project
                     .as_deref()
-                    .map(|dir| read_project_requirements(Path::new(dir)))
+                    .map(|dir| read_project_setup(Path::new(dir)))
                     .transpose()?;
+                let (requirements, skipped) = read.unzip();
+                for line in skipped.iter().flatten() {
+                    eprintln!("warning: {line}");
+                }
                 sync_worker(
                     &mut SshRemote::new(&spec.cluster_key_path),
                     &env,

@@ -12,6 +12,7 @@ pub mod shards;
 pub mod status;
 pub mod summary;
 pub(crate) mod timing;
+pub mod toolchains;
 
 use local_ci::FrozenPlan;
 use summary::PlanSummary;

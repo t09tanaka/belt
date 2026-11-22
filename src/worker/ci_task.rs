@@ -464,6 +464,28 @@ fn origin_task(task: &CiTask) -> Result<String, ApiError> {
         .unwrap_or_else(|| Ok(task.task_id.clone()))
 }
 
+/// The delivered plan of `task` and the task of it whose jobs the attempt
+/// runs: the task itself, the task a dispatched matrix member comes from, or
+/// the task a discovery attempt lists the tests of.
+pub fn plan_task(
+    state_dir: &Path,
+    task: &CiTask,
+) -> Result<(FrozenPlan, local_ci::dag::ExecutionTask), ApiError> {
+    let plan = delivered_plan(state_dir, &task.plan_digest)?;
+    let id = match task.inputs.pointer("/belt_discovery/original_task") {
+        Some(original) => original
+            .as_str()
+            .ok_or_else(|| invalid("the discovery attempt names no task"))?
+            .to_string(),
+        None => origin_task(task)?,
+    };
+    let found = plan
+        .task(&id)
+        .cloned()
+        .ok_or_else(|| invalid("the frozen plan has no such task"))?;
+    Ok((plan, found))
+}
+
 /// What is checked of a CI task when its attempt is accepted, beyond the
 /// payload: the task in the plan, when the plan is here already. A plan
 /// that has not been delivered is no reason to refuse here (the attempt
@@ -678,6 +700,68 @@ mod tests {
         assert_eq!(put_fault(large).code, ErrorCode::InvalidInput);
         let other = std::io::Error::other("disk");
         assert_eq!(put_fault(other).code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn the_task_an_attempt_runs_the_jobs_of_comes_from_the_delivered_plan() {
+        let f = fixture(WORKFLOW);
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let digest = store_plan(dir.path(), &serde_json::to_vec(&f.plan).unwrap()).unwrap();
+        let mut task = payload_for(&f, &digest, "build").ci_task.unwrap();
+        let (plan, found) = plan_task(dir.path(), &task).unwrap();
+        assert_eq!(plan.digest, f.plan.digest);
+        assert_eq!(found.jobs, ["build"]);
+        // A discovery attempt lists the tests of another task: that task.
+        let test = task_of(&f.plan, "test").to_string();
+        task.task_id = "belt-discover-x".into();
+        task.inputs["belt_discovery"] = serde_json::json!({ "original_task": test });
+        assert_eq!(plan_task(dir.path(), &task).unwrap().1.jobs, ["test"]);
+        task.inputs["belt_discovery"] = serde_json::json!({ "original_task": 1 });
+        assert_eq!(
+            plan_task(dir.path(), &task).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        // A task the plan does not hold, and a plan that was never delivered.
+        task.inputs = serde_json::to_value(TaskInputs::default()).unwrap();
+        task.task_id = "no such task".into();
+        let refused = plan_task(dir.path(), &task).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidInput);
+        assert!(refused.message.contains("no such task"), "{refused:?}");
+        task.plan_digest = Digest::of_bytes(b"never delivered");
+        assert_eq!(
+            plan_task(dir.path(), &task).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+    }
+
+    /// The discovery attempt as the submit really stages it resolves to the
+    /// task whose tests it lists, so its bundle is checked as that task's.
+    #[test]
+    fn a_staged_discovery_attempt_resolves_to_the_task_it_lists_the_tests_of() {
+        let f = fixture(
+            "on: push\njobs:\n  js:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
+        );
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let digest = store_plan(dir.path(), &serde_json::to_vec(&f.plan).unwrap()).unwrap();
+        let source = Digest::of_bytes(b"source");
+        let mut specs = crate::service::ci_run::task_specs(
+            &f.plan,
+            &digest,
+            &source,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        crate::ci::discovery::stage(&f.plan, &mut specs, 2, 1, "project", &[]);
+        let probes: Vec<&CiTask> = specs
+            .iter()
+            .filter_map(|(_, spec)| spec.ci.as_ref().map(|ci| &ci.task))
+            .filter(|task| crate::wire::is_discovery_task(task))
+            .collect();
+        assert_eq!(probes.len(), 1);
+        assert!(f.plan.task(&probes[0].task_id).is_none());
+        let (_, found) = plan_task(dir.path(), probes[0]).unwrap();
+        assert_eq!(found.id, task_of(&f.plan, "js"));
     }
 
     fn payload_for(f: &Fixture, digest: &Digest, job: &str) -> AttemptPayload {

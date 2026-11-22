@@ -105,12 +105,74 @@ fn object(doc: &Document, format: &str) -> Result<Value, Diagnostic> {
     Ok(value)
 }
 
+fn too_many_documents() -> Diagnostic {
+    Diagnostic {
+        code: "too_many_documents".into(),
+        locations: vec![],
+    }
+}
+/// A version file in a format of its own (`go.mod`, `pyproject.toml`): it is
+/// never read as a plain version.
+pub const STRUCTURED_VERSION_FILE: &str = "structured_version_file";
+const STRUCTURED: &[&str] = &[
+    ".mod", ".work", ".toml", ".json", ".yaml", ".yml", ".lock", ".xml", ".gradle", ".kts",
+];
+
 /// Read one explicit project scope. Call separately for monorepo roots; only
 /// workflow steps in `workflows` are included, never a live workflow reread.
 pub fn read_project(
     project: &str,
     documents: &BTreeMap<String, Document>,
     workflows: &[String],
+) -> Result<Vec<Declaration>, Diagnostic> {
+    Ok(read_setup(project, documents, workflows)?.declarations)
+}
+/// [`read_project`] with what was left out. An input of a setup step that
+/// cannot be read is an error, except a version file in a structured format,
+/// which is only skipped. A step under an `if:` condition is read as any
+/// other.
+pub fn read_setup(
+    project: &str,
+    documents: &BTreeMap<String, Document>,
+    workflows: &[String],
+) -> Result<SetupRead, Diagnostic> {
+    if workflows.len() > MAX_DOCUMENTS {
+        return Err(too_many_documents());
+    }
+    let scope = Scope::project(project);
+    let mut read = SetupRead {
+        declarations: read_files(project, documents)?,
+        ..Default::default()
+    };
+    for path in workflows {
+        let doc = documents.get(path).ok_or_else(|| {
+            Diagnostic::at(
+                "missing_workflow",
+                Location {
+                    path: path.clone(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            )
+        })?;
+        read_workflow(doc, &scope, documents, &mut read)?;
+        let unread = |s: &&Skipped| s.code != STRUCTURED_VERSION_FILE;
+        if let Some(skipped) = read.skipped.iter().find(unread) {
+            return Err(Diagnostic::at(&skipped.code, skipped.location.clone()));
+        }
+    }
+    // Validate each individual effective scope, not all workflows together.
+    effective(&read.declarations, &scope)?;
+    for d in &read.declarations {
+        effective(&read.declarations, &d.scope)?;
+    }
+    Ok(read)
+}
+/// The declarations of the version files of one project scope. No workflow is
+/// read and nothing is compared.
+pub fn read_files(
+    project: &str,
+    documents: &BTreeMap<String, Document>,
 ) -> Result<Vec<Declaration>, Diagnostic> {
     if !project.is_empty() && !safe_path(project) {
         return Err(Diagnostic::at(
@@ -122,11 +184,8 @@ pub fn read_project(
             },
         ));
     }
-    if documents.len() > MAX_DOCUMENTS || workflows.len() > MAX_DOCUMENTS {
-        return Err(Diagnostic {
-            code: "too_many_documents".into(),
-            locations: vec![],
-        });
+    if documents.len() > MAX_DOCUMENTS {
+        return Err(too_many_documents());
     }
     for (path, doc) in documents {
         if path != &doc.path {
@@ -292,31 +351,17 @@ pub fn read_project(
             }
         }
     }
-    for path in workflows {
-        let doc = documents.get(path).ok_or_else(|| {
-            Diagnostic::at(
-                "missing_workflow",
-                Location {
-                    path: path.clone(),
-                    first_line: 1,
-                    last_line: 1,
-                },
-            )
-        })?;
-        read_workflow(doc, &scope, documents, &mut out)?;
-    }
-    // Validate each individual effective scope, not all workflows together.
-    effective(&out, &scope)?;
-    for d in &out {
-        effective(&out, &d.scope)?;
-    }
     Ok(out)
 }
-fn read_workflow(
+/// The setup steps of one workflow, added to `read`: each version input is a
+/// declaration or, when it names no version that can be read, a skipped
+/// input with the code of the reason. Only a workflow that does not parse is
+/// an error.
+pub fn read_workflow(
     doc: &Document,
     project: &Scope,
     documents: &BTreeMap<String, Document>,
-    out: &mut Vec<Declaration>,
+    read: &mut SetupRead,
 ) -> Result<(), Diagnostic> {
     let workflow = local_ci::workflow::parse(&doc.path, &doc.text)
         .map_err(|_| doc.error("invalid_workflow", ""))?;
@@ -339,80 +384,135 @@ fn read_workflow(
                 .skip(cursor)
                 .find(|(_, line)| line.trim_start().starts_with("- "))
                 .map_or(lines.len(), |(i, _)| i);
-            let first_added = out.len();
             let Some((tool, key)) = action_tool(action) else {
                 continue;
             };
+            let tool = ToolId::parse(tool).expect("registered action tool");
             let scope = Scope {
                 project: project.project.clone(),
                 workflow: Some(doc.path.clone()),
                 job: Some(job.id.clone()),
                 step: Some(index),
             };
-            let get = |key: &str| {
-                step.with
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.as_str())
+            // The line of the step's version input, or of the step itself.
+            let line = lines
+                .iter()
+                .enumerate()
+                .take(end)
+                .skip(start)
+                .find(|(_, line)| line.contains(key))
+                .map_or(start, |(i, _)| i)
+                + 1;
+            let here = Location {
+                path: doc.path.clone(),
+                first_line: line,
+                last_line: line,
             };
+            // The step itself: its `uses:` line.
+            let step_line = Location {
+                path: doc.path.clone(),
+                first_line: start + 1,
+                last_line: start + 1,
+            };
+            read.steps.push((scope.clone(), step_line.clone()));
+            if step.cond.is_some() {
+                read.conditional.push(scope.clone());
+            }
+            let mut found: Vec<(Result<Constraint, String>, &str, Location)> = Vec::new();
             let (direct, file) = version_inputs(action, key, &step.with);
             if let Some(raw) = direct {
-                add(out, doc, &scope, tool, raw, key)?;
+                let constraint = Constraint::parse(raw).map_err(String::from);
+                found.push((constraint, raw, here.clone()));
             }
-            let file_key = format!("{key}-file");
             if let Some(file) = file {
-                if file.contains("${{") {
-                    Constraint::parse(file).map_err(|code| doc.error(code, &file_key))?;
-                    out.push(Declaration {
-                        tool: ToolId::parse(tool).expect("registered action tool"),
-                        constraint: Constraint::VersionFileExpression(file.into()),
-                        scope: scope.clone(),
-                        location: doc.location(&file_key),
-                    });
-                } else {
-                    if !safe_path(file) {
-                        return Err(doc.error("invalid_version_file", &file_key));
-                    }
-                    let input = documents
-                        .get(file)
-                        .ok_or_else(|| doc.error("missing_version_file", &file_key))?;
-                    if action == "actions/setup-node" {
-                        let (constraint, key) = node_file_constraint(input)?;
-                        out.push(Declaration {
-                            tool: ToolId::parse(tool).expect("registered action tool"),
-                            constraint,
-                            scope: scope.clone(),
-                            location: input.location(key),
-                        });
-                    } else {
-                        let value = plain_version(&input.text);
-                        add(out, input, &scope, tool, &value, "")?;
-                    }
-                }
+                let (constraint, location) = version_file(action, &tool, file, documents, &here);
+                found.push((constraint, file, location));
             }
             if action == "dtolnay/rust-toolchain"
-                && get(key).is_none()
-                && ["stable", "beta", "nightly"].contains(&reference)
+                && !step.with.iter().any(|(name, _)| name == key)
+                && rust_reference(reference)
             {
-                add(out, doc, &scope, tool, reference, "uses")?;
+                if let Ok(constraint) = Constraint::parse(reference) {
+                    found.push((Ok(constraint), reference, here.clone()));
+                }
             }
-            for declaration in &mut out[first_added..] {
-                if declaration.location.path == doc.path {
-                    let line = lines
-                        .iter()
-                        .enumerate()
-                        .take(end)
-                        .skip(start)
-                        .find(|(_, line)| line.contains(key))
-                        .map_or(start, |(i, _)| i)
-                        + 1;
-                    declaration.location.first_line = line;
-                    declaration.location.last_line = line;
+            for (constraint, value, location) in found {
+                match constraint {
+                    Ok(constraint) => read.declarations.push(Declaration {
+                        tool: tool.clone(),
+                        constraint,
+                        scope: scope.clone(),
+                        location,
+                    }),
+                    Err(code) => read.skipped.push(Skipped {
+                        tool: tool.clone(),
+                        scope: scope.clone(),
+                        code,
+                        value: value.chars().take(80).collect(),
+                        location,
+                        step: step_line.clone(),
+                    }),
                 }
             }
         }
     }
     Ok(())
+}
+/// The version a `*-version-file` input names, and where it is written: in
+/// the file, or at the step (`here`) when no file was read.
+fn version_file(
+    action: &str,
+    tool: &ToolId,
+    file: &str,
+    documents: &BTreeMap<String, Document>,
+    here: &Location,
+) -> (Result<Constraint, String>, Location) {
+    let at_step = |read: Result<Constraint, &str>| (read.map_err(String::from), here.clone());
+    if file.contains("${{") {
+        let path = Constraint::VersionFileExpression(file.into());
+        return at_step(Constraint::parse(file).map(|_| path));
+    }
+    if !safe_path(file) {
+        return at_step(Err("invalid_version_file"));
+    }
+    let Some(input) = documents.get(file) else {
+        return at_step(Err("missing_version_file"));
+    };
+    if action == "actions/setup-node" {
+        return match node_file_constraint(input) {
+            Ok((constraint, key)) => (Ok(constraint), input.location(key)),
+            Err(diagnostic) => (Err(diagnostic.code), diagnostic.locations[0].clone()),
+        };
+    }
+    // A file in a format the project's own reader knows is read by it, for
+    // the tool of the step.
+    let registered = VERSION_FILES.iter().find_map(|name| {
+        let dir = file.strip_suffix(name)?;
+        (dir.is_empty() || dir.ends_with('/')).then(|| dir.trim_end_matches('/'))
+    });
+    if let Some(dir) = registered {
+        let one = BTreeMap::from([(file.to_string(), input.clone())]);
+        return match read_files(dir, &one) {
+            Ok(found) => match found.into_iter().find(|d| &d.tool == tool) {
+                Some(d) => (Ok(d.constraint), d.location),
+                None => at_step(Err("version_file_without_tool")),
+            },
+            // An error of the one file that was read says where in it.
+            Err(unread) => (Err(unread.code), unread.locations[0].clone()),
+        };
+    }
+    if STRUCTURED.iter().any(|suffix| file.ends_with(suffix)) {
+        return at_step(Err(STRUCTURED_VERSION_FILE));
+    }
+    let version = Constraint::parse(&plain_version(&input.text)).map_err(String::from);
+    (version, input.location(""))
+}
+/// `dtolnay/rust-toolchain@<reference>` names the toolchain when the
+/// reference is a channel or a version (`1.89`, `1.89.0`); a branch, a tag
+/// of the action or a commit does not.
+fn rust_reference(reference: &str) -> bool {
+    ["stable", "beta", "nightly"].contains(&reference)
+        || (reference.contains('.') && reference.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
 }
 
 fn action_tool(action: &str) -> Option<(&'static str, &'static str)> {
@@ -432,34 +532,53 @@ fn action_tool(action: &str) -> Option<(&'static str, &'static str)> {
         _ => return None,
     })
 }
-/// Only recognized setup actions may request captured version-file bytes.
-pub fn workflow_version_files(doc: &Document) -> Result<Vec<String>, Diagnostic> {
+/// The `*-version-file` inputs of the recognized setup steps of `doc`: the
+/// input's name and the path as written.
+fn version_file_inputs(doc: &Document) -> Result<Vec<(String, String)>, Diagnostic> {
     let workflow = local_ci::workflow::parse(&doc.path, &doc.text)
         .map_err(|_| doc.error("invalid_workflow", ""))?;
-    let mut paths = vec![];
+    let mut inputs = vec![];
     for step in workflow.jobs.into_iter().flat_map(|j| j.steps) {
         let Some(uses) = step.uses else { continue };
         let action = uses.split('@').next().unwrap_or("");
         let Some((_, key)) = action_tool(action) else {
             continue;
         };
-        let file_key = format!("{key}-file");
         if let Some(path) = version_inputs(action, key, &step.with).1 {
-            if path.contains("${{") {
-                Constraint::parse(path).map_err(|code| doc.error(code, &file_key))?;
-                continue;
-            }
-            if !safe_path(path) {
-                return Err(doc.error("invalid_version_file", &file_key));
-            }
-            paths.push(path.to_string());
+            inputs.push((format!("{key}-file"), path.to_string()));
         }
+    }
+    Ok(inputs)
+}
+/// Only recognized setup actions may request captured version-file bytes.
+pub fn workflow_version_files(doc: &Document) -> Result<Vec<String>, Diagnostic> {
+    let mut paths = vec![];
+    for (file_key, path) in version_file_inputs(doc)? {
+        if path.contains("${{") {
+            Constraint::parse(&path).map_err(|code| doc.error(code, &file_key))?;
+            continue;
+        }
+        if !safe_path(&path) {
+            return Err(doc.error("invalid_version_file", &file_key));
+        }
+        paths.push(path);
     }
     Ok(paths)
 }
+/// [`workflow_version_files`] for the freeze of a CI task: the paths that can
+/// name a file of the source. Anything else names no file to read, and a
+/// workflow that does not parse names none.
+pub fn setup_version_files(doc: &Document) -> Vec<String> {
+    let inputs = version_file_inputs(doc).unwrap_or_default();
+    let paths = inputs.into_iter().map(|(_, path)| path);
+    let named = |path: &String| !path.contains("${{") && safe_path(path);
+    paths.filter(named).collect()
+}
 
-// setup-node returns its nonempty direct input before it consults a file.
-// Share this decision with snapshot discovery, including unresolved expressions.
+// A setup action takes its direct version input before it consults a file:
+// with both, the file is not read. setup-node does so for a nonempty input
+// only. Share this decision with snapshot discovery, including unresolved
+// expressions.
 fn version_inputs<'a>(
     action: &str,
     key: &str,
@@ -475,11 +594,7 @@ fn version_inputs<'a>(
     if action == "actions/setup-node" {
         direct = direct.filter(|value| !value.trim().is_empty());
     }
-    let file = if action == "actions/setup-node" && direct.is_some() {
-        None
-    } else {
-        get(&format!("{key}-file"))
-    };
+    let file = get(&format!("{key}-file")).filter(|_| direct.is_none());
     (direct, file)
 }
 fn plain_version(text: &str) -> String {

@@ -296,6 +296,132 @@ pub fn requirement_scopes(declarations: &[Declaration]) -> Vec<Scope> {
     }
     scopes.into_iter().collect()
 }
+/// A version input of a setup step that names no version belt can read: no
+/// requirement comes from it, and the freeze of a CI run says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub tool: ToolId,
+    /// The step the input is written in.
+    pub scope: Scope,
+    /// Why, as the code a diagnostic of it carries.
+    pub code: String,
+    /// The version or the file path as written, shortened.
+    pub value: String,
+    /// Where a diagnostic of it points: the step, or the version file.
+    pub location: Location,
+    /// The step in its workflow.
+    pub step: Location,
+}
+/// What the setup steps of the workflows declare, with the project's own
+/// declarations: the versions that were read, the inputs that were not, the
+/// steps that run under an `if:` condition, and where each setup step is
+/// written in its workflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupRead {
+    pub declarations: Vec<Declaration>,
+    pub skipped: Vec<Skipped>,
+    pub conditional: Vec<Scope>,
+    pub steps: Vec<(Scope, Location)>,
+}
+/// `${{ <context>.<key> }}` and nothing else: the context (in lower case: a
+/// context name is not case sensitive) and the key. Any other expression (an
+/// operator, a function, two references, text around it) is not one
+/// reference.
+pub fn context_reference(expression: &str) -> Option<(String, &str)> {
+    let inner = expression
+        .trim()
+        .strip_prefix("${{")?
+        .strip_suffix("}}")?
+        .trim();
+    let (context, key) = inner.split_once('.')?;
+    let name = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    (name(context) && name(key)).then(|| (context.to_ascii_lowercase(), key))
+}
+/// The declarations one CI task runs under, the scope they are frozen in, and
+/// the inputs of its setup steps that are no requirement. The declarations
+/// are the project's own and those of the setup steps of `jobs` in
+/// `workflow`, taken together as one requirement set (a task has one
+/// environment); where a setup step requires a tool, the project's own
+/// declaration of that tool is left out, as the step installs its version
+/// for the job. A version that is one context reference takes the value
+/// `lookup` gives for the step it is written in. What belt cannot interpret is
+/// no requirement: an input the reader skipped, a step under a condition, any
+/// other expression, a reference `lookup` does not know or whose value is no
+/// version, a version-file path that is an expression, and a channel or an
+/// alias `unresolved` says no concrete version is known for. A job the task
+/// does not run has no part in any of this. A task without a setup
+/// requirement keeps the project scope unchanged.
+pub fn task_declarations(
+    read: &SetupRead,
+    project: &str,
+    workflow: &str,
+    jobs: &[String],
+    lookup: &dyn Fn(&Scope, &str, &str) -> Option<String>,
+    unresolved: &dyn Fn(&ToolId, &str) -> bool,
+) -> (Scope, Vec<Declaration>, Vec<Skipped>) {
+    let whole = Scope::project(project);
+    let narrow = Scope {
+        project: project.into(),
+        workflow: Some(workflow.into()),
+        job: Some(jobs.join(",")),
+        step: None,
+    };
+    let own = |scope: &Scope| {
+        scope.workflow.as_deref() == Some(workflow)
+            && scope.job.as_ref().is_some_and(|job| jobs.contains(job))
+    };
+    let mut steps: Vec<Declaration> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    skipped.extend(read.skipped.iter().filter(|s| own(&s.scope)).cloned());
+    for d in read.declarations.iter().filter(|d| own(&d.scope)) {
+        let resolved = match &d.constraint {
+            _ if read.conditional.contains(&d.scope) => Err("conditional_step"),
+            Constraint::VersionFileExpression(_) => Err("version_file_expression"),
+            Constraint::Expression(text) => context_reference(text)
+                .and_then(|(context, key)| lookup(&d.scope, &context, key))
+                .and_then(|value| Constraint::parse(&value).ok())
+                .filter(|c| !matches!(c, Constraint::Expression(_)))
+                .ok_or("unresolved_expression"),
+            other => Ok(other.clone()),
+        };
+        let resolved = resolved.and_then(|constraint| match &constraint {
+            Constraint::Resolve(alias) if unresolved(&d.tool, alias) => Err("unresolved_alias"),
+            _ => Ok(constraint),
+        });
+        match resolved {
+            Ok(constraint) => steps.push(Declaration {
+                tool: d.tool.clone(),
+                constraint,
+                scope: narrow.clone(),
+                location: d.location.clone(),
+            }),
+            Err(code) => {
+                // The step in its workflow, also when the version was read
+                // from a file.
+                let at = read.steps.iter().find(|(scope, _)| scope == &d.scope);
+                skipped.push(Skipped {
+                    tool: d.tool.clone(),
+                    scope: d.scope.clone(),
+                    code: code.into(),
+                    value: d.constraint.describe(),
+                    location: d.location.clone(),
+                    step: at.map_or(&d.location, |(_, step)| step).clone(),
+                })
+            }
+        }
+    }
+    let superseded = |d: &&Declaration| steps.iter().any(|step| step.tool == d.tool);
+    let project = read.declarations.iter().filter(|d| d.scope == whole);
+    let mut out: Vec<Declaration> = project.filter(|d| !superseded(d)).cloned().collect();
+    let scope = if steps.is_empty() { whole } else { narrow };
+    out.extend(steps);
+    (scope, out, skipped)
+}
 /// Reject contradictory constraints in the selected scope. No file wins by
 /// accidental read order. Ranges intersect; unresolved aliases stay unresolved.
 pub fn effective(
