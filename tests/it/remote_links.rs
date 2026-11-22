@@ -145,6 +145,29 @@ async fn submit(
     name: &str,
     delay: u32,
 ) -> TaskId {
+    submit_requiring(
+        client,
+        state,
+        env,
+        key,
+        root,
+        name,
+        delay,
+        Default::default(),
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn submit_requiring(
+    client: &Client,
+    state: &Path,
+    env: &BTreeMap<String, String>,
+    key: &Path,
+    root: &Path,
+    name: &str,
+    delay: u32,
+    requirements: belt::toolchain::capability::ExecutionRequirements,
+) -> TaskId {
     let dir = root.join(format!("source-{name}"));
     private(&dir);
     std::fs::write(dir.join("ordinary"), name).unwrap();
@@ -184,7 +207,7 @@ async fn submit(
     let spec = TaskSpec {
         ci: None,
         toolchains: None,
-        in_place: false, outputs: Vec::new(), requirements: Default::default(),
+        in_place: false, outputs: Vec::new(), requirements,
         local: false,
         setup: None, plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest).or_else(|_| Digest::parse(&format!("sha256:{manifest}"))).unwrap(),
@@ -488,6 +511,14 @@ async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
         .cluster_id()
         .clone();
     let home = root.join("peer-a");
+    // Only this worker runs the profile the task selects, so the scheduler
+    // has no other worker to place it on, whatever else is ready.
+    private(&home);
+    private(&home.join(".belt"));
+    write_private(
+        &home.join(".belt/profiles.toml"),
+        b"schema_version=1\nactive='remote-only'\n[profiles.remote-only]\npath=['/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='remote-only'\n",
+    );
     let mut worker = spawn_worker(&home, &cluster, &key, "remote-a");
     wait_for("remote worker socket", || {
         assert!(worker.child.as_mut().unwrap().try_wait().unwrap().is_none());
@@ -511,7 +542,21 @@ async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
     })
     .await;
     let first_bridge = bridge(&home, owner.pid).unwrap();
-    let task = submit(&client, &state, &spec.env, &key, root, "first", u32::MAX).await;
+    let remote_only = belt::toolchain::capability::ExecutionRequirements {
+        profile: Some("remote-only".into()),
+        requires: Vec::new(),
+    };
+    let task = submit_requiring(
+        &client,
+        &state,
+        &spec.env,
+        &key,
+        root,
+        "first",
+        u32::MAX,
+        remote_only,
+    )
+    .await;
     wait_for("remote execution", || root.join("count-first").exists()).await;
     let placed = attempt(&state, &task).unwrap();
     assert_eq!(placed.worker_id.as_str(), "remote-a");
@@ -526,7 +571,6 @@ async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
     })
     .await;
     std::fs::write(root.join("release-first"), "release").unwrap();
-    std::fs::write(root.join("release-blocker"), "release").unwrap();
     wait_for("result collection", || {
         attempt(&state, &task).is_some_and(|a| a.receipts.collected_at_ms.is_some())
     })
