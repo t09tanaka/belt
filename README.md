@@ -349,7 +349,7 @@ the workspace itself are built again: their sources are newer than the build.)
   renamed, so two jobs saving one key cannot mix them; the job's own `target/`
   is not touched.
 - **Limits.** Entries are in `<cache dir>/build/<key>/`. Once the cache (the
-  entries being written count) is over 20 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`),
+  entries being written count) is over 50 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`),
   the least recently used entries are removed after a save; when that is not
   enough the new entry goes too, with a note. `LOCAL_CI_BUILD_CACHE_MAX_GB=0`
   turns the cache off. A temporary entry is removed only when its lock can be

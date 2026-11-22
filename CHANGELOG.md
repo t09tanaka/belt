@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Record in each build cache entry what made its key. Beside the marker, an entry now holds `.local-ci-inputs.json` with the SHA-256 of each part of the key (schema, toolchain, OS, job, each lock, each build-affecting variable by name, each config file, the matrix), never the values, which can hold secrets. When a run saves an entry that an earlier run could have reused, two such files show which input made the keys differ. The file is for reading only: listing, pruning and restoring ignore it, an entry without it is as good, and it is not copied into `target/`. The key itself is unchanged.
+
+- Raise the default cap of the build cache from 20 GB to 50 GB. An entry for a mid-sized Rust workspace is 2 to 3 GB and one run of such a workspace needs about eight of them (test legs, an MSRV job, mutation shards), so the old cap was the whole of what one run needed and the entries were evicted by the run that needed them and saved again on the next. `LOCAL_CI_BUILD_CACHE_MAX_GB` still sets the cap.
+
 ## [0.18.4] - 2026-11-23
 
 - Fix the build cache's entries never being deleted from the trash. An entry that the cache evicts, or a temporary one it gives up, is moved to `<cache>/trash`, but the trash was emptied only of the names a worktree gets there, so neither a run nor `local-ci cache prune` deleted them and they piled up (on one machine to over a hundred GB). They are now deleted like the rest, and what is already there goes at the start of the next run. Nothing else in the trash is touched.
