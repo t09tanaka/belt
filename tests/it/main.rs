@@ -14,6 +14,7 @@ mod coordinator;
 mod direct_exec;
 mod doctor;
 mod forecast;
+mod gaps_cli;
 mod not_implemented;
 mod one_host;
 mod protocol;
