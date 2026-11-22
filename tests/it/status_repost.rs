@@ -69,10 +69,8 @@ fn project(step: &str) -> Project {
         );
     }
     let root = super::common::DaemonRoot::new(root, &spec.state_dir);
-    spec.env.insert(
-        "PATH".into(),
-        tool_path(root.path(), &["git", "fast-worktree"]),
-    );
+    spec.env
+        .insert("PATH".into(), tool_path(root.path(), &["git"]));
     let (calls, refuse) = (root.path().join("gh-calls"), root.path().join("gh-refuse"));
     let gh = root.path().join("bin/gh");
     std::fs::write(
@@ -179,9 +177,39 @@ impl Project {
     }
 }
 
+/// Every file under `dir` with its size and a hash of its content.
+fn tree(dir: &std::path::Path) -> BTreeMap<String, (u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let mut out = BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(next) = todo.pop() {
+        for entry in std::fs::read_dir(&next).unwrap().flatten() {
+            let path = entry.path();
+            let name = path.strip_prefix(dir).unwrap().display().to_string();
+            // A reader of the database maps its shared memory: not a write.
+            if name.ends_with("-shm") {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                out.insert(name, (0, 0));
+                todo.push(path);
+            } else if meta.is_file() {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::fs::read(&path).unwrap().hash(&mut hasher);
+                out.insert(name, (meta.len(), hasher.finish()));
+            }
+        }
+    }
+    out
+}
+
 async fn shutdown(spec: &Spec) {
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
-    let client = Client::load(&spec.state_dir, store.cluster_id().clone()).unwrap();
+    // Already stopped is as good.
+    let Ok(client) = Client::load(&spec.state_dir, store.cluster_id().clone()) else {
+        return;
+    };
     assert!(matches!(
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
@@ -214,8 +242,19 @@ async fn a_status_that_failed_or_was_skipped_is_posted_again_as_it_was_first_sen
 
     // Showing reads only: with no resident, and nothing is posted.
     shutdown(&p.spec).await;
+    let before = tree(&p.spec.state_dir);
     let (code, shown) = p.json(&["ci", "status", &run]);
     assert_eq!(code, Some(0), "{shown}");
+    let after = tree(&p.spec.state_dir);
+    let changed: Vec<_> = after
+        .iter()
+        .filter(|(name, entry)| before.get(*name) != Some(*entry))
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        changed.is_empty() && after.len() == before.len(),
+        "showing writes nothing: {changed:?}"
+    );
     let result = &shown["result"];
     assert_eq!(result["post"], false);
     assert_eq!(result["previous"], first);
@@ -280,9 +319,58 @@ async fn a_status_that_failed_or_was_skipped_is_posted_again_as_it_was_first_sen
     let calls = p.calls();
     assert_eq!(calls.len(), 4);
     assert_eq!(calls[3], line.replace("context=local-ci", "context=mine"));
+    let calls_before = p.calls().len();
     // Without a context asked for, the one last posted under is kept.
     let (_, kept) = p.json(&["ci", "status", &run]);
     assert_eq!(kept["result"]["send"]["context"], "mine");
+
+    // Skipped for a reason of this call (run from another checkout): shown,
+    // not kept, so the last real attempt and its context stay.
+    let other = p.repo.parent().unwrap().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let git_in_other = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&other)
+            .env_clear()
+            .envs(&p.spec.env)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git_in_other(&["init", "-q"]);
+    git_in_other(&["remote", "add", "origin", "git@github.com:someone/else.git"]);
+    let mut command = p.belt(&["--json", "ci", "status", &run, "--post"]);
+    command.current_dir(&other);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["result"]["github_status"]["posting"], "skipped",
+        "{value}"
+    );
+    assert_eq!(value["result"]["recorded"], false);
+    assert_eq!(p.calls().len(), calls_before);
+    let (_, view) = p.json(&["show", &run]);
+    assert_eq!(
+        view["data"]["run"]["github_status"]["posting"], "posted",
+        "{view}"
+    );
+    assert_eq!(view["data"]["run"]["github_status"]["context"], "mine");
+    let (_, kept) = p.json(&["ci", "status", &run]);
+    assert_eq!(kept["result"]["send"]["context"], "mine");
+    assert_eq!(kept["result"]["previous"]["posting"], "posted");
+
+    // No source store on this host: nothing is created to look.
+    shutdown(&p.spec).await;
+    std::fs::remove_dir_all(p.spec.state_dir.join("sources")).unwrap();
+    let (code, value) = p.json(&["ci", "status", &run]);
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(
+        value["result"]["reason"],
+        "the input of the run cannot be read: this host holds no captured input"
+    );
+    assert!(!p.spec.state_dir.join("sources").exists());
 
     // What the run collected is gone: nothing is guessed from what is left
     // (that would post `error` over the success GitHub holds).
@@ -299,6 +387,7 @@ async fn a_status_that_failed_or_was_skipped_is_posted_again_as_it_was_first_sen
         assert!(message.contains("cannot be read"), "{message}");
     }
     assert_eq!(p.calls().len(), calls);
+
     shutdown(&p.spec).await;
 }
 

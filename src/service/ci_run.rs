@@ -401,7 +401,7 @@ pub async fn run(
     // Decided only here, after the wait: on the parent, from the result of
     // the run and what it collected.
     let (executed_digest, jobs, github_status) = tokio::task::spawn_blocking(move || {
-        let (executed_digest, jobs) = super::bootstrap::read_only_store(&spec)
+        let (executed_digest, jobs, _) = super::bootstrap::read_only_store(&spec)
             .ok()
             .and_then(|store| {
                 job_report(
@@ -555,12 +555,8 @@ pub(super) fn verdict_of(
     super::github_status::verdict(context, run, &end, options)
 }
 
-/// The tasks of the frozen plan that were submitted, from the rows of the
-/// run: the ones the submit receipt names (a discovery task is not one).
-pub fn expected_tasks(
-    store: &crate::storage::CoordinatorStore,
-    run: &RunId,
-) -> Result<Vec<String>, String> {
+/// The tasks of the run now that are not discovery tasks.
+fn row_tasks(store: &crate::storage::CoordinatorStore, run: &RunId) -> Result<Vec<String>, String> {
     let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
     let specs = rows.iter().filter_map(|row| {
         serde_json::from_value::<TaskSpec>(row.spec.clone())
@@ -574,6 +570,20 @@ pub fn expected_tasks(
 }
 
 impl JobLine {
+    #[cfg(test)]
+    fn clone_line(&self) -> JobLine {
+        JobLine {
+            task_id: self.task_id.clone(),
+            plan_task: self.plan_task.clone(),
+            job: self.job.clone(),
+            status: self.status.clone(),
+            part: self.part,
+            skipped: self.skipped.clone(),
+            reason: self.reason.clone(),
+            superseded: self.superseded,
+        }
+    }
+
     /// The line as the status decision reads it.
     pub(super) fn status_line(&self) -> crate::ci::status::Job<'_> {
         crate::ci::status::Job {
@@ -596,17 +606,20 @@ pub fn jobs(spec: &super::bootstrap::Spec, run: &RunId) -> Result<Vec<JobLine>, 
     )
 }
 
-/// The lines of a run for a post again: [`job_lines`], and the digest, but a
-/// result or the plan that the run recorded and that cannot be read is an
-/// error. Posting `error` over what GitHub holds from the first time because a
-/// file was removed would be wrong.
-pub fn job_lines_strict(
+/// What a post again decides from: the tasks the submit receipt named and
+/// the lines of the run. A result or the plan that the run recorded and that
+/// cannot be read, a join of a split job that cannot be replayed, and a split
+/// job without a joined result are errors: posting `error` over the success
+/// GitHub holds because a file is gone, or `success` when the join is missing,
+/// would not be what the automatic post said.
+pub fn strict_report(
     store: &crate::storage::CoordinatorStore,
     state_dir: &std::path::Path,
     results: &std::path::Path,
     run: &RunId,
-) -> Result<Vec<JobLine>, String> {
-    job_report(store, state_dir, results, run, true).map(|(_, lines)| lines)
+) -> Result<(Vec<String>, Vec<JobLine>), String> {
+    let (_, lines, split) = job_report(store, state_dir, results, run, true)?;
+    Ok((expected_of(row_tasks(store, run)?, &split), lines))
 }
 
 /// `state_dir` holds the frozen plan of the run. Without it (it is kept as
@@ -618,7 +631,7 @@ pub fn job_lines(
     results: &std::path::Path,
     run: &RunId,
 ) -> Result<Vec<JobLine>, String> {
-    job_report(store, state_dir, results, run, false).map(|(_, lines)| lines)
+    job_report(store, state_dir, results, run, false).map(|(_, lines, _)| lines)
 }
 
 /// The result a finished attempt kept, if it kept one. `Err` when it did and
@@ -648,7 +661,7 @@ fn job_report(
     results: &std::path::Path,
     run: &RunId,
     strict: bool,
-) -> Result<(Option<Digest>, Vec<JobLine>), String> {
+) -> Result<JobReport, String> {
     let mut lines = Vec::new();
     let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
     let mut by_plan_task = std::collections::BTreeMap::new();
@@ -700,13 +713,68 @@ fn job_report(
         read => read.and_then(Result::ok),
     }
     .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
+    let mut split = Vec::new();
     if let Some(plan) = plan {
         let row_of = |task: &str| by_plan_task.get(task).copied();
-        if let Ok(progress) = crate::ci::advance::replay(store, results, &plan, row_of) {
-            lines::mark_split_jobs(&mut lines, &plan, &progress);
+        match crate::ci::advance::replay(store, results, &plan, row_of) {
+            Ok(progress) => lines::mark_split_jobs(&mut lines, &plan, &progress),
+            Err(why) if strict => {
+                return Err(format!(
+                    "the join of the split jobs cannot be replayed: {}",
+                    why.reason()
+                ))
+            }
+            Err(_) => {}
+        }
+        split = plan
+            .shard_groups
+            .iter()
+            .filter(|group| group.split)
+            .map(|group| (group.id.clone(), group.shards.clone()))
+            .collect();
+        if let Some(job) = strict.then(|| unjoined(&lines, &split)).flatten() {
+            return Err(format!("the split job {job} has no joined result"));
         }
     }
-    Ok((digest, lines))
+    Ok((digest, lines, split))
+}
+
+/// A split job: its id (the task of the plan it was submitted as) and its
+/// shards.
+type SplitGroup = (String, Vec<String>);
+
+/// The digest of the plan the lines are of, the lines, and the split jobs.
+type JobReport = (Option<Digest>, Vec<JobLine>, Vec<SplitGroup>);
+
+/// The first split job whose join left no line of its own. The automatic
+/// post needs that line (the job was submitted as one task); without it the
+/// status cannot be told from what the shards say.
+fn unjoined(lines: &[JobLine], split: &[SplitGroup]) -> Option<String> {
+    split
+        .iter()
+        .find(|(id, _)| {
+            !lines
+                .iter()
+                .any(|line| &line.plan_task == id && line.part == Some(Part::Job))
+        })
+        .map(|(id, _)| id.clone())
+}
+
+/// The tasks the submit receipt named, from the tasks of the run now: a
+/// shard that discovery made of a task stands for the task it was made of,
+/// which is the id of its split job.
+fn expected_of(tasks: Vec<String>, split: &[SplitGroup]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for task in tasks {
+        let task = split
+            .iter()
+            .find(|(_, shards)| shards.contains(&task))
+            .map_or(task, |(id, _)| id.clone());
+        if !out.contains(&task) {
+            out.push(task);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -799,6 +867,73 @@ mod tests {
             crate::ci::status::description(crate::ci::status::Computed::Failure, &status),
             "failure: pass 0 / fail 1 / error 0 / skip 0"
         );
+    }
+
+    /// A split job whose shards all succeeded, with or without the join the
+    /// automatic post sees: the post again decides the same, or refuses.
+    #[test]
+    fn a_split_job_is_expected_as_the_task_it_was_submitted_as_and_needs_its_join() {
+        use crate::ci::progress::{Input, NeedsProgression, Progression};
+        use crate::ci::status::{computed, Computed, RunEnd};
+        let plan = crate::ci::shards::tests::split_plan(false);
+        let group = crate::ci::shards::tests::group(&plan).clone();
+        let split = vec![(group.id.clone(), group.shards.clone())];
+        // The shards are the tasks of the run now; the receipt named the job.
+        let mut tasks = group.shards.clone();
+        tasks.insert(1, "other".into());
+        tasks.push(group.shards[0].clone());
+        let expected = expected_of(tasks, &split);
+        assert_eq!(expected, [group.id.clone(), "other".to_string()]);
+        let mut progress = NeedsProgression::new(&plan).unwrap();
+        let mut lines = Vec::new();
+        for shard in &group.shards {
+            progress
+                .step(Input::Fence {
+                    task: shard.clone(),
+                    status: local_ci::task::JobStatus::Success,
+                    reason: "ok".into(),
+                })
+                .unwrap();
+            lines.push(JobLine {
+                task_id: TaskId::generate(),
+                plan_task: shard.clone(),
+                job: Some("test".into()),
+                status: "success".into(),
+                part: None,
+                skipped: None,
+                reason: None,
+                superseded: false,
+            });
+        }
+        lines.push(JobLine {
+            plan_task: "other".into(),
+            ..lines[0].clone_line()
+        });
+        let end = |lines: &[JobLine]| {
+            let status: Vec<_> = lines.iter().map(JobLine::status_line).collect();
+            let names: Vec<&str> = expected.iter().map(String::as_str).collect();
+            computed(&RunEnd {
+                settled: true,
+                cancel_requested: false,
+                collection_pending: Some(false),
+                exit_code: 0,
+                failed: None,
+                expected: &names,
+                jobs: &status,
+            })
+        };
+        // The join is missing: the automatic post says error, and the post
+        // again refuses instead of saying success from the shards.
+        assert_eq!(unjoined(&lines, &split), Some(group.id.clone()));
+        assert_eq!(end(&lines), Computed::Error);
+        lines::mark_split_jobs(&mut lines, &plan, &progress);
+        assert_eq!(unjoined(&lines, &split), None);
+        // The join of these shards (no test results) is a failure: that line
+        // of the job, not the successes of the shards, is what both say.
+        let job = lines.iter().find(|line| line.part == Some(Part::Job));
+        assert_eq!(job.map(|line| line.status.as_str()), Some("failure"));
+        assert_eq!(end(&lines), Computed::Failure);
+        assert_eq!(unjoined(&[], &[]), None);
     }
 
     #[test]

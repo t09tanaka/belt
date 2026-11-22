@@ -131,6 +131,8 @@ pub struct Options {
     /// `false` with `--no-status`.
     pub enabled: bool,
     pub context: String,
+    /// Create nothing while looking the input up (showing, not posting).
+    pub read_only: bool,
 }
 
 impl Default for Options {
@@ -138,6 +140,7 @@ impl Default for Options {
         Options {
             enabled: true,
             context: status::DEFAULT_CONTEXT.to_string(),
+            read_only: false,
         }
     }
 }
@@ -169,10 +172,19 @@ impl Verdict {
 /// the reason it is not posted.
 pub fn verdict(context: &Context, run: &RunId, end: &RunEnd<'_>, options: &Options) -> Verdict {
     let computed = status::computed(end);
-    let manifest = match super::input::source_manifest(context, run) {
+    let looked_up = if options.read_only {
+        super::input::source_manifest_existing(context, run)
+    } else {
+        super::input::source_manifest(context, run)
+    };
+    let manifest = match looked_up {
         Ok(manifest) => manifest,
         Err(error) => {
-            let reason = format!("the input of the run cannot be read: {}", error.message);
+            let reason = if error.code == crate::error::ErrorCode::SourceBusy {
+                format!("the source store is busy, try again: {}", error.message)
+            } else {
+                format!("the input of the run cannot be read: {}", error.message)
+            };
             return Verdict {
                 computed,
                 decision: status::Decision::Skip(reason),
@@ -226,21 +238,6 @@ pub fn verdict(context: &Context, run: &RunId, end: &RunEnd<'_>, options: &Optio
         source_digest: Some(manifest.manifest_digest),
         original_head: manifest.original_head,
     }
-}
-
-/// [`verdict`], and the post when it may be. Never fails: what could not be
-/// looked up or posted is in the record, and the computed result is the
-/// same whatever became of the post.
-pub fn settle(
-    context: &Context,
-    run: &RunId,
-    end: &RunEnd<'_>,
-    options: &Options,
-    poster: &dyn Poster,
-) -> Record {
-    let verdict = verdict(context, run, end, options);
-    let posting = status::outcome(verdict.decision.clone(), |post| poster.post(post));
-    verdict.record(posting)
 }
 
 /// One line of `git` in the repository `ci` was run from.

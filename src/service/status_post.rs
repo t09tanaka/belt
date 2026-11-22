@@ -49,6 +49,12 @@ pub struct Reposted {
     /// What became of the post, with `--post`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_status: Option<Record>,
+    /// With `--post`: whether the attempt was kept with the run. A skipped
+    /// one is not, and neither is one the resident could not take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_error: Option<String>,
 }
 
 impl Reposted {
@@ -87,6 +93,9 @@ impl Reposted {
             out.push_str(&status::render(record));
             out.push('\n');
         }
+        if let Some(why) = &self.record_error {
+            out.push_str(&format!("not recorded with the run: {why}\n"));
+        }
         out
     }
 }
@@ -107,7 +116,9 @@ fn read(context: &Context, run: &RunId) -> Result<Standing, ApiError> {
     let spec = &context.bootstrap;
     let internal = |why: String| ApiError::new(ErrorCode::Internal, why);
     let store = super::bootstrap::read_only_store(spec).map_err(|e| internal(e.to_string()))?;
-    let expected = ci_run::expected_tasks(&store, run).map_err(internal)?;
+    let results = spec.state_dir.join("results");
+    let (expected, jobs) = ci_run::strict_report(&store, &spec.state_dir, &results, run)
+        .map_err(|why| invalid(format!("the status of {run} cannot be decided: {why}")))?;
     if expected.is_empty() {
         return Err(ApiError::new(
             ErrorCode::NotFound,
@@ -117,9 +128,6 @@ fn read(context: &Context, run: &RunId) -> Result<Standing, ApiError> {
     let snapshot = store
         .completion(Target::Run(run.clone()))
         .map_err(|e| internal(e.to_string()))?;
-    let results = spec.state_dir.join("results");
-    let jobs = ci_run::job_lines_strict(&store, &spec.state_dir, &results, run)
-        .map_err(|why| invalid(format!("the status of {run} cannot be decided: {why}")))?;
     let previous = store
         .github_status_of(run)
         .map_err(|e| internal(e.to_string()))?
@@ -149,6 +157,7 @@ pub async fn run(
         let options = Options {
             enabled: true,
             context: status::context_for(asked.as_deref(), standing.previous.as_ref()),
+            read_only: !post,
         };
         let jobs: Vec<_> = standing
             .jobs
@@ -185,16 +194,31 @@ pub async fn run(
         Decision::Skip(reason) => (None, Some(reason.clone())),
     };
     let computed = verdict.computed;
+    let mut recorded = None;
+    let mut record_error = None;
     let github_status = if post {
         let decision = verdict.decision.clone();
+        let skipped = matches!(decision, Decision::Skip(_));
         let posted = tokio::task::spawn_blocking(move || {
             status::outcome(decision, |sent| poster.post(sent))
         })
         .await
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         let record = verdict.record(posted);
-        if let Err(why) = ci_run::keep_status(&context, run.clone(), record.clone()).await {
-            eprintln!("warning: the status of the run was not recorded: {why}");
+        // A status that was not posted for a reason of this call (another
+        // checkout, a busy store) says nothing about what GitHub holds, and
+        // would hide the last real attempt: it is shown, not kept.
+        if skipped {
+            recorded = Some(false);
+        } else {
+            match ci_run::keep_status(&context, run.clone(), record.clone()).await {
+                Ok(()) => recorded = Some(true),
+                Err(why) => {
+                    eprintln!("warning: the status of the run was not recorded: {why}");
+                    recorded = Some(false);
+                    record_error = Some(why);
+                }
+            }
         }
         Some(record)
     } else {
@@ -208,6 +232,8 @@ pub async fn run(
         send,
         reason,
         github_status,
+        recorded,
+        record_error,
     })
 }
 
@@ -230,6 +256,8 @@ mod tests {
                 description: "success: pass 1 / fail 0 / error 0 / skip 0".into(),
             }),
             reason: None,
+            recorded: None,
+            record_error: None,
             github_status: posting.map(|posting| Record {
                 computed: Computed::Success,
                 posting,

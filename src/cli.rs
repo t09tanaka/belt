@@ -826,6 +826,7 @@ fn run_ci(cli: &Cli) -> i32 {
             let status = crate::service::github_status::Options {
                 enabled: !args.no_status,
                 context: args.status_context.clone(),
+                read_only: false,
             };
             let poster = std::sync::Arc::new(crate::service::github_status::Gh::new(&context));
             let result = crate::service::ci_run::run(
