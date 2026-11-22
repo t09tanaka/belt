@@ -295,6 +295,9 @@ fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
 }
 
 /// Caller holds source EX; history scan is deliberate and not a bounded-ref claim.
+/// A retired attempt (`retired = 1` only after the worker confirmed it is not
+/// running) never reads the inputs again, so it is skipped by the "every
+/// attempt ended and collected" proof and only moves the end time.
 fn input_retention_end_on(c: &Connection, run: &str, source: &str) -> Result<Option<u64>> {
     let ended:Option<i64>=c.query_row("SELECT CASE WHEN
               EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
@@ -303,8 +306,8 @@ fn input_retention_end_on(c: &Connection, run: &str, source: &str) -> Result<Opt
                 (NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
                  OR (t.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal')))))
               AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
-                WHERE t.run_id=?1 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
-              THEN (SELECT max(max(coalesce(a.terminal_at_ms,0),coalesce(x.closed_at_ms,0))) FROM task t JOIN attempt a USING(task_id) JOIN collection x USING(attempt_id) WHERE t.run_id=?1)
+                WHERE t.run_id=?1 AND a.retired=0 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
+              THEN (SELECT max(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0),coalesce(x.closed_at_ms,0))) FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id) WHERE t.run_id=?1)
               ELSE NULL END",params![run,source],|r|r.get(0))?;
     ended.map(to_u64).transpose()
 }

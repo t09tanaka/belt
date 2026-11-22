@@ -1280,6 +1280,36 @@ mod tests {
             )
             .unwrap();
         }
+        /// Drive `attempt` from accepted to a closed, collected result; each
+        /// step is stamped `from`, `from + 1`, ...
+        fn settle(&self, attempt: &AttemptId, from: u64) {
+            for state in [
+                AttemptState::Preparing,
+                AttemptState::Ready,
+                AttemptState::Starting,
+                AttemptState::Active,
+                AttemptState::Finalizing,
+            ] {
+                self.owner.transition_attempt(attempt, state, from).unwrap();
+            }
+            self.owner
+                .finalize_attempt(
+                    attempt,
+                    Termination::new(Outcome::Failed, Some(crate::state::Exit::Code(9)), None)
+                        .unwrap(),
+                    from + 1,
+                )
+                .unwrap();
+            self.owner
+                .close_collection(
+                    attempt,
+                    None,
+                    crate::results::plan::Verdict::GaveUp,
+                    false,
+                    from + 2,
+                )
+                .unwrap();
+        }
         fn terminal(&self, run: &RunId) -> (TaskId, AttemptId) {
             let id = self.store.source_of_run(run).unwrap().unwrap();
             let source = super::super::classify::source_id_of_ci(&id).unwrap();
@@ -1308,32 +1338,7 @@ mod tests {
                     2,
                 )
                 .unwrap();
-            for state in [
-                AttemptState::Preparing,
-                AttemptState::Ready,
-                AttemptState::Starting,
-                AttemptState::Active,
-                AttemptState::Finalizing,
-            ] {
-                self.owner.transition_attempt(&attempt, state, 3).unwrap();
-            }
-            self.owner
-                .finalize_attempt(
-                    &attempt,
-                    Termination::new(Outcome::Failed, Some(crate::state::Exit::Code(9)), None)
-                        .unwrap(),
-                    4,
-                )
-                .unwrap();
-            self.owner
-                .close_collection(
-                    &attempt,
-                    None,
-                    crate::results::plan::Verdict::GaveUp,
-                    false,
-                    5,
-                )
-                .unwrap();
+            self.settle(&attempt, 3);
             (task, attempt)
         }
         fn preview(&self, cursor: &mut PreviewCursor, wall: u64, mono: u64) -> Preview {
@@ -1499,6 +1504,99 @@ mod tests {
         assert_eq!(f.owner.input_retention_end(&run, &source).unwrap(), None);
         assert!(f.owner.get_attempt(&attempt).unwrap().is_some());
         assert_ne!(task, queued);
+    }
+    /// A run whose task has a retired attempt before its result: the retire
+    /// was confirmed (`retired = 1`), so the worker no longer reads the
+    /// inputs and the end is reached; a retire that is only requested still
+    /// holds the inputs.
+    #[test]
+    fn a_confirmed_retired_attempt_does_not_hold_the_inputs_but_an_unconfirmed_one_does() {
+        let f = Fixture::new();
+        let run = RunId::generate();
+        f.bind(&run);
+        let (_, first) = f.terminal(&run);
+        let source =
+            super::super::classify::source_id_of_ci(&f.store.source_of_run(&run).unwrap().unwrap())
+                .unwrap();
+        let spare = |task: &TaskId, at| {
+            let attempt = AttemptId::generate();
+            f.owner
+                .create_attempt(
+                    NewAttempt {
+                        attempt_id: attempt.clone(),
+                        task_id: task.clone(),
+                        worker_id: WorkerId::parse("test").unwrap(),
+                        payload_hash: Digest::of_bytes(b"payload"),
+                        permit_id: None,
+                    },
+                    at,
+                )
+                .unwrap();
+            attempt
+        };
+        assert_eq!(f.owner.input_retention_end(&run, &source).unwrap(), Some(5));
+        // Second task: a retire is requested but not confirmed.
+        let other = TaskId::generate();
+        f.owner
+            .create_task(&other, &run, &serde_json::json!({}), 6)
+            .unwrap();
+        let held = spare(&other, 7);
+        f.owner.begin_retire(&held, "lost_ack", 8).unwrap();
+        assert_eq!(f.owner.input_retention_end(&run, &source).unwrap(), None);
+        // Confirmed: still no current attempt, so the task waits for a new one.
+        f.owner.confirm_retire(&held, 9).unwrap();
+        assert_eq!(f.owner.input_retention_end(&run, &source).unwrap(), None);
+        // The new attempt ends: the retired one no longer matters.
+        let second = spare(&other, 10);
+        assert_eq!(f.owner.input_retention_end(&run, &source).unwrap(), None);
+        f.settle(&second, 11);
+        assert_eq!(
+            f.owner.input_retention_end(&run, &source).unwrap(),
+            Some(13)
+        );
+        assert!(f.owner.get_attempt(&first).unwrap().is_some());
+    }
+    /// A task cancelled after its only attempt was retired and confirmed
+    /// has nothing left that could read the inputs; the end is the retire.
+    #[test]
+    fn a_cancelled_task_with_only_retired_attempts_ends_at_the_retire() {
+        let f = Fixture::new();
+        let run = RunId::generate();
+        f.bind(&run);
+        let (_, _) = f.terminal(&run);
+        let source =
+            super::super::classify::source_id_of_ci(&f.store.source_of_run(&run).unwrap().unwrap())
+                .unwrap();
+        let other = TaskId::generate();
+        f.owner
+            .create_task(&other, &run, &serde_json::json!({}), 6)
+            .unwrap();
+        let lone = AttemptId::generate();
+        f.owner
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: lone.clone(),
+                    task_id: other.clone(),
+                    worker_id: WorkerId::parse("test").unwrap(),
+                    payload_hash: Digest::of_bytes(b"payload"),
+                    permit_id: None,
+                },
+                7,
+            )
+            .unwrap();
+        f.owner.begin_retire(&lone, "lost_ack", 8).unwrap();
+        f.owner.confirm_retire(&lone, 20).unwrap();
+        f.owner
+            .db
+            .call(|c| {
+                c.execute("UPDATE task SET cancel_requested_at_ms=21", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            f.owner.input_retention_end(&run, &source).unwrap(),
+            Some(20)
+        );
     }
     #[test]
     fn exclusive_preview_fences_enqueue_without_holding_coordinator_transaction() {
