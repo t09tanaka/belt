@@ -3693,6 +3693,75 @@ mod tests {
             assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).removed, 1);
             assert!(!reopened.has(&r));
         }
+        /// A crash that leaves the classification pin (`retention.lock`) or the
+        /// registration marker cut short must not let a pass delete anything,
+        /// and the same files made whole again let the next pass go on.
+        #[test]
+        fn vault_cut_short_pin_or_marker_keeps_every_copy_until_restored() {
+            use std::os::unix::fs::FileExt;
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let secrets = f.state.join("secrets");
+            let plaintext = secrets.join(format!("{r}.json"));
+            let kept = std::fs::read(&plaintext).unwrap();
+            let lock_path = secrets.join("retention.lock");
+            let marker = secrets.join("parent-retention.json");
+            let pin = std::fs::read(&lock_path).unwrap();
+            let published = std::fs::read(&marker).unwrap();
+            assert!(!pin.is_empty() && !published.is_empty());
+            let fail_closed = |c: &mut VaultCursor| {
+                assert!(!v.has(&r));
+                assert!(Vault::open(&f.state).is_err());
+                assert!(f
+                    .store
+                    .vault_retention_page(&f.owner, &v, c, 101, 11, Some("boot".into()))
+                    .is_err());
+                assert_eq!(std::fs::read(&plaintext).unwrap(), kept);
+                assert!(lock_path.exists() && marker.exists());
+            };
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            for cut in [1, pin.len() / 2, pin.len() - 1] {
+                lock.set_len(cut as u64).unwrap();
+                lock.sync_all().unwrap();
+                fail_closed(&mut c);
+            }
+            lock.write_all_at(&pin, 0).unwrap();
+            lock.set_len(pin.len() as u64).unwrap();
+            lock.sync_all().unwrap();
+            for cut in [1, published.len() / 2, published.len() - 1] {
+                std::fs::write(&marker, &published[..cut]).unwrap();
+                fail_closed(&mut c);
+            }
+            std::fs::write(&marker, &published).unwrap();
+            assert!(v.has(&r));
+            assert_eq!(tick(&f, &v, &k, &mut c, 102, 12).removed, 1);
+            assert!(!v.has(&r));
+        }
+        /// An empty pin beside an intact marker is the crash before the pin was
+        /// written: the marker stands for the registration, and the next pass
+        /// pins it again and deletes exactly what it should.
+        #[test]
+        fn vault_empty_pin_with_an_intact_marker_is_pinned_again() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let lock_path = f.state.join("secrets/retention.lock");
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            lock.set_len(0).unwrap();
+            lock.sync_all().unwrap();
+            let reopened = Vault::open(&f.state).unwrap();
+            assert!(reopened.has(&r));
+            assert!(f.state.join("secrets/parent-retention.json").exists());
+            assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).removed, 1);
+            assert!(!reopened.has(&r));
+        }
         #[test]
         fn vault_parent_tombstone_deletes_only_private_copy_and_never_expires_source() {
             let (f, r, v, k) = prepared();

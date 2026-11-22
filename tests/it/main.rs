@@ -15,6 +15,7 @@ mod direct_exec;
 mod doctor;
 mod forecast;
 mod gaps_cli;
+mod gaps_worker;
 mod not_implemented;
 mod one_host;
 mod protocol;
@@ -35,8 +36,11 @@ mod resident;
 
 mod bootstrap;
 
+mod status_repost;
+
 mod init;
 
+mod ephemeral_stop;
 mod warmup_stop;
 mod worker_ephemeral;
 mod worker_role;
@@ -46,8 +50,10 @@ mod remote_links;
 mod test_tmp_root;
 
 mod workers_lifecycle;
+mod workers_listing;
 mod workers_upgrade;
 
+mod retry_dependents;
 mod top;
 
 mod group_join;

@@ -131,6 +131,8 @@ pub struct Options {
     /// `false` with `--no-status`.
     pub enabled: bool,
     pub context: String,
+    /// Create nothing while looking the input up (showing, not posting).
+    pub read_only: bool,
 }
 
 impl Default for Options {
@@ -138,32 +140,57 @@ impl Default for Options {
         Options {
             enabled: true,
             context: status::DEFAULT_CONTEXT.to_string(),
+            read_only: false,
         }
     }
 }
 
-/// Decide the status of `run` from how it ended and post it when it may be.
-/// Never fails: what could not be looked up or posted is in the record, and
-/// the computed result is the same whatever became of the post.
-pub fn settle(
-    context: &Context,
-    run: &RunId,
-    end: &RunEnd<'_>,
-    options: &Options,
-    poster: &dyn Poster,
-) -> Record {
+/// What [`verdict`] found: the computed result, whether it may be posted
+/// and what exactly would be sent, and what was tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub computed: status::Computed,
+    pub decision: status::Decision,
+    pub source_digest: Option<String>,
+    pub original_head: Option<String>,
+}
+
+impl Verdict {
+    /// The record of what became of the decision once it was carried out.
+    pub fn record(self, posting: Posting) -> Record {
+        Record {
+            computed: self.computed,
+            posting,
+            source_digest: self.source_digest,
+            original_head: self.original_head,
+        }
+    }
+}
+
+/// Decide the status of `run` from how it ended, and whether and how it may
+/// be posted, without posting. Never fails: what could not be looked up is
+/// the reason it is not posted.
+pub fn verdict(context: &Context, run: &RunId, end: &RunEnd<'_>, options: &Options) -> Verdict {
     let computed = status::computed(end);
-    let manifest = match super::input::source_manifest(context, run) {
+    let looked_up = if options.read_only {
+        super::input::source_manifest_existing(context, run)
+    } else {
+        super::input::source_manifest(context, run)
+    };
+    let manifest = match looked_up {
         Ok(manifest) => manifest,
         Err(error) => {
-            return Record {
+            let reason = if error.code == crate::error::ErrorCode::SourceBusy {
+                format!("the source store is busy, try again: {}", error.message)
+            } else {
+                format!("the input of the run cannot be read: {}", error.message)
+            };
+            return Verdict {
                 computed,
-                posting: Posting::Skipped {
-                    reason: format!("the input of the run cannot be read: {}", error.message),
-                },
+                decision: status::Decision::Skip(reason),
                 source_digest: None,
                 original_head: None,
-            }
+            };
         }
     };
     let git = |args: &[&str]| git(context, args);
@@ -205,9 +232,9 @@ pub fn settle(
             tree_of_head: tree.as_deref(),
         },
     );
-    Record {
+    Verdict {
         computed,
-        posting: status::outcome(decision, |post| poster.post(post)),
+        decision,
         source_digest: Some(manifest.manifest_digest),
         original_head: manifest.original_head,
     }

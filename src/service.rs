@@ -18,6 +18,7 @@ pub mod output_export;
 pub mod outputs;
 pub mod query;
 pub mod resident;
+pub mod status_post;
 pub mod submit;
 pub mod systemd;
 

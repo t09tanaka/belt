@@ -2195,6 +2195,40 @@ impl Agent {
         )
     }
 
+    /// For an ephemeral worker's graceful end: how many attempts are live,
+    /// and how many processes of this worker still run (supervisors, which
+    /// release their lock only as they end, and setup builders). `None`: not
+    /// readable now, never taken as idle.
+    pub fn settling(&self) -> (Option<u64>, Option<u64>) {
+        self.reap();
+        let spawned = lock(&self.children).len() as u64;
+        let builds = self.host.setup_owner().map_or(0, |s| s.running() as u64);
+        let held = (|| {
+            let dir = self.cfg.state_dir.join("supervisors");
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
+                Err(_) => return None,
+            };
+            let mut held = 0u64;
+            for entry in entries {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                let attempt = AttemptId::parse(name.strip_suffix(".lock")?).ok()?;
+                // Taken for a moment and dropped: only a live supervisor holds it.
+                match SupervisorLock::try_acquire(&self.cfg.state_dir, &attempt) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => held += 1,
+                    Err(_) => return None,
+                }
+            }
+            Some(held)
+        })();
+        (
+            self.store.count_nonterminal().ok(),
+            held.map(|h| h + spawned + builds),
+        )
+    }
+
     /// The identity currently published by this worker.
     pub(crate) fn advertised_boot(&self) -> WorkerBootId {
         lock(&self.identity).clone()
