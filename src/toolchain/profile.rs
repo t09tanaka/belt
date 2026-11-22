@@ -115,6 +115,7 @@ struct Definition {
 /// Retained for the resident lifetime. Changes require operator drain/restart.
 #[derive(Clone)]
 pub struct Profile {
+    embedded_bin: Option<PathBuf>,
     explicit_allowlist: bool,
     name: String,
     definition: Definition,
@@ -319,6 +320,7 @@ impl Profile {
             .map_err(|_| "cannot hash worker profile")?;
         let digest = Digest::of_bytes(&bytes);
         let profile = Self {
+            embedded_bin: None,
             explicit_allowlist,
             name,
             definition,
@@ -342,6 +344,12 @@ impl Profile {
             }
         }
         Ok(profile)
+    }
+    pub(crate) fn with_embedded_bin(mut self, bin: PathBuf) -> Result<Self, String> {
+        let path = crate::workspace::embedded::prepend(&bin, &self.env["PATH"])?;
+        self.env.insert("PATH".into(), path);
+        self.embedded_bin = Some(bin);
+        Ok(self)
     }
     /// The absolute PATH directories the profile executes with.
     pub fn path_dirs(&self) -> &[PathBuf] {
@@ -414,6 +422,15 @@ impl Profile {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let mut env = binding.environment(&own)?;
+        if let Some(bin) = &self.embedded_bin {
+            env.insert(
+                "PATH".into(),
+                crate::workspace::embedded::prepend(
+                    bin,
+                    env.get("PATH").ok_or("activation has no PATH")?,
+                )?,
+            );
+        }
         crate::config::traffic::apply_step_env(&mut env, &self.scope_env);
         Ok(env)
     }
@@ -612,7 +629,12 @@ impl Profile {
         crate::setup::preparation_probe::bounded_path(self.shell()).ok()?;
         for dir in &self.definition.path {
             crate::setup::preparation_probe::bounded_path(dir).ok()?;
-            for tool in TOOLS.iter().copied().chain(["xcrun"]) {
+            for tool in TOOLS
+                .iter()
+                .copied()
+                .chain(["xcrun"])
+                .filter(|tool| crate::workspace::embedded::version(tool).is_none())
+            {
                 let binary = if tool == "xcode" { "xcodebuild" } else { tool };
                 crate::setup::preparation_probe::bounded_path(&dir.join(binary)).ok()?;
             }
@@ -670,6 +692,7 @@ impl Profile {
             .iter()
             .copied()
             .chain(["xcrun"])
+            .filter(|tool| crate::workspace::embedded::version(tool).is_none())
             .map(|tool| {
                 let binary = if tool == "xcode" { "xcodebuild" } else { tool };
                 let file = self
@@ -744,6 +767,12 @@ impl Profile {
         tool: &str,
         deadline: &dyn Fn() -> Duration,
     ) -> Result<ToolObservation, ProbeMiss> {
+        if let Some(version) = crate::workspace::embedded::version(tool) {
+            return Ok(ToolObservation::Available {
+                version: version.into(),
+                identity: Digest::of_bytes(format!("{tool}/{version}").as_bytes()),
+            });
+        }
         let binary = if tool == "xcode" { "xcodebuild" } else { tool };
         let Some(path) = self
             .definition

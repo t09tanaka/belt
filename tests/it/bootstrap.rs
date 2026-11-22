@@ -5628,3 +5628,23 @@ async fn a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order() 
     assert_eq!(attempts.values().sum::<usize>(), 5);
     shutdown(&load(&spec)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_commands_find_the_embedded_helpers_before_standalone_tools() {
+    let (_root, spec, input) = control_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(45),
+        tokio::process::Command::new(&spec.executable)
+            .args(["--json", "exec", "--", "/bin/sh", "-ec",
+                r#"case "$(command -v fast-worktree)" in */tool-bin/*/fast-worktree) ;; *) exit 21;; esac
+                   case "$(command -v portool)" in */tool-bin/*/portool) ;; *) exit 22;; esac
+                   fast-worktree --version && portool --version"#])
+            .env_clear().envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    shutdown(&client).await;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
