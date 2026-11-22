@@ -107,6 +107,13 @@ const OWNERSHIP_LOCKS: [&str; 2] = ["startup.lock", "coordinator.lock"];
 /// that does not exist is not held and is never created, and the lock taken
 /// to find out (shared, so concurrent probes do not see each other) is
 /// released at once.
+///
+/// Known limit: a resident started by launchd or systemd holds neither lock
+/// nor socket between its process start and the moment it opens the
+/// coordinator store (`open_bound`), so a probe in that interval says the
+/// resident is stopped. The daemon start takes no lock of its own to close
+/// it, because `bootstrap::ensure` already holds `startup.lock` while it
+/// starts the daemon.
 fn lock_held(dir: &std::path::Path, name: &str) -> Result<bool, ApiError> {
     use std::fs::{File, OpenOptions, TryLockError};
     use std::os::unix::fs::OpenOptionsExt;
@@ -338,6 +345,55 @@ extern "C" fn on_signal(sig: libc::c_int) {
     PENDING.store(sig, Ordering::SeqCst);
 }
 
+/// The descriptor of belt's controlling terminal, or -1 when it has none.
+static TTY: AtomicI32 = AtomicI32::new(-1);
+
+/// Find the controlling terminal once, before any handler is installed:
+/// stdin when it is a terminal, else `/dev/tty`. The descriptor is kept for
+/// the life of the process so the handler can query it.
+fn find_tty() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(find_tty_once);
+}
+
+fn find_tty_once() {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: isatty only inspects a descriptor.
+    let fd = if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        libc::STDIN_FILENO
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open("/dev/tty")
+            .map_or(-1, IntoRawFd::into_raw_fd)
+    };
+    TTY.store(fd, Ordering::SeqCst);
+}
+
+/// Whether belt forwards `sig` to the command. The terminal sends Ctrl-C's
+/// SIGINT to the whole foreground group, belt and the command both, and many
+/// programs treat a second SIGINT as "force quit" and skip their cleanup, so
+/// a SIGINT is not forwarded when belt's group is the terminal's foreground
+/// group (the command already has it). SIGTERM and SIGHUP are always forwarded.
+fn forwards(sig: libc::c_int, terminal_foreground: bool) -> bool {
+    sig != libc::SIGINT || !terminal_foreground
+}
+
+/// The handler while the command runs: [`on_signal`] minus a SIGINT the
+/// terminal already delivered to the command. A SIGINT sent with `kill` to
+/// belt alone while belt is in the terminal's foreground group is therefore
+/// not forwarded either; the terminal case is the one that matters here.
+extern "C" fn on_running_signal(sig: libc::c_int) {
+    let fd = TTY.load(Ordering::SeqCst);
+    // SAFETY: tcgetpgrp and getpgrp are async-signal-safe and touch no memory.
+    let foreground = fd >= 0 && unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() };
+    if forwards(sig, foreground) {
+        on_signal(sig);
+    }
+}
+
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
     // SAFETY: installs a handler that only stores to an atomic.
     unsafe {
@@ -359,9 +415,12 @@ fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
 /// SIGINT, SIGTERM and SIGHUP that belt itself receives are recorded. Waiting
 /// for admission, the run is stopped and its entry removed before the process
 /// ends, and the command is never started. Running, the runner forwards the
-/// signal to the command's pid alone (never a group), once per signal belt
-/// received. A terminal's Ctrl-C reaches belt and the command both, so the
-/// command then gets SIGINT twice, once from the terminal and once forwarded.
+/// signal to the command's pid alone (never a group). It keeps a single
+/// pending slot, so two different signals close together forward only the
+/// last, and a signal that lands just before `wait4` blocks is forwarded at
+/// the next interruption of that wait, not at once. A terminal's Ctrl-C
+/// already reaches the command, so it is not forwarded again (see
+/// [`on_running_signal`]).
 ///
 /// Handlers do nothing but store (SIGQUIT: nothing at all) rather than
 /// ignoring the signal: an ignored signal stays ignored in the command
@@ -379,6 +438,7 @@ impl Supervisor for Signals {
     }
 
     fn running(&self) {
+        find_tty();
         set_handler(
             libc::SIGQUIT,
             on_terminal as extern "C" fn(libc::c_int) as libc::sighandler_t,
@@ -386,7 +446,7 @@ impl Supervisor for Signals {
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             set_handler(
                 sig,
-                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+                on_running_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
             );
         }
     }
@@ -405,6 +465,16 @@ impl Supervisor for Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigint_is_not_forwarded_only_while_the_terminal_has_it_in_the_foreground() {
+        assert!(!forwards(libc::SIGINT, true));
+        assert!(forwards(libc::SIGINT, false));
+        for sig in [libc::SIGTERM, libc::SIGHUP] {
+            assert!(forwards(sig, true));
+            assert!(forwards(sig, false));
+        }
+    }
 
     #[test]
     fn options_that_need_a_run_are_refused_and_local_is_not() {
