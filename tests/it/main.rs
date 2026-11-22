@@ -14,6 +14,8 @@ mod coordinator;
 mod direct_exec;
 mod doctor;
 mod forecast;
+mod gaps_cli;
+mod gaps_worker;
 mod not_implemented;
 mod one_host;
 mod protocol;
@@ -37,6 +39,7 @@ mod bootstrap;
 mod init;
 
 mod ephemeral_stop;
+mod warmup_stop;
 mod worker_ephemeral;
 mod worker_role;
 
