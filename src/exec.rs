@@ -273,6 +273,8 @@ pub struct Runner<'a> {
 /// What one job did with the build cache.
 struct BuildCacheRun {
     key: String,
+    /// what the key was made of, recorded in the entry the job saves
+    inputs: crate::build_cache::KeyInputs,
     stat: crate::build_cache::JobCache,
     notes: Vec<String>,
     /// false when the job goes without the cache (only `notes` is left)
@@ -283,6 +285,7 @@ impl BuildCacheRun {
     fn off(note: String) -> Self {
         BuildCacheRun {
             key: String::new(),
+            inputs: Default::default(),
             stat: Default::default(),
             notes: vec![note],
             active: false,
@@ -3776,7 +3779,7 @@ impl<'a> Runner<'a> {
                 )))
             }
         };
-        let key = bc::key(&bc::KeyInputs {
+        let inputs = bc::KeyInputs {
             rustc,
             cargo,
             os_arch: bc::os_arch(),
@@ -3785,8 +3788,10 @@ impl<'a> Runner<'a> {
             env,
             files: bc::config_digests(ws),
             matrix: cm.get("matrix").map(|m| m.to_string()).unwrap_or_default(),
-        });
+        };
+        let key = bc::key(&inputs);
         let mut run = BuildCacheRun {
+            inputs,
             stat: bc::JobCache {
                 key: key[..12].to_string(),
                 ..Default::default()
@@ -3821,7 +3826,7 @@ impl<'a> Runner<'a> {
         };
         let t = Instant::now();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        match bc::save(self.ctx, s, &run.key, ws, seq) {
+        match bc::save_with(self.ctx, s, &run.key, ws, seq, Some(&run.inputs)) {
             bc::Save::Saved => {
                 run.stat.saved = true;
                 run.notes.push(format!(

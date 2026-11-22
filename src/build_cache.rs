@@ -21,6 +21,13 @@
 //! gone. The marker file in an entry holds its size, and its mtime is the time
 //! of its last use (for the least-recently-used pruning).
 //!
+//! An entry also holds `.local-ci-inputs.json`, beside the marker: for each
+//! part of its key (schema, toolchain, OS, job, each lock, each variable by
+//! name, each config file, the matrix) the SHA-256 of that part's text, never
+//! the text, so that two entries can be compared to see what made their keys
+//! differ. Nothing reads it back here; a missing or unreadable one is
+//! tolerated and it is not restored.
+//!
 //! The key holds the toolchain as `rustc -vV` and `cargo -V` report it before
 //! the job's steps run. A toolchain that a setup step of the job installs is
 //! not seen by the key: the job uses the one that is there at the start.
@@ -43,6 +50,11 @@ pub const SCHEMA: u32 = 2;
 
 /// The file in an entry that holds its size in bytes.
 const MARKER: &str = ".local-ci-entry";
+
+/// The file in an entry, beside the marker, that records which inputs made
+/// its key (see [`inputs_record`]). Only for a reader: nothing here depends on
+/// it, and it is never copied into `target/`.
+pub const INPUTS: &str = ".local-ci-inputs.json";
 
 /// Directory name (of the cache directory) the entries live in.
 pub const DIR: &str = "build";
@@ -173,29 +185,68 @@ pub struct KeyInputs {
     pub matrix: String,
 }
 
+/// The parts of the key in the order they are hashed: the label, the name
+/// inside the label (for the parts that come in several: a lock, a variable,
+/// a config file) and the text.
+fn key_parts(i: &KeyInputs) -> Vec<(&'static str, String, String)> {
+    let one = |label: &'static str, text: &str| (label, String::new(), text.to_string());
+    let mut v = vec![
+        one("schema", &SCHEMA.to_string()),
+        one("rustc", &i.rustc),
+        one("cargo", &i.cargo),
+        one("os", &i.os_arch),
+        one("job", &i.job),
+    ];
+    for (p, d) in &i.locks {
+        v.push(("lock", p.clone(), format!("{p}={d}")));
+    }
+    for (k, val) in &i.env {
+        v.push(("env", k.clone(), format!("{k}={val}")));
+    }
+    for (n, d) in &i.files {
+        v.push(("file", n.clone(), format!("{n}={d}")));
+    }
+    v.push(one("matrix", &i.matrix));
+    v
+}
+
 pub fn key(i: &KeyInputs) -> String {
     let mut h = Sha256::new();
-    let mut part = |label: &str, text: &str| {
+    for (label, _, text) in key_parts(i) {
         // a length in front of each part, so that no two inputs run together
         h.update(format!("{label}:{}:", text.len()).as_bytes());
         h.update(text.as_bytes());
-    };
-    part("schema", &SCHEMA.to_string());
-    part("rustc", &i.rustc);
-    part("cargo", &i.cargo);
-    part("os", &i.os_arch);
-    part("job", &i.job);
-    for (p, d) in &i.locks {
-        part("lock", &format!("{p}={d}"));
     }
-    for (k, v) in &i.env {
-        part("env", &format!("{k}={v}"));
-    }
-    for (n, d) in &i.files {
-        part("file", &format!("{n}={d}"));
-    }
-    part("matrix", &i.matrix);
     hex(&h.finalize())
+}
+
+/// What an entry records of its key (`INPUTS`): the SHA-256 of the text of
+/// each part, never the text itself (a variable can hold a token). Names (of
+/// the lock files, variables and config files) are in clear. Two entries can
+/// be compared part by part to see what made their keys differ.
+pub fn inputs_record(i: &KeyInputs) -> serde_json::Value {
+    let mut parts = serde_json::Map::new();
+    let mut groups: BTreeMap<&str, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    for (label, name, text) in key_parts(i) {
+        let digest = serde_json::Value::String(hex(&Sha256::digest(text.as_bytes())));
+        if name.is_empty() {
+            parts.insert(label.to_string(), digest);
+        } else {
+            groups.entry(label).or_default().insert(name, digest);
+        }
+    }
+    for (label, g) in groups {
+        parts.insert(
+            match label {
+                "lock" => "locks",
+                "file" => "files",
+                other => other,
+            }
+            .to_string(),
+            serde_json::Value::Object(g),
+        );
+    }
+    serde_json::json!({ "version": 1, "key_schema": SCHEMA, "parts": parts })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -731,6 +782,18 @@ pub enum Save {
 /// `key`, if there is none. `seq` tells apart the temporary names of the
 /// threads of one process.
 pub fn save(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path, seq: usize) -> Save {
+    save_with(ctx, s, key, ws, seq, None)
+}
+
+/// [`save`], recording the inputs of the key in the entry when they are given.
+pub fn save_with(
+    ctx: &ExecContext,
+    s: &Settings,
+    key: &str,
+    ws: &Path,
+    seq: usize,
+    inputs: Option<&KeyInputs>,
+) -> Save {
     let entry = s.dir.join(key);
     if entry.exists() {
         return Save::Exists;
@@ -794,6 +857,10 @@ pub fn save(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path, seq: usize) -
     }
     if let Err(e) = std::fs::write(tmp.join(MARKER), size.to_string()) {
         return fail(format!("{MARKER}: {e}"));
+    }
+    // only for a reader: an entry without it is as good
+    if let Some(i) = inputs {
+        let _ = std::fs::write(tmp.join(INPUTS), inputs_record(i).to_string());
     }
     match std::fs::rename(&tmp, &entry) {
         Ok(()) => Save::Saved,
@@ -1348,6 +1415,58 @@ mod tests {
         let es = entries(&s.dir);
         assert_eq!(es.len(), 1);
         assert!(es[0].bytes > 0);
+    }
+
+    #[test]
+    fn an_entry_records_the_digests_of_its_key_and_nothing_reads_them_back() {
+        let t = tempfile::tempdir().unwrap();
+        let s = settings(t.path());
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        make_target(&a);
+        std::fs::create_dir_all(&b).unwrap();
+        let mut i = inputs();
+        i.env = vec![("CARGO_REGISTRY_TOKEN".into(), "s3cr3t-token".into())];
+        let c = ctx();
+        assert_eq!(save_with(&c, &s, "k", &a, 0, Some(&i)), Save::Saved);
+        let text = std::fs::read_to_string(s.dir.join("k").join(INPUTS)).unwrap();
+        // names in clear, values only as digests
+        assert!(text.contains("CARGO_REGISTRY_TOKEN"));
+        assert!(!text.contains("s3cr3t-token"));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let sha = |t: &str| hex(&Sha256::digest(t.as_bytes()));
+        assert_eq!(v["parts"]["rustc"], sha("rustc 1.100.0"));
+        assert_eq!(v["parts"]["matrix"], sha("{\"os\":\"linux\"}"));
+        assert_eq!(
+            v["parts"]["env"]["CARGO_REGISTRY_TOKEN"],
+            sha("CARGO_REGISTRY_TOKEN=s3cr3t-token")
+        );
+        assert_eq!(v["parts"]["locks"]["Cargo.lock"], sha("Cargo.lock=aa"));
+        assert_eq!(
+            v["parts"]["files"]["rust-toolchain.toml"],
+            sha("rust-toolchain.toml=t1")
+        );
+        for part in ["schema", "cargo", "os", "job"] {
+            assert!(v["parts"][part].is_string(), "{part}");
+        }
+        // the entry is listed, restored without the file, and pruned whole
+        assert_eq!(entries(&s.dir).len(), 1);
+        assert_eq!(restore(&c, &s, "k", &b), Restore::Restored);
+        assert!(!b.join("target").join(INPUTS).exists());
+        assert!(!allowed(&a.join("target"))
+            .iter()
+            .any(|p| p.ends_with(INPUTS)));
+        // an entry without the file (an older one) is as good
+        std::fs::remove_file(s.dir.join("k").join(INPUTS)).unwrap();
+        assert_eq!(entries(&s.dir).len(), 1);
+        let d = t.path().join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(restore(&c, &s, "k", &d), Restore::Restored);
+        // two different inputs differ in exactly the part that changed
+        let mut j = i.clone();
+        j.matrix = "{\"os\":\"mac\"}".into();
+        let (x, y) = (inputs_record(&i), inputs_record(&j));
+        assert_ne!(x["parts"]["matrix"], y["parts"]["matrix"]);
+        assert_eq!(x["parts"]["rustc"], y["parts"]["rustc"]);
     }
 
     #[test]
