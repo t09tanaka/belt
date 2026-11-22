@@ -979,6 +979,8 @@ if __name__ == "__main__":
             action = {"up": up, "run": run, "down": down, "variants": variants}.get(sys.argv[1])
             if sys.argv[1] == "a46":
                 from a46 import run as action
+            elif sys.argv[1] == "peers":
+                from peers import run as action
             if action is None:
                 raise ValueError(f"unknown action: {sys.argv[1]}")
             sys.exit(action() or 0)
