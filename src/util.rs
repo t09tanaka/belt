@@ -49,8 +49,10 @@ pub type Sink = Box<dyn FnMut(Stream, &str)>;
 
 /// What the library sets for the duration of one call: where the output
 /// goes instead of the terminal, and which executable runs the detached
-/// helper commands (`pool fill`, `install --changed`). The CLI sets nothing:
-/// output goes to stdout and stderr, and the helper is the running binary.
+/// helper commands (`pool fill`, `install --changed`). The CLI sets nothing,
+/// so output goes to stdout and stderr and the helper is the running binary,
+/// unless it is embedded with a helper (`cli::run_with_helper`): then it sets
+/// only the helper.
 struct Context {
     /// `None`: stdout and stderr, and what a child writes goes there
     /// directly.
@@ -236,6 +238,16 @@ mod tests {
         assert_eq!(tilde_with(Path::new("/home/me"), home), "~");
         assert_eq!(tilde_with(Path::new("/home/meow/a"), home), "/home/meow/a");
         assert_eq!(tilde_with(Path::new("/x"), Path::new("/")), "/x");
+    }
+
+    #[test]
+    fn the_helper_is_the_one_in_context_and_else_the_running_binary() {
+        let exe = PathBuf::from("/opt/x/fast-worktree");
+        let got = with_context(None, Some(exe.clone()), helper_exe).unwrap();
+        assert_eq!(got, exe);
+        assert_eq!(helper_exe().unwrap(), env::current_exe().unwrap());
+        let none = with_context(None, None, helper_exe);
+        assert_eq!(none.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

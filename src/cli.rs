@@ -1,9 +1,11 @@
 //! The `fast-worktree` command line: argument parsing and dispatch to the
-//! commands. `main` only calls [`run`].
+//! commands. `main` only calls [`run`]; a program that embeds the command
+//! calls [`run_with_helper`].
 
-use crate::util::errln;
+use crate::util::{self, errln};
 use crate::{cmd, pool};
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -189,8 +191,63 @@ enum CacheCmd {
 }
 
 /// Parse the command line, run the command and return its exit code.
+///
+/// The background helpers (`pool fill`, `install --changed --deferred`)
+/// re-exec the running binary. This is [`run_with_helper`] with the
+/// process's arguments and no helper.
 pub fn run() -> i32 {
-    let cli = Cli::parse();
+    run_with_helper(std::env::args_os(), None)
+}
+
+/// Run the command line `args` and return its exit code, for a program
+/// that embeds the `fast-worktree` command.
+///
+/// `args` starts with the program name, as `std::env::args_os()` does.
+/// Usage errors, `--help` and `--version` are printed as the command
+/// prints them and return their exit code (2, 0, 0) instead of exiting.
+///
+/// `helper` is the executable that every background helper this call starts
+/// re-execs: `pool fill` after `add` and `hook create`, and `install
+/// --changed --deferred`. It must behave as the `fast-worktree` command:
+/// for example a link named `fast-worktree` to the embedding binary, whose
+/// `main` sees that name and calls this function again with the same
+/// helper. `None` re-execs [`std::env::current_exe`], as [`run`] does. On
+/// Linux that resolves links to the real binary, so an embedding binary
+/// started through a link should pass the link here.
+///
+/// Unlike [`crate::Repository::with_helper`], `None` does not turn the
+/// helpers off.
+///
+/// ```no_run
+/// use std::path::PathBuf;
+///
+/// let code = fast_worktree::cli::run_with_helper(
+///     ["fast-worktree", "pool", "status"],
+///     Some(PathBuf::from("/usr/local/bin/fast-worktree")),
+/// );
+/// std::process::exit(code);
+/// ```
+pub fn run_with_helper<I, T>(args: I, helper: Option<PathBuf>) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return e.exit_code();
+        }
+    };
+    match helper {
+        // Only the helper: output stays on stdout and stderr.
+        Some(exe) => util::with_context(None, Some(exe), || dispatch(cli)),
+        None => dispatch(cli),
+    }
+}
+
+fn dispatch(cli: Cli) -> i32 {
     let result = match cli.cmd {
         Cmd::Add {
             path,
