@@ -19,6 +19,24 @@ Cargo installs the executable as `belt` (normally in `~/.cargo/bin`). The packag
 
 ## First run on one machine
 
+### Run in the current directory
+
+On a Mac with no belt coordinator or worker agent running, run a command in your current directory:
+
+```sh
+belt exec -- /usr/bin/printf 'hello from belt\n'
+```
+
+This prints `hello from belt` on stdout. Belt reports direct execution on stderr and uses the same host admission budget as `task-traffic-controller exec`. A direct command creates no snapshot or run ID.
+
+```sh
+belt --json exec --local -- /usr/bin/true
+```
+
+The JSON result includes `"mode":"direct"` and `"exit_code":0`. Once a coordinator is running, `--local` pins execution to your own worker and the command follows the normal snapshot and run lifecycle.
+
+### Run with a durable queue
+
 To use the durable queue, initialize the resident for your user, then check its status:
 
 ```sh
