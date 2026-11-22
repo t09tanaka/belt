@@ -76,7 +76,7 @@ include a few library consumers such as `service::outputs::`. Actual integration
 discovery fails if any selected test is outside `config::`. Normal CI on both
 platforms and the coverage gate still execute the full test suite.
 
-The runner pins cargo-schemata 0.4.0, limits baseline/test execution to 60 seconds
+The runner pins cargo-schemata 0.6.0, limits baseline/test execution to 60 seconds
 per binary/mutant (compilation is separate), and rejects missing, empty, surviving,
 timed-out or unknown results. `python3 scripts/mutation-policy-test.py` checks the
 real runner's Cargo arguments and rejects workflow bypasses and accidental extra

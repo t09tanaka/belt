@@ -153,8 +153,8 @@ jobs:
       - name: install cargo-schemata
         run: |
           # A cached binary of another version is replaced, not reused.
-          if ! cargo schemata --version 2>/dev/null | grep -qx 'cargo-schemata 0\.4\.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -qx 'cargo-schemata 0\.6\.0'; then
+            cargo install cargo-schemata --locked --version 0.6.0 --force
           fi
       - name: mutate this shard
         run: python3 scripts/mutation-run.py --shard "${{ matrix.shard }}/4"
@@ -180,8 +180,8 @@ jobs:
           save-if: false
       - name: install cargo-schemata
         run: |
-          if ! cargo schemata --version 2>/dev/null | grep -qx 'cargo-schemata 0\.4\.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -qx 'cargo-schemata 0\.6\.0'; then
+            cargo install cargo-schemata --locked --version 0.6.0 --force
           fi
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh $(cat scripts/pure-modules.txt)
