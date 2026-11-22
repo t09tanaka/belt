@@ -600,7 +600,7 @@ fn job_report(
         else {
             continue;
         };
-        if ci.task.inputs.get("belt_discovery").is_some() {
+        if !lines::has_lines(&ci.task.inputs) {
             continue;
         }
         by_plan_task.insert(ci.task.task_id.clone(), row);
@@ -624,7 +624,7 @@ fn job_report(
         .as_ref()
         .and_then(|digest| crate::ci::advance::read_plan(state_dir, digest).ok())
         .and_then(|bytes| serde_json::from_slice::<local_ci::FrozenPlan>(&bytes).ok())
-        .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
+        .filter(lines::has_split_job);
     if let Some(plan) = plan {
         let row_of = |task: &str| by_plan_task.get(task).copied();
         if let Ok(progress) = crate::ci::advance::replay(store, results, &plan, row_of) {
