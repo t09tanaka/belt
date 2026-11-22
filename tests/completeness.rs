@@ -748,15 +748,13 @@ fn a_workflow_that_cannot_be_run_makes_the_run_incomplete() {
 // ---- the machine's GitHub token ----
 
 fn ctx_with_gh(home: &Path, token: Option<&str>) -> ExecContext {
-    use std::os::unix::fs::PermissionsExt;
     let bin = home.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = match token {
         Some(t) => format!("#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo {t}\n"),
         None => "#!/bin/sh\nexit 1\n".to_string(),
     };
-    std::fs::write(bin.join("gh"), script).unwrap();
-    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_executable(&bin.join("gh"), script, 0o755);
     ExecContext::new(
         [
             (
@@ -819,13 +817,15 @@ fn the_machines_github_token_is_supplied_and_masked_in_the_log() {
 /// `bash` that waits a second before it starts makes that certain.
 #[test]
 fn a_small_script_whose_writer_is_gone_before_the_shell_starts_still_runs() {
-    use std::os::unix::fs::PermissionsExt;
     let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - timeout-minutes: 0.5\n        run: test \"$GH_TOKEN\" = ghs_faketoken123\n";
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
     let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
     let bash = tmp.path().join("fakebin/bash");
-    std::fs::write(&bash, "#!/bin/sh\nsleep 1\nexec /bin/bash \"$@\"\n").unwrap();
-    std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_executable(
+        &bash,
+        "#!/bin/sh\nsleep 1\nexec /bin/bash \"$@\"\n",
+        0o755,
+    );
     let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
     let ws = workspace(&tmp, &dir, &fp, "slowshell");
     let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();

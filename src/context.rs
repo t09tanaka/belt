@@ -366,15 +366,13 @@ mod tests {
         assert!(c.0.pgids.lock().unwrap().is_empty());
     }
     fn cleanup_fixture(body: &str) -> (tempfile::TempDir, ExecContext) {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let docker = root.path().join("docker");
-        std::fs::write(
+        crate::fake_exec::write_executable(
             &docker,
             format!("#!/bin/sh\necho \"$*\" >> \"$HOME/calls\"\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let ctx = ExecContext::new(
             [
                 (

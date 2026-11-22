@@ -88,20 +88,17 @@ impl Fixture {
         let bin = area.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let docker = bin.join("docker");
-        std::fs::write(
+        crate::fake_exec::write_executable(
             &docker,
             "#!/bin/sh\nprintf cleanup >> \"$HOME/cleanup-called\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let portool = bin.join("portool");
-        std::fs::write(
+        crate::fake_exec::write_executable(
             &portool,
             "#!/bin/sh\nprintf release >> \"$HOME/port-release-called\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&portool, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let ctx = ExecContext::new(
             [
                 ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
@@ -534,7 +531,6 @@ fn git_derived_native_background_remains_for_next_step_and_drains_with_entry() {
 
 #[test]
 fn git_attempt_cleanup_failure_keeps_the_actual_result_and_pending_port() {
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let mut d = f.driver();
     f.seed(&mut d);
@@ -542,8 +538,7 @@ fn git_attempt_cleanup_failure_keeps_the_actual_result_and_pending_port() {
     let ws = f.ws("port-cleanup-failure");
     std::fs::write(ws.root.join(".portool.toml"), b"# private fixture").unwrap();
     let portool = f.area.path().join("bin/portool");
-    std::fs::write(&portool,"#!/bin/sh\ncase \"$1\" in\nsync) : > .env.portool;;\nrelease) printf release >> \"$HOME/port-release-called\"; exit 1;;\nesac\nexit 0\n").unwrap();
-    std::fs::set_permissions(&portool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::fake_exec::write_executable(&portool,"#!/bin/sh\ncase \"$1\" in\nsync) : > .env.portool;;\nrelease) printf release >> \"$HOME/port-release-called\"; exit 1;;\nesac\nexit 0\n", 0o700);
     let mut opts = f.opts();
     opts.portool = Some(portool);
     let ctx = f.ctx.fresh_attempt();

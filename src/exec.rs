@@ -4901,22 +4901,23 @@ mod tests {
 
     #[test]
     fn npm_installs_once_per_directory() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("calls");
         let fake = tmp.path().join("fake-npm");
-        fs::write(
+        crate::fake_exec::write_executable(
             &fake,
             format!(
                 "#!/bin/sh\necho \"$*\" >> {}\nmkdir -p node_modules\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let shim = tmp.path().join("npm");
-        fs::write(&shim, NPM_SHIM.replace("__REAL__", &fake.to_string_lossy())).unwrap();
-        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_exec::write_executable(
+            &shim,
+            NPM_SHIM.replace("__REAL__", &fake.to_string_lossy()),
+            0o755,
+        );
         let ws = tmp.path().join("ws");
         let proj = ws.join("proj");
         fs::create_dir_all(&proj).unwrap();

@@ -317,15 +317,13 @@ fn what_is_not_cargos_is_not_kept_or_restored() {
 
 #[test]
 fn a_probe_that_takes_too_long_goes_without_the_cache() {
-    use std::os::unix::fs::PermissionsExt;
     let f = fixture_with(
         "name: ci\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo hi\n",
     );
     let bin = f.tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let rustc = bin.join("rustc");
-    std::fs::write(&rustc, "#!/bin/sh\nsleep 60\n").unwrap();
-    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_executable(&rustc, "#!/bin/sh\nsleep 60\n", 0o755);
     let mut env = ctx(&f.log).env().clone();
     let path = format!(
         "{}:{}",

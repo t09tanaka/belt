@@ -602,16 +602,11 @@ fn run_with_fake_npm(
 ) -> local_ci::report::RunResult {
     let bin = tmp.path().join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(
-        bin.join("npm"),
+    common::fake_exec::write_executable(
+        &bin.join("npm"),
         "#!/bin/sh\nprintf '%s' \"$NODE_ENV\" > dep.marker\n",
-    )
-    .unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(bin.join("npm"))
-        .status()
-        .unwrap();
+        0o755,
+    );
     let c = ctx_with(
         tmp.path(),
         &format!(
@@ -1057,12 +1052,7 @@ fn library_commands_use_the_context_env_and_not_the_processs() {
     // a shim on the context's PATH is what runs
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("git"), "#!/bin/sh\necho shim\n").unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(bin.join("git"))
-        .status()
-        .unwrap();
+    common::fake_exec::write_executable(&bin.join("git"), "#!/bin/sh\necho shim\n", 0o755);
     let shimmed = ctx_with(tmp.path(), &bin.to_string_lossy());
     assert_eq!(
         local_ci::git::git(&shimmed, tmp.path(), &["status"]).unwrap(),
@@ -1189,19 +1179,14 @@ fn units_run_in_copies_that_are_bound_to_the_setup_once_for_any_installer() {
     let bin = tmp.path().join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     let count = tmp.path().join("yarn.count");
-    std::fs::write(
-        bin.join("yarn"),
+    common::fake_exec::write_executable(
+        &bin.join("yarn"),
         format!(
             "#!/bin/sh\necho run >> {}\nmkdir -p node_modules/pkg\n",
             count.display()
         ),
-    )
-    .unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(bin.join("yarn"))
-        .status()
-        .unwrap();
+        0o755,
+    );
     let c = ctx_with(
         tmp.path(),
         &format!(

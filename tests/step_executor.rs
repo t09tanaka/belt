@@ -11,7 +11,6 @@ use local_ci::{
     ExecContext, FrozenPlan, Quiet, ScriptPipe, StepExecutor, StepExit, StepRequest, Target,
     TaskInputs, TaskResult,
 };
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,15 +60,13 @@ fn ctx(home: &Path) -> ExecContext {
     std::fs::create_dir_all(&bin).unwrap();
     // These executor fixtures own no Docker resources. Keep cleanup local even
     // on a host with an installed but unavailable Docker daemon.
-    std::fs::write(bin.join("docker"), "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_executable(&bin.join("docker"), "#!/bin/sh\nexit 0\n", 0o755);
 
-    std::fs::write(
-        bin.join("gh"),
+    common::fake_exec::write_executable(
+        &bin.join("gh"),
         "#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo ghs_faketoken123\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     ExecContext::new(
         [
             (

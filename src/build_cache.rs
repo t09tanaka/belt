@@ -1619,10 +1619,7 @@ mod tests {
     }
 
     fn fake_tool(dir: &Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_exec::write_executable(&dir.join(name), format!("#!/bin/sh\n{body}\n"), 0o755);
     }
 
     #[test]

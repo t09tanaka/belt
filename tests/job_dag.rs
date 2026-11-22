@@ -826,16 +826,14 @@ fn a_matrix_with_two_keys_that_print_alike_is_not_planned() {
 fn fake_gh(dir: &Path, marker: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     let gh = dir.join("gh");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &gh,
         format!(
             "#!/bin/sh\necho called >> '{}'\nprintf '{F}\\tdisabled_manually\\n'\n",
             marker.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
 }
 
 #[test]

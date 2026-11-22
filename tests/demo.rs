@@ -457,16 +457,14 @@ jobs:
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho \"$*\" >> {}/argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 2\nexec \"$@\"\n",
             d.home.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let o = local_ci_path(
         &d,
@@ -537,13 +535,11 @@ jobs:
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 7\nexec \"$@\"\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let o = local_ci_path(
         &d,
@@ -592,7 +588,7 @@ jobs:
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\n\
          for i in 1 2 3 4 5 6 7 8; do\n\
@@ -602,10 +598,8 @@ jobs:
          sleep 0.5\n\
          done\n\
          exec \"$@\"\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let o = local_ci_path(
         &d,
@@ -870,13 +864,11 @@ fn fake_gh_disabled(d: &Demo) -> String {
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &gh,
         "#!/bin/sh\nprintf '.github/workflows/ci.yml\\tdisabled_manually\\n'\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     git(
         &d.repo,
         &[
@@ -1115,18 +1107,16 @@ fn bad_config_is_an_error() {
 
 /// A stand-in controller named `name` that records its argv in `<home>/<name>.argv`.
 fn fake_controller(d: &Demo, bin: &Path, name: &str) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(bin).unwrap();
     let fake = bin.join(name);
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho \"$*\" >> {}/{name}.argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
             d.home.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
 }
 
 #[test]
@@ -1215,16 +1205,14 @@ fn budget_controller(d: &Demo) -> String {
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         format!(
             "#!/bin/sh\nif [ \"$1\" = inspect ]; then echo '{{\"limits\":{{\"budget\":8}}}}'; exit 0; fi\necho \"$*\" >> {}/argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
             d.home.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
 }
 
@@ -1466,16 +1454,14 @@ fn no_share_is_given_when_the_controller_cannot_say_its_budget() {
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
-    std::fs::write(
+    common::fake_exec::write_executable(
         &fake,
         format!(
             "#!/bin/sh\nif [ \"$1\" = inspect ]; then exit 1; fi\necho \"$*\" >> {}/argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
             d.home.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let o = local_ci_threads(&d, &path, &[], &["--json"]);
     assert!(o.status.success(), "{}", stdout(&o));
