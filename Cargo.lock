@@ -965,9 +965,9 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-ci"
-version = "0.18.3"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9355fce8ed10ebcf9e5836c0e5599312223c1324661407e4bca092a86a1dc9d"
+checksum = "a1d949826187c0bc9450d9832ded0fdf9bb56c18537bebe4b331de1108371708"
 dependencies = [
  "anyhow",
  "clap",
