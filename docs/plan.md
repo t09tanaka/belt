@@ -1872,3 +1872,15 @@ scheduler は、run の入力が届いた remote worker だけを候補にする
 - R03〜R08、R10、R12、R14、R66、R74、R93。
 
 version 0.1.0 への変更、`cargo publish`、tag、Release は、実機試験のあとに行う。
+
+## 仕様1.7（第25章: ディスクに残すものと消す時点）の実装
+
+仕様1.7は実装に先行する。実装との差は仕様の25.9にある。実装は仕組みごとに5つに分ける。どの組も、更新の試用中は消す処理を止める（25.1の8）。
+
+1. **runとattemptごとのfileを、刈り取りと終了で消す。** 親: 刈り取りの順序（25.2）のうち、`reader-pins/<run>.lock`、`in-place/<run>.json`、`sources/runs/<run>` とそのlock、`sources/retention.db` のrunの行、bundle、親のGit領域のref。worker: `supervisors/<attempt>.lock` の削除と、全走査をやめること、ACKの直後の削除。触るfile: `src/service/resident/result_retention.rs`、`src/service/resident/input_retention.rs`、`src/results/pin.rs`、`src/results/retention.rs`、`src/workspace/in_place.rs`、`src/source/store.rs`、`src/source/retention.rs`、`src/source/retention/deletion.rs`、`src/service/forward.rs`、`src/supervisor/lock.rs`、`src/worker/agent.rs`、`src/storage/policy.rs`。lockを取る側すべてにinodeの確認を入れる（25.1）。
+2. **workerの側のstore（source、clone、toolchain）。** sourceごと・rootごとの最後に使った時刻とbytes、attemptからの参照、14日・20 GiBの削除、cloneのrefの削除と `git gc`、`incoming/` の24時間、submitの `input_missing`、親の `ready` の10分。触るfile: `src/worker/machine.rs`、`src/worker/blobs.rs`、`src/worker/blob_policy.rs`、`src/worker/agent.rs`、`src/source/retention.rs`、`src/workspace/mod.rs`、`src/toolchain/adapters.rs`、`src/setup/builder.rs`、`src/setup/policy.rs`、`src/coordinator/input_gate.rs`、`src/service/resident/delivery.rs`、`src/wire.rs`、`src/storage/schema.rs`。
+3. **crashの受け皿と古いbinary。** 起動時の走査（25.5）、所有marker付きの一時directory（`ci-plan-*`、`belt-log-reader-*`）、`sources/tmp/` と `.s*`・`.tmp*`・`.init-*`、Vaultの一時file、commitでの `bin/<digest>/` と `tool-bin/<digest>/` の削除。触るfile: `src/platform/owned_temp.rs`、`src/service/planning.rs`、`src/service/logs.rs`、`src/service/worker.rs`、`src/service/resident.rs`、`src/secrets/vault/guard.rs`、`src/storage/coordinator.rs`、`src/service/init/upgrade.rs`、`src/service/init/takeover.rs`、`src/service/worker_service/upgrade.rs`、`src/workspace/embedded.rs`。`scripts/s26/down.sh` に `--all` を足す。
+4. **journalと行の刈り取り。** 親DB: 「消せない」triggerを外すmigration、`run` の印、`event(run_id, seq)` の索引、行の削除（25.2の6）、runに属さないevent、`ci_test_timing` の時刻、identityの記録。worker DB: attemptの行とeventの削除、重複防止の記録、epochとACKとメンバーの削除による消去。行の無いattemptへの `ack_collected`。触るfile: `src/storage/schema.rs`、`src/storage/coordinator.rs`、`src/storage/coordinator/retention.rs`、`src/storage/coordinator/ci.rs`、`src/storage/coordinator/identity.rs`、`src/storage/common.rs`、`src/storage/worker.rs`、`src/coordinator/mod.rs`、`src/results/collect.rs`、`src/service/group/rotate.rs`。
+5. **一時workerの起動し直し。** 所有marker `ephemeral.json`、前のprocessが居ないことの証明、残ったattemptの停止、stateの削除（25.3）。触るfile: `src/service/worker/ephemeral.rs`、`src/service/worker/ephemeral/plan.rs`、`src/platform/owned_temp.rs`、`src/supervisor/recover.rs`。
+
+順序: 4の `run` の印と行の削除は、1の親の側より先か同時に入れる（印が無いと、刈り取りの途中で落ちたrunを続けられない）。1のACK直後の削除は、4のworkerの重複防止の記録と同時に入れる（行を消すと、遅れたsubmitを断る記録が無くなる）。2は独立。3の起動時の走査は、1と4の後に入れると対象が決まる。5は独立。組み込んだライブラリ（task-traffic-controller、fast-worktree、portool）の自動保持は、各ライブラリの版の採用時に、beltが呼ぶ関数を仕様の25.4の表に書き足す。
