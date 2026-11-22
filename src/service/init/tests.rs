@@ -1273,3 +1273,42 @@ async fn worker_start_refuses_pending_membership_undo() {
     assert!(fake.0.borrow().calls.is_empty());
     assert!(paths.config.join("membership-undo.json").exists());
 }
+
+#[tokio::test]
+async fn a_rotated_managed_key_still_proves_the_runtime_binding() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context, &mut Unknown).await.is_err());
+    let spec = read_journal(&paths.journal).unwrap().spec;
+    managed_journal(&spec).unwrap();
+    let staged = crate::group::next_key_path(&paths.key);
+    crate::secrets::key::init(&staged).unwrap();
+    assert!(crate::group::switch_to_next(&paths.key).unwrap());
+    managed_journal(&spec).unwrap();
+    assert!(read_journal(&paths.journal)
+        .unwrap()
+        .switching_key
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_crash_during_managed_key_rotation_accepts_only_the_recorded_files() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context, &mut Unknown).await.is_err());
+    let mut j = read_journal(&paths.journal).unwrap();
+    let staged = crate::group::next_key_path(&paths.key);
+    crate::secrets::key::init(&staged).unwrap();
+    let mut next = Proof::read(&staged).unwrap();
+    next.path = paths.key.clone();
+    j.switching_key = Some(next);
+    fs::write(&paths.journal, serde_json::to_vec(&j).unwrap()).unwrap();
+    managed_journal(&j.spec).unwrap();
+    fs::rename(staged, &paths.key).unwrap();
+    managed_journal(&j.spec).unwrap();
+    let bytes = fs::read(&paths.key).unwrap();
+    let mut replacement = tempfile::NamedTempFile::new_in(&paths.config).unwrap();
+    replacement.write_all(&bytes).unwrap();
+    replacement.persist(&paths.key).unwrap();
+    assert!(managed_journal(&j.spec).is_err());
+}
