@@ -390,7 +390,11 @@ impl Profile {
             (self.explicit_allowlist
                 && !self.definition.allowed_env.contains(key)
                 && !protected_env(key))
-                || protected_env(key) && own(key) != Some(value)
+                || protected_env(key)
+                    && own(key) != Some(value)
+                    && !(key == "PATH"
+                        && self.embedded_bin.is_some()
+                        && std::env::split_paths(value).eq(self.definition.path.iter().cloned()))
         }) {
             return Err(
                 "command env is outside the active profile allowlist or changes protected environment"
@@ -398,7 +402,14 @@ impl Profile {
             );
         }
         let mut env = self.host_environment();
-        env.extend(extra.clone());
+        // Protected values may repeat the configured profile. Keep the effective
+        // worker value, including its private helper directory.
+        env.extend(
+            extra
+                .iter()
+                .filter(|(k, _)| !protected_env(k))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         Ok(env)
     }
     /// The environment of one command: [`Profile::execution_environment`],
@@ -416,11 +427,22 @@ impl Profile {
             return Ok(unbound);
         };
         // Checked against the worker's values above; the activation has none.
-        let own: BTreeMap<String, String> = extra
+        let mut own: BTreeMap<String, String> = extra
             .iter()
             .filter(|(k, _)| !scope_env(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        if let (Some(bin), Some(given), Some(bound)) = (
+            &self.embedded_bin,
+            own.get("PATH"),
+            binding.activation.environment.get("PATH"),
+        ) {
+            if crate::workspace::embedded::prepend(bin, given)?
+                == crate::workspace::embedded::prepend(bin, bound)?
+            {
+                own.remove("PATH");
+            }
+        }
         let mut env = binding.environment(&own)?;
         if let Some(bin) = &self.embedded_bin {
             env.insert(
