@@ -315,6 +315,9 @@ pub fn daemon_main(input: Option<&Path>) -> i32 {
             );
         }
         validate(&spec)?;
+        // A key switch that stopped between its two journal writes is
+        // resolved in memory by `validate`; write it down before going on.
+        super::init::settle_key_change(&spec)?;
         let binding = if spec.managed_service.is_some() {
             Some(super::init::managed_identity(&spec)?)
         } else {

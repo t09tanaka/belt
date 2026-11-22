@@ -1320,3 +1320,95 @@ async fn a_crash_during_managed_key_rotation_accepts_only_the_recorded_files() {
     replacement.persist(&paths.key).unwrap();
     assert!(managed_journal(&j.spec).is_err());
 }
+
+/// A journal that still names a `switching_key`, as a crash between the two
+/// journal writes of a key rotation leaves it. Returns the spec, the paths and
+/// the receipt of the staged key.
+async fn journal_with_leftover(context: ContextInput) -> (Spec, Paths, Proof) {
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context, &mut Unknown).await.is_err());
+    let mut j = read_journal(&paths.journal).unwrap();
+    let staged = crate::group::next_key_path(&paths.key);
+    crate::secrets::key::init(&staged).unwrap();
+    let mut next = Proof::read(&staged).unwrap();
+    next.path = paths.key.clone();
+    j.switching_key = Some(next.clone());
+    fs::write(&paths.journal, serde_json::to_vec(&j).unwrap()).unwrap();
+    (j.spec, paths, next)
+}
+
+#[tokio::test]
+async fn a_start_clears_a_leftover_key_switch_before_the_rename() {
+    let (_root, context) = fixture();
+    let (spec, paths, _) = journal_with_leftover(context).await;
+    let before = read_raw_journal(&paths.journal).unwrap();
+    let old_receipt = before.files.iter().find(|p| p.path == paths.key).unwrap();
+    let old_key = fs::read(&paths.key).unwrap();
+    settle_key_change(&spec).unwrap();
+    let disk = fs::read_to_string(&paths.journal).unwrap();
+    assert!(!disk.contains("switching_key"));
+    let after = read_raw_journal(&paths.journal).unwrap();
+    let kept = after.files.iter().find(|p| p.path == paths.key).unwrap();
+    assert_eq!(
+        serde_json::to_value(kept).unwrap(),
+        serde_json::to_value(old_receipt).unwrap()
+    );
+    kept.verify().unwrap();
+    assert_eq!(fs::read(&paths.key).unwrap(), old_key);
+    assert!(crate::group::next_key_path(&paths.key).exists());
+}
+
+#[tokio::test]
+async fn a_start_clears_a_leftover_key_switch_after_the_rename() {
+    let (_root, context) = fixture();
+    let (spec, paths, next) = journal_with_leftover(context).await;
+    fs::rename(crate::group::next_key_path(&paths.key), &paths.key).unwrap();
+    settle_key_change(&spec).unwrap();
+    let disk = fs::read_to_string(&paths.journal).unwrap();
+    assert!(!disk.contains("switching_key"));
+    let after = read_raw_journal(&paths.journal).unwrap();
+    let kept = after.files.iter().find(|p| p.path == paths.key).unwrap();
+    assert_eq!(
+        serde_json::to_value(kept).unwrap(),
+        serde_json::to_value(&next).unwrap()
+    );
+    kept.verify().unwrap();
+}
+
+#[tokio::test]
+async fn a_start_refuses_a_leftover_key_switch_it_cannot_resolve() {
+    let (_root, context) = fixture();
+    let (spec, paths, _) = journal_with_leftover(context).await;
+    let bytes = fs::read(&paths.key).unwrap();
+    let mut replacement = tempfile::NamedTempFile::new_in(&paths.config).unwrap();
+    replacement.write_all(&bytes).unwrap();
+    replacement.persist(&paths.key).unwrap();
+    assert!(settle_key_change(&spec).is_err());
+    assert!(fs::read_to_string(&paths.journal)
+        .unwrap()
+        .contains("switching_key"));
+}
+
+#[tokio::test]
+async fn a_start_leaves_a_leftover_to_a_change_that_holds_the_lock() {
+    let (_root, context) = fixture();
+    let (spec, paths, _) = journal_with_leftover(context).await;
+    let lock = resident::secure_file(&paths.config.join("init.lock"), true).unwrap();
+    lock.lock().unwrap();
+    settle_key_change(&spec).unwrap();
+    assert!(fs::read_to_string(&paths.journal)
+        .unwrap()
+        .contains("switching_key"));
+    assert!(finish_key_change(&spec).is_err());
+}
+
+#[tokio::test]
+async fn a_start_without_a_leftover_changes_nothing() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context, &mut Unknown).await.is_err());
+    let spec = read_journal(&paths.journal).unwrap().spec;
+    let before = fs::read(&paths.journal).unwrap();
+    settle_key_change(&spec).unwrap();
+    assert_eq!(fs::read(&paths.journal).unwrap(), before);
+}

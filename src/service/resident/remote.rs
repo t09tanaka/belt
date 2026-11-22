@@ -323,7 +323,17 @@ async fn session(
     // the next connection proves with the new key.
     if let (Some(Err(refused)), Some(key_path)) = (&connected, coordinator.group_key_path()) {
         if let Some(fingerprint) = refused.peer_key_fingerprint() {
-            let _ = crate::group::switch_if_peer_is_on_next(key_path, fingerprint);
+            // File and lock work: off the async task.
+            let (path, fingerprint) = (key_path.to_path_buf(), fingerprint.to_owned());
+            let switched = tokio::task::spawn_blocking(move || {
+                crate::group::switch_if_peer_is_on_next(&path, &fingerprint)
+            })
+            .await;
+            // The next connection proves with the old key and is refused
+            // again; say why the switch did not happen. Local error only.
+            if let Ok(Err(error)) = &switched {
+                eprintln!("{}", key_switch_failure(error));
+            }
         }
     }
     let outcome = async {
@@ -384,13 +394,33 @@ async fn session(
     outcome
 }
 
+/// The line for a key switch that failed (a busy `init.lock`, a staged key
+/// that does not load, a journal that disagrees). The error is a local one.
+fn key_switch_failure(error: &std::io::Error) -> String {
+    format!("group key switch after a peer refusal failed: {error}")
+}
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod key_tests {
-    use super::outdated;
+    use super::{key_switch_failure, outdated};
     use crate::group;
+
+    #[test]
+    fn a_failed_key_switch_is_reported_with_its_cause() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        crate::secrets::key::init(&path).unwrap();
+        let first = group::fingerprint(&group::load_keys(&path).unwrap().current);
+        // A next key that cannot be loaded makes the switch fail.
+        std::fs::write(group::next_key_path(&path), b"not a key").unwrap();
+        let error = group::switch_if_peer_is_on_next(&path, &first).unwrap_err();
+        let line = key_switch_failure(&error);
+        assert!(line.starts_with("group key switch after a peer refusal failed: "));
+        assert!(line.len() > "group key switch after a peer refusal failed: ".len());
+    }
 
     /// A link of this member stays while the member holds the key it was
     /// proven with, through the first stage of a rotation as well, and is

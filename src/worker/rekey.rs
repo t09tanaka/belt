@@ -64,6 +64,34 @@ fn cleanup_stray_key(state: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+/// Where the new key waits while it is published: a fixed name beside the key,
+/// so a crash leftover is found and removed (a random name was never).
+fn staged_key_path(key_path: &Path) -> std::path::PathBuf {
+    let mut name = key_path.as_os_str().to_owned();
+    name.push(".installing");
+    name.into()
+}
+/// Remove a leftover without following it: a symlink at the name is removed
+/// as a link, whatever it points at.
+fn remove_staged_key(staged: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(staged) {
+        Ok(()) => std::fs::File::open(staged.parent().unwrap())?.sync_all(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+/// Create exclusively (no existing file or link at the name is opened), 0600.
+fn stage_new_key(staged: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(staged)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
 pub(crate) fn stage(state: &Path, key: &crate::secrets::key::ClusterKey) -> anyhow::Result<String> {
     anyhow::ensure!(
         !pending(state),
@@ -98,14 +126,16 @@ pub(crate) fn finish(state: &Path, key_path: &Path, store: &WorkerStore) -> anyh
         }
     };
     let text: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    let mut staged = tempfile::NamedTempFile::new_in(
-        key_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("key parent missing"))?,
-    )?;
-    staged.write_all(format!("{text}\n").as_bytes())?;
-    staged.as_file().sync_all()?;
-    crate::service::init::install_key(staged.path(), key_path)?;
+    let staged = staged_key_path(key_path);
+    remove_staged_key(&staged)?;
+    let published = stage_new_key(&staged, format!("{text}\n").as_bytes())
+        .map_err(anyhow::Error::from)
+        .and_then(|()| crate::service::init::install_key(&staged, key_path));
+    if published.is_err() {
+        // A retry creates it again; never leave a key file behind.
+        let _ = remove_staged_key(&staged);
+    }
+    published?;
     match std::fs::remove_file(crate::group::next_key_path(key_path)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -159,5 +189,31 @@ mod tests {
         write(&dir.path().join(KEY), b"retained").unwrap();
         cleanup_stray_key(dir.path()).unwrap();
         assert_eq!(read(dir.path(), KEY).unwrap().as_deref(), Some("retained"));
+    }
+    #[test]
+    fn a_crash_leftover_of_the_staged_key_is_replaced_and_a_link_is_not_followed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let key = dir.path().join("worker-cluster.key");
+        let staged = staged_key_path(&key);
+        assert_eq!(staged, dir.path().join("worker-cluster.key.installing"));
+        std::fs::write(&staged, b"crash leftover").unwrap();
+        remove_staged_key(&staged).unwrap();
+        assert!(!staged.exists());
+        remove_staged_key(&staged).unwrap();
+        stage_new_key(&staged, b"new\n").unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new\n");
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(stage_new_key(&staged, b"again").is_err());
+        std::fs::remove_file(&staged).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, &staged).unwrap();
+        assert!(stage_new_key(&staged, b"new").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        remove_staged_key(&staged).unwrap();
+        assert!(std::fs::symlink_metadata(&staged).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     }
 }

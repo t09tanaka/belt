@@ -445,6 +445,91 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     b.stop().await;
 }
 
+/// A changed registration redials the worker (`ReloadWorkers`) while it holds
+/// a live attempt: the new session adopts the same attempt, the command is
+/// started once, and no second attempt is placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let root = root.path();
+    private(root);
+    let state = root.join("parent");
+    let config_dir = root.join("config").join("belt");
+    let bin = root.join("bin");
+    for dir in [&state, &root.join("local"), &config_dir, &bin] {
+        private(dir);
+    }
+    let key = root.join("key");
+    belt::secrets::key::init(&key).unwrap();
+    let cluster = CoordinatorStore::open(&state, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let home = root.join("peer-a");
+    let mut worker = spawn_worker(&home, &cluster, &key, "remote-a");
+    wait_for("remote worker socket", || {
+        assert!(worker.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        home.join(".belt/agent.sock").exists()
+    })
+    .await;
+    let fake = bin.join("ssh");
+    let script = format!("#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhome=$1\nshift\n[ \"$1\" = \"'belt' 'worker' '--stdio'\" ] || exit 91\nprintf '%s\\n' $$ > \"$home/bridge.pid\"\nHOME=\"$home\" exec {} worker --stdio\n", belt::protocol::ssh::quote(BIN));
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let registration = |priority: u32| {
+        format!("schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\nlocal_worker_priority=-100\nmax_active_task=1\n[scheduler]\nprefetch_per_worker=0\n[[workers]]\nid='remote-a'\nssh='{}'\npriority={priority}\n", home.display())
+    };
+    write_private(
+        &config_dir.join("config.toml"),
+        registration(100).as_bytes(),
+    );
+    let (owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
+    wait_for("verified remote bridge", || {
+        bridge(&home, owner.pid).is_some()
+    })
+    .await;
+    let first_bridge = bridge(&home, owner.pid).unwrap();
+    let task = submit(&client, &state, &spec.env, &key, root, "first", u32::MAX).await;
+    wait_for("remote execution", || root.join("count-first").exists()).await;
+    let placed = attempt(&state, &task).unwrap();
+    assert_eq!(placed.worker_id.as_str(), "remote-a");
+    // Change the registration of the worker that runs the attempt.
+    write_private(&config_dir.join("config.toml"), registration(90).as_bytes());
+    match client.request(Operation::ReloadWorkers).await.unwrap() {
+        Reply::WorkersReloaded { connecting } => assert_eq!(connecting, ["remote-a"]),
+        other => panic!("{other:?}"),
+    }
+    wait_for("redialed bridge", || {
+        bridge(&home, owner.pid).is_some_and(|b| b != first_bridge)
+    })
+    .await;
+    std::fs::write(root.join("release-first"), "release").unwrap();
+    wait_for("result collection", || {
+        attempt(&state, &task).is_some_and(|a| a.receipts.collected_at_ms.is_some())
+    })
+    .await;
+    let attempts = CoordinatorStore::open_read_only(&state)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap();
+    assert_eq!(attempts.len(), 1, "no second attempt is placed");
+    assert_eq!(attempts[0].attempt_id, placed.attempt_id);
+    assert_eq!(
+        attempts[0].termination.unwrap().outcome(),
+        Outcome::Succeeded
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("count-first")).unwrap(),
+        "once\n"
+    );
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    owner.wait().await;
+    worker.stop().await;
+}
+
 /// A46 across the real daemon, worker executable and stdio bridge. The SSH
 /// executable stands in for the user's tunnel and can disconnect it without
 /// stopping the worker it leads to.

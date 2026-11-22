@@ -1479,7 +1479,7 @@ mod tests;
 
 mod key_change;
 mod membership_undo;
-pub(crate) use key_change::{finish_key_change, install_key};
+pub(crate) use key_change::{finish_key_change, install_key, settle_key_change};
 mod takeover;
 pub mod upgrade;
 
