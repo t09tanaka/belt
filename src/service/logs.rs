@@ -4,7 +4,7 @@
 use super::completion::Target;
 use super::query::{LogMetadata, Query, Reader, Response};
 use crate::error::{ApiError, ErrorCode};
-use crate::ids::{AttemptId, TaskId};
+use crate::ids::{AttemptId, RunId, TaskId};
 use crate::results::store::ResultStore;
 use crate::storage::query::Task;
 use crate::wire::LogStream;
@@ -399,6 +399,49 @@ impl Observer {
         summary.undrained_streams += u64::from(offset < committed);
         Ok(())
     }
+    /// The GitHub commit status of a run target (`None` for a task target or
+    /// a run that posted none).
+    async fn github_status(&self) -> Result<Option<(RunId, serde_json::Value)>, ApiError> {
+        let Target::Run(run_id) = &self.target else {
+            return Ok(None);
+        };
+        match self
+            .reader
+            .query(Query::Run {
+                run_id: run_id.clone(),
+            })
+            .await
+            .map_err(query_error)?
+        {
+            Response::Run { run } => {
+                Ok(run.and_then(|run| run.github_status.map(|status| (run_id.clone(), status))))
+            }
+            _ => Err(internal("unexpected run response")),
+        }
+    }
+
+    /// Print it after the output: the `ci` line on stderr (stdout carries
+    /// only command bytes), or a `status` record in `--json`.
+    async fn print_github_status(
+        run_id: RunId,
+        status: serde_json::Value,
+        sink: &mut Sink<'_>,
+    ) -> Result<(), ApiError> {
+        if sink.json {
+            sink.record(serde_json::json!({
+                "kind": "status", "run_id": run_id, "github_status": status
+            }))
+            .await
+        } else {
+            let record = serde_json::from_value(status).map_err(internal)?;
+            sink.err
+                .write_all(format!("{}\n", crate::ci::status::render(&record)).as_bytes())
+                .await
+                .map_err(internal)?;
+            sink.err.flush().await.map_err(internal)
+        }
+    }
+
     pub async fn observe(
         &mut self,
         follow: bool,
@@ -425,13 +468,21 @@ impl Observer {
                             && end.collection_pending_tasks == 0;
                     }
                 }
-                Ok((summary, done))
+                let status = if !follow || done {
+                    self.github_status().await?
+                } else {
+                    None
+                };
+                Ok((summary, done, status))
             }
             .await;
             match result {
-                Ok((summary, done)) => {
+                Ok((summary, done, status)) => {
                     retry_ms = 200;
                     if !follow || done {
+                        if let Some((run_id, status)) = status {
+                            Self::print_github_status(run_id, status, &mut sink).await?;
+                        }
                         return Ok(summary);
                     }
                 }
@@ -788,6 +839,120 @@ mod tests {
         assert_eq!(notes.len(), 1);
         task.unrunnable = Some("the frozen plan is gone".into());
         assert!(note_news(&mut notes, &task));
+    }
+
+    #[tokio::test]
+    async fn run_without_github_status_adds_no_output() {
+        let f = Fixture::new();
+        f.append(LogStream::Stderr, b"last command output\n", true);
+        f.terminal(true);
+        for follow in [false, true] {
+            for json in [false, true] {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                f.observer(true)
+                    .observe(follow, json, &mut out, &mut err)
+                    .await
+                    .unwrap();
+                if json {
+                    assert!(!String::from_utf8(out).unwrap().contains("github_status"));
+                    assert!(err.is_empty());
+                } else {
+                    assert!(out.is_empty());
+                    assert!(err.ends_with(b"last command output\n"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_reads_github_status_after_the_run_ends() {
+        let f = Fixture::new();
+        f.append(LogStream::Stdout, b"before\n", false);
+        let mut observer = f.observer(true);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (result, ()) = tokio::join!(observer.observe(true, false, &mut out, &mut err), async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            f.append(LogStream::Stderr, b"after\n", true);
+            f.db.record_github_status(
+                &f.run,
+                &serde_json::json!({
+                    "computed": "failure", "posting": "failed", "sha": "0123456789abcdef",
+                    "state": "failure", "context": "local-ci", "error": "unavailable"
+                }),
+                9,
+            )
+            .unwrap();
+            f.terminal(true);
+        });
+        result.unwrap();
+        assert_eq!(out, b"before\n");
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.ends_with(
+                "after\nstatus: local-ci=failure could not be posted to 0123456 (unavailable)\n"
+            ),
+            "{err}"
+        );
+        assert_eq!(err.matches("status: local-ci=").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_status_follows_run_logs_once_in_text_and_json() {
+        let f = Fixture::new();
+        f.append(LogStream::Stdout, b"command output\n", true);
+        f.append(LogStream::Stderr, b"command error\n", true);
+        f.terminal(true);
+        let record = serde_json::json!({
+            "computed": "success", "posting": "skipped", "reason": "--no-status",
+            "source_digest": "digest", "original_head": "0123456789abcdef"
+        });
+        f.db.record_github_status(&f.run, &record, 9).unwrap();
+        for follow in [false, true] {
+            for json in [false, true] {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                f.observer(true)
+                    .observe(follow, json, &mut out, &mut err)
+                    .await
+                    .unwrap();
+                if json {
+                    let records: Vec<serde_json::Value> = out
+                        .split(|b| *b == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| serde_json::from_slice(line).unwrap())
+                        .collect();
+                    assert_eq!(
+                        records.last().unwrap()["data"],
+                        serde_json::json!({
+                            "kind": "status", "run_id": f.run, "github_status": record
+                        })
+                    );
+                    assert_eq!(
+                        records
+                            .iter()
+                            .filter(|r| !r["data"]["github_status"].is_null())
+                            .count(),
+                        1
+                    );
+                    assert!(err.is_empty());
+                } else {
+                    assert_eq!(out, b"command output\n");
+                    let err = String::from_utf8(err).unwrap();
+                    assert!(
+                        err.ends_with("command error\nstatus: not posted (--no-status)\n"),
+                        "{err}"
+                    );
+                    assert_eq!(err.matches("status: not posted").count(), 1);
+                }
+            }
+        }
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        f.observer(false)
+            .observe(false, false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(err)
+            .unwrap()
+            .contains("status: not posted"));
     }
 
     #[tokio::test]
