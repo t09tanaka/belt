@@ -135,6 +135,9 @@ fn spawn_orphan_watchdog(
     submitted_at: chrono::DateTime<Utc>,
     grace_secs: u64,
 ) {
+    // Never the thread a forwarded SIGTERM lands on (see the usage
+    // sampler): block everything while spawning so the mask is inherited.
+    let old = task_traffic_controller::usage::block_all_signals();
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(1));
         if jobs::read_exit(&ctx, &id).is_some() {
@@ -149,6 +152,7 @@ fn spawn_orphan_watchdog(
             return;
         }
     });
+    task_traffic_controller::usage::restore_signals(&old);
 }
 
 /// How often `submit` checks whether its runner has registered.

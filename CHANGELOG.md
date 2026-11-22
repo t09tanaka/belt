@@ -9,11 +9,11 @@ the minor version).
 
 ### Fixed
 
-- `exec` no longer loses a stop signal: two different signals received before they were consumed are both delivered, and a signal arriving just before the blocking wait is forwarded to the command at once instead of on the next signal.
+- `exec` no longer loses a stop signal: two different signals received before they were consumed are both delivered, and a signal arriving just before the blocking wait is forwarded to the command at once instead of on the next signal. The handler never signals a pid after it was reaped (in-flight counter), keeps `errno`, and an inherited `SIGCHLD = SIG_IGN` no longer auto-reaps the command while its pid is published.
 
 ### Added
 
-- `Supervisor::child_started` and `Supervisor::child_exited` (default no-ops) so a supervisor can forward stop signals from its handlers; `take_pending` now returns one signal per call and is called until it returns 0.
+- `Supervisor::child_started` and `Supervisor::child_exited` (default no-ops) so a supervisor can forward stop signals from its handlers; `take_pending` now returns one signal per call and is called until it returns 0 (at most 64 times per drain).
 
 ## [0.10.4] - 2026-11-17
 

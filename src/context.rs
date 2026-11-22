@@ -218,8 +218,10 @@ pub trait Supervisor: Send + Sync {
     /// never calls it: restoring default dispositions earlier lets a second
     /// stop signal kill the process before the outcome is written down.
     fn finished(&self) {}
-    /// One signal received since it was last taken, or 0. Call it until it
-    /// returns 0: each distinct signal received is returned once.
+    /// One-shot: each call returns one pending signal and clears it, or 0
+    /// when none is pending. Callers drain it by calling until 0 (the
+    /// runner stops after a bounded number of calls), so an implementation
+    /// that keeps returning the same signal would never be believed.
     fn take_pending(&self) -> i32 {
         0
     }

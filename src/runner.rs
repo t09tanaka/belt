@@ -355,7 +355,7 @@ pub fn run_with(
             libc::kill(pid, sig);
         }
     };
-    loop {
+    for _ in 0..MAX_DRAIN {
         let sig = ctx.supervisor.take_pending();
         if sig == 0 {
             break;
@@ -382,7 +382,7 @@ pub fn run_with(
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
-            loop {
+            for _ in 0..MAX_DRAIN {
                 let sig = ctx.supervisor.take_pending();
                 if sig == 0 {
                     break;
@@ -466,6 +466,10 @@ pub fn run_with(
 
 /// `task-traffic-controller exec -- "npm run x"` looks for a program named `npm run x`.
 /// When that is the likely mistake, say how to write it instead.
+/// Upper bound on `take_pending` calls per drain, so an embedder that
+/// breaks the one-shot contract cannot spin the runner forever.
+const MAX_DRAIN: usize = 64;
+
 fn spawn_hint(argv: &[String], e: &std::io::Error) -> String {
     match argv {
         [one] if e.kind() == std::io::ErrorKind::NotFound && one.contains(char::is_whitespace) => {
