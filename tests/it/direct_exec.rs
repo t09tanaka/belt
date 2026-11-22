@@ -207,9 +207,10 @@ fn hold_with_library(fx: &Fx, held: &Path, release: &Path) -> std::thread::JoinH
 
 fn holder_script(held: &Path, release: &Path) -> String {
     crate::fixture_process::script(&format!(
-        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.05; done",
+        "touch '{}'; while [ ! -e '{}' ] && [ -d '{}' ]; do sleep 0.05; done",
         held.display(),
-        release.display()
+        release.display(),
+        release.parent().unwrap().display()
     ))
 }
 
@@ -684,4 +685,80 @@ fn a_signal_while_waiting_for_admission_ends_belt_without_starting_the_command()
         holder.join().unwrap();
         assert!(entries(&fx).is_empty());
     }
+}
+
+/// Starts belt with SIGINT and SIGQUIT either ignored or at their default,
+/// the way a background job of a non-interactive shell hands them down.
+fn spawn_with_dispositions(
+    fx: &Fx,
+    cwd: &Path,
+    script: &str,
+    ignored: bool,
+) -> std::process::Child {
+    let mut command = belt(fx, cwd, &["exec", "--", "/bin/sh", "-c", script]);
+    // SAFETY: signal() is async-signal-safe and runs in the forked child.
+    unsafe {
+        command.pre_exec(move || {
+            let handler = if ignored {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            };
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGQUIT, handler);
+            Ok(())
+        });
+    }
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// A command started normally can be interrupted: it does not inherit an
+/// ignored SIGINT or SIGQUIT (its own traps work).
+#[test]
+fn a_command_started_normally_does_not_inherit_ignored_sigint_or_sigquit() {
+    let fx = host(2);
+    let cwd = fx.path("project");
+    let script = "trap 'echo INT >> got' INT; trap 'echo QUIT >> got' QUIT; \
+                  kill -INT $$; kill -QUIT $$; : > done";
+    let mut child = spawn_with_dispositions(&fx, &cwd, script, false);
+    let status = finish(&mut child);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("got")).unwrap(),
+        "INT\nQUIT\n"
+    );
+}
+
+/// SIGINT and SIGQUIT ignored when belt starts stay ignored: the command
+/// inherits them, and a SIGINT sent to belt neither ends belt nor reaches the
+/// command, while a SIGTERM still does.
+#[test]
+fn sigint_and_sigquit_ignored_at_start_stay_ignored_for_belt_and_the_command() {
+    let fx = host(2);
+    let cwd = fx.path("project");
+    let script = "trap 'echo INT >> got; exit 42' INT; trap 'echo QUIT >> got; exit 44' QUIT; \
+                  trap 'echo TERM >> got; exit 41' TERM; kill -QUIT $$; : > started; \
+                  while :; do sleep 0.05; done";
+    let mut child = spawn_with_dispositions(&fx, &cwd, script, true);
+    wait_for("the command to start", || cwd.join("started").exists());
+    // Only the process this test started, never a group.
+    assert!(child.id() > 1);
+    assert!(belt::platform::process::signal_pid(
+        child.id(),
+        libc::SIGINT
+    ));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(child.try_wait().unwrap().is_none(), "belt ended on SIGINT");
+    assert!(!cwd.join("got").exists(), "the command got a signal");
+    assert!(belt::platform::process::signal_pid(
+        child.id(),
+        libc::SIGTERM
+    ));
+    let status = finish(&mut child);
+    assert_eq!(status.code(), Some(41), "{status:?}");
+    assert_eq!(std::fs::read_to_string(cwd.join("got")).unwrap(), "TERM\n");
 }
