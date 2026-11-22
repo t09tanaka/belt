@@ -93,19 +93,33 @@ fn clear_leftover(spec: &Spec, skip_if_busy: bool) -> anyhow::Result<()> {
     }
     let (mut journal, _) = managed_journal(spec)?;
     if skip_if_busy {
-        // The rename did not happen: `read_journal` kept the leftover only
-        // after the recorded previous key verified, so the journal without
-        // it is the ordinary state and a retry of the rotation records it
-        // again. A start does not decide about the rotation itself.
-        journal.switching_key = None;
+        settle_held(path, &mut journal)
+    } else {
+        ensure!(
+            journal.switching_key.is_none(),
+            "managed key switch is still pending"
+        );
+        save_over(path, &journal)
     }
-    ensure!(
-        journal.switching_key.is_none(),
-        "managed key switch is still pending"
-    );
+}
+
+/// For a caller that already holds `init.lock` (`belt upgrade`, `belt init`):
+/// `resolved` is what `read_journal` returned for `path`. A leftover
+/// `switching_key` on disk is dropped from it and the journal is rewritten, so
+/// nothing copied or retargeted from it carries the field. The rename did not
+/// happen when a leftover is still in `resolved`; see `clear_leftover`.
+pub(crate) fn settle_held(path: &Path, resolved: &mut Journal) -> anyhow::Result<()> {
+    if read_raw_journal(path)?.switching_key.is_none() {
+        return Ok(());
+    }
+    resolved.switching_key = None;
+    save_over(path, resolved)
+}
+
+fn save_over(path: &Path, journal: &Journal) -> anyhow::Result<()> {
     JournalFile {
-        path: path.clone(),
+        path: path.to_owned(),
         proof: Some(Proof::read(path)?),
     }
-    .save(&journal)
+    .save(journal)
 }

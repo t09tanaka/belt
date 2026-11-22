@@ -75,7 +75,10 @@ fn staged_key_path(key_path: &Path) -> std::path::PathBuf {
 /// as a link, whatever it points at.
 fn remove_staged_key(staged: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(staged) {
-        Ok(()) => std::fs::File::open(staged.parent().unwrap())?.sync_all(),
+        Ok(()) => std::fs::File::open(staged.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "key parent missing")
+        })?)?
+        .sync_all(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }

@@ -331,8 +331,8 @@ async fn session(
             .await;
             // The next connection proves with the old key and is refused
             // again; say why the switch did not happen. Local error only.
-            if let Ok(Err(error)) = &switched {
-                eprintln!("{}", key_switch_failure(error));
+            if let Some(line) = key_switch_failure(&switched) {
+                eprintln!("{line}");
             }
         }
     }
@@ -395,9 +395,18 @@ async fn session(
 }
 
 /// The line for a key switch that failed (a busy `init.lock`, a staged key
-/// that does not load, a journal that disagrees). The error is a local one.
-fn key_switch_failure(error: &std::io::Error) -> String {
-    format!("group key switch after a peer refusal failed: {error}")
+/// that does not load, a journal that disagrees) or whose task did not finish.
+/// The error is a local one. `None` when the switch ran.
+fn key_switch_failure<T>(
+    switched: &Result<std::io::Result<T>, tokio::task::JoinError>,
+) -> Option<String> {
+    match switched {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(format!(
+            "group key switch after a peer refusal failed: {error}"
+        )),
+        Err(error) => Some(format!("group key switch task failed: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -416,10 +425,20 @@ mod key_tests {
         let first = group::fingerprint(&group::load_keys(&path).unwrap().current);
         // A next key that cannot be loaded makes the switch fail.
         std::fs::write(group::next_key_path(&path), b"not a key").unwrap();
-        let error = group::switch_if_peer_is_on_next(&path, &first).unwrap_err();
-        let line = key_switch_failure(&error);
+        let failed = Ok(group::switch_if_peer_is_on_next(&path, &first));
+        let line = key_switch_failure(&failed).unwrap();
         assert!(line.starts_with("group key switch after a peer refusal failed: "));
         assert!(line.len() > "group key switch after a peer refusal failed: ".len());
+        let ok: Result<std::io::Result<()>, _> = Ok(Ok(()));
+        assert_eq!(key_switch_failure(&ok), None);
+    }
+
+    #[tokio::test]
+    async fn a_key_switch_that_panicked_is_reported() {
+        let lost: Result<std::io::Result<()>, _> = tokio::spawn(async { panic!("boom") }).await;
+        assert!(key_switch_failure(&lost)
+            .unwrap()
+            .starts_with("group key switch task failed: "));
     }
 
     /// A link of this member stays while the member holds the key it was

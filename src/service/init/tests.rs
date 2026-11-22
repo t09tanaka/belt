@@ -1390,6 +1390,23 @@ async fn a_start_refuses_a_leftover_key_switch_it_cannot_resolve() {
 }
 
 #[tokio::test]
+async fn init_clears_a_leftover_key_switch_before_it_saves_or_starts_anything() {
+    let (_root, context) = fixture();
+    let again = ContextInput {
+        env: context.env.clone(),
+        executable: context.executable.clone(),
+    };
+    let (_, paths, _) = journal_with_leftover(context).await;
+    let old_key = fs::read(&paths.key).unwrap();
+    // Unknown service: init stops at the service, after the journal settled.
+    assert!(initialize(again, &mut Unknown).await.is_err());
+    assert!(!fs::read_to_string(&paths.journal)
+        .unwrap()
+        .contains("switching_key"));
+    assert_eq!(fs::read(&paths.key).unwrap(), old_key);
+}
+
+#[tokio::test]
 async fn a_start_leaves_a_leftover_to_a_change_that_holds_the_lock() {
     let (_root, context) = fixture();
     let (spec, paths, _) = journal_with_leftover(context).await;
