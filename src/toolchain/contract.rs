@@ -650,6 +650,28 @@ mod tests {
         broken.frozen.schema_version = 2;
         assert_eq!(broken.clone().seal_observed(&node(known())), broken);
     }
+    #[test]
+    fn a_pub_range_is_sealed_by_the_same_rule() {
+        let pub_bundle = || {
+            let mut frozen = bundle_for("dart", "3.4.0").frozen;
+            frozen.selections.clear();
+            frozen.requirements[0].constraints =
+                vec![Constraint::Pub(PubRange::parse("^3.4.0").unwrap())];
+            FrozenBundle::seal_exact(frozen).unwrap()
+        };
+        let open = pub_bundle();
+        assert!(open.evidence.is_empty());
+        let sealed = open
+            .clone()
+            .seal_observed(&seen("dart", VersionObservation::parse("3.5.2")));
+        sealed.validate(&sealed.frozen.source_manifest).unwrap();
+        assert_eq!(sealed.evidence[0].concrete.to_string(), "3.5.2");
+        assert_eq!(
+            open.clone()
+                .seal_observed(&seen("dart", VersionObservation::parse("4.0.0"))),
+            open
+        );
+    }
     fn native_report(
         tools: &[(&str, &str, &[u8])],
     ) -> crate::toolchain::capability::WorkerCapabilities {
