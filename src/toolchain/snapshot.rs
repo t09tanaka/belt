@@ -44,9 +44,7 @@ fn load(
     if entry.mode != 0o100644 && entry.mode != 0o100755 {
         return Err(error("version_document_not_regular", path));
     }
-    if entry.size > MAX_DOCUMENT_BYTES as u64
-        || store.blob_size(&entry.hash) != Some(entry.size)
-    {
+    if entry.size > MAX_DOCUMENT_BYTES as u64 || store.blob_size(&entry.hash) != Some(entry.size) {
         return Err(error("invalid_document_size", path));
     }
     let upload = store
@@ -58,8 +56,7 @@ fn load(
         .take(MAX_DOCUMENT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| error("unreadable_document_blob", path))?;
-    if bytes.len() as u64 != entry.size || format!("{:x}", Sha256::digest(&bytes)) != entry.hash
-    {
+    if bytes.len() as u64 != entry.size || format!("{:x}", Sha256::digest(&bytes)) != entry.hash {
         return Err(error("invalid_document_blob", path));
     }
     Ok(Some(Document::new(path, &bytes)?))

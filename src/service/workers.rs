@@ -1894,13 +1894,10 @@ pub fn read_project_setup(
     let mut skipped: Vec<String> = Vec::new();
     for s in &read.skipped {
         let tool = s.tool.as_str();
-        let line = format!(
+        skipped.push(format!(
             "{}:{}: {tool}: the version file {} is not a plain version file; no {tool} version is taken from this step",
             s.step.path, s.step.first_line, s.value
-        );
-        if !skipped.contains(&line) {
-            skipped.push(line);
-        }
+        ));
     }
     let found = read.declarations;
     let scopes = versions::requirement_scopes(&found);

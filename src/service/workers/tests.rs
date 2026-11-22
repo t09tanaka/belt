@@ -2387,6 +2387,39 @@ mod sync {
     }
 
     #[test]
+    fn a_structured_version_file_of_a_setup_step_is_skipped_and_said() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".node-version"), "20.1.0\n").unwrap();
+        fs::write(root.join("go.mod"), "module x\n\ngo 1.22\n").unwrap();
+        let step = "name: t\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n";
+        workflow(root, ".github/workflows", "ci.yml", step);
+        // `go.mod` is not read as a version: nothing is required of go, the
+        // rest of the project is, and the line says which step.
+        let (reqs, skipped) = read_project_setup(root).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].tool.as_str(), "node");
+        assert_eq!(
+            skipped,
+            [".github/workflows/ci.yml:7: go: the version file go.mod is not a plain version file; no go version is taken from this step"]
+        );
+        assert_eq!(read_project_requirements(root).unwrap(), reqs);
+        // Nothing skipped, nothing said.
+        fs::remove_dir_all(root.join(".github")).unwrap();
+        assert_eq!(read_project_setup(root).unwrap(), (reqs, vec![]));
+        // A version file that is named and missing is the error it was.
+        workflow(root, ".github/workflows", "ci.yml", step);
+        fs::remove_file(root.join("go.mod")).unwrap();
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message
+                .contains("missing_version_file at .github/workflows/ci.yml:9"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn project_workflows_are_not_read_through_links() {
         let dir = crate::test_tmp::tempdir().unwrap();
         let root = dir.path();

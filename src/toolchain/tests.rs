@@ -1867,7 +1867,7 @@ fn a_step_under_a_condition_and_a_skipped_input_require_nothing() {
     let (scope, got, skipped) = task_of(&read, "ci.yml", &["build"], &no_value);
     // Nothing of the steps is required: the project's file is, as before.
     assert_eq!(scope, Scope::project(""));
-    assert_eq!(got, [project.clone()]);
+    assert_eq!(got, std::slice::from_ref(&project));
     assert_eq!(
         skipped,
         [
@@ -2031,7 +2031,7 @@ fn the_reader_records_each_setup_step_and_what_it_could_not_read() {
             (go.clone(), line("ci.yml", 15)),
         ]
     );
-    assert_eq!(read.conditional, [python.clone()]);
+    assert_eq!(read.conditional, std::slice::from_ref(&python));
     assert_eq!(read.declarations.len(), 1);
     assert_eq!(read.declarations[0].scope, zeta);
     assert_eq!(read.declarations[0].location, line("ci.yml", 8));
