@@ -4,9 +4,9 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 safe_paths
 case "${1:-}" in
-    "") driver=("$S26_ROOT/scripts/s26/harness.py" run) ;;
-    --a46) driver=("$S26_ROOT/scripts/s26/harness.py" a46) ;;
-    --peers) driver=("$S26_ROOT/scripts/s26/peers.py") ;;
+    "") action=run ;;
+    --a46) action=a46 ;;
+    --peers) action=peers ;;
     *) echo "usage: scripts/s26/run.sh [--a46|--peers]" >&2; exit 2 ;;
 esac
 if (( $# > 1 )); then
@@ -19,4 +19,4 @@ PORTOOL=$(tool portool)
 cd "$S26_BASE/resources"
 "$PORTOOL" sync --quiet
 "$PORTOOL" check
-exec "$TTC" exec -- "$PORTOOL" exec -- python3 "${driver[@]}"
+exec "$TTC" exec -- "$PORTOOL" exec -- python3 "$S26_ROOT/scripts/s26/harness.py" "$action"

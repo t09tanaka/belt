@@ -1,6 +1,5 @@
 """S26 real-SSH acceptance for independent submitters and group key rotation."""
 import json
-import sys
 
 from harness import Checks, RUN, USER_BUS, command, save, ssh, until
 
@@ -122,7 +121,7 @@ def key_distribution(checks):
     return "retained attempt completed once, skipped w2 rejoined via send-key, removed w2 reported reachable"
 
 
-def main():
+def run():
     checks = Checks()
     try:
         checks.start()
@@ -136,7 +135,3 @@ def main():
         checks.close()
         save(RUN / "evidence/peer-summary.json", checks.results)
     return 0 if all(check["status"] == "PASS" for check in checks.results) else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
