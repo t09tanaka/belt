@@ -150,6 +150,8 @@ struct State {
     /// no input is ready there.
     refused_plan: Option<String>,
     refused_runs: Vec<RunId>,
+    /// Attempts that were cancelled before they arrived: they never start.
+    tombstones: Vec<AttemptId>,
 }
 
 struct Worker {
@@ -317,9 +319,13 @@ impl Worker {
             })),
             Request::GetAttempt(r) => match s.jobs.get(&r.attempt_id) {
                 Some(job) => Ok(Response::GetAttempt(Self::status(&r.attempt_id, job))),
+                None if s.tombstones.contains(&r.attempt_id) => Err(err(ErrorCode::Retired)),
                 None => Err(err(ErrorCode::NotFound)),
             },
             Request::SubmitAttempt(r) => {
+                if s.tombstones.contains(&r.attempt_id) {
+                    return Err(err(ErrorCode::Retired));
+                }
                 let generation = r.payload.generation;
                 let job = s.jobs.entry(r.attempt_id.clone()).or_insert(Job {
                     payload: r.payload,
@@ -447,10 +453,17 @@ impl Worker {
             Request::Forecast(_) => Err(err(ErrorCode::Internal)),
             // A cancel stops the attempt at once; it leaves no result.
             Request::CancelAttempt(r) => {
-                let job = s
-                    .jobs
-                    .get_mut(&r.attempt_id)
-                    .ok_or_else(|| err(ErrorCode::NotFound))?;
+                let Some(job) = s.jobs.get_mut(&r.attempt_id) else {
+                    // It never arrived: the worker remembers the cancel.
+                    s.tombstones.push(r.attempt_id.clone());
+                    return Ok(Response::CancelAttempt(CancelAttemptResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        attempt_id: r.attempt_id,
+                        phase: CancelPhase::Accepted,
+                        state: None,
+                        tombstone: true,
+                    }));
+                };
                 if job.state != AttemptState::Terminal {
                     job.state = AttemptState::Terminal;
                     job.termination = Some(ended(Outcome::Cancelled));
@@ -6086,4 +6099,50 @@ jobs:
             assert_eq!(fx.w.offsets("workflow_read"), [0]);
         }
     }
+}
+
+/// A cancel of the run recorded after a CI task was placed and before its
+/// worker took it (the submit did not arrive): the task is never submitted
+/// again, so no step starts, it ends cancelled, nothing that waits is
+/// released, and the run settles as cancelled.
+#[tokio::test]
+async fn a_run_cancel_recorded_before_a_ci_task_is_accepted_starts_nothing_and_settles_cancelled() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    fx.w.set(|s| s.trip = Some(("submit", 1, Lost::Request)));
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let attempt = report.placed[0].clone();
+    assert!(
+        fx.w.state.lock().unwrap().jobs.is_empty(),
+        "the worker never took it"
+    );
+
+    c.cancel_run(run.clone()).await.unwrap();
+    fx.w.set(|s| s.offline = false);
+    for _ in 0..4 {
+        c.tick().await.unwrap();
+        collect(&c, &files).await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+    }
+    assert_eq!(fx.w.count("submit"), 1, "not sent again");
+    assert!(
+        !fx.w
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .any(|job| job.state != AttemptState::Terminal),
+        "no step runs"
+    );
+    let record = c.store().get_attempt(&attempt).unwrap().unwrap();
+    assert_eq!(record.termination.unwrap().outcome(), Outcome::Cancelled);
+    assert!(c.store().attempts_of_task(&ids["test"]).unwrap().is_empty());
+    let target = belt::service::completion::Target::Run(run.clone());
+    let snapshot = c.store().completion(target).unwrap();
+    assert!(snapshot.settled());
+    assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Cancelled);
 }

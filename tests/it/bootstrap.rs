@@ -5325,6 +5325,94 @@ async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_
     shutdown(&load(&spec)).await;
 }
 
+/// A run with no waiting task whose frozen plan the parent loses while the
+/// job is still queued (the worker's plan store is full, so the delivery is
+/// tried again): the delivery finds the plan gone, cancels the queued job
+/// with the reason, says so once (`ci_task_unrunnable`), and `ci` ends as no
+/// success instead of waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_ends_a_queued_job_whose_plan_the_parent_lost_without_a_waiting_task() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/build\n",
+    );
+    let plans = belt::worker::ci_task::plans_dir(&spec.worker_state_dir);
+    std::fs::create_dir_all(&plans).unwrap();
+    for n in 0..belt::worker::ci_task::MAX_PLANS {
+        let digest = belt::ids::Digest::of_bytes(format!("filler {n}").as_bytes());
+        let path = belt::worker::ci_task::plan_path(&spec.worker_state_dir, &digest);
+        std::fs::write(&path, b"{}").unwrap();
+    }
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await.unwrap() });
+    let events = |kind: &str| -> Vec<belt::storage::Event> {
+        let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
+            return Vec::new();
+        };
+        let all = store.events_after(0, 10_000).unwrap_or_default();
+        all.into_iter().filter(|e| e.kind == kind).collect()
+    };
+    // The delivery is refused and tried again: the job is queued, and the run
+    // has no task that waits for an input.
+    let started = std::time::Instant::now();
+    let refused = loop {
+        let refused = events("ci_plan_refused");
+        if !refused.is_empty() {
+            break refused;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the delivery was never refused");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let run = belt::ids::RunId::parse(refused[0].run_id.as_deref().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert!(store.ci_waiting_runs(16).unwrap().is_empty());
+    let rows = store.ci_run_tasks(&run).unwrap();
+    let digest = belt::ids::Digest::parse(rows[0].spec["plan_digest"].as_str().unwrap()).unwrap();
+    drop(store);
+    std::fs::remove_file(belt::worker::ci_task::plan_path(&spec.state_dir, &digest)).unwrap();
+
+    let output = match tokio::time::timeout(Duration::from_secs(120), running).await {
+        Ok(output) => output.unwrap(),
+        Err(elapsed) => {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("ci did not end: {elapsed}");
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.code().is_some_and(|code| code != 0),
+        "{value}"
+    );
+    let jobs = ci_jobs(&value);
+    assert_eq!(jobs.len(), 1, "{value}");
+    assert!(
+        jobs.values().all(|(status, _)| status != "success"),
+        "{value}"
+    );
+    assert!(ci_marks(&marks, "build").is_empty());
+    let unrunnable = events("ci_task_unrunnable");
+    assert_eq!(unrunnable.len(), 1, "{unrunnable:?}");
+    assert_eq!(unrunnable[0].run_id.as_deref(), Some(run.as_str()));
+    let reason = unrunnable[0].payload["reason"].as_str().unwrap();
+    assert!(reason.contains("frozen plan"), "{reason}");
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let shown = store.query_tasks(run, 16, None).unwrap();
+    assert_eq!(shown.items[0].unrunnable.as_deref(), Some(reason));
+    drop(store);
+    // The delivery does not go on trying: nothing more is recorded.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(events("ci_task_unrunnable").len(), 1);
+    shutdown(&load(&spec)).await;
+}
+
 /// A job that fails: the jobs that need it are skipped without a step
 /// started (and so is what needs those), `if: always()` and `if: failure()`
 /// run, and the run is a failure.
