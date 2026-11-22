@@ -473,7 +473,7 @@ async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
     })
     .await;
     let fake = bin.join("ssh");
-    let script = format!("#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhome=$1\nshift\n[ \"$1\" = \"'belt' 'worker' '--stdio'\" ] || exit 91\nprintf '%s\\n' $$ > \"$home/bridge.pid\"\nHOME=\"$home\" exec {} worker --stdio\n", belt::protocol::ssh::quote(BIN));
+    let script = format!("#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhome=$1\nshift\n[ \"$1\" = \"'belt' 'worker' '--stdio'\" ] || exit 91\n[ ! -e \"$home/offline\" ] || exit 92\nprintf '%s\\n' $$ > \"$home/bridge.pid\"\nHOME=\"$home\" exec {} worker --stdio\n", belt::protocol::ssh::quote(BIN));
     std::fs::write(&fake, script).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
     let registration = |priority: u32| {
@@ -504,6 +504,7 @@ async fn reload_with_a_live_attempt_readopts_it_and_starts_the_command_once() {
     })
     .await;
     std::fs::write(root.join("release-first"), "release").unwrap();
+    std::fs::write(root.join("release-blocker"), "release").unwrap();
     wait_for("result collection", || {
         attempt(&state, &task).is_some_and(|a| a.receipts.collected_at_ms.is_some())
     })
