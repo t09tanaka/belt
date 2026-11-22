@@ -335,11 +335,11 @@ pub(super) async fn freeze_resolved(
         .map_err(|e| invalid(e.to_string()))?
     };
     let toolchains = match frozen? {
-        Some(bundle) if bundle.validate(digest).is_err() => {
+        Some((bundle, observed)) if bundle.validate(digest).is_err() => {
             let asked = bundle.frozen.describe_requirements();
             match owner
                 .request(Operation::ResolveToolchains {
-                    bundle,
+                    bundle: bundle.clone(),
                     requirements: requirements.clone(),
                 })
                 .await
@@ -349,7 +349,16 @@ pub(super) async fn freeze_resolved(
                     bundle.validate(digest).map_err(|e| invalid(e.into()))?;
                     Some(bundle)
                 }
-                Reply::ControlError { error } => return Err(error),
+                // No registry could resolve it. A range the tool this host
+                // observed satisfies is sealed to that version; anything
+                // else keeps the refusal as it came.
+                Reply::ControlError { error } => {
+                    let sealed = bundle.seal_observed(&observed);
+                    if sealed.validate(digest).is_err() {
+                        return Err(error);
+                    }
+                    Some(sealed)
+                }
                 _ => {
                     return Err(ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
@@ -358,7 +367,7 @@ pub(super) async fn freeze_resolved(
                 }
             }
         }
-        other => other,
+        other => other.map(|(bundle, _)| bundle),
     };
     drop(guard);
     Ok(toolchains)
@@ -369,7 +378,7 @@ fn freeze_toolchains(
     captured: &crate::source::manifest::SourceManifest,
     digest: Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
-) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+) -> Result<Option<(crate::toolchain::contract::FrozenBundle, Observed)>, ApiError> {
     use crate::toolchain::{
         contract::{self, FrozenBundle},
         versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId, VersionObservation},
@@ -453,7 +462,7 @@ fn freeze_toolchains(
     }
     let mut bundle = FrozenBundle::seal_exact(frozen).map_err(|e| blocked(e.into()))?;
     if bundle.validate(&bundle.frozen.source_manifest).is_ok() {
-        return Ok(Some(bundle));
+        return Ok(Some((bundle, observations)));
     }
     // Loading a configured inventory is read-only and invokes no managers.
     if let Some(registry) = worker_inventory(&context.bootstrap.worker_state_dir, &profile) {
@@ -467,8 +476,14 @@ fn freeze_toolchains(
             }
         }
     }
-    Ok(Some(bundle))
+    Ok(Some((bundle, observations)))
 }
+
+/// What the profile of this host reports for each tool at capture.
+type Observed = std::collections::BTreeMap<
+    crate::toolchain::versions::ToolId,
+    crate::toolchain::versions::VersionObservation,
+>;
 
 /// The inventory of the local worker, if this host has one. The worker opens
 /// its state through the canonical path and the inventory refuses any other

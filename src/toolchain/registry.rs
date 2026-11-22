@@ -60,6 +60,16 @@ pub enum Unavailable {
     NotInInventory,
     Invalid(&'static str),
 }
+impl Unavailable {
+    /// No managed install can serve the selection, so the tool the worker's
+    /// own profile already has may. Every other refusal stays a refusal.
+    pub fn allows_native(&self) -> bool {
+        matches!(
+            self,
+            Self::Unconfigured | Self::Unsupported | Self::NotInInventory
+        )
+    }
+}
 /// Retain for the resident lifetime. Configuration changes require drain/restart.
 /// Inventory means operator-authorized versions, not installed-version claims.
 #[derive(Debug, Clone)]

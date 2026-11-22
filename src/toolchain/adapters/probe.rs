@@ -475,6 +475,7 @@ pub(crate) fn prospective_activation(
     compose_activation(
         frozen,
         &pairs,
+        &[],
         base_profile,
         observations,
         base_env,

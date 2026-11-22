@@ -642,3 +642,22 @@ fn a_warm_up_request_is_the_install_an_attempt_pinning_the_version_gets() {
         Unavailable::Unsupported
     );
 }
+
+#[test]
+fn only_the_lack_of_a_managed_install_leaves_room_for_a_native_tool() {
+    for open in [
+        Unavailable::Unconfigured,
+        Unavailable::Unsupported,
+        Unavailable::NotInInventory,
+    ] {
+        assert!(open.allows_native(), "{open:?}");
+    }
+    for closed in [
+        Unavailable::ManualRequired("xcode"),
+        Unavailable::ResolveRequired,
+        Unavailable::BaselineCheckRequired,
+        Unavailable::Invalid("parent_resolution_mismatch"),
+    ] {
+        assert!(!closed.allows_native(), "{closed:?}");
+    }
+}

@@ -1769,3 +1769,91 @@ fn an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables() {
     other.insert("ORDINARY".into(), "x".into());
     assert_ne!(activation_of(&other).1, binding.activation);
 }
+
+#[test]
+fn a_native_selection_adds_no_private_path_and_its_identity_is_the_receipt() {
+    use crate::toolchain::contract::NativeTool;
+    use crate::toolchain::versions::VersionObservation;
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let frozen = &f.plan.frozen;
+    let env = base_env(&f.plan);
+    let base = Digest::of_bytes(b"base");
+    let policy = Digest::of_bytes(b"policy");
+    let native = |tool: &ToolId, version: &str, identity: &[u8]| NativeTool {
+        tool: tool.clone(),
+        version: Version::parse(version).unwrap(),
+        identity: Digest::of_bytes(identity),
+    };
+    let seen =
+        |version: &str| BTreeMap::from([(f.plan.tool.clone(), VersionObservation::parse(version))]);
+    let activate = |native: &[NativeTool], observed: &BTreeMap<_, _>| {
+        activate_with_native(
+            frozen,
+            &[],
+            native,
+            base.clone(),
+            observed,
+            &env,
+            policy.clone(),
+            &f.shell,
+        )
+    };
+    let node = &f.plan.tool;
+    let first = activate(&[native(node, "1.2.3", b"a")], &seen("1.2.3")).unwrap();
+    // The attempt uses the tool of the profile path; nothing is put before it.
+    assert_eq!(first.environment, env);
+    assert_eq!(
+        first.installation,
+        hash(&vec![(node.clone(), Digest::of_bytes(b"a"))])
+    );
+    // The same version from another executable is another execution identity.
+    let replaced = activate(&[native(node, "1.2.3", b"b")], &seen("1.2.3")).unwrap();
+    assert_ne!(replaced.installation, first.installation);
+    assert_ne!(replaced.binding_digest, first.binding_digest);
+    assert_ne!(replaced.execution_fingerprint, first.execution_fingerprint);
+    // The profile has to report the selected version when it is activated.
+    for observed in [seen("1.2.4"), BTreeMap::new()] {
+        assert_eq!(
+            activate(&[native(node, "1.2.3", b"a")], &observed),
+            Err("activation_native_mismatch")
+        );
+    }
+    // A native tool stands only for its own selection, at its version, once.
+    let other = ToolId::parse("go").unwrap();
+    for (tools, observed) in [
+        (vec![native(node, "1.2.4", b"a")], seen("1.2.4")),
+        (
+            vec![native(&other, "1.2.3", b"a")],
+            BTreeMap::from([(other.clone(), VersionObservation::parse("1.2.3"))]),
+        ),
+    ] {
+        assert_eq!(
+            activate(&tools, &observed),
+            Err("activation_native_mismatch")
+        );
+    }
+    for tools in [
+        vec![],
+        vec![native(node, "1.2.3", b"a"), native(node, "1.2.3", b"a")],
+    ] {
+        assert_eq!(
+            activate(&tools, &seen("1.2.3")),
+            Err("complete_activation_set_required")
+        );
+    }
+    // A managed install and a native tool cannot both claim one selection.
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert_eq!(
+        activate_with_native(
+            frozen,
+            &[(&f.plan, &receipt)],
+            &[native(node, "1.2.3", b"a")],
+            base.clone(),
+            &seen("1.2.3"),
+            &env,
+            policy.clone(),
+            &f.shell,
+        ),
+        Err("complete_activation_set_required")
+    );
+}

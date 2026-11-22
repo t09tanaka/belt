@@ -1351,9 +1351,36 @@ pub fn activate_set(
     setup_policy: Digest,
     shell: &FileIdentity,
 ) -> Result<ActivationReceipt> {
+    activate_with_native(
+        frozen,
+        installed,
+        &[],
+        base_profile,
+        base_observations,
+        base_env,
+        setup_policy,
+        shell,
+    )
+}
+/// `activate_set` for a contract some of whose selections the profile's own
+/// tools serve. A native tool adds no private path: the attempt uses the one
+/// on the profile path, and its observed identity stands where an
+/// installation receipt would.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_with_native(
+    frozen: &FrozenToolchains,
+    installed: &[(&InstallPlan, &InstallationReceipt)],
+    native: &[super::contract::NativeTool],
+    base_profile: Digest,
+    base_observations: &BTreeMap<ToolId, super::versions::VersionObservation>,
+    base_env: &BTreeMap<String, String>,
+    setup_policy: Digest,
+    shell: &FileIdentity,
+) -> Result<ActivationReceipt> {
     compose_activation(
         frozen,
         installed,
+        native,
         base_profile,
         base_observations,
         base_env,
@@ -1367,6 +1394,7 @@ pub fn activate_set(
 fn compose_activation(
     frozen: &FrozenToolchains,
     installed: &[(&InstallPlan, &InstallationReceipt)],
+    native: &[super::contract::NativeTool],
     base_profile: Digest,
     base_observations: &BTreeMap<ToolId, super::versions::VersionObservation>,
     base_env: &BTreeMap<String, String>,
@@ -1376,7 +1404,9 @@ fn compose_activation(
     validate_receipt: impl Fn(&InstallPlan, &InstallationReceipt) -> Result<()>,
 ) -> Result<ActivationReceipt> {
     use super::versions::{Match, MatchPolicy, VersionObservation};
-    if !frozen.is_resolved() || installed.len() != frozen.selections.len() || installed.len() > 256
+    if !frozen.is_resolved()
+        || installed.len() + native.len() != frozen.selections.len()
+        || installed.len() > 256
     {
         return Err("complete_activation_set_required");
     }
@@ -1437,6 +1467,26 @@ fn compose_activation(
             }
         }
         receipts.push((plan.tool.clone(), receipt.digest()));
+    }
+    for tool in native {
+        // The profile has to report the selected version at this moment too.
+        let selected = frozen
+            .selections
+            .iter()
+            .find(|s| s.tool == tool.tool)
+            .is_some_and(|s| s.concrete == tool.version);
+        if !selected
+            || !tools.insert(tool.tool.clone())
+            || MatchPolicy::Exact.compare(
+                &VersionObservation::Known(tool.version.clone()),
+                base_observations
+                    .get(&tool.tool)
+                    .unwrap_or(&VersionObservation::Unknown),
+            ) != Match::Match
+        {
+            return Err("activation_native_mismatch");
+        }
+        receipts.push((tool.tool.clone(), tool.identity.clone()));
     }
     if frozen.selections.iter().any(|s| !tools.contains(&s.tool)) {
         return Err("complete_activation_set_required");

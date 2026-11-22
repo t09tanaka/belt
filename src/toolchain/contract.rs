@@ -60,23 +60,7 @@ impl FrozenBundle {
                 _ => None,
             });
             if let Some(concrete) = concrete {
-                let mut base = frozen.clone();
-                base.selections.clear();
-                let proof = ResolutionEvidence {
-                    contract: base.digest(),
-                    tool: requirement.tool.clone(),
-                    concrete,
-                    catalog: Digest::of_bytes(
-                        &serde_json::to_vec(&(
-                            "source_exact_pin_v1",
-                            &base.source_manifest,
-                            &base.scope,
-                            &requirement,
-                        ))
-                        .expect("proof serializes"),
-                    ),
-                    resolved_inputs: Default::default(),
-                };
+                let proof = proof(&frozen, &requirement, concrete, "source_exact_pin_v1");
                 if let Ok(resolved) = adapters::resolve(&frozen, &proof) {
                     frozen = resolved;
                     evidence.push(proof);
@@ -89,6 +73,108 @@ impl FrozenBundle {
             evidence,
         })
     }
+    /// Seals each requirement that still has no evidence to the version the
+    /// parent observed for that tool, when every constraint of the requirement
+    /// accepts that version. An alias, a channel or an expression never
+    /// matches an observation, so it stays unresolved.
+    pub fn seal_observed(
+        mut self,
+        observed: &std::collections::BTreeMap<
+            super::versions::ToolId,
+            super::versions::VersionObservation,
+        >,
+    ) -> Self {
+        use super::versions::{Match, VersionObservation};
+        for requirement in self.frozen.requirements.clone() {
+            if self.evidence.iter().any(|e| e.tool == requirement.tool) {
+                continue;
+            }
+            let Some(VersionObservation::Known(concrete)) = observed.get(&requirement.tool) else {
+                continue;
+            };
+            let seen = VersionObservation::Known(concrete.clone());
+            if requirement
+                .constraints
+                .iter()
+                .any(|c| c.matches(&seen) != Match::Match)
+            {
+                continue;
+            }
+            let proof = proof(
+                &self.frozen,
+                &requirement,
+                concrete.clone(),
+                "parent_observed_version_v1",
+            );
+            if let Ok(resolved) = adapters::resolve(&self.frozen, &proof) {
+                self.frozen = resolved;
+                self.evidence.push(proof);
+            }
+        }
+        self
+    }
+}
+/// Evidence for a version the source itself fixes (`domain` says how), bound
+/// to the contract without its selections.
+fn proof(
+    frozen: &FrozenToolchains,
+    requirement: &super::versions::EffectiveRequirement,
+    concrete: node_semver::Version,
+    domain: &str,
+) -> ResolutionEvidence {
+    let mut base = frozen.clone();
+    base.selections.clear();
+    ResolutionEvidence {
+        contract: base.digest(),
+        tool: requirement.tool.clone(),
+        concrete,
+        catalog: Digest::of_bytes(
+            &serde_json::to_vec(&(domain, &base.source_manifest, &base.scope, requirement))
+                .expect("proof serializes"),
+        ),
+        resolved_inputs: Default::default(),
+    }
+}
+
+/// A frozen selection the worker serves from its own profile, with no managed
+/// install: the exact version its probe reports, and the identity of that
+/// probe in place of an installation receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTool {
+    pub tool: super::versions::ToolId,
+    pub version: node_semver::Version,
+    pub identity: Digest,
+}
+/// The native tool that serves the selection of `tool`, if the profile probe
+/// reports exactly the selected version.
+pub fn native_tool(
+    frozen: &FrozenToolchains,
+    tool: &super::versions::ToolId,
+    report: &super::capability::WorkerCapabilities,
+) -> Option<NativeTool> {
+    use super::versions::{Match, MatchPolicy, VersionObservation};
+    let selection = frozen.selections.iter().find(|s| &s.tool == tool)?;
+    let observed = observations(report);
+    if MatchPolicy::Exact.compare(
+        &VersionObservation::Known(selection.concrete.clone()),
+        observed.get(tool).unwrap_or(&VersionObservation::Unknown),
+    ) != Match::Match
+    {
+        return None;
+    }
+    let probes: Vec<_> = report
+        .tools
+        .iter()
+        .filter(|(name, _)| canonical_tool(name) == tool.as_str())
+        .collect();
+    Some(NativeTool {
+        tool: tool.clone(),
+        version: selection.concrete.clone(),
+        identity: Digest::of_bytes(
+            &serde_json::to_vec(&("native_observed_v1", &selection.concrete, &probes))
+                .expect("native identity serializes"),
+        ),
+    })
 }
 
 /// Trusted worker-local execution context; never accepted from the wire.
@@ -182,7 +268,11 @@ pub fn canonical_tool(name: &str) -> &str {
 mod tests {
     use super::*;
     use crate::toolchain::versions::*;
+    use std::collections::BTreeMap;
     fn bundle(value: &str) -> FrozenBundle {
+        bundle_for("node", value)
+    }
+    fn bundle_for(tool: &str, value: &str) -> FrozenBundle {
         let scope = Scope::project("");
         FrozenBundle::seal_exact(
             FrozenToolchains::freeze(
@@ -190,7 +280,7 @@ mod tests {
                 Digest::of_bytes(b"parent"),
                 scope.clone(),
                 &[Declaration {
-                    tool: ToolId::parse("node").unwrap(),
+                    tool: ToolId::parse(tool).unwrap(),
                     constraint: Constraint::parse(value).unwrap(),
                     scope,
                     location: Location {
@@ -477,5 +567,177 @@ mod tests {
                 .unwrap()["PATH"],
             env["PATH"]
         );
+    }
+    fn seen(tool: &str, version: VersionObservation) -> BTreeMap<ToolId, VersionObservation> {
+        BTreeMap::from([(ToolId::parse(tool).unwrap(), version)])
+    }
+    #[test]
+    fn a_range_is_sealed_to_the_version_the_parent_observed() {
+        let open = bundle("20");
+        let sealed = open
+            .clone()
+            .seal_observed(&seen("node", VersionObservation::parse("20.11.1")));
+        sealed.validate(&sealed.frozen.source_manifest).unwrap();
+        assert_eq!(sealed.evidence.len(), 1);
+        assert_eq!(sealed.evidence[0].concrete.to_string(), "20.11.1");
+        assert_eq!(sealed.frozen.selections[0].concrete.to_string(), "20.11.1");
+        assert!(sealed.evidence[0].resolved_inputs.is_empty());
+        // The evidence says it came from an observation, not from a source pin.
+        let tagged = |domain: &str| {
+            Digest::of_bytes(
+                &serde_json::to_vec(&(
+                    domain,
+                    &open.frozen.source_manifest,
+                    &open.frozen.scope,
+                    &open.frozen.requirements[0],
+                ))
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            sealed.evidence[0].catalog,
+            tagged("parent_observed_version_v1")
+        );
+        assert_ne!(sealed.evidence[0].catalog, tagged("source_exact_pin_v1"));
+        assert_eq!(sealed.evidence[0].contract, open.frozen.digest());
+    }
+    #[test]
+    fn an_observation_seals_nothing_it_does_not_prove() {
+        let node = |version| seen("node", version);
+        let known = || VersionObservation::parse("20.11.1");
+        // No observation of that tool, or none that is a version in the range.
+        for observed in [
+            BTreeMap::new(),
+            seen("go", known()),
+            node(VersionObservation::Unknown),
+            node(VersionObservation::identity("20.11.1-custom")),
+            node(VersionObservation::parse("21.0.0")),
+        ] {
+            let open = bundle("20");
+            assert_eq!(open.clone().seal_observed(&observed), open);
+        }
+        // A channel, an alias or an expression is never an observed version.
+        for floating in ["lts/*", "latest", "stable", "${{ matrix.node }}"] {
+            let open = bundle(floating);
+            assert_eq!(open.clone().seal_observed(&node(known())), open);
+        }
+        // Every constraint of the requirement has to accept the version.
+        for extra in [">=20.11.2", "lts/*"] {
+            let mut frozen = bundle("20").frozen;
+            frozen.requirements[0]
+                .constraints
+                .push(Constraint::parse(extra).unwrap());
+            frozen.requirements[0].provenance.push(Location {
+                path: ".nvmrc".into(),
+                first_line: 1,
+                last_line: 1,
+            });
+            frozen.validate().unwrap();
+            let open = FrozenBundle::seal_exact(frozen).unwrap();
+            assert!(open.evidence.is_empty());
+            assert_eq!(open.clone().seal_observed(&node(known())), open);
+        }
+        // What already has evidence keeps it.
+        let pinned = bundle("20.0.0");
+        assert_eq!(
+            pinned
+                .clone()
+                .seal_observed(&node(VersionObservation::parse("20.0.0"))),
+            pinned
+        );
+        // A contract that cannot be resolved stays as it was.
+        let mut broken = bundle("20");
+        broken.frozen.schema_version = 2;
+        assert_eq!(broken.clone().seal_observed(&node(known())), broken);
+    }
+    fn native_report(
+        tools: &[(&str, &str, &[u8])],
+    ) -> crate::toolchain::capability::WorkerCapabilities {
+        use crate::toolchain::capability::{ToolObservation, WorkerCapabilities};
+        let id = Digest::of_bytes(b"profile");
+        WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            profile: "default".into(),
+            profile_digest: id.clone(),
+            execution_uid: 1000,
+            protocol_versions: vec![1],
+            profile_fingerprint: id,
+            tools: tools
+                .iter()
+                .map(|(name, version, identity)| {
+                    (
+                        name.to_string(),
+                        ToolObservation::Available {
+                            version: version.to_string(),
+                            identity: Digest::of_bytes(identity),
+                        },
+                    )
+                })
+                .collect(),
+            features: Default::default(),
+        }
+    }
+    #[test]
+    fn a_selection_is_native_only_at_exactly_the_observed_version() {
+        let node = ToolId::parse("node").unwrap();
+        let frozen = bundle("20.0.0").frozen;
+        let native = native_tool(
+            &frozen,
+            &node,
+            &native_report(&[("node", "20.0.0", b"a"), ("go", "1.22.0", b"g")]),
+        )
+        .unwrap();
+        assert_eq!(native.tool, node);
+        assert_eq!(native.version.to_string(), "20.0.0");
+        // Another tool is not part of the identity; the probe of this one is.
+        assert_eq!(
+            native_tool(
+                &frozen,
+                &node,
+                &native_report(&[("node", "20.0.0", b"a"), ("go", "1.23.0", b"other")]),
+            ),
+            Some(native.clone())
+        );
+        let replaced =
+            native_tool(&frozen, &node, &native_report(&[("node", "20.0.0", b"b")])).unwrap();
+        assert_ne!(replaced.identity, native.identity);
+        assert_eq!(replaced.version, native.version);
+        // A different, unknown or absent version does not serve the selection.
+        for report in [
+            native_report(&[("node", "20.0.1", b"a")]),
+            native_report(&[("node", "not a version", b"a")]),
+            native_report(&[("go", "20.0.0", b"a")]),
+        ] {
+            assert_eq!(native_tool(&frozen, &node, &report), None);
+        }
+        // Nothing is native for a tool the contract did not select.
+        let mut open = frozen.clone();
+        open.selections.clear();
+        let same = native_report(&[("node", "20.0.0", b"a")]);
+        assert_eq!(native_tool(&open, &node, &same), None);
+        assert_eq!(
+            native_tool(&frozen, &ToolId::parse("go").unwrap(), &same),
+            None
+        );
+    }
+    #[test]
+    fn a_native_tool_of_several_programs_needs_all_of_them_to_agree() {
+        let rust = ToolId::parse("rust").unwrap();
+        let frozen = bundle_for("rust", "1.89.0").frozen;
+        let both = |cargo: &str, identity: &[u8]| {
+            native_tool(
+                &frozen,
+                &rust,
+                &native_report(&[("rustc", "1.89.0", b"r"), ("cargo", cargo, identity)]),
+            )
+        };
+        let native = both("1.89.0", b"c").unwrap();
+        assert_eq!(native.version.to_string(), "1.89.0");
+        assert_ne!(both("1.89.0", b"d").unwrap().identity, native.identity);
+        assert_eq!(both("1.88.0", b"c"), None);
     }
 }
