@@ -409,6 +409,12 @@ pub fn run_gated_with(
         Gate::Finished(exit, record) => (exit, record),
     };
     let _ = managed::append_record(ctx, &record);
+    // Not when a stop signal is waiting: whoever sent it wants this process
+    // gone, not tidying up. (While the sweep runs a signal waits for it: at
+    // most 500 removals and 4 log cuts, and no lock.)
+    if ctx.supervisor.take_pending() != 0 {
+        return Ok(Gated::Finished(exit));
+    }
     if let Some(report) = crate::retention::sweep_if_due(ctx, cfg) {
         for e in &report.errors {
             (hooks.progress)(&format!("task-traffic-controller: cleanup: {e}"));

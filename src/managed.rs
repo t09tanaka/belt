@@ -1723,10 +1723,11 @@ pub(crate) fn gc_measurements_locked(ctx: &Context) -> Result<usize> {
 /// Remove the sidecars of managed commands that the retention rule says go
 /// ([`crate::retention::sidecar_due`]): one that ended more than
 /// `keep_days` ago (the receipt of a finished run is only needed so a
-/// repeated registration finds its outcome), and one an hour old that
-/// records no end or cannot be read and has neither a ledger entry nor a
-/// held lease (a crash between writing the sidecar and saving the ledger
-/// left it). One whose entry is in the ledger is never removed. Files that
+/// repeated registration finds its outcome), and one an hour old that was
+/// never launched or is not JSON and has neither a ledger entry nor a held
+/// lease (a crash between writing the sidecar and saving the ledger left
+/// it). One whose entry is in the ledger, and one whose launch was begun,
+/// are never removed. Files that
 /// are not sidecars are not touched here. Returns how many were removed.
 pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
     // Under the ledger lock, so a registration cannot slip in between the
@@ -1760,12 +1761,23 @@ pub(crate) fn gc_sidecars_locked(
         let Ok(modified) = ent.metadata().and_then(|m| m.modified()) else {
             continue;
         };
+        use crate::retention::SidecarKind;
         let view = crate::retention::SidecarView {
-            ended: match load_sidecar(ctx, id) {
+            kind: match load_sidecar(ctx, id) {
                 Loaded::Ok(sc) if sc.phase == Phase::Terminal => {
-                    Some(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
+                    SidecarKind::Ended(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
                 }
-                _ => None,
+                Loaded::Ok(sc) if sc.phase == Phase::Registered => SidecarKind::NeverLaunched,
+                // Another version's sidecar is JSON too: only what no
+                // version could have finished writing is a leftover.
+                Loaded::Corrupt(_)
+                    if std::fs::read(&p).is_ok_and(|b| {
+                        serde_json::from_slice::<serde_json::Value>(&b).is_err()
+                    }) =>
+                {
+                    SidecarKind::Unparseable
+                }
+                _ => SidecarKind::Other,
             },
             in_ledger: ledger.find(id).is_some(),
             lease_held: lock::lease_is_held(ctx, id),
@@ -1781,9 +1793,6 @@ pub(crate) fn gc_sidecars_locked(
             removed += 1;
         }
     }
-    // Empty: remove it too. Every creator of a first sidecar, of this and
-    // of released versions, holds this lock while it makes the directory.
-    let _ = std::fs::remove_dir(ctx.paths.managed_dir());
     removed
 }
 

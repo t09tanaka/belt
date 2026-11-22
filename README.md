@@ -879,8 +879,9 @@ The automatic sweep never delays or fails anything:
 - it takes no lock it would have to wait for. A stage whose lock is busy is
   skipped, the sweep is not recorded as done, and it is tried again 10
   minutes later;
-- it removes, marks or cuts at most 500 files a time (the rest 10 minutes
-  later) and looks at no process other than with signal 0;
+- it removes or marks at most 500 files and cuts at most 4 job logs a time
+  (the rest 10 minutes later), looks at no process other than with signal
+  0, and is not started when a stop signal is waiting;
 - a step that fails is reported on stderr once, as
   `task-traffic-controller: cleanup: ...`, by the `exec` that ran the sweep,
   and the other steps still run. A job's runner does not print them (its
@@ -904,19 +905,19 @@ and says so each time: a full disk is when it is needed.
 | `history.jsonl` | the weight learner (the newest 5 usable records of a key), `estimate`, `inspect`, `history` | each record beyond `history_keep` (50) per key, and every key not run for `history_keep_days` (30, the age at which the forecast already calls a sample stale), by the sweep; the file itself when nothing is left | 50 records for each key run in 30 days |
 | `measurements/<id>.applied` | `record_measurement`, to refuse a replay while a record with that id exists | at the moment the history drops the last record with that id | one per kept record |
 | `measurements/<id>.pending` | nobody (a dead attempt's) | at once when the append fails; the sweep for a crash. It becomes `.applied` if its record exists | none |
-| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it has an entry or its owner holds the lease; one that records no end or cannot be read, and has neither, an hour after it was written (a crash between writing it and saving the ledger) | per command in 7 days |
+| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it has an entry or its owner holds the lease; one that was never launched or is not JSON, and has neither, an hour after it was written (a crash between writing it and saving the ledger). One whose launch was begun and that has no entry stays until `resolve` settles it: a process of it may be alive | per command in 7 days |
 | temporary files (`.ttc-tmp.<pid>.*`) | nobody but the process that is writing one | by the sweep, when an hour old **and** process `<pid>` is gone (a writer stopped for longer keeps its file). The `.tmpXXXXXX` files of earlier versions name no process and go by age alone | none |
 | job files with no readable descriptor | nobody | by the sweep, when every file of that id is an hour old and the job has no entry, no held lease and no `wait` | none |
-| empty `measurements/`, `managed/` | nobody | when the last file in them goes | none |
-| `ledger.json`, `ledger.lock`, `history.lock`, `last-sweep`, and the directories `leases/` and `jobs/` | every command | never | four small files, two directories |
+| empty `measurements/` | nobody | when the last file in it goes | none |
+| `ledger.json`, `ledger.lock`, `history.lock`, `last-sweep`, and the directories `leases/`, `jobs/` and `managed/` | every command | never | four small files, three directories |
 
 Why the last row is fixed: several versions of this tool may run on one
 machine against the same state directory. The versions before this one
 create a directory and then open a file in it, and open a lock file and then
 lock it, without looking again. A directory or a lock that vanishes in
 between makes them fail, or leaves them holding a lock nobody else can see.
-So `leases/` and `jobs/` are never removed (`measurements/` and `managed/`
-are only made and removed under the lock that every version takes first),
+So `leases/`, `jobs/` and `managed/` are never removed (`measurements/` is
+only made and removed under the lock that every version takes first),
 and a lock file is removed only by its owner or while the remover holds its
 lock; this version also checks, after taking any lock, that the name still
 points to the file it locked, and starts again if not. What remains with an
@@ -953,8 +954,10 @@ command, and a program that embeds the library with its own `Config`).
 Neither removes what the other asked to keep: for each of `history_keep`,
 `history_keep_days`, `jobs_keep_days`, `jobs_log_max_mib` and
 `managed_keep_days`, a sweep uses the larger of its own number and the one
-recorded in `last-sweep` by another sweep, and a recorded number stays in
-force for 30 days after the last sweep that asked for at least that much.
+recorded in `last-sweep` by another program, and a recorded number stays in
+force for 30 days after the program that asked for at least that much last
+ran a command (each program writes its numbers there when they are larger
+than what is recorded, and again once a day).
 Lowering a number therefore takes effect 30 days later when something else
 had asked for more, and at once otherwise.
 

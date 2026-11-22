@@ -676,6 +676,77 @@ fn a_program_with_shorter_numbers_does_not_remove_what_another_asked_to_keep() {
     assert_eq!(retention::sweep(&ctx, &short).history_dropped, 50);
 }
 
+/// The program with the shorter numbers does every sweep; the other only
+/// ever runs commands in between. Its numbers still count, from its first
+/// command on and for as long as it is in use.
+#[test]
+fn a_program_that_never_does_the_sweep_itself_is_still_heard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    // (Age plays no part here: the key is kept however old.)
+    let long = Config {
+        history_keep: 100,
+        history_keep_days: 3650,
+        ..Config::default()
+    };
+    let short = Config {
+        history_keep_days: 3650,
+        ..Config::default()
+    };
+    assert_eq!(short.history_keep, 50);
+    // The short one is first in the state directory: it arms the clock.
+    assert!(retention::sweep_if_due(&ctx, &short).is_none());
+    for i in 0..100 {
+        let at = clock.now() - Span::seconds(i);
+        history::append(ctx.paths.history_file(), &record("k", at)).unwrap();
+    }
+    let kept = || history::read_all(ctx.paths.history_file()).unwrap().len();
+    // Six hours a step for 40 days: the long one is never the sweeper.
+    for step in 0..160 {
+        assert!(
+            retention::sweep_if_due(&ctx, &long).is_none(),
+            "step {step}: the long one swept"
+        );
+        clock.advance(Duration::from_secs(SWEEP_EVERY_SECS as u64));
+        let report = retention::sweep_if_due(&ctx, &short).expect("due");
+        assert_eq!(report.history_dropped, 0, "step {step}");
+    }
+    assert_eq!(kept(), 100);
+    // The long one is gone for 30 days: the short numbers apply.
+    let mut dropped = 0;
+    for _ in 0..121 {
+        clock.advance(Duration::from_secs(SWEEP_EVERY_SECS as u64));
+        dropped += retention::sweep_if_due(&ctx, &short).map_or(0, |r| r.history_dropped);
+    }
+    assert_eq!(dropped, 50);
+    assert_eq!(kept(), 50);
+}
+
+#[test]
+fn an_automatic_sweep_cuts_a_few_logs_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    let cfg = Config {
+        jobs_log_max_mib: 1,
+        ..Config::default()
+    };
+    let n = retention::AUTO_MAX_CUTS + 2;
+    for i in 0..n {
+        let id = format!("j{i}");
+        finished_job(&ctx, &id, now - Span::hours(2), now - Span::hours(1));
+        std::fs::write(ctx.paths.job_log(&id), vec![b'a'; (1 << 20) + 1]).unwrap();
+    }
+    old_stamp(&ctx);
+    let report = retention::sweep_if_due(&ctx, &cfg).expect("due");
+    assert_eq!(report.logs_cut, retention::AUTO_MAX_CUTS);
+    assert!(!report.complete);
+    clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
+    let report = retention::sweep_if_due(&ctx, &cfg).expect("due again");
+    assert_eq!(report.logs_cut, 2);
+    assert!(report.complete);
+}
+
 #[test]
 fn a_job_whose_descriptor_cannot_be_read_goes_after_an_hour_unless_it_is_live() {
     let dir = tempfile::tempdir().unwrap();

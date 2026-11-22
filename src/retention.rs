@@ -16,19 +16,20 @@
 //! | `history.jsonl` | newest `history_keep` records per key, and only keys seen within `history_keep_days` | sweep |
 //! | `measurements/*.applied` | while the history keeps the record | the trim that drops the record |
 //! | `measurements/*.pending` | none (a dead attempt's) | sweep |
-//! | `managed/<id>.json` | `managed_keep_days` after the command ended; an hour when it never got an entry or cannot be read | sweep |
+//! | `managed/<id>.json` | `managed_keep_days` after the command ended; an hour when it was never launched and has no entry, or is not JSON | sweep |
 //! | `jobs/<id>.log` | at most `jobs_log_max_mib`, while running too; until `wait` printed it | the runner, `wait`, sweep |
 //! | `jobs/<id>.json`, `.exit` | `jobs_keep_days` after the job finished or was found dead | sweep |
 //! | job files without a readable descriptor, temporary files | an hour, and only when their owner is gone | sweep |
-//! | `ledger.lock`, `history.lock`, `last-sweep`, `leases/`, `jobs/` | fixed: every command, of every released version, opens them | never |
+//! | `ledger.lock`, `history.lock`, `last-sweep`, `leases/`, `jobs/`, `managed/` | fixed: every command, of every released version, opens them | never |
 //!
 //! Nothing here removes what a live process may use: an entry, a held
 //! lease, a job a `wait` holds, a temporary file whose writer is alive. A
 //! lock file is only removed while the sweep holds its lock. The automatic
 //! sweep never waits for a lock (a busy stage is left for the next try,
 //! [`RETRY_AFTER_SECS`] later), never looks at processes other than with
-//! signal 0, does at most [`AUTO_MAX_ACTIONS`] removals a time, and never
-//! fails the command that triggered it.
+//! signal 0, does at most [`AUTO_MAX_ACTIONS`] removals and
+//! [`AUTO_MAX_CUTS`] log cuts a time, and never fails the command that
+//! triggered it.
 
 use crate::config::Config;
 use crate::error::Result;
@@ -51,6 +52,10 @@ pub const RETRY_AFTER_SECS: i64 = 600;
 /// The most files one automatic sweep removes, marks or cuts. What is left
 /// is done by the next one, [`RETRY_AFTER_SECS`] later.
 pub const AUTO_MAX_ACTIONS: usize = 500;
+
+/// The most job logs one automatic sweep cuts: a cut copies the part it
+/// keeps, up to `jobs_log_max_mib`.
+pub const AUTO_MAX_CUTS: usize = 4;
 
 /// A job with no exit file, no ledger entry and no lease older than this is
 /// dead (its runner was killed). Far above the few seconds a runner needs
@@ -144,9 +149,9 @@ pub fn effective(
     let mut keep = *own;
     let mut record = BTreeMap::new();
     for (name, mine) in own.fields() {
-        let other = asked.get(name).filter(|a| {
-            a.value > mine && a.at <= now && now - a.at < Duration::seconds(ASK_TTL_SECS)
-        });
+        let other = asked
+            .get(name)
+            .filter(|a| a.value > mine && a.at <= now && !age_at_least(a.at, now, ASK_TTL_SECS));
         let ask = match other {
             Some(a) => a.clone(),
             None => Ask {
@@ -159,6 +164,34 @@ pub fn effective(
     }
     (keep, record)
 }
+
+/// What a program that is not sweeping writes into the stamp, if anything:
+/// its own numbers, when one of them is larger than what is recorded (or
+/// nothing valid is), or when its own record is [`ASK_REFRESH_SECS`] old.
+/// Without this only the program that happens to do the sweep would be
+/// heard, and a program that never sweeps would be forgotten after
+/// [`ASK_TTL_SECS`] while in daily use. `None`: nothing to write.
+pub fn refreshed_asks(
+    own: &Keep,
+    asked: &BTreeMap<String, Ask>,
+    now: DateTime<Utc>,
+) -> Option<BTreeMap<String, Ask>> {
+    let (_, record) = effective(own, asked, now);
+    let stale = record.iter().any(|(name, ask)| match asked.get(name) {
+        Some(old) if old == ask => false,
+        // Ours either way (a larger valid one would have been kept as it
+        // is): new or changed, or the same number with an old date.
+        Some(old) if old.value == ask.value => {
+            old.at > now || age_at_least(old.at, now, ASK_REFRESH_SECS)
+        }
+        _ => true,
+    });
+    stale.then_some(record)
+}
+
+/// How old a program's own recorded numbers may get before it writes them
+/// again ([`refreshed_asks`]): at most one small write a day per program.
+pub const ASK_REFRESH_SECS: i64 = 86_400;
 
 /// `days` days before `now`; `None` when that is before the calendar
 /// begins, so no number in a configuration can make the arithmetic fail:
@@ -315,11 +348,23 @@ pub(crate) fn sweep_if_due_keep(ctx: &Context, own: &Keep) -> Option<Report> {
     let read = read_stamp(&path);
     let now = ctx.clock.now();
     match due(&read, now) {
-        Due::No => return None,
+        Due::No => {
+            // Not sweeping: still say what this program keeps by, so the
+            // one that does sweep goes by the larger numbers.
+            if let StampRead::Read(stamp) = read {
+                if let Some(asked) = refreshed_asks(own, &stamp.asked, now) {
+                    if let Ok(Some(_one)) = lock::try_acquire(&path) {
+                        let _ = write_stamp(&path, &Stamp { asked, ..stamp });
+                    }
+                }
+            }
+            return None;
+        }
         Due::Arm => {
             let armed = Stamp {
                 complete: Some(now),
-                ..Stamp::default()
+                attempt: None,
+                asked: effective(own, &BTreeMap::new(), now).1,
             };
             // A stamp that cannot be written must not mean "never sweep".
             if write_stamp(&path, &armed).is_ok() {
@@ -350,6 +395,8 @@ pub fn sweep(ctx: &Context, cfg: &Config) -> Report {
 /// What is left of a sweep's allowance.
 struct Allowance {
     left: usize,
+    /// Log cuts left: each copies up to `jobs_log_max_mib`.
+    cuts: usize,
     /// Something was left undone.
     short: bool,
 }
@@ -362,6 +409,15 @@ impl Allowance {
             return false;
         }
         self.left -= 1;
+        true
+    }
+
+    fn take_cut(&mut self) -> bool {
+        if self.cuts == 0 {
+            self.short = true;
+            return false;
+        }
+        self.cuts -= 1;
         true
     }
 }
@@ -415,6 +471,7 @@ fn run(ctx: &Context, own: &Keep, read: StampRead, auto: bool) -> Report {
     };
     let mut allow = Allowance {
         left: if auto { AUTO_MAX_ACTIONS } else { usize::MAX },
+        cuts: if auto { AUTO_MAX_CUTS } else { usize::MAX },
         short: false,
     };
 
@@ -515,11 +572,25 @@ fn reap(ctx: &Context) -> Result<(Ledger, usize)> {
 
 // ------------------------------------------------------------- sidecars
 
+/// What a `managed/<id>.json` says.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SidecarKind {
+    /// Its command ended then.
+    Ended(DateTime<Utc>),
+    /// Registered and never launched: with no ledger entry, what a crash
+    /// between writing the sidecar and saving the ledger left.
+    NeverLaunched,
+    /// Not JSON at all: a write that was cut short.
+    Unparseable,
+    /// A launch was begun, or the file is another version's: only
+    /// `resolve` (or its owner) settles it.
+    Other,
+}
+
 /// What the sweep knows about one `managed/<id>.json`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidecarView {
-    /// When its command ended, for a readable sidecar that records an end.
-    pub ended: Option<DateTime<Utc>>,
+    pub kind: SidecarKind,
     /// The ledger has an entry for it.
     pub in_ledger: bool,
     /// Its owner holds the lease.
@@ -530,16 +601,20 @@ pub struct SidecarView {
 /// Whether a managed sidecar goes. Never while the ledger has its entry or
 /// its owner holds the lease. One that records an end goes
 /// `managed_keep_days` after it (a repeated registration finds the outcome
-/// until then). One that records none, or cannot be read, is what a crash
-/// between writing the sidecar and saving the ledger left: it goes once the
-/// file is [`STRAY_AFTER_SECS`] old.
+/// until then). One that was never launched, or is not JSON, goes once the
+/// file is [`STRAY_AFTER_SECS`] old: nothing was started for it. One whose
+/// launch was begun stays: a process of it may be alive, and removing the
+/// record would let the same id be started again (see `resolve`).
 pub fn sidecar_due(v: &SidecarView, now: DateTime<Utc>, keep_days: u64) -> bool {
     if v.in_ledger || v.lease_held {
         return false;
     }
-    match v.ended {
-        Some(t) => days_before(now, keep_days).is_some_and(|cutoff| t < cutoff),
-        None => age_at_least(v.modified, now, STRAY_AFTER_SECS),
+    match v.kind {
+        SidecarKind::Ended(t) => days_before(now, keep_days).is_some_and(|cutoff| t < cutoff),
+        SidecarKind::NeverLaunched | SidecarKind::Unparseable => {
+            age_at_least(v.modified, now, STRAY_AFTER_SECS)
+        }
+        SidecarKind::Other => false,
     }
 }
 
@@ -777,7 +852,7 @@ fn cut_log(
     allow: &mut Allowance,
 ) {
     let over = std::fs::metadata(ctx.paths.job_log(id)).is_ok_and(|m| m.len() > max);
-    if live || !over || !allow.take() {
+    if live || !over || !allow.take_cut() {
         return;
     }
     match jobs::cap_log(ctx, id, max) {
@@ -947,6 +1022,51 @@ mod tests {
     }
 
     #[test]
+    fn a_program_that_does_not_sweep_records_its_numbers_once_a_day_or_when_they_rise() {
+        let now = t(0);
+        let ask = |value, at| Ask { value, at: t(at) };
+        let all = |value, at| -> BTreeMap<String, Ask> {
+            keep(0)
+                .fields()
+                .iter()
+                .map(|(n, _)| (n.to_string(), ask(value, at)))
+                .collect()
+        };
+        // Nothing recorded: write ours.
+        assert_eq!(
+            refreshed_asks(&keep(50), &BTreeMap::new(), now),
+            Some(all(50, 0))
+        );
+        // Ours, recorded less than a day ago: nothing to write.
+        assert_eq!(
+            refreshed_asks(&keep(50), &all(50, -ASK_REFRESH_SECS + 1), now),
+            None
+        );
+        // A day old: written again, so it does not run out while in use.
+        assert_eq!(
+            refreshed_asks(&keep(50), &all(50, -ASK_REFRESH_SECS), now),
+            Some(all(50, 0))
+        );
+        // Ours is larger than the record: written at once.
+        assert_eq!(
+            refreshed_asks(&keep(200), &all(50, -5), now),
+            Some(all(200, 0))
+        );
+        // Another program's larger numbers: left exactly as they are.
+        assert_eq!(refreshed_asks(&keep(50), &all(200, -5 * DAY), now), None);
+        // ...until they run out.
+        assert_eq!(
+            refreshed_asks(&keep(50), &all(200, -ASK_TTL_SECS), now),
+            Some(all(50, 0))
+        );
+        // A date in the future is replaced.
+        assert_eq!(
+            refreshed_asks(&keep(50), &all(50, 5), now),
+            Some(all(50, 0))
+        );
+    }
+
+    #[test]
     fn no_number_of_days_can_make_the_date_arithmetic_fail() {
         let now = t(0);
         assert_eq!(days_before(now, 0), Some(now));
@@ -1008,7 +1128,7 @@ mod tests {
 
     fn sidecar(ended: Option<i64>, in_ledger: bool, lease_held: bool, age: i64) -> SidecarView {
         SidecarView {
-            ended: ended.map(t),
+            kind: ended.map_or(SidecarKind::NeverLaunched, |s| SidecarKind::Ended(t(s))),
             in_ledger,
             lease_held,
             modified: t(-age),
@@ -1040,6 +1160,22 @@ mod tests {
             now,
             7
         ));
+        let of = |kind, age| SidecarView {
+            kind,
+            ..sidecar(None, false, false, age)
+        };
+        assert!(!sidecar_due(
+            &of(SidecarKind::Unparseable, STRAY_AFTER_SECS - 1),
+            now,
+            7
+        ));
+        assert!(sidecar_due(
+            &of(SidecarKind::Unparseable, STRAY_AFTER_SECS),
+            now,
+            7
+        ));
+        // A launch that was begun is never the sweep's to settle.
+        assert!(!sidecar_due(&of(SidecarKind::Other, 900 * DAY), now, 7));
         // Never with an entry or a held lease.
         assert!(!sidecar_due(&sidecar(None, true, false, 9 * DAY), now, 7));
         assert!(!sidecar_due(&sidecar(None, false, true, 9 * DAY), now, 7));

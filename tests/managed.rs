@@ -2716,8 +2716,9 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
     terminal_sidecar(&ctx, "old", now - days(10), false);
     terminal_sidecar(&ctx, "recent", now - days(1), false);
     let _owner = terminal_sidecar(&ctx, "in-ledger", now - days(10), true);
-    // Not terminal and without an entry: what a crash between writing the
-    // sidecar and saving the ledger leaves. Kept while the file is young.
+    // Registered, never launched, and without an entry: what a crash
+    // between writing the sidecar and saving the ledger leaves. Kept while
+    // the file is young.
     let (_, g) = registered(
         managed::register(
             &ctx,
@@ -2741,6 +2742,13 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
             .unwrap();
     }
     std::fs::write(m.join("notes.txt"), b"x").unwrap();
+    // A launch that was begun, with no entry: only `resolve` settles it,
+    // however old. Another version's sidecar (JSON, but not ours): kept.
+    let mut begun = sidecar(&ctx, "live");
+    begun.command_id = "begun".into();
+    begun.phase = task_traffic_controller::receipt::Phase::LaunchIntent;
+    managed::write_sidecar(&ctx, &begun).unwrap();
+    std::fs::write(m.join("foreign.json"), br#"{"version":99}"#).unwrap();
     let listing = || {
         let mut left: Vec<String> = std::fs::read_dir(&m)
             .unwrap()
@@ -2757,7 +2765,9 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
         [
             ".tmpNEW",
             ".tmpOLD",
+            "begun.json",
             "corrupt.json",
+            "foreign.json",
             "in-ledger.json",
             "live.json",
             "notes.txt",
@@ -2768,7 +2778,7 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
     // An hour after they were written, the unreadable sidecar and the one
     // that never got an entry go. A held lease keeps one.
     let hour_old = std::time::SystemTime::now() - Duration::from_secs(3600 + 5);
-    for name in ["corrupt.json", "live.json"] {
+    for name in ["corrupt.json", "live.json", "begun.json", "foreign.json"] {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(m.join(name))
@@ -2785,6 +2795,8 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
         [
             ".tmpNEW",
             ".tmpOLD",
+            "begun.json",
+            "foreign.json",
             "in-ledger.json",
             "notes.txt",
             "recent.json"

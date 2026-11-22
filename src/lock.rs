@@ -77,7 +77,15 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<Lock> {
         if names(&file, path) {
             return Ok(Lock { file });
         }
+        release(&file);
     }
+}
+
+/// Unlock explicitly. Closing the file is not enough: a process forked by
+/// another thread at this moment holds a copy of the descriptor until it
+/// execs, and the lock would stay with that copy.
+fn release(file: &File) {
+    let _ = FileExt::unlock(file);
 }
 
 /// [`acquire`] without waiting: `None` when the lock is busy.
@@ -100,9 +108,16 @@ pub fn remove_if_unheld(path: &Path) -> bool {
             return std::fs::symlink_metadata(path).is_err();
         };
         match file.try_lock_exclusive() {
-            Ok(()) if names(&file, path) => return std::fs::remove_file(path).is_ok(),
-            // Unlinked (and perhaps made again) meanwhile: look again.
-            Ok(()) => continue,
+            Ok(()) => {
+                let gone = names(&file, path).then(|| std::fs::remove_file(path).is_ok());
+                release(&file);
+                match gone {
+                    Some(gone) => return gone,
+                    // Unlinked (and perhaps made again) meanwhile: look
+                    // again.
+                    None => continue,
+                }
+            }
             Err(_) => return false,
         }
     }
@@ -265,8 +280,8 @@ pub fn try_take_lease(ctx: &Context, id: &str) -> Result<Option<Lock>> {
             }
             // The file was unlinked between the open and the lock: the
             // lock (or its refusal) is about a file that is gone.
-            Ok(()) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Ok(()) => release(&file),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 return Err(Error::Ledger(format!(
                     "lease {} cannot be locked: {e}",
@@ -290,6 +305,7 @@ pub fn take_shared(path: &Path) -> Result<Lock> {
         if names(&file, path) {
             return Ok(Lock { file });
         }
+        release(&file);
     }
 }
 
@@ -300,9 +316,15 @@ pub fn is_held(path: &Path) -> bool {
             return false;
         };
         match file.try_lock_exclusive() {
-            Ok(()) if names(&file, path) => return false,
-            // Free, but not the file the name points to any more.
-            Ok(()) => continue,
+            Ok(()) => {
+                // Unlocked at once and explicitly: this look must not be
+                // taken for a holder by the next one.
+                release(&file);
+                if names(&file, path) {
+                    return false;
+                }
+                // Free, but not the file the name points to any more.
+            }
             Err(e) => return e.kind() == std::io::ErrorKind::WouldBlock,
         }
     }
@@ -552,8 +574,12 @@ mod tests {
         assert!(start.elapsed() >= LEASE_PROBE_WAIT);
         // Somebody only looking: gone within the wait.
         let ctx2 = ctx.clone();
-        let t = thread::spawn(move || take_lease(&ctx2, "a").is_ok());
-        thread::sleep(Duration::from_millis(30));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = thread::spawn(move || {
+            tx.send(()).unwrap();
+            take_lease(&ctx2, "a").is_ok()
+        });
+        rx.recv().unwrap();
         drop(held);
         assert!(t.join().unwrap());
     }
