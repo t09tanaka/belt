@@ -102,6 +102,24 @@ fn an_updated_task_traffic_controller_passes_the_runtime_check() {
 }
 
 #[test]
+fn an_idle_initialized_setup_with_the_command_installed_is_healthy_and_exits_zero() {
+    let fx = Fx::new();
+    fx.init();
+    no_engine(&fx);
+    tool(
+        &fx,
+        "task-traffic-controller",
+        "printf '%s\\n' '{\"ledger_format\":1,\"entries\":[]}'",
+    );
+    let out = fx.run(&["doctor"]);
+    let report = json(&out);
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    assert_eq!(report["result"]["healthy"], true);
+    assert_eq!(report["result"]["not_checked"], 0);
+    assert_eq!(check(&report, "parent", "traffic_processes")["level"], "ok");
+}
+
+#[test]
 fn an_unreachable_worker_fails_and_the_diff_slot_is_listed_as_not_checked() {
     let fx = Fx::new();
     fx.init();
@@ -288,6 +306,8 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
                 fingerprint: Some("sha256:f".into()),
                 error: None,
             },
+            cli_jobs: None,
+            cli_jobs_error: None,
             linger: None,
         },
     }});

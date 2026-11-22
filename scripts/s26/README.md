@@ -152,6 +152,35 @@ scripts/s26/down.sh
 git worktree remove "$S26_BASE/src-native"
 ```
 
+## Linux parent (`--linux-parent`)
+
+A Linux container is the parent and another is its worker; no native Mac binary
+is needed (`S26_BELT` is not read). On a fresh `up.sh`, after `build-linux.sh`:
+
+```bash
+scripts/s26/run.sh --linux-parent
+scripts/s26/down.sh
+```
+
+m1 is initialized with `belt init --name m1` (a lingering systemd user
+service). It reaches w1 over a test-only SSH key generated inside the
+containers (the host's `~/.ssh` is untouched), then runs `belt workers add w1
+--ssh w1 --install`. Everything is driven through m1's own installed binary
+over SSH. Scenarios, each PASS/FAIL/SKIP (a SKIP is not a PASS and fails the
+run):
+
+| Check | Required evidence |
+| --- | --- |
+| L01 | `belt init` on Linux: one active init unit, lingering, `bin/resident` names the installed digest, `belt group` answers |
+| L02 | `workers add w1 --install` from the Linux parent; w1 connected |
+| L03 | A submitted run is placed on w1; its result is collected (one complete, succeeded attempt, command started once) and `belt logs` shows w1's output |
+| L04 | `belt exec` from the parent, with the parent's own worker busy, runs on w1 (attempt worker and `belt logs` output) |
+| L05 | `belt cancel` ends a run on w1; the attempt is not succeeded and nothing keeps running there |
+| L06 | `belt doctor` reports checks for w1; none fails and only `traffic_processes` is `not_checked` (by design once the task-traffic-controller scope exists, which makes the report unhealthy and the exit code 1; A45 tolerates the same) |
+| L07 | The parent's service is stopped while a run is on w1, then started; the same attempt is collected, command started once |
+
+Evidence: `run/evidence/linux-parent-summary.json` and the `*-lp-*` files.
+
 ## Scope and expected time
 
 Expect roughly **5–10 minutes** for a warm acceptance run; cold Rust/image builds

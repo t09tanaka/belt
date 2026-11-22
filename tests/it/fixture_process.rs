@@ -5,6 +5,11 @@ fn fixture_sleeper() {
     let Ok(mode) = std::env::var("BELT_IT_FIXTURE") else {
         return;
     };
+    // A test that inspects this process from outside waits for the file: the
+    // shell that spawned it has finished its exec by then.
+    if let Ok(ready) = std::env::var("BELT_IT_READY") {
+        std::fs::File::create(ready).unwrap();
+    }
     if mode == "cat" {
         std::io::copy(&mut std::io::stdin().lock(), &mut std::io::stdout().lock()).unwrap();
     } else {
@@ -70,15 +75,29 @@ fn fixture_environment_is_readable_by_the_product_marker_scan() {
     }
     let id = format!("fixture-{}", std::process::id());
     let scope = "fixture-environment-test";
+    // `sh` is replaced by the fixture binary after the spawn returns, and the
+    // kernel does not give the environment of a process that is mid-exec: a
+    // scan then rightly says Unknown. Scan only once the fixture is running.
+    let tmp = crate::test_tmp::tempdir().unwrap();
+    let ready = tmp.path().join("ready");
     let child = Child(
         std::process::Command::new("sh")
             .arg("-c")
             .arg(script("exec sleep 30"))
             .env(marker::ENV_VAR, &id)
             .env(marker::SCOPE_VAR, scope)
+            .env("BELT_IT_READY", &ready)
             .spawn()
             .unwrap(),
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let scan = process::scan_system(&id, scope);
     assert!(
         scan.alive.iter().any(|p| p.pid == child.0.id()),

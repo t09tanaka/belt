@@ -381,6 +381,8 @@ fn healthy() -> HostFacts {
             fingerprint: Some("sha256:f".into()),
             error: None,
         },
+        cli_jobs: Some(CliJobs::default()),
+        cli_jobs_error: None,
         linger: None,
     }
 }
@@ -407,14 +409,9 @@ fn a_host_that_fits_together_passes_every_check() {
             "service_profile"
         ]
     );
-    // Everything that was looked at passes; what was not is said, not passed.
-    assert!(checks.iter().all(|c| c.host == "mini-a"
-        && c.level
-            == if c.id == "traffic_processes" {
-                Level::NotChecked
-            } else {
-                Level::Ok
-            }));
+    assert!(checks
+        .iter()
+        .all(|c| c.host == "mini-a" && c.level == Level::Ok));
     assert!(detail(&checks, "service_profile").contains("default (sha256:f)"));
     assert!(detail(&checks, "docker_resource_domain").contains("E1"));
 }
@@ -929,10 +926,7 @@ fn every_registered_worker_is_asked_through_its_registered_binary() {
     assert_eq!(left_out("environment_diff"), 2);
     assert_eq!(
         (report.failed, report.not_checked),
-        (
-            0,
-            left_out("environment_diff") + left_out("traffic_processes")
-        )
+        (0, left_out("environment_diff"))
     );
     let (code, message) = report.problem().unwrap();
     assert_eq!(code, ErrorCode::CommandFailed);
@@ -1230,26 +1224,147 @@ fn a_report_is_healthy_only_when_nothing_failed_and_nothing_was_left_out() {
 }
 
 #[test]
-fn running_processes_of_the_command_are_said_to_be_unexamined() {
-    // The command is installed: its jobs may run, and nobody looked.
+fn the_jobs_of_the_command_are_judged_from_the_facts() {
+    let jobs = |live, stale| Some(CliJobs { live, stale });
+    let judged = |facts: &HostFacts| {
+        let checks = evaluate("mini-a", facts);
+        (
+            level(&checks, "traffic_processes"),
+            detail(&checks, "traffic_processes").to_string(),
+        )
+    };
+    // Nothing runs, nothing is left over.
     let mut facts = healthy();
-    facts.cli_scope.ledger_entries = Some(3);
-    let checks = evaluate("mini-a", &facts);
-    assert_eq!(level(&checks, "traffic_processes"), Level::NotChecked);
-    assert!(detail(&checks, "traffic_processes").contains("are not examined (3 entries"));
-    facts.cli_scope.ledger_entries = None;
-    assert!(detail(&evaluate("mini-a", &facts), "traffic_processes").contains("unreadable"));
-    // No command, but it left state behind: the same.
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::Ok);
+    assert!(d.contains("no job of the command is running"));
+    // Jobs run under a command that knows managed entries: noted.
+    facts.cli_jobs = jobs(2, 1);
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::Notice);
+    assert!(d.contains("2 job(s)") && d.contains("1 left-over"));
+    // The same under a command that does not know them, or cannot be asked.
+    facts.cli.as_mut().unwrap().knows_managed = false;
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::Fail);
+    assert!(d.contains("2 job(s)") && d.contains("update the command"));
+    facts.cli.as_mut().unwrap().knows_managed = true;
+    facts.cli.as_mut().unwrap().status_readable = false;
+    assert_eq!(judged(&facts).0, Level::Fail);
+    // The command is gone but its jobs still run: noted, not failed.
     facts.cli = None;
-    assert_eq!(
-        level(&evaluate("mini-a", &facts), "traffic_processes"),
-        Level::NotChecked
-    );
-    // Neither a command nor state: there is nothing that could be running.
+    assert_eq!(judged(&facts).0, Level::Notice);
+    // Only left-over entries: noted.
+    facts.cli_jobs = jobs(0, 3);
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::Notice);
+    assert!(d.contains("3 entries") && d.contains("no live owner"));
+    // Not read: said, with the reason.
+    facts.cli_jobs = None;
+    facts.cli_scope.ledger_entries = None;
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::NotChecked);
+    assert!(d.contains("ledger is unreadable"));
+    facts.cli_scope.ledger_entries = Some(0);
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::NotChecked);
+    assert!(d.contains("predates the check"));
+    facts.cli_jobs_error = Some("permission denied".into());
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::NotChecked);
+    assert!(d.contains("could not be read (permission denied)") && !d.contains("predates"));
+    // Neither a command nor state: nothing could be running.
     facts.cli_scope.in_use = false;
-    let checks = evaluate("mini-a", &facts);
-    assert_eq!(level(&checks, "traffic_processes"), Level::Ok);
-    assert!(detail(&checks, "traffic_processes").contains("none of its jobs can be running"));
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::Ok);
+    assert!(d.contains("none of its jobs can be running"));
+}
+
+fn listing(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in read.flatten() {
+            out.push(e.path());
+            if e.path().is_dir() {
+                todo.push(e.path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn ledger_entry(id: &str, parent: Option<&str>) -> task_traffic_controller::ledger::Entry {
+    let mut v = serde_json::json!({
+        "id": id, "pid": 1, "state": "running", "front": false, "weight": 1,
+        "predicted_rss": 0, "repo": "r", "argv": "a", "key": "k", "seq": 1,
+        "enqueued_at": "2026-01-01T00:00:00Z"
+    });
+    if let Some(p) = parent {
+        v["parent"] = p.into();
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn the_jobs_of_a_scope_are_read_from_leases_and_sidecars_without_writing() {
+    let h = Host::new();
+    let (state, config) = cli_scope_paths(&h.env);
+    // No ledger: nothing runs, and nothing is created.
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs::default()));
+    assert!(!state.exists());
+    let paths = Paths::new(&state, &config);
+    let context = Context::new(Paths::new(&state, &config));
+    fs::create_dir_all(paths.managed_dir()).unwrap();
+    let ledger = Ledger {
+        version: 3,
+        entries: vec![
+            ledger_entry("held", None),
+            ledger_entry("gone", None),
+            ledger_entry("managed", None),
+            ledger_entry("nested", Some("managed")),
+            ledger_entry("deeper", Some("nested")),
+        ],
+        ..Ledger::default()
+    };
+    ledger.save(&paths.ledger_file()).unwrap();
+    // `held` has an owner, `gone` has none, `managed` is belt's, and what
+    // runs inside it is belt's too.
+    let _lease = lock::take_lease(&context, "held").unwrap();
+    let _nested = lock::take_lease(&context, "nested").unwrap();
+    fs::write(paths.managed_file("managed"), "{}").unwrap();
+    let before = listing(&state);
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 1, stale: 1 }));
+    assert_eq!(listing(&state), before);
+    // A ledger nobody can read is no answer, and says why.
+    fs::write(paths.ledger_file(), "not a ledger").unwrap();
+    assert!(cli_jobs(&state, &config).is_err());
+}
+
+#[test]
+fn a_scope_with_a_ledger_but_no_lock_or_lease_files_gets_none_created() {
+    let h = Host::new();
+    let (state, config) = cli_scope_paths(&h.env);
+    let paths = Paths::new(&state, &config);
+    let ledger = Ledger {
+        entries: vec![ledger_entry("plain", None)],
+        ..Ledger::default()
+    };
+    ledger.save(&paths.ledger_file()).unwrap();
+    let before = listing(&state);
+    // A live, sidecar-less entry is a foreign job; with no lease it is stale.
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 0, stale: 1 }));
+    assert_eq!(listing(&state), before);
+    assert!(!paths.ledger_lock().exists());
+    assert!(!paths.lease_file("plain").exists());
+    // With the owner's lease it is live, under a command that knows managed entries.
+    let context = Context::new(Paths::new(&state, &config));
+    let _lease = lock::take_lease(&context, "plain").unwrap();
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 1, stale: 0 }));
 }
 
 mod environment_diff {

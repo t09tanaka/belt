@@ -251,7 +251,7 @@ pub(super) async fn sources(
                         "worker": worker_id, "source_was_ready": verified,
                         "source_ms": source_ms, "plan_ms": plan_ms,
                     });
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let written = tokio::task::spawn_blocking(move || {
                         owner.store().append_event(
                             Some(&run),
                             None,
@@ -261,9 +261,24 @@ pub(super) async fn sources(
                         )
                     })
                     .await;
+                    if let Some(line) = event_write_failure(&written) {
+                        eprintln!("{line}");
+                    }
                 }
             }
         }
+    }
+}
+
+/// The line for an event that was not written: the store refused it, or the
+/// task that wrote it did not finish. `None` when it was written.
+fn event_write_failure<T, E: std::fmt::Display>(
+    written: &Result<Result<T, E>, tokio::task::JoinError>,
+) -> Option<String> {
+    match written {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(format!("event ci_input_delivered not written: {error}")),
+        Err(error) => Some(format!("event ci_input_delivered task failed: {error}")),
     }
 }
 
@@ -412,6 +427,22 @@ pub(super) async fn secrets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_lost_event_write_is_reported_and_a_written_one_is_not() {
+        let ok: Result<Result<(), String>, _> = tokio::spawn(async { Ok(()) }).await;
+        assert_eq!(event_write_failure(&ok), None);
+        let refused: Result<Result<(), String>, _> =
+            tokio::spawn(async { Err("disk full".to_owned()) }).await;
+        assert_eq!(
+            event_write_failure(&refused).unwrap(),
+            "event ci_input_delivered not written: disk full"
+        );
+        let lost: Result<Result<(), String>, _> = tokio::spawn(async { panic!("boom") }).await;
+        assert!(event_write_failure(&lost)
+            .unwrap()
+            .starts_with("event ci_input_delivered task failed: "));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_plan_not_delivered_on_trial_records_nothing_until_the_trial_is_over() {
