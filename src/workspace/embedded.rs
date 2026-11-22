@@ -5,6 +5,20 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
+/// Version of the belt binary and the four tools linked into this build.
+pub const BUILD_ID: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (task-traffic-controller ",
+    env!("BELT_TTC_VERSION"),
+    ", local-ci ",
+    env!("BELT_LOCAL_CI_VERSION"),
+    ", fast-worktree ",
+    env!("BELT_FAST_WORKTREE_VERSION"),
+    ", portool ",
+    env!("BELT_PORTOOL_VERSION"),
+    ")"
+);
+
 pub const NAMES: [&str; 2] = ["fast-worktree", "portool"];
 
 pub fn version(name: &str) -> Option<&'static str> {

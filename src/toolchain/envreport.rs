@@ -251,14 +251,7 @@ fn measure(
     // is run.
     let mut helpers = BTreeMap::from([(
         "belt".to_string(),
-        Some(format!(
-            "{} (task-traffic-controller {}, local-ci {}, fast-worktree {}, portool {})",
-            env!("CARGO_PKG_VERSION"),
-            env!("BELT_TTC_VERSION"),
-            env!("BELT_LOCAL_CI_VERSION"),
-            env!("BELT_FAST_WORKTREE_VERSION"),
-            env!("BELT_PORTOOL_VERSION")
-        )),
+        Some(crate::workspace::embedded::BUILD_ID.to_owned()),
     )]);
     if let Some(why) =
         crate::workspace::embedded::incompatible_registry(&profile.host_environment())
