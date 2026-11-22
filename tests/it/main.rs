@@ -4,6 +4,24 @@
 
 mod common;
 mod proto_common;
+
+/// Runs before `main`: the stop signals are at their default for this process
+/// and so for every child a test starts. A test binary started from a
+/// background job of a non-interactive shell (or under `nohup`) inherits them
+/// as ignored, and belt keeps a signal that was ignored at start ignored, so
+/// the tests that send SIGINT or SIGHUP to a belt they spawned would hang.
+/// A test about an inherited ignore sets `SIG_IGN` itself in `pre_exec`.
+extern "C" fn default_stop_signals() {
+    for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: signal() with SIG_DFL, before any thread exists.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
+}
+
+#[used]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_vendor = "apple"), link_section = ".init_array")]
+static DEFAULT_STOP_SIGNALS: extern "C" fn() = default_stop_signals;
 #[path = "../../src/test_tmp.rs"]
 mod test_tmp;
 
