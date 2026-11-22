@@ -19,7 +19,7 @@ LINUX_BINARY = "belt-linux-" + os.environ["S26_MACHINE"]
 RUN = Path(os.environ["S26_RUN"])
 LABEL = "io.belt.s26.run"
 # w1 and w2 stay worker-only (installed by the host); m1 becomes an init member.
-HOSTS = ("w1", "w2", "m1")
+HOSTS = ("w1",) if os.environ.get("S26_SYSTEM_WORKER") == "1" else ("w1", "w2", "m1")
 USER_BUS = ('export XDG_RUNTIME_DIR=/run/user/1000; '
             'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; ')
 CONFIG = """schema_version=1
@@ -121,7 +121,7 @@ def up():
             host, 'test "$(cat /proc/1/comm)" = systemd && '
             'test "$(loginctl show-user 1000 -p Linger --value)" = yes && '
             'test -S /run/user/1000/bus', check=False).returncode == 0)
-    print(f"w1, w2 and m1 ready. Evidence and private SSH files: {RUN}")
+    print(f"{', '.join(HOSTS)} ready. Evidence and private SSH files: {RUN}")
 
 
 class Checks:
@@ -780,6 +780,11 @@ kill -s CONT "$pid"
 def run():
     checks = Checks()
     try:
+        if os.environ.get("S26_SYSTEM_WORKER") == "1":
+            from system_worker import verify
+            checks.check("A35 Docker system worker",
+                         lambda: verify(checks, RUN, BASE / LINUX_BINARY, command, save))
+            return 0 if checks.results[-1]["pass"] else 1
         if repo := os.environ.get("S26_PROJECT_CI"):
             from project_ci import compare
             checks.check("A37 Docker project comparison",

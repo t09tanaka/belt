@@ -170,3 +170,12 @@ collection timestamps. The first and repeat measurements on each topology are
 reported separately. The local worker keeps its cache when the other workers
 join. A distributed run must place work on at least two workers and return the
 same job outcomes as the local baseline. Copy the evidence before `down.sh`.
+
+## Dedicated system service
+
+On a fresh allocation, set `S26_SYSTEM_WORKER=1` for both `up.sh` and
+`run.sh`. This case uses w1 only. It stages the worker as the SSH user,
+registers the unit with a trusted administrator copy of belt inside w1,
+enables it in the system manager and finishes enrollment from the parent.
+A job must then complete on that worker while its service runs as the
+non-root belt account. The evidence is in `run/evidence/system-worker.json`.
