@@ -36,6 +36,8 @@ mod resident;
 
 mod bootstrap;
 
+mod status_repost;
+
 mod init;
 
 mod warmup_stop;
