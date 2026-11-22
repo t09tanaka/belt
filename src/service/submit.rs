@@ -336,6 +336,7 @@ pub(super) async fn freeze_resolved(
     };
     let toolchains = match frozen? {
         Some(bundle) if bundle.validate(digest).is_err() => {
+            let asked = bundle.frozen.describe_requirements();
             match owner
                 .request(Operation::ResolveToolchains {
                     bundle,
@@ -352,7 +353,7 @@ pub(super) async fn freeze_resolved(
                 _ => {
                     return Err(ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
-                        "toolchain resolve required",
+                        format!("toolchain resolve required ({asked})"),
                     ))
                 }
             }
@@ -438,14 +439,17 @@ fn freeze_toolchains(
         policy,
     )
     .map_err(|e| blocked(e.code))?;
-    if frozen
+    let unknown: Vec<&str> = frozen
         .baseline
         .iter()
-        .any(|b| b.version == VersionObservation::Unknown)
-    {
-        return Err(blocked(
-            "toolchain baseline unknown; capture requires an observed required tool".into(),
-        ));
+        .filter(|b| b.version == VersionObservation::Unknown)
+        .map(|b| b.tool.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(blocked(format!(
+            "toolchain baseline unknown; capture requires an observed required tool ({})",
+            unknown.join(", ")
+        )));
     }
     let mut bundle = FrozenBundle::seal_exact(frozen).map_err(|e| blocked(e.into()))?;
     if bundle.validate(&bundle.frozen.source_manifest).is_ok() {

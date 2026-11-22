@@ -5318,6 +5318,11 @@ async fn ci_task_gets_the_declared_toolchain_activated_on_the_worker_before_its_
 /// The refusal half: a version the operator never authorized leaves no
 /// compatible worker for a CI task, as for a plain command. No step runs, no
 /// manager runs, and the job does not fall back to the Node on the PATH.
+///
+/// The block is at placement, not at submit: the run is accepted (its
+/// `task_waiting` event exists, and `ci` is still waiting on it when the
+/// events are read), and the worker is left out with `capability_mismatch`
+/// whose `unmet` line names `node=21.0.0`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ci_task_needing_an_unauthorized_toolchain_is_blocked_and_runs_with_no_other_version() {
     let (root, spec, input) = control_fixture();
@@ -5352,6 +5357,16 @@ async fn ci_task_needing_an_unauthorized_toolchain_is_blocked_and_runs_with_no_o
         waiting.payload["decision"]["excluded"][0]["why"], "capability_mismatch",
         "{}",
         waiting.payload
+    );
+    assert_eq!(
+        waiting.payload["decision"]["excluded"][0]["unmet"],
+        serde_json::json!(["toolchain node=21.0.0 unavailable"]),
+        "{}",
+        waiting.payload
+    );
+    assert!(
+        !running.is_finished(),
+        "ci ended: the block was not at placement"
     );
     assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
     assert!(!host.join("calls").exists(), "a manager ran");

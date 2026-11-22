@@ -1569,7 +1569,10 @@ impl Agent {
                 .map_err(|e| {
                     ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
-                        format!("toolchain resolve required: {e:?}"),
+                        format!(
+                            "toolchain resolve required: {e:?} ({})",
+                            requirement.describe()
+                        ),
                     )
                 })?;
             bundle.frozen = request.frozen;

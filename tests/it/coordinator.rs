@@ -2927,6 +2927,109 @@ async fn slow_toolchain_attestation_respects_round_budget_and_other_lease_progre
     assert_eq!(only(&c, &first[0]).state, AttemptState::Terminal);
 }
 
+/// Answers a frozen-toolchain question with a bundle that is not the one asked
+/// (the worker cannot provide it) and counts the questions.
+struct RefusingAttestor {
+    worker: Arc<FakeWorker>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl WorkerLink for RefusingAttestor {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        self.worker.call(request)
+    }
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            match request {
+                Request::ResolveToolchains(mut r) => {
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    r.bundle.frozen.profile_definition = Digest::of_bytes(b"another profile");
+                    Ok(Response::ResolveToolchains(ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle: r.bundle,
+                    }))
+                }
+                other => self.worker.call(other).await,
+            }
+        })
+    }
+}
+
+/// A worker that cannot provide the frozen toolchain is left out by a line
+/// that names the tool and version, and the tasks of a run that share the
+/// bundle ask it once in a tick, not once each.
+#[tokio::test]
+async fn a_worker_left_out_by_the_frozen_toolchain_names_it_and_is_asked_once_a_tick() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let f = fx();
+    let worker = f.worker("w-a", (4, 0));
+    let c = f.open(&[]);
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    c.attach(
+        worker.id.clone(),
+        Arc::new(RefusingAttestor {
+            worker: worker.clone(),
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    let mut task_spec = spec();
+    let scope = Scope::project("");
+    task_spec.toolchains = Some(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                task_spec.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let run = RunId::generate();
+    let tasks: Vec<_> = (0..3)
+        .map(|_| (TaskId::generate(), task_spec.clone()))
+        .collect();
+    c.enqueue(run, source(&c), tasks).await.unwrap();
+    let report = c.tick().await.unwrap();
+    assert!(report.placed.is_empty());
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "one question per worker");
+    let waiting: Vec<_> = c
+        .store()
+        .events_after(0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "task_waiting")
+        .collect();
+    assert_eq!(waiting.len(), 3);
+    for event in waiting {
+        let excluded = &event.payload["decision"]["excluded"][0];
+        assert_eq!(excluded["why"], "capability_mismatch");
+        assert_eq!(
+            excluded["unmet"],
+            serde_json::json!(["toolchain node=20.0.0 unavailable"])
+        );
+    }
+}
+
 #[tokio::test]
 async fn measured_cold_choice_waits_without_attempt_then_failed_prefetch_places_healthy_warm() {
     measured_cold_fixture(true, false, false).await;
