@@ -294,7 +294,15 @@ pub fn try_take_lease(ctx: &Context, id: &str) -> Result<Option<Lock>> {
 
 /// True when some process currently holds the lease lock for `id`.
 pub fn lease_is_held(ctx: &Context, id: &str) -> bool {
+    #[cfg(test)]
+    LEASE_LOOKS.with(|n| n.set(n.get() + 1));
     is_held(&ctx.paths.lease_file(id))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread looked at a lease ([`lease_is_held`]).
+    pub(crate) static LEASE_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Take a *shared* lock on `path` (several holders allowed), held until drop.
@@ -454,21 +462,58 @@ pub const ORPHAN_LEASE_AFTER_SECS: i64 = 3600;
 /// [`ORPHAN_LEASE_AFTER_SECS`] old and only while nobody holds them
 /// ([`remove_if_unheld`]). Returns how many were removed.
 pub fn sweep_orphan_leases(ctx: &Context, ledger: &Ledger) -> usize {
+    let old = old_lease_ids(ctx, &mut || true);
+    remove_orphan_leases(ctx, ledger, &old, &mut || true)
+}
+
+/// The ids of the lease files that are [`ORPHAN_LEASE_AFTER_SECS`] old: the
+/// ones [`remove_orphan_leases`] may remove. Only a listing; no lock is
+/// needed or touched. `go` is asked before each file; false stops.
+pub(crate) fn old_lease_ids(ctx: &Context, go: &mut dyn FnMut() -> bool) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(ctx.paths.leases_dir()) else {
-        return 0;
+        return Vec::new();
     };
     let now = ctx.clock.now();
-    let mut n = 0;
+    let mut ids = Vec::new();
     for ent in rd.flatten() {
+        if !go() {
+            break;
+        }
         let name = ent.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".lock")) else {
             continue;
         };
-        let old = ent
+        if ent
             .metadata()
             .and_then(|m| m.modified())
-            .is_ok_and(|t| orphan_lease_due(t.into(), now));
-        if ledger.find(id).is_none() && old && remove_if_unheld(&ent.path()) {
+            .is_ok_and(|t| orphan_lease_due(t.into(), now))
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Of the old lease files `ids` ([`old_lease_ids`]), remove those `ledger`
+/// has no entry for and nobody holds. The caller holds the ledger lock and
+/// read `ledger` under it. A lease is only looked at (locked for an
+/// instant) here, after its age and the ledger said it is a leftover.
+/// `allow` is asked before each; false stops.
+pub(crate) fn remove_orphan_leases(
+    ctx: &Context,
+    ledger: &Ledger,
+    ids: &[String],
+    allow: &mut dyn FnMut() -> bool,
+) -> usize {
+    let mut n = 0;
+    for id in ids {
+        if ledger.find(id).is_some() {
+            continue;
+        }
+        if !allow() {
+            break;
+        }
+        if remove_if_unheld(&ctx.paths.lease_file(id)) {
             n += 1;
         }
     }

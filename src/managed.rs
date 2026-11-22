@@ -1265,6 +1265,7 @@ fn launch_command(
 /// free the budget with nothing recorded.
 pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()> {
     let id = guard.id.clone();
+    let sweeps = sweeps_after(&kind);
     if guard.managed {
         if guard
             .tracker_unknown
@@ -1321,11 +1322,18 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
     let keep = guard.keep;
     drop(guard);
     // The command is over and its budget free: the retention sweep, when
-    // one is due, delays nobody here. It never fails the caller.
-    if let Some(keep) = keep {
-        let _ = crate::retention::sweep_if_due_keep(ctx, &keep);
+    // one is due. Only after a command that ended well: a caller that
+    // cancels, or has a failure to deal with, gets its answer at once.
+    if let (Some(keep), true) = (keep, sweeps) {
+        crate::retention::after_command(ctx, &keep, &|| false, &|line| eprintln!("{line}"));
     }
     Ok(())
+}
+
+/// Whether [`finish`] runs the retention sweep (when one is due) after a
+/// command that ended as `kind`: only after one that exited with 0.
+pub fn sweeps_after(kind: &TerminalKind) -> bool {
+    matches!(kind, TerminalKind::Exited { code: 0 })
 }
 
 /// Settle a managed entry by hand after investigating it (for example a
@@ -1726,30 +1734,72 @@ pub(crate) fn gc_measurements_locked(ctx: &Context) -> Result<usize> {
 /// repeated registration finds its outcome), and one an hour old that was
 /// never launched or is not JSON and has neither a ledger entry nor a held
 /// lease (a crash between writing the sidecar and saving the ledger left
-/// it). One whose entry is in the ledger, and one whose launch was begun,
-/// are never removed. Files that
-/// are not sidecars are not touched here. Returns how many were removed.
+/// it), and one whose launch was begun (or that another version wrote)
+/// that has neither and was last written `keep_days` ago. One whose entry
+/// is in the ledger is never removed. Files that are not sidecars are not
+/// touched here. Returns how many were removed.
 pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
-    // Under the ledger lock, so a registration cannot slip in between the
-    // look at the ledger and the removal.
+    // Found without the lock, removed under it, so a registration cannot
+    // slip in between the look at the ledger and the removal.
+    let found = sidecar_candidates(ctx, keep_days, &mut || true);
     let _guard = lock::ledger(ctx)?;
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
-    Ok(gc_sidecars_locked(ctx, &ledger, keep_days, &mut || true))
+    Ok(remove_sidecars_locked(
+        ctx,
+        &ledger,
+        &found,
+        keep_days,
+        &mut || true,
+    ))
 }
 
-/// [`gc_sidecars`] for a caller that holds the ledger lock and has read
-/// `ledger` under it. `allow` is asked before each removal; false stops.
-pub(crate) fn gc_sidecars_locked(
+/// What the sidecar of `id` is to the retention rule, as it is on disk now.
+/// `None`: no such file.
+fn sidecar_view(ctx: &Context, id: &str, in_ledger: bool) -> Option<crate::retention::SidecarView> {
+    use crate::retention::SidecarKind;
+    let p = ctx.paths.managed_file(id);
+    let modified = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+    let kind = match load_sidecar(ctx, id) {
+        Loaded::Missing => return None,
+        Loaded::Ok(sc) if sc.phase == Phase::Terminal => {
+            SidecarKind::Ended(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
+        }
+        Loaded::Ok(sc) if sc.phase == Phase::Registered => SidecarKind::NeverLaunched,
+        // Another version's sidecar is JSON too: only what no version
+        // could have finished writing is a leftover.
+        Loaded::Corrupt(_)
+            if std::fs::read(&p)
+                .is_ok_and(|b| serde_json::from_slice::<serde_json::Value>(&b).is_err()) =>
+        {
+            SidecarKind::Unparseable
+        }
+        _ => SidecarKind::Other,
+    };
+    Some(crate::retention::SidecarView {
+        kind,
+        in_ledger,
+        lease_held: false,
+        modified: modified.into(),
+    })
+}
+
+/// The ids of the sidecars that [`crate::retention::sidecar_due`] would let
+/// go if they had no ledger entry and no lease holder, oldest file first:
+/// what [`remove_sidecars_locked`] then looks at again under the ledger
+/// lock. Everything that takes time is done here, without any lock: the
+/// listing, and reading and parsing each file. The oldest come first so
+/// that a sweep that runs out of time has looked at the ones most likely
+/// to go. `go` is asked before each file is read; false stops.
+pub(crate) fn sidecar_candidates(
     ctx: &Context,
-    ledger: &Ledger,
     keep_days: u64,
-    allow: &mut dyn FnMut() -> bool,
-) -> usize {
+    go: &mut dyn FnMut() -> bool,
+) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
-        return 0;
+        return Vec::new();
     };
     let now = ctx.clock.now();
-    let mut removed = 0;
+    let mut old: Vec<(std::time::SystemTime, String)> = Vec::new();
     for ent in rd.filter_map(|e| e.ok()) {
         let p = ent.path();
         let (Some(id), true) = (
@@ -1761,35 +1811,51 @@ pub(crate) fn gc_sidecars_locked(
         let Ok(modified) = ent.metadata().and_then(|m| m.modified()) else {
             continue;
         };
-        use crate::retention::SidecarKind;
-        let view = crate::retention::SidecarView {
-            kind: match load_sidecar(ctx, id) {
-                Loaded::Ok(sc) if sc.phase == Phase::Terminal => {
-                    SidecarKind::Ended(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
-                }
-                Loaded::Ok(sc) if sc.phase == Phase::Registered => SidecarKind::NeverLaunched,
-                // Another version's sidecar is JSON too: only what no
-                // version could have finished writing is a leftover.
-                Loaded::Corrupt(_)
-                    if std::fs::read(&p).is_ok_and(|b| {
-                        serde_json::from_slice::<serde_json::Value>(&b).is_err()
-                    }) =>
-                {
-                    SidecarKind::Unparseable
-                }
-                _ => SidecarKind::Other,
-            },
-            in_ledger: ledger.find(id).is_some(),
-            lease_held: lock::lease_is_held(ctx, id),
-            modified: modified.into(),
-        };
-        if !crate::retention::sidecar_due(&view, now, keep_days) {
+        old.push((modified, id.to_string()));
+    }
+    old.sort();
+    let mut found = Vec::new();
+    for (_, id) in old {
+        if !go() {
+            break;
+        }
+        if sidecar_view(ctx, &id, false)
+            .is_some_and(|v| crate::retention::sidecar_due(&v, now, keep_days))
+        {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// Remove those of the sidecars `ids` ([`sidecar_candidates`]) that the
+/// retention rule lets go. The caller holds the ledger lock and read
+/// `ledger` under it, so no registration can slip in between the look and
+/// the removal. Each one is read again here (it may have been registered
+/// anew since it was found), and its lease is looked at last, only when
+/// everything else says it goes. `allow` is asked before each; false stops.
+pub(crate) fn remove_sidecars_locked(
+    ctx: &Context,
+    ledger: &Ledger,
+    ids: &[String],
+    keep_days: u64,
+    allow: &mut dyn FnMut() -> bool,
+) -> usize {
+    let now = ctx.clock.now();
+    let mut removed = 0;
+    for id in ids {
+        if ledger.find(id).is_some() {
             continue;
         }
         if !allow() {
             break;
         }
-        if std::fs::remove_file(&p).is_ok() {
+        let due = sidecar_view(ctx, id, false)
+            .is_some_and(|v| crate::retention::sidecar_due(&v, now, keep_days));
+        if due
+            && !lock::lease_is_held(ctx, id)
+            && std::fs::remove_file(ctx.paths.managed_file(id)).is_ok()
+        {
             removed += 1;
         }
     }

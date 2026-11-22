@@ -377,10 +377,17 @@ pub enum Ending<'a> {
 /// Nothing is released earlier than without it. `ending` is not called when
 /// the run fails before it has taken its lease.
 ///
-/// After a run that finished, the retention sweep runs when it is due
-/// ([`crate::retention::sweep_if_due`]): the command is over and its entry
-/// released, so it delays nobody's start. Each step that failed is passed
-/// to `hooks.progress` as a `task-traffic-controller: cleanup: ...` line.
+/// After a run that finished by itself, the retention sweep runs when it
+/// is due ([`crate::retention::sweep_if_due`]): the command is over and its
+/// entry released, so it delays nobody's start. Not after a command that a
+/// signal ended, and not when a stop is waiting
+/// ([`crate::Supervisor::stop_pending`]) or `hooks.cancelled` says so; a
+/// stop that arrives during the sweep ends it at its next item. No signal
+/// is taken from the supervisor for this: whatever
+/// [`crate::Supervisor::take_pending`] holds when the run is over is still
+/// there for the caller. Each step that failed is passed to
+/// `hooks.progress` as a `task-traffic-controller: cleanup: ...` line, and
+/// nothing the sweep does, a panic included, changes what is returned.
 pub fn run_gated_with(
     ctx: &Context,
     cfg: &Config,
@@ -409,16 +416,15 @@ pub fn run_gated_with(
         Gate::Finished(exit, record) => (exit, record),
     };
     let _ = managed::append_record(ctx, &record);
-    // Not when a stop signal is waiting: whoever sent it wants this process
-    // gone, not tidying up. (While the sweep runs a signal waits for it: at
-    // most 500 removals and 4 log cuts, and no lock.)
-    if ctx.supervisor.take_pending() != 0 {
-        return Ok(Gated::Finished(exit));
-    }
-    if let Some(report) = crate::retention::sweep_if_due(ctx, cfg) {
-        for e in &report.errors {
-            (hooks.progress)(&format!("task-traffic-controller: cleanup: {e}"));
-        }
+    // Not after a command that was stopped: whoever stopped it wants this
+    // process gone, not tidying up.
+    if !matches!(exit, Exit::Signal(_)) {
+        crate::retention::after_command(
+            ctx,
+            &crate::retention::Keep::of(cfg),
+            hooks.cancelled,
+            hooks.progress,
+        );
     }
     Ok(Gated::Finished(exit))
 }

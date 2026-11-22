@@ -67,6 +67,15 @@ impl TestEnv {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
+    /// Job `id` finished long ago, as far as its descriptor says.
+    fn finished_long_ago(&self, id: &str) {
+        let p = self.state().join(format!("jobs/{id}.json"));
+        let mut job: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert!(job["finished_at"].is_string(), "{job}");
+        job["finished_at"] = "2020-01-01T00:00:00Z".into();
+        fs::write(&p, serde_json::to_vec(&job).unwrap()).unwrap();
+    }
+
     fn state_of(&self, id: &str) -> String {
         self.jobs_json()
             .iter()
@@ -253,16 +262,64 @@ fn submit_prints_an_estimate_from_history() {
 
 #[test]
 fn gc_removes_old_finished_jobs_only() {
-    let env = TestEnv::new("budget = 4\njobs_keep_days = 0\n");
+    let env = TestEnv::new("budget = 4\n");
     let (id, _) = env.submit(&[], "true");
-    assert!(env.run(&["wait", &id]).status.success());
-    // finished_at is "now"; with keep_days = 0 the cutoff is also now, so
-    // the job is already older and gets removed.
-    thread::sleep(Duration::from_millis(1100));
+    let (fresh, _) = env.submit(&[], "true");
+    assert!(env.run(&["wait", &id, &fresh]).status.success());
+    // One finished long ago, one just now: only the first is past
+    // `jobs_keep_days` (a day).
+    env.finished_long_ago(&id);
     let out = env.run(&["gc"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("removed 1 old jobs"), "{text}");
-    assert!(env.jobs_json().is_empty());
+    let left = env.jobs_json();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0]["id"], fresh.as_str());
+}
+
+/// With 0 a job's own runner, sweeping right after the job, would remove
+/// the result before `wait` reads it (`submit A; submit B; wait A B`).
+#[test]
+fn jobs_keep_days_zero_is_refused() {
+    let env = TestEnv::new("budget = 4\njobs_keep_days = 0\n");
+    let out = env.run(&["jobs"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("jobs_keep_days must be between 1 and 3650"),
+        "{err}"
+    );
+}
+
+/// The runner writes the exit code while its entry is still in the queue
+/// (it cannot leave the queue here: the test holds the ledger lock). With
+/// the order the other way round a `wait` could find a job with no entry
+/// and no exit code, and call it lost.
+#[test]
+fn the_runner_records_the_exit_before_it_leaves_the_queue() {
+    use task_traffic_controller::{ledger::Ledger, lock};
+    let env = TestEnv::new("budget = 4\n");
+    let go = env.dir.path().join("go");
+    let (id, _) = env.submit(
+        &[],
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done; exit 4",
+            go.display()
+        ),
+    );
+    assert!(wait_until(Duration::from_secs(10), || env.state_of(&id) == "running"));
+    let held = lock::acquire(&env.state().join("ledger.lock"), Duration::from_secs(10)).unwrap();
+    fs::write(&go, "").unwrap();
+    let exit = env.state().join(format!("jobs/{id}.exit"));
+    assert!(
+        wait_until(Duration::from_secs(8), || exit.exists()),
+        "no exit code while the runner still had its entry"
+    );
+    assert_eq!(fs::read_to_string(&exit).unwrap().trim(), "4");
+    let ledger = Ledger::load(&env.state().join("ledger.json")).unwrap();
+    assert!(ledger.find(&id).is_some(), "the entry was released first");
+    drop(held);
+    assert_eq!(env.run(&["wait", &id]).status.code(), Some(4));
 }
 
 #[test]
@@ -353,10 +410,10 @@ fn exec_and_submit_clean_up_by_themselves_when_the_sweep_is_due() {
 
 #[test]
 fn gc_exits_2_after_doing_the_rest_when_a_step_failed() {
-    let env = TestEnv::new("budget = 4\njobs_keep_days = 0\n");
+    let env = TestEnv::new("budget = 4\n");
     let (id, _) = env.submit(&[], "true");
     assert!(env.run(&["wait", &id]).status.success());
-    thread::sleep(Duration::from_millis(1100));
+    env.finished_long_ago(&id);
     // The stamp can neither be read nor written.
     let stamp = env.state().join("last-sweep");
     let _ = fs::remove_file(&stamp);

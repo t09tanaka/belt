@@ -224,9 +224,37 @@ pub fn remove_output(ctx: &Context, id: &str) -> bool {
     true
 }
 
-/// One cut at a time in a process: the runner's watcher and the end of the
-/// job both cut the same log.
+/// One cut at a time in a process, and no cut by the runner's watcher once
+/// the job has its exit record: the watcher looks for the record and cuts
+/// under this lock ([`cap_running_log`]), and the end of the job makes its
+/// last cut and writes the record under it ([`end`]). Whoever sees the exit
+/// record therefore reads a log that its runner no longer cuts.
 static CUTTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Record how job `id` ended, as its runner: the log is cut to `max_bytes`
+/// first, so that whoever sees the exit file reads the log in its final
+/// size (a failure to cut leaves it whole), and no cut of the runner's can
+/// follow the record. Nothing when the job already has its record.
+pub fn end(ctx: &Context, id: &str, code: i32, max_bytes: u64) {
+    let _one = CUTTING.lock().unwrap_or_else(|p| p.into_inner());
+    if read_exit(ctx, id).is_some() {
+        return;
+    }
+    let _ = cut_log_held(ctx, id, max_bytes, keep_bytes(max_bytes, false));
+    write_exit(ctx, id, code);
+}
+
+/// [`cap_log`] by somebody who is not the job's runner, for a job that is
+/// over: the cut is made while this call holds the waiter lock exclusively
+/// (taken without waiting, as [`remove_files`] does), so no `wait`, of this
+/// or a released version, is reading the log or starts to. `None` when a
+/// `wait` holds the job; nothing was cut then.
+pub fn cap_log_unwaited(ctx: &Context, id: &str, max_bytes: u64) -> Result<Option<bool>> {
+    let Some(_held) = crate::lock::try_acquire(&ctx.paths.job_waiter(id))? else {
+        return Ok(None);
+    };
+    cap_log(ctx, id, max_bytes).map(Some)
+}
 
 /// How much of a log longer than `max_bytes` stays after a cut. At the end
 /// of the job as much as fits behind the note; while it runs half, so that
@@ -254,14 +282,25 @@ pub fn cap_log(ctx: &Context, id: &str, max_bytes: u64) -> Result<bool> {
     cut_log(ctx, id, max_bytes, keep_bytes(max_bytes, false))
 }
 
-/// [`cap_log`] for a job that is still writing ([`keep_bytes`]).
+/// [`cap_log`] for a job that is still writing ([`keep_bytes`]), by its
+/// runner. Nothing is cut once the job has its exit record: a `wait` may be
+/// reading the log from then on ([`end`]).
 pub fn cap_running_log(ctx: &Context, id: &str, max_bytes: u64) -> Result<bool> {
-    cut_log(ctx, id, max_bytes, keep_bytes(max_bytes, true))
+    let _one = CUTTING.lock().unwrap_or_else(|p| p.into_inner());
+    if read_exit(ctx, id).is_some() {
+        return Ok(false);
+    }
+    cut_log_held(ctx, id, max_bytes, keep_bytes(max_bytes, true))
 }
 
 fn cut_log(ctx: &Context, id: &str, max_bytes: u64, keep: u64) -> Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
     let _one = CUTTING.lock().unwrap_or_else(|p| p.into_inner());
+    cut_log_held(ctx, id, max_bytes, keep)
+}
+
+/// [`cut_log`] for a caller that holds [`CUTTING`].
+fn cut_log_held(ctx: &Context, id: &str, max_bytes: u64, keep: u64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
     let path = ctx.paths.job_log(id);
     let mut f = match fs::OpenOptions::new().read(true).append(true).open(&path) {
         Ok(f) => f,
@@ -430,6 +469,52 @@ mod tests {
         assert!(!ctx.paths.job_log("j").exists() && ctx.paths.job_exit("j").exists());
         assert!(remove_files(&ctx, "j"));
         assert_eq!(fs::read_dir(ctx.paths.jobs_dir()).unwrap().count(), 0);
+    }
+
+    /// Whoever sees the exit record reads a log its runner no longer
+    /// cuts: the record is written with the last cut, and the watcher's
+    /// cut looks for the record under the same lock.
+    #[test]
+    fn the_runner_cuts_nothing_once_the_exit_is_recorded() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(d.path());
+        std::fs::create_dir_all(ctx.paths.jobs_dir()).unwrap();
+        let log = ctx.paths.job_log("j");
+        std::fs::write(&log, "line\n".repeat(2000)).unwrap();
+        end(&ctx, "j", 3, 4000);
+        assert_eq!(read_exit(&ctx, "j"), Some(3));
+        // Cut to the limit by the end itself.
+        let len = std::fs::metadata(&log).unwrap().len();
+        assert!(len <= 4000, "{len}");
+        // Something the job left behind writes on: not the runner's to cut
+        // any more.
+        std::fs::write(&log, "line\n".repeat(2000)).unwrap();
+        assert!(!cap_running_log(&ctx, "j", 4000).unwrap());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 10_000);
+        // And the first record stands.
+        end(&ctx, "j", 9, 4000);
+        assert_eq!(read_exit(&ctx, "j"), Some(3));
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 10_000);
+    }
+
+    /// A cut by somebody else than the runner is made under the waiter
+    /// lock, taken without waiting: never while a `wait` holds the job.
+    #[test]
+    fn a_job_a_wait_holds_is_not_cut_by_the_sweep() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(d.path());
+        std::fs::create_dir_all(ctx.paths.jobs_dir()).unwrap();
+        let log = ctx.paths.job_log("j");
+        std::fs::write(&log, "line\n".repeat(2000)).unwrap();
+        let waiter = take_waiter(&ctx, "j").unwrap();
+        assert_eq!(cap_log_unwaited(&ctx, "j", 4000).unwrap(), None);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 10_000);
+        drop(waiter);
+        assert_eq!(cap_log_unwaited(&ctx, "j", 4000).unwrap(), Some(true));
+        assert!(std::fs::metadata(&log).unwrap().len() <= 4000);
+        assert_eq!(cap_log_unwaited(&ctx, "j", 4000).unwrap(), Some(false));
+        // The lock is free again afterwards.
+        assert!(!has_waiter(&ctx, "j"));
     }
 
     #[test]

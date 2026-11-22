@@ -16,7 +16,7 @@
 //! | `history.jsonl` | newest `history_keep` records per key, and only keys seen within `history_keep_days` | sweep |
 //! | `measurements/*.applied` | while the history keeps the record | the trim that drops the record |
 //! | `measurements/*.pending` | none (a dead attempt's) | sweep |
-//! | `managed/<id>.json` | `managed_keep_days` after the command ended; an hour when it was never launched and has no entry, or is not JSON | sweep |
+//! | `managed/<id>.json` | `managed_keep_days` after the command ended, or after it was last written when a launch was begun and it has no entry; an hour when it was never launched and has no entry, or is not JSON | sweep |
 //! | `jobs/<id>.log` | at most `jobs_log_max_mib`, while running too; until `wait` printed it | the runner, `wait`, sweep |
 //! | `jobs/<id>.json`, `.exit` | `jobs_keep_days` after the job finished or was found dead | sweep |
 //! | job files without a readable descriptor, temporary files | an hour, and only when their owner is gone | sweep |
@@ -28,8 +28,12 @@
 //! sweep never waits for a lock (a busy stage is left for the next try,
 //! [`RETRY_AFTER_SECS`] later), never looks at processes other than with
 //! signal 0, does at most [`AUTO_MAX_ACTIONS`] removals and
-//! [`AUTO_MAX_CUTS`] log cuts a time, and never fails the command that
-//! triggered it.
+//! [`AUTO_MAX_CUTS`] log cuts a time, takes at most [`SWEEP_BUDGET`], ends
+//! at its next item when a stop is asked for, and never fails the command
+//! that triggered it, or keeps it from returning.
+//!
+//! The numbers it goes by are the larger of the caller's and those of the
+//! configuration file of the state directory ([`Keep::at_least`]).
 
 use crate::config::Config;
 use crate::error::Result;
@@ -41,12 +45,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::time::Instant;
 
 /// The automatic sweep runs at most this often (per state directory).
 pub const SWEEP_EVERY_SECS: i64 = 6 * 3600;
 
-/// A sweep that left something undone (a lock was busy, or it reached
-/// [`AUTO_MAX_ACTIONS`]) is tried again this long after.
+/// A sweep that left something undone (a lock was busy, it reached
+/// [`AUTO_MAX_ACTIONS`] or [`SWEEP_BUDGET`], or it was stopped) is tried
+/// again this long after.
 pub const RETRY_AFTER_SECS: i64 = 600;
 
 /// The most files one automatic sweep removes, marks or cuts. What is left
@@ -56,6 +62,15 @@ pub const AUTO_MAX_ACTIONS: usize = 500;
 /// The most job logs one automatic sweep cuts: a cut copies the part it
 /// keeps, up to `jobs_log_max_mib`.
 pub const AUTO_MAX_CUTS: usize = 4;
+
+/// How long one automatic sweep may take, by the wall clock
+/// ([`Context::sweep_budget`]). The sweep runs in the process whose command
+/// just ended, so it is what the caller waits for after its result is
+/// known: a fifth of a second is not noticed after a command worth
+/// queueing, and is some thousand small files. It is looked at between two
+/// items (a file looked at or removed, one log cut, one rewrite of the
+/// history), so the sweep ends at most one item later. `gc` has no budget.
+pub const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A job with no exit file, no ledger entry and no lease older than this is
 /// dead (its runner was killed). Far above the few seconds a runner needs
@@ -67,10 +82,6 @@ pub const DEAD_JOB_AFTER_SECS: i64 = 3600;
 /// before the sweep removes it (an atomic write takes milliseconds; this is
 /// a margin for a stalled machine).
 pub const STRAY_AFTER_SECS: i64 = 3600;
-
-/// How long the retention numbers another program asked for in this state
-/// directory stay in force after its last sweep ([`effective`]).
-pub const ASK_TTL_SECS: i64 = 30 * 86_400;
 
 /// At most this many failed steps are spelled out in [`Report::errors`].
 const MAX_ERRORS: usize = 8;
@@ -96,26 +107,25 @@ impl Keep {
         }
     }
 
-    fn fields(&self) -> [(&'static str, u64); 5] {
-        [
-            ("history_keep", self.history_keep),
-            ("history_keep_days", self.history_keep_days),
-            ("jobs_keep_days", self.jobs_keep_days),
-            ("jobs_log_max_mib", self.jobs_log_max_mib),
-            ("managed_keep_days", self.managed_keep_days),
-        ]
-    }
-
-    fn with(mut self, name: &str, value: u64) -> Keep {
-        match name {
-            "history_keep" => self.history_keep = value,
-            "history_keep_days" => self.history_keep_days = value,
-            "jobs_keep_days" => self.jobs_keep_days = value,
-            "jobs_log_max_mib" => self.jobs_log_max_mib = value,
-            "managed_keep_days" => self.managed_keep_days = value,
-            _ => {}
+    /// The numbers a sweep goes by: for each one the larger of the
+    /// caller's own (`self`) and the one in the configuration file of the
+    /// state directory (`file`; the defaults when there is no such file or
+    /// it is not valid).
+    ///
+    /// Programs with different configurations may share a state directory
+    /// (the `task-traffic-controller` command and a program that embeds the
+    /// library), and neither may remove what the other still wants. The
+    /// file is what the command goes by, so every sweep reads it; nothing
+    /// is recorded, and a number changed in the file counts from the next
+    /// sweep on.
+    pub fn at_least(self, file: &Keep) -> Keep {
+        Keep {
+            history_keep: self.history_keep.max(file.history_keep),
+            history_keep_days: self.history_keep_days.max(file.history_keep_days),
+            jobs_keep_days: self.jobs_keep_days.max(file.jobs_keep_days),
+            jobs_log_max_mib: self.jobs_log_max_mib.max(file.jobs_log_max_mib),
+            managed_keep_days: self.managed_keep_days.max(file.managed_keep_days),
         }
-        self
     }
 
     /// `jobs_log_max_mib` in bytes.
@@ -124,74 +134,29 @@ impl Keep {
     }
 }
 
-/// A number somebody asked the sweep of this state directory to keep by.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Ask {
-    pub value: u64,
-    pub at: DateTime<Utc>,
-}
+/// Said once in a process: the configuration file cannot be used.
+static CONFIG_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The numbers a sweep goes by, and what to record for the next one.
-///
-/// Programs with different configurations may share a state directory (the
-/// `task-traffic-controller` command and a program that embeds the
-/// library). Neither may remove what the other still wants, so for each
-/// number the larger one wins: `asked` is what the stamp file recorded from
-/// earlier sweeps, and a recorded number larger than `own` stays in force
-/// for [`ASK_TTL_SECS`] after the sweep that last asked for at least that
-/// much. A program that stops using the directory (or lowers its number)
-/// therefore stops counting 30 days later.
-pub fn effective(
-    own: &Keep,
-    asked: &BTreeMap<String, Ask>,
-    now: DateTime<Utc>,
-) -> (Keep, BTreeMap<String, Ask>) {
-    let mut keep = *own;
-    let mut record = BTreeMap::new();
-    for (name, mine) in own.fields() {
-        let other = asked
-            .get(name)
-            .filter(|a| a.value > mine && a.at <= now && !age_at_least(a.at, now, ASK_TTL_SECS));
-        let ask = match other {
-            Some(a) => a.clone(),
-            None => Ask {
-                value: mine,
-                at: now,
-            },
-        };
-        keep = keep.with(name, ask.value);
-        record.insert(name.to_string(), ask);
-    }
-    (keep, record)
-}
-
-/// What a program that is not sweeping writes into the stamp, if anything:
-/// its own numbers, when one of them is larger than what is recorded (or
-/// nothing valid is), or when its own record is [`ASK_REFRESH_SECS`] old.
-/// Without this only the program that happens to do the sweep would be
-/// heard, and a program that never sweeps would be forgotten after
-/// [`ASK_TTL_SECS`] while in daily use. `None`: nothing to write.
-pub fn refreshed_asks(
-    own: &Keep,
-    asked: &BTreeMap<String, Ask>,
-    now: DateTime<Utc>,
-) -> Option<BTreeMap<String, Ask>> {
-    let (_, record) = effective(own, asked, now);
-    let stale = record.iter().any(|(name, ask)| match asked.get(name) {
-        Some(old) if old == ask => false,
-        // Ours either way (a larger valid one would have been kept as it
-        // is): new or changed, or the same number with an old date.
-        Some(old) if old.value == ask.value => {
-            old.at > now || age_at_least(old.at, now, ASK_REFRESH_SECS)
+/// The retention numbers of the configuration file of this state directory
+/// ([`crate::Paths::config_file`]: the file the `task-traffic-controller`
+/// command reads). No file: the defaults. A file that cannot be read or is
+/// not valid: the defaults too, and that is noted, once in a process.
+fn file_keep(ctx: &Context, errors: &mut Errors) -> Keep {
+    let path = ctx.paths.config_file();
+    match Config::load(path) {
+        Ok(cfg) => Keep::of(&cfg),
+        Err(e) => {
+            if !CONFIG_SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                errors.note(format_args!(
+                    "{}: {e}; the cleanup goes by the defaults where they keep more than \
+                     the numbers of this program",
+                    path.display()
+                ));
+            }
+            Keep::of(&Config::default())
         }
-        _ => true,
-    });
-    stale.then_some(record)
+    }
 }
-
-/// How old a program's own recorded numbers may get before it writes them
-/// again ([`refreshed_asks`]): at most one small write a day per program.
-pub const ASK_REFRESH_SECS: i64 = 86_400;
 
 /// `days` days before `now`; `None` when that is before the calendar
 /// begins, so no number in a configuration can make the arithmetic fail:
@@ -219,7 +184,8 @@ pub struct Report {
     /// Steps that failed; the others still ran.
     pub errors: Vec<String>,
     /// False when something was left for the next sweep: a lock was busy,
-    /// or the sweep reached [`AUTO_MAX_ACTIONS`].
+    /// the sweep reached [`AUTO_MAX_ACTIONS`] or its time budget, or a stop
+    /// was asked for.
     pub complete: bool,
 }
 
@@ -244,8 +210,8 @@ impl fmt::Display for Report {
 
 // --------------------------------------------------------------- stamp
 
-/// The stamp file (`last-sweep`): when the sweep last finished, when it was
-/// last tried, and the numbers asked for ([`effective`]).
+/// The stamp file (`last-sweep`): when the sweep last finished and when it
+/// was last tried. Only what the throttle needs.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stamp {
     /// When a sweep last did everything.
@@ -254,8 +220,6 @@ pub struct Stamp {
     /// When a sweep was last started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub asked: BTreeMap<String, Ask>,
 }
 
 /// What reading the stamp file gave.
@@ -316,17 +280,22 @@ fn read_stamp(path: &Path) -> StampRead {
     }
 }
 
-/// Written in place (the file keeps its inode, which the single-sweeper
-/// lock is on). A reader that catches it half-written finds it unreadable,
-/// which only means "due".
+/// Written whole or not at all: a temporary file beside it, then a rename,
+/// so no reader ever finds half a stamp. (The file the name points to
+/// changes with every write; see [`sweep_if_due`] for why the lock on it
+/// still lets only one process sweep.)
 fn write_stamp(path: &Path, stamp: &Stamp) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_string(stamp).map_err(std::io::Error::other)?,
-    )
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = crate::paths::temp_file_in(dir)?;
+    tmp.write_all(
+        serde_json::to_string(stamp)
+            .map_err(std::io::Error::other)?
+            .as_bytes(),
+    )?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Run the sweep when it is due ([`due`]); `None` when it is not, or when
@@ -335,36 +304,42 @@ fn write_stamp(path: &Path, stamp: &Stamp) -> std::io::Result<()> {
 /// ignore the result.
 ///
 /// The library calls this itself at the end of [`crate::exec::run_gated`]
-/// and of [`crate::managed::finish`]: after the command, never before it. A
-/// program that writes state by other means (only
-/// [`crate::managed::record_measurement`], say) calls it from its own entry
-/// points, after its work.
+/// and of [`crate::managed::finish`]: after the command, never before it,
+/// and only when the command ended by itself. A program that writes state
+/// by other means (only [`crate::managed::record_measurement`], say) calls
+/// it from its own entry points, after its work.
+///
+/// It takes at most [`Context::sweep_budget`] and ends early, at the next
+/// item, when [`crate::Supervisor::stop_pending`] says a stop was asked
+/// for; what is left is done [`RETRY_AFTER_SECS`] later.
+///
+/// One process sweeps at a time: the stamp is read again under a lock on
+/// the stamp file, and the sweeper writes its start into the stamp before
+/// it does anything. A process that locks the file an earlier write
+/// replaced therefore still reads, by name, a stamp that says "not due".
 pub fn sweep_if_due(ctx: &Context, cfg: &Config) -> Option<Report> {
-    sweep_if_due_keep(ctx, &Keep::of(cfg))
+    sweep_if_due_keep(ctx, &Keep::of(cfg), &|| false)
 }
 
-pub(crate) fn sweep_if_due_keep(ctx: &Context, own: &Keep) -> Option<Report> {
+/// [`sweep_if_due`] with the caller's numbers and one more thing that can
+/// ask for a stop.
+pub(crate) fn sweep_if_due_keep(
+    ctx: &Context,
+    own: &Keep,
+    stop: &dyn Fn() -> bool,
+) -> Option<Report> {
+    let stop = || stop() || ctx.supervisor.stop_pending();
+    if stop() {
+        return None;
+    }
     let path = ctx.paths.sweep_stamp();
-    let read = read_stamp(&path);
     let now = ctx.clock.now();
-    match due(&read, now) {
-        Due::No => {
-            // Not sweeping: still say what this program keeps by, so the
-            // one that does sweep goes by the larger numbers.
-            if let StampRead::Read(stamp) = read {
-                if let Some(asked) = refreshed_asks(own, &stamp.asked, now) {
-                    if let Ok(Some(_one)) = lock::try_acquire(&path) {
-                        let _ = write_stamp(&path, &Stamp { asked, ..stamp });
-                    }
-                }
-            }
-            return None;
-        }
+    match due(&read_stamp(&path), now) {
+        Due::No => return None,
         Due::Arm => {
             let armed = Stamp {
                 complete: Some(now),
                 attempt: None,
-                asked: effective(own, &BTreeMap::new(), now).1,
             };
             // A stamp that cannot be written must not mean "never sweep".
             if write_stamp(&path, &armed).is_ok() {
@@ -380,30 +355,133 @@ pub(crate) fn sweep_if_due_keep(ctx: &Context, own: &Keep) -> Option<Report> {
         Ok(Some(lock)) => Some(lock),
         Err(_) => None,
     };
-    Some(run(ctx, own, read, true))
+    // Again, now that nobody else can be deciding: another process may
+    // just have swept, or be sweeping with its lock on the file that was
+    // here a moment ago.
+    let before = match read_stamp(&path) {
+        StampRead::Read(s) if due(&StampRead::Read(s.clone()), now) == Due::No => return None,
+        StampRead::Read(s) => s,
+        _ => Stamp::default(),
+    };
+    Some(run(ctx, own, before, Some(ctx.sweep_budget), &stop))
 }
+
+/// The sweep the library runs by itself after a command: when it is due,
+/// within the budget, and never in the caller's way. `stop` is one more
+/// thing that can ask for a stop (a caller's own cancellation). Each failed
+/// step is given to `say` as a `task-traffic-controller: cleanup: ...`
+/// line, and a line already said in this process is not said again. A
+/// panic in the sweep ends here: it is said once and the caller goes on.
+pub(crate) fn after_command(
+    ctx: &Context,
+    own: &Keep,
+    stop: &dyn Fn() -> bool,
+    say: &dyn Fn(&str),
+) {
+    let swept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sweep_if_due_keep(ctx, own, stop)
+    }));
+    let lines = match swept {
+        Ok(report) => report.map_or(Vec::new(), |r| r.errors),
+        Err(_) => vec![
+            "stopped by an internal error (see above); the command is not \
+                        affected, and the cleanup is tried again later"
+                .to_string(),
+        ],
+    };
+    for line in lines {
+        if first_time(&line) {
+            // Whoever is told may fail too: that is not the caller's
+            // business either.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                say(&format!("task-traffic-controller: cleanup: {line}"))
+            }));
+        }
+    }
+}
+
+/// Whether `line` was not said before in this process (the first
+/// [`SAID_MAX`] different lines are remembered; after that nothing new is
+/// said).
+fn first_time(line: &str) -> bool {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+    if said.len() >= SAID_MAX || said.iter().any(|s| s == line) {
+        return false;
+    }
+    said.push(line.to_string());
+    true
+}
+
+/// How many different cleanup lines a process says ([`after_command`]).
+const SAID_MAX: usize = 32;
 
 /// Apply every retention rule now (what `gc` does): the same rules as the
 /// automatic sweep, but it waits for the locks, has no limit on how much it
-/// removes, and scans processes to release managed entries whose owner is
-/// gone. Every step runs even when an earlier one failed.
+/// removes or how long it takes, and scans processes to release managed
+/// entries whose owner is gone. Every step runs even when an earlier one
+/// failed.
+///
+/// It does not take the sweeper's lock (an automatic sweep at the same
+/// time does no harm: every stage has its own lock); it writes the stamp
+/// the same way, whole, so it cannot damage it.
 pub fn sweep(ctx: &Context, cfg: &Config) -> Report {
-    let read = read_stamp(&ctx.paths.sweep_stamp());
-    run(ctx, &Keep::of(cfg), read, false)
+    let before = match read_stamp(&ctx.paths.sweep_stamp()) {
+        StampRead::Read(s) => s,
+        _ => Stamp::default(),
+    };
+    run(ctx, &Keep::of(cfg), before, None, &|| false)
+}
+
+/// Whether the time is up: `end` is when (`None`: never).
+pub fn time_is_up(end: Option<Instant>, now: Instant) -> bool {
+    end.is_some_and(|end| now >= end)
+}
+
+/// The end of a stage that starts at `now`, when the whole sweep ends at
+/// `end` and `stages` stages are still to run (this one included): an equal
+/// share of what is left, so a stage that has much to look at cannot keep
+/// the later ones from ever running.
+pub fn stage_end(end: Option<Instant>, now: Instant, stages: u32) -> Option<Instant> {
+    let end = end?;
+    Some(now + end.saturating_duration_since(now) / stages.max(1))
 }
 
 /// What is left of a sweep's allowance.
-struct Allowance {
+struct Allowance<'a> {
     left: usize,
     /// Log cuts left: each copies up to `jobs_log_max_mib`.
     cuts: usize,
+    /// When the sweep must be over (`None`: no budget).
+    end: Option<Instant>,
+    /// When the stage that is running must be ([`stage_end`]).
+    stage: Option<Instant>,
+    stop: &'a dyn Fn() -> bool,
     /// Something was left undone.
     short: bool,
 }
 
-impl Allowance {
+impl Allowance<'_> {
+    /// A stage begins; `stages` are left, this one included.
+    fn begin(&mut self, stages: u32) {
+        self.stage = stage_end(self.end, Instant::now(), stages);
+    }
+
+    /// Whether the sweep may go on to its next item: there is time left
+    /// and nobody asked for a stop. Notes when it may not.
+    fn go(&mut self) -> bool {
+        if time_is_up(self.stage, Instant::now()) || (self.stop)() {
+            self.short = true;
+            return false;
+        }
+        true
+    }
+
     /// Whether one more action may be done; notes when it may not.
     fn take(&mut self) -> bool {
+        if !self.go() {
+            return false;
+        }
         if self.left == 0 {
             self.short = true;
             return false;
@@ -448,19 +526,22 @@ impl Errors {
     }
 }
 
-fn run(ctx: &Context, own: &Keep, read: StampRead, auto: bool) -> Report {
+/// The sweep. `budget`: `None` is `gc` (wait for the locks, no limits).
+fn run(
+    ctx: &Context,
+    own: &Keep,
+    before: Stamp,
+    budget: Option<std::time::Duration>,
+    stop: &dyn Fn() -> bool,
+) -> Report {
+    let started = Instant::now();
+    let auto = budget.is_some();
     let now = ctx.clock.now();
     let path = ctx.paths.sweep_stamp();
-    let before = match read {
-        StampRead::Read(s) => s,
-        _ => Stamp::default(),
-    };
-    let (keep, asked) = effective(own, &before.asked, now);
     // Before the work, so that a process arriving meanwhile stays away.
     let mut stamp = Stamp {
         complete: before.complete,
         attempt: Some(now),
-        asked,
     };
     let mut stamp_error = write_stamp(&path, &stamp).err();
 
@@ -469,14 +550,23 @@ fn run(ctx: &Context, own: &Keep, read: StampRead, auto: bool) -> Report {
         shown: Vec::new(),
         more: 0,
     };
+    let keep = own.at_least(&file_keep(ctx, &mut errors));
     let mut allow = Allowance {
         left: if auto { AUTO_MAX_ACTIONS } else { usize::MAX },
         cuts: if auto { AUTO_MAX_CUTS } else { usize::MAX },
+        end: budget.map(|b| started + b),
+        stage: None,
+        stop,
         short: false,
     };
 
-    // The ledger, dead entries, leases nobody has, managed receipts: all
-    // under the ledger lock.
+    // Stage 1: dead ledger entries, leases nobody has, managed receipts.
+    // What may go is found first, without any lock (the listing, the reads
+    // and the parsing); the ledger lock is then held only to look at each
+    // of those again and remove it, which the allowance bounds.
+    allow.begin(4);
+    let leases = lock::old_lease_ids(ctx, &mut || allow.go());
+    let sidecars = managed::sidecar_candidates(ctx, keep.managed_keep_days, &mut || allow.go());
     if !auto {
         lock::refresh_verdicts(ctx);
     }
@@ -493,51 +583,69 @@ fn run(ctx: &Context, own: &Keep, read: StampRead, auto: bool) -> Report {
         Some(_guard) => {
             if let Some((l, reaped)) = errors.ok("ledger", reap(ctx)) {
                 r.reaped = reaped;
-                lock::sweep_orphan_leases(ctx, &l);
-                r.receipts_removed =
-                    managed::gc_sidecars_locked(ctx, &l, keep.managed_keep_days, &mut || {
-                        allow.take()
-                    });
+                lock::remove_orphan_leases(ctx, &l, &leases, &mut || allow.take());
+                r.receipts_removed = managed::remove_sidecars_locked(
+                    ctx,
+                    &l,
+                    &sidecars,
+                    keep.managed_keep_days,
+                    &mut || allow.take(),
+                );
                 ledger = Some(l);
             }
         }
     }
+    // The jobs and the stray files only need to know which ids have an
+    // entry. With the lock busy the ledger is read as it is (it is replaced
+    // whole, never written in place): an entry added since is a command
+    // that holds its lease, which is asked before anything of it goes.
+    let ledger = ledger.or_else(|| errors.ok("ledger", Ledger::load(&ctx.paths.ledger_file())));
 
-    // The history and the measurement markers: under the history lock.
-    let guard = if auto {
-        errors
-            .ok("history", lock::try_acquire(&ctx.paths.history_lock()))
-            .flatten()
-    } else {
-        errors.ok(
-            "history",
-            lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout),
-        )
-    };
-    match guard {
-        None => allow.short = true,
-        Some(_guard) => {
-            r.history_dropped = errors
-                .ok(
-                    "history",
-                    managed::trim_history_locked(
-                        ctx,
-                        usize::try_from(keep.history_keep).unwrap_or(usize::MAX),
-                        // No cutoff when the number of days is beyond the
-                        // calendar: no key is then too old.
-                        days_before(now, keep.history_keep_days),
-                    ),
-                )
-                .unwrap_or(0);
-            r.markers_removed = errors
-                .ok("measurements", managed::gc_measurements_locked(ctx))
-                .unwrap_or(0);
+    // Stage 2: the history and the measurement markers, under the history
+    // lock. One rewrite of the history is one item.
+    allow.begin(3);
+    if allow.go() {
+        let guard = if auto {
+            errors
+                .ok("history", lock::try_acquire(&ctx.paths.history_lock()))
+                .flatten()
+        } else {
+            errors.ok(
+                "history",
+                lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout),
+            )
+        };
+        match guard {
+            None => allow.short = true,
+            Some(_guard) => {
+                r.history_dropped = errors
+                    .ok(
+                        "history",
+                        managed::trim_history_locked(
+                            ctx,
+                            usize::try_from(keep.history_keep).unwrap_or(usize::MAX),
+                            // No cutoff when the number of days is beyond
+                            // the calendar: no key is then too old.
+                            days_before(now, keep.history_keep_days),
+                        ),
+                    )
+                    .unwrap_or(0);
+                if allow.go() {
+                    r.markers_removed = errors
+                        .ok("measurements", managed::gc_measurements_locked(ctx))
+                        .unwrap_or(0);
+                }
+            }
         }
     }
 
     if let Some(ledger) = &ledger {
+        allow.begin(2);
         sweep_jobs(ctx, &keep, ledger, &mut r, &mut errors, &mut allow);
+        allow.begin(1);
         sweep_strays(ctx, ledger, &mut r, &mut errors, &mut allow);
+    } else {
+        allow.short = true;
     }
 
     r.complete = !allow.short;
@@ -582,8 +690,9 @@ pub enum SidecarKind {
     NeverLaunched,
     /// Not JSON at all: a write that was cut short.
     Unparseable,
-    /// A launch was begun, or the file is another version's: only
-    /// `resolve` (or its owner) settles it.
+    /// A launch was begun, or the file is another version's. With a
+    /// ledger entry it is the reaper's or `resolve`'s to settle; without
+    /// one nothing ever looks at it again.
     Other,
 }
 
@@ -603,18 +712,26 @@ pub struct SidecarView {
 /// `managed_keep_days` after it (a repeated registration finds the outcome
 /// until then). One that was never launched, or is not JSON, goes once the
 /// file is [`STRAY_AFTER_SECS`] old: nothing was started for it. One whose
-/// launch was begun stays: a process of it may be alive, and removing the
-/// record would let the same id be started again (see `resolve`).
+/// launch was begun, or that another version wrote, goes when the file was
+/// last written `managed_keep_days` ago: with an entry it is held for
+/// `resolve`, but without one (the ledger was lost, or the release could
+/// not be written down) nothing charges for it or settles it any more, and
+/// the same time a finished one is remembered is given to it.
+///
+/// The caller asks for the lease last, and only for a sidecar that would
+/// go with `lease_held` false: looking at a lease locks it for an instant,
+/// which a released version that is taking it does not forgive.
 pub fn sidecar_due(v: &SidecarView, now: DateTime<Utc>, keep_days: u64) -> bool {
     if v.in_ledger || v.lease_held {
         return false;
     }
+    let kept_days = |t: DateTime<Utc>| days_before(now, keep_days).is_some_and(|cutoff| t < cutoff);
     match v.kind {
-        SidecarKind::Ended(t) => days_before(now, keep_days).is_some_and(|cutoff| t < cutoff),
+        SidecarKind::Ended(t) => kept_days(t),
         SidecarKind::NeverLaunched | SidecarKind::Unparseable => {
             age_at_least(v.modified, now, STRAY_AFTER_SECS)
         }
-        SidecarKind::Other => false,
+        SidecarKind::Other => kept_days(v.modified),
     }
 }
 
@@ -784,8 +901,11 @@ fn list_files(dir: &Path) -> Vec<FileInfo> {
         .collect()
 }
 
+/// Whether somebody may still use job `id`. The ledger is looked at first
+/// (it costs nothing) and the locks last: looking at a lease locks it for
+/// an instant.
 fn job_is_live(ctx: &Context, ledger: &Ledger, id: &str) -> bool {
-    ledger.find(id).is_some() || lock::lease_is_held(ctx, id) || jobs::has_waiter(ctx, id)
+    ledger.find(id).is_some() || jobs::has_waiter(ctx, id) || lock::lease_is_held(ctx, id)
 }
 
 /// Apply [`job_action`] to every job, and cut the logs of the jobs that are
@@ -800,65 +920,63 @@ fn sweep_jobs(
 ) {
     let now = ctx.clock.now();
     let max = keep.jobs_log_max_bytes();
+    if !allow.go() {
+        return;
+    }
     let Some(all) = errors.ok("jobs", jobs::list(ctx)) else {
         return;
     };
     for job in all {
-        let live = job_is_live(ctx, ledger, &job.id);
-        let exit_written = std::fs::metadata(ctx.paths.job_exit(&job.id))
-            .and_then(|m| m.modified())
-            .ok()
-            .map(DateTime::<Utc>::from);
+        if !allow.go() {
+            return;
+        }
+        let exit_written = match job.finished_at {
+            Some(_) => None,
+            None => std::fs::metadata(ctx.paths.job_exit(&job.id))
+                .and_then(|m| m.modified())
+                .ok()
+                .map(DateTime::<Utc>::from),
+        };
+        // What would be done if nobody used the job: whether somebody does
+        // is asked last, and only when there is something to do.
         let view = JobView {
             finished_at: job.finished_at,
             submitted_at: job.submitted_at,
             exit_written,
-            live,
+            live: false,
         };
         let action = job_action(&view, now, keep.jobs_keep_days);
+        let over = std::fs::metadata(ctx.paths.job_log(&job.id)).is_ok_and(|m| m.len() > max);
+        if (action == JobAction::Keep && !over) || job_is_live(ctx, ledger, &job.id) {
+            continue;
+        }
         if action != JobAction::Keep && !allow.take() {
             return;
         }
+        let id = job.id.clone();
         match action {
             JobAction::Remove => {
                 // False when a `wait` took the job meanwhile: it stays.
-                if jobs::remove_files(ctx, &job.id) {
+                if jobs::remove_files(ctx, &id) {
                     r.jobs_removed += 1;
                 }
                 continue;
             }
-            JobAction::MarkFinished(t) => {
-                let id = job.id.clone();
-                match mark_finished(ctx, job, t) {
-                    Ok(()) => r.jobs_found_dead += 1,
-                    Err(e) => errors.note(format_args!("job {id}: {e}")),
-                }
-                cut_log(ctx, &id, live, max, r, errors, allow);
-            }
-            JobAction::Keep => cut_log(ctx, &job.id, live, max, r, errors, allow),
+            JobAction::MarkFinished(t) => match mark_finished(ctx, job, t) {
+                Ok(()) => r.jobs_found_dead += 1,
+                Err(e) => errors.note(format_args!("job {id}: {e}")),
+            },
+            JobAction::Keep => {}
         }
-    }
-}
-
-/// Cut the log of a job that is over (a running job's runner cuts its own;
-/// a job a `wait` holds may be being read).
-fn cut_log(
-    ctx: &Context,
-    id: &str,
-    live: bool,
-    max: u64,
-    r: &mut Report,
-    errors: &mut Errors,
-    allow: &mut Allowance,
-) {
-    let over = std::fs::metadata(ctx.paths.job_log(id)).is_ok_and(|m| m.len() > max);
-    if live || !over || !allow.take_cut() {
-        return;
-    }
-    match jobs::cap_log(ctx, id, max) {
-        Ok(true) => r.logs_cut += 1,
-        Ok(false) => {}
-        Err(e) => errors.note(format_args!("job {id}: log: {e}")),
+        if over && allow.take_cut() {
+            // Nothing when a `wait` took the job meanwhile: it may be
+            // reading the log.
+            match jobs::cap_log_unwaited(ctx, &id, max) {
+                Ok(Some(true)) => r.logs_cut += 1,
+                Ok(_) => {}
+                Err(e) => errors.note(format_args!("job {id}: log: {e}")),
+            }
+        }
     }
 }
 
@@ -891,6 +1009,9 @@ fn sweep_strays(
         }
     }
     for (dir, legacy) in dirs {
+        if !allow.go() {
+            return;
+        }
         for name in stale_temp_files(&list_files(&dir), &pid_alive, legacy, now) {
             if !allow.take() {
                 return;
@@ -901,6 +1022,9 @@ fn sweep_strays(
                 Err(e) => errors.note(format_args!("{}: {e}", dir.join(&name).display())),
             }
         }
+    }
+    if !allow.go() {
+        return;
     }
     let Some(jobs) = errors.ok("jobs", jobs::list(ctx)) else {
         return;
@@ -931,7 +1055,6 @@ mod tests {
         StampRead::Read(Stamp {
             complete: complete.map(t),
             attempt: attempt.map(t),
-            asked: BTreeMap::new(),
         })
     }
 
@@ -980,90 +1103,54 @@ mod tests {
     }
 
     #[test]
-    fn the_larger_number_wins_for_thirty_days_after_it_was_last_asked_for() {
-        let now = t(0);
-        let ask = |value, at| Ask { value, at: t(at) };
-        let mut asked = BTreeMap::new();
-        // Larger and recent: wins and keeps its date.
-        asked.insert("history_keep".to_string(), ask(200, -5));
-        // Larger but exactly at the limit: no longer counts.
-        asked.insert("history_keep_days".to_string(), ask(90, -ASK_TTL_SECS));
-        // One second inside the limit: still counts.
-        asked.insert("jobs_keep_days".to_string(), ask(90, -ASK_TTL_SECS + 1));
-        // Equal: ours, dated now. Smaller: ours.
-        asked.insert("jobs_log_max_mib".to_string(), ask(50, -5));
-        asked.insert("managed_keep_days".to_string(), ask(7, -5));
-        // Not a number of ours: dropped.
-        asked.insert("other".to_string(), ask(9999, -5));
-        let (got, record) = effective(&keep(50), &asked, now);
-        assert_eq!(
-            got,
-            Keep {
-                history_keep: 200,
-                history_keep_days: 50,
-                jobs_keep_days: 90,
-                jobs_log_max_mib: 50,
-                managed_keep_days: 50,
-            }
-        );
-        assert_eq!(record.len(), 5);
-        assert_eq!(record["history_keep"], ask(200, -5));
-        assert_eq!(record["history_keep_days"], ask(50, 0));
-        assert_eq!(record["jobs_keep_days"], ask(90, -ASK_TTL_SECS + 1));
-        assert_eq!(record["jobs_log_max_mib"], ask(50, 0));
-        assert_eq!(record["managed_keep_days"], ask(50, 0));
-        // An ask dated in the future (the clock went back) does not count.
-        let mut future = BTreeMap::new();
-        future.insert("history_keep".to_string(), ask(200, 1));
-        assert_eq!(effective(&keep(50), &future, now).0, keep(50));
-        // The program that asked for more refreshes its own date.
-        let (_, again) = effective(&keep(200), &record, now);
-        assert_eq!(again["history_keep"], ask(200, 0));
+    fn each_number_is_the_larger_of_the_callers_and_the_files() {
+        let own = Keep {
+            history_keep: 10,
+            history_keep_days: 20,
+            jobs_keep_days: 30,
+            jobs_log_max_mib: 40,
+            managed_keep_days: 50,
+        };
+        let file = Keep {
+            history_keep: 11,
+            history_keep_days: 19,
+            jobs_keep_days: 31,
+            jobs_log_max_mib: 39,
+            managed_keep_days: 51,
+        };
+        let both = Keep {
+            history_keep: 11,
+            history_keep_days: 20,
+            jobs_keep_days: 31,
+            jobs_log_max_mib: 40,
+            managed_keep_days: 51,
+        };
+        assert_eq!(own.at_least(&file), both);
+        assert_eq!(file.at_least(&own), both);
+        assert_eq!(own.at_least(&own), own);
     }
 
     #[test]
-    fn a_program_that_does_not_sweep_records_its_numbers_once_a_day_or_when_they_rise() {
-        let now = t(0);
-        let ask = |value, at| Ask { value, at: t(at) };
-        let all = |value, at| -> BTreeMap<String, Ask> {
-            keep(0)
-                .fields()
-                .iter()
-                .map(|(n, _)| (n.to_string(), ask(value, at)))
-                .collect()
-        };
-        // Nothing recorded: write ours.
-        assert_eq!(
-            refreshed_asks(&keep(50), &BTreeMap::new(), now),
-            Some(all(50, 0))
-        );
-        // Ours, recorded less than a day ago: nothing to write.
-        assert_eq!(
-            refreshed_asks(&keep(50), &all(50, -ASK_REFRESH_SECS + 1), now),
-            None
-        );
-        // A day old: written again, so it does not run out while in use.
-        assert_eq!(
-            refreshed_asks(&keep(50), &all(50, -ASK_REFRESH_SECS), now),
-            Some(all(50, 0))
-        );
-        // Ours is larger than the record: written at once.
-        assert_eq!(
-            refreshed_asks(&keep(200), &all(50, -5), now),
-            Some(all(200, 0))
-        );
-        // Another program's larger numbers: left exactly as they are.
-        assert_eq!(refreshed_asks(&keep(50), &all(200, -5 * DAY), now), None);
-        // ...until they run out.
-        assert_eq!(
-            refreshed_asks(&keep(50), &all(200, -ASK_TTL_SECS), now),
-            Some(all(50, 0))
-        );
-        // A date in the future is replaced.
-        assert_eq!(
-            refreshed_asks(&keep(50), &all(50, 5), now),
-            Some(all(50, 0))
-        );
+    fn the_time_is_up_at_the_end_and_never_without_one() {
+        let now = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert!(!time_is_up(None, now));
+        assert!(!time_is_up(Some(now + ms(1)), now));
+        assert!(time_is_up(Some(now), now));
+        assert!(time_is_up(Some(now), now + ms(1)));
+    }
+
+    #[test]
+    fn a_stage_gets_an_equal_share_of_what_is_left() {
+        let now = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(stage_end(None, now, 4), None);
+        assert_eq!(stage_end(Some(now + ms(200)), now, 4), Some(now + ms(50)));
+        assert_eq!(stage_end(Some(now + ms(200)), now, 1), Some(now + ms(200)));
+        // Nothing left: the stage is over as it begins.
+        assert_eq!(stage_end(Some(now), now + ms(5), 2), Some(now + ms(5)));
+        // Never a division by nothing.
+        assert_eq!(stage_end(Some(now + ms(200)), now, 0), Some(now + ms(200)));
     }
 
     #[test]
@@ -1174,8 +1261,17 @@ mod tests {
             now,
             7
         ));
-        // A launch that was begun is never the sweep's to settle.
-        assert!(!sidecar_due(&of(SidecarKind::Other, 900 * DAY), now, 7));
+        // A launch that was begun, or another version's file: keep_days
+        // after it was last written.
+        assert!(!sidecar_due(&of(SidecarKind::Other, 7 * DAY), now, 7));
+        assert!(sidecar_due(&of(SidecarKind::Other, 7 * DAY + 1), now, 7));
+        for held in [(true, false), (false, true)] {
+            let v = SidecarView {
+                kind: SidecarKind::Other,
+                ..sidecar(None, held.0, held.1, 900 * DAY)
+            };
+            assert!(!sidecar_due(&v, now, 7));
+        }
         // Never with an entry or a held lease.
         assert!(!sidecar_due(&sidecar(None, true, false, 9 * DAY), now, 7));
         assert!(!sidecar_due(&sidecar(None, false, true, 9 * DAY), now, 7));
@@ -1189,6 +1285,85 @@ mod tests {
             now,
             7
         ));
+    }
+
+    /// Looking at a lease locks it for an instant, which a released
+    /// version that is just taking it takes for an owner. So a sweep looks
+    /// at no lease at all unless age, ledger and exit record have already
+    /// said that something goes.
+    #[test]
+    fn a_sweep_with_nothing_due_looks_at_no_lease() {
+        use crate::{FakeClock, FixedBoot, FixedLive, Paths};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(FakeClock::new(Utc::now()));
+        let mut ctx = Context::new(Paths::new(dir.path().join("s"), dir.path().join("c.toml")))
+            .with_live(Arc::new(FixedLive(None)))
+            .with_boot(Arc::new(FixedBoot(Some("b".into()))))
+            .with_clock(clock.clone());
+        ctx.sweep_budget = std::time::Duration::from_secs(3600);
+        let now = ctx.clock.now();
+        let job = |id: &str, submitted: DateTime<Utc>, finished: Option<DateTime<Utc>>| {
+            let mut v = serde_json::json!({
+                "id": id, "argv": ["true"], "cwd": "/", "submitted_at": submitted,
+                "front": false, "submitter_pid": 1,
+            });
+            if let Some(t) = finished {
+                v["finished_at"] = serde_json::json!(t);
+            }
+            let j: Job = serde_json::from_value(v).unwrap();
+            jobs::save(&ctx, &j).unwrap();
+            std::fs::write(ctx.paths.job_log(id), "out\n").unwrap();
+        };
+        // A job that ended an hour ago, one that is running (young, no
+        // exit), and their lease files, as a released version leaves them.
+        job(
+            "done",
+            now - Duration::hours(2),
+            Some(now - Duration::hours(1)),
+        );
+        job("young", now - Duration::minutes(5), None);
+        std::fs::create_dir_all(ctx.paths.leases_dir()).unwrap();
+        for id in ["done", "young", "fresh"] {
+            std::fs::write(ctx.paths.lease_file(id), "").unwrap();
+        }
+        // A sidecar that is being written (not JSON yet, not an hour old).
+        std::fs::create_dir_all(ctx.paths.managed_dir()).unwrap();
+        std::fs::write(ctx.paths.managed_file("fresh"), "{").unwrap();
+        std::fs::write(
+            ctx.paths.sweep_stamp(),
+            r#"{"complete":"2000-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        lock::LEASE_LOOKS.with(|n| n.set(0));
+        let report = sweep_if_due(&ctx, &Config::default()).expect("due");
+        assert!(report.complete, "{report:?}");
+        assert_eq!(lock::LEASE_LOOKS.with(|n| n.get()), 0);
+        assert_eq!(jobs::list(&ctx).unwrap().len(), 2);
+
+        // Something is due (a job dead for more than an hour, a sidecar
+        // nobody finished writing an hour ago): now, and only for those,
+        // the lease is asked, and a held one keeps both.
+        job("dead", now - Duration::hours(2), None);
+        std::fs::write(ctx.paths.managed_file("cut"), "{").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(ctx.paths.managed_file("cut"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let held = [
+            lock::take_lease(&ctx, "dead").unwrap(),
+            lock::take_lease(&ctx, "cut").unwrap(),
+        ];
+        lock::LEASE_LOOKS.with(|n| n.set(0));
+        let report = sweep(&ctx, &Config::default());
+        assert_eq!((report.jobs_found_dead, report.receipts_removed), (0, 0));
+        assert_eq!(lock::LEASE_LOOKS.with(|n| n.get()), 2);
+        drop(held);
+        let report = sweep(&ctx, &Config::default());
+        assert_eq!((report.jobs_found_dead, report.receipts_removed), (1, 1));
     }
 
     fn file(name: &str, age: i64) -> FileInfo {

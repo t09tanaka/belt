@@ -16,10 +16,21 @@ use task_traffic_controller::retention::{
 use task_traffic_controller::{lock, Clock, Context, FakeClock, FixedBoot, FixedLive, Paths};
 
 fn ctx_at(dir: &Path, clock: Arc<FakeClock>) -> Context {
-    Context::new(Paths::new(dir.join("state"), dir.join("config.toml")))
+    let mut ctx = Context::new(Paths::new(dir.join("state"), dir.join("config.toml")))
         .with_live(Arc::new(FixedLive(None)))
         .with_boot(Arc::new(FixedBoot(Some("boot-1".into()))))
-        .with_clock(clock)
+        .with_clock(clock);
+    // These tests are about what a sweep does when it has the time; the
+    // budget has tests of its own.
+    ctx.sweep_budget = Duration::from_secs(3600);
+    ctx
+}
+
+/// The configuration file of the state directory says `text`: what the
+/// `task-traffic-controller` command goes by, and so every sweep.
+fn config(ctx: &Context, text: &str) -> Config {
+    std::fs::write(ctx.paths.config_file(), text).unwrap();
+    Config::load(ctx.paths.config_file()).unwrap()
 }
 
 fn ctx(dir: &Path) -> (Context, Arc<FakeClock>) {
@@ -170,19 +181,36 @@ fn a_managed_command_sweeps_when_it_finishes_and_not_when_it_registers() {
         services: vec![],
     };
     let cfg = Config::default();
-    let managed::Registration::Registered(_, guard) = managed::register(&ctx, &cfg, &spec).unwrap()
-    else {
-        panic!("not registered");
+    let register = |id: &str| {
+        let spec = CommandSpec {
+            command_id: id.into(),
+            ..spec.clone()
+        };
+        match managed::register(&ctx, &cfg, &spec).unwrap() {
+            managed::Registration::Registered(_, guard) => guard,
+            _ => panic!("not registered"),
+        }
     };
+    let left = || history::read_all(ctx.paths.history_file()).unwrap().len();
+    let guard = register("c");
     // Nothing before the command: registering costs no sweep.
-    assert_eq!(
-        history::read_all(ctx.paths.history_file()).unwrap().len(),
-        1
-    );
-    managed::finish(&ctx, guard, managed::TerminalKind::Cancelled).unwrap();
-    assert!(history::read_all(ctx.paths.history_file())
-        .unwrap()
-        .is_empty());
+    assert_eq!(left(), 1);
+    // Nothing after a command that did not end well either: whoever
+    // cancels, or has a failure to report, gets the answer at once.
+    use managed::TerminalKind as Kind;
+    assert!(!managed::sweeps_after(&Kind::Cancelled));
+    assert!(!managed::sweeps_after(&Kind::Exited { code: 1 }));
+    assert!(!managed::sweeps_after(&Kind::Signaled { signal: 15 }));
+    assert!(!managed::sweeps_after(&Kind::SpawnFailed));
+    assert!(!managed::sweeps_after(&Kind::Interrupted));
+    assert!(!managed::sweeps_after(&Kind::Abandoned));
+    assert!(managed::sweeps_after(&Kind::Exited { code: 0 }));
+    managed::finish(&ctx, guard, Kind::Cancelled).unwrap();
+    assert_eq!(left(), 1);
+    managed::finish(&ctx, register("e"), Kind::Exited { code: 3 }).unwrap();
+    assert_eq!(left(), 1);
+    managed::finish(&ctx, register("d"), Kind::Exited { code: 0 }).unwrap();
+    assert_eq!(left(), 0);
 }
 
 #[test]
@@ -223,10 +251,7 @@ fn a_job_whose_runner_died_gets_a_finish_time_and_is_then_removed() {
 fn a_dead_jobs_log_is_cut_to_the_limit_and_keeps_its_tail() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());
-    let cfg = Config {
-        jobs_log_max_mib: 1,
-        ..Config::default()
-    };
+    let cfg = config(&ctx, "jobs_log_max_mib = 1\n");
     jobs::save(&ctx, &job("big", clock.now() - Span::hours(5))).unwrap();
     let mut text = String::new();
     for i in 0..60_000 {
@@ -254,10 +279,7 @@ fn a_dead_jobs_log_is_cut_to_the_limit_and_keeps_its_tail() {
 fn a_live_jobs_log_is_not_cut() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());
-    let cfg = Config {
-        jobs_log_max_mib: 1,
-        ..Config::default()
-    };
+    let cfg = config(&ctx, "jobs_log_max_mib = 1\n");
     jobs::save(&ctx, &job("run", clock.now() - Span::hours(5))).unwrap();
     let _lease = lock::take_lease(&ctx, "run").unwrap();
     std::fs::write(ctx.paths.job_log("run"), vec![b'a'; 2 << 20]).unwrap();
@@ -430,10 +452,7 @@ fn a_job_that_keeps_failing_does_not_stop_the_jobs_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());
     let now = clock.now();
-    let cfg = Config {
-        jobs_log_max_mib: 1,
-        ..Config::default()
-    };
+    let cfg = config(&ctx, "jobs_log_max_mib = 1\n");
     // Looked at first (newest): its log is over the limit and cannot be
     // opened. Looked at after it: an old job that must still go.
     finished_job(&ctx, "bad", now - Span::hours(2), now - Span::hours(1));
@@ -588,6 +607,14 @@ fn the_automatic_sweep_skips_a_busy_lock_and_comes_back_for_it() {
         &record("stale", now - Span::days(200)),
     )
     .unwrap();
+    // A temporary file whose writer is gone, and a sidecar that was never
+    // launched: an hour old both.
+    let stray = ctx.paths.state_dir().join(".ttc-tmp.2147483646.x");
+    std::fs::write(&stray, "x").unwrap();
+    age(&stray, STRAY_AFTER_SECS + 5);
+    std::fs::create_dir_all(ctx.paths.managed_dir()).unwrap();
+    std::fs::write(ctx.paths.managed_file("gone"), "not json").unwrap();
+    age(&ctx.paths.managed_file("gone"), STRAY_AFTER_SECS + 5);
     old_stamp(&ctx);
     // Somebody holds the ledger lock for as long as it likes.
     let held = lock::ledger(&ctx).unwrap();
@@ -595,17 +622,27 @@ fn the_automatic_sweep_skips_a_busy_lock_and_comes_back_for_it() {
     let report = retention::sweep_if_due(&ctx, &cfg).expect("due");
     // It did not wait for the lock (10 s by default)...
     assert!(started.elapsed() < Duration::from_secs(5));
-    // ...did the stage that was free, and says the rest is left.
+    // ...did every stage that does not need it (the jobs and the stray
+    // files only read the ledger), and says the rest is left.
     assert!(!report.complete);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!((report.history_dropped, report.jobs_removed), (1, 0));
+    assert_eq!(
+        (
+            report.history_dropped,
+            report.jobs_removed,
+            report.strays_removed,
+            report.receipts_removed
+        ),
+        (1, 1, 1, 0)
+    );
+    assert!(ctx.paths.managed_file("gone").exists());
     // Not again at once, and not six hours later either.
     assert!(retention::sweep_if_due(&ctx, &cfg).is_none());
     clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
     drop(held);
     let report = retention::sweep_if_due(&ctx, &cfg).expect("due again");
     assert!(report.complete);
-    assert_eq!(report.jobs_removed, 1);
+    assert_eq!(report.receipts_removed, 1);
     clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
     assert!(retention::sweep_if_due(&ctx, &cfg).is_none());
 }
@@ -645,11 +682,8 @@ fn one_automatic_sweep_does_a_bounded_amount_and_the_next_does_the_rest() {
     assert_eq!(retention::sweep(&ctx, &cfg).jobs_removed, n);
 }
 
-#[test]
-fn a_program_with_shorter_numbers_does_not_remove_what_another_asked_to_keep() {
-    let dir = tempfile::tempdir().unwrap();
-    let (ctx, clock) = ctx(dir.path());
-    let now = clock.now();
+/// A hundred records of one key, the newest now.
+fn hundred_records(ctx: &Context, now: DateTime<Utc>) {
     for i in 0..100 {
         history::append(
             ctx.paths.history_file(),
@@ -657,69 +691,365 @@ fn a_program_with_shorter_numbers_does_not_remove_what_another_asked_to_keep() {
         )
         .unwrap();
     }
-    let long = Config {
-        history_keep: 100,
-        ..Config::default()
-    };
-    let short = Config {
-        history_keep: 50,
-        ..Config::default()
-    };
-    assert_eq!(retention::sweep(&ctx, &long).history_dropped, 0);
-    // The other program's sweep, with its own shorter number: nothing goes.
-    assert_eq!(retention::sweep(&ctx, &short).history_dropped, 0);
-    // Until the first one has not asked for 30 days.
-    clock.advance(Duration::from_secs(retention::ASK_TTL_SECS as u64 - 1));
-    history::append(ctx.paths.history_file(), &record("k", clock.now())).unwrap();
-    assert_eq!(retention::sweep(&ctx, &short).history_dropped, 1);
-    clock.advance(Duration::from_secs(1));
-    assert_eq!(retention::sweep(&ctx, &short).history_dropped, 50);
 }
 
-/// The program with the shorter numbers does every sweep; the other only
-/// ever runs commands in between. Its numbers still count, from its first
-/// command on and for as long as it is in use.
+/// Programs with different numbers share a state directory: the larger of
+/// the caller's and the configuration file's counts, nothing is recorded,
+/// and a number lowered in the file counts from the next sweep.
 #[test]
-fn a_program_that_never_does_the_sweep_itself_is_still_heard() {
+fn the_larger_of_the_callers_number_and_the_config_files_wins_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());
-    // (Age plays no part here: the key is kept however old.)
-    let long = Config {
-        history_keep: 100,
-        history_keep_days: 3650,
-        ..Config::default()
-    };
-    let short = Config {
-        history_keep_days: 3650,
-        ..Config::default()
-    };
-    assert_eq!(short.history_keep, 50);
-    // The short one is first in the state directory: it arms the clock.
-    assert!(retention::sweep_if_due(&ctx, &short).is_none());
-    for i in 0..100 {
-        let at = clock.now() - Span::seconds(i);
-        history::append(ctx.paths.history_file(), &record("k", at)).unwrap();
-    }
+    hundred_records(&ctx, clock.now());
     let kept = || history::read_all(ctx.paths.history_file()).unwrap().len();
-    // Six hours a step for 40 days: the long one is never the sweeper.
-    for step in 0..160 {
-        assert!(
-            retention::sweep_if_due(&ctx, &long).is_none(),
-            "step {step}: the long one swept"
-        );
-        clock.advance(Duration::from_secs(SWEEP_EVERY_SECS as u64));
-        let report = retention::sweep_if_due(&ctx, &short).expect("due");
-        assert_eq!(report.history_dropped, 0, "step {step}");
-    }
-    assert_eq!(kept(), 100);
-    // The long one is gone for 30 days: the short numbers apply.
-    let mut dropped = 0;
-    for _ in 0..121 {
-        clock.advance(Duration::from_secs(SWEEP_EVERY_SECS as u64));
-        dropped += retention::sweep_if_due(&ctx, &short).map_or(0, |r| r.history_dropped);
-    }
-    assert_eq!(dropped, 50);
+    let embedder = Config::default();
+    assert_eq!(embedder.history_keep, 50);
+    // The command's file keeps more than the embedding program: its sweep
+    // removes nothing of it.
+    config(&ctx, "history_keep = 100\n");
+    assert_eq!(retention::sweep(&ctx, &embedder).history_dropped, 0);
+    // Lowered in the file: at once.
+    config(&ctx, "history_keep = 70\n");
+    assert_eq!(retention::sweep(&ctx, &embedder).history_dropped, 30);
+    // The caller's own number is the larger one: the file does not lower it.
+    let command = config(&ctx, "history_keep = 10\n");
+    assert_eq!(retention::sweep(&ctx, &embedder).history_dropped, 20);
     assert_eq!(kept(), 50);
+    // The command itself goes by its file.
+    assert_eq!(retention::sweep(&ctx, &command).history_dropped, 40);
+    // No file: the defaults stand in for it, so a caller's smaller number
+    // alone removes nothing the command would keep.
+    std::fs::remove_file(ctx.paths.config_file()).unwrap();
+    hundred_records(&ctx, clock.now());
+    let small = Config {
+        history_keep: 5,
+        ..Config::default()
+    };
+    assert_eq!(retention::sweep(&ctx, &small).history_dropped, 60);
+    assert_eq!(kept(), 50);
+    // The stamp holds what the throttle needs and nothing else.
+    let stamp = std::fs::read_to_string(ctx.paths.sweep_stamp()).unwrap();
+    let stamp: serde_json::Value = serde_json::from_str(&stamp).unwrap();
+    assert_eq!(stamp.as_object().unwrap().len(), 1, "{stamp}");
+    assert!(stamp["complete"].is_string(), "{stamp}");
+}
+
+#[test]
+fn a_config_file_that_is_not_valid_is_said_once_and_the_defaults_stand_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    hundred_records(&ctx, clock.now());
+    std::fs::write(ctx.paths.config_file(), "history_keep = \"many\"\n").unwrap();
+    let small = Config {
+        history_keep: 5,
+        ..Config::default()
+    };
+    let report = retention::sweep(&ctx, &small);
+    assert_eq!(report.history_dropped, 50);
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("config.toml"),
+        "{:?}",
+        report.errors
+    );
+    // Once in a process.
+    hundred_records(&ctx, clock.now());
+    let report = retention::sweep(&ctx, &small);
+    assert_eq!(report.history_dropped, 100);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+}
+
+/// Many processes find the sweep due at the same moment: one sweeps. The
+/// others either find the lock busy or, with the lock, read the stamp
+/// again and find it was done.
+#[test]
+fn only_one_of_many_that_find_the_sweep_due_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    for i in 0..40 {
+        finished_job(
+            &ctx,
+            &format!("j{i}"),
+            now - Span::days(4),
+            now - Span::days(3),
+        );
+    }
+    old_stamp(&ctx);
+    let gate = Arc::new(std::sync::Barrier::new(8));
+    let sweepers: Vec<_> = (0..8)
+        .map(|_| {
+            let (ctx, gate) = (ctx.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                retention::sweep_if_due(&ctx, &Config::default())
+            })
+        })
+        .collect();
+    let reports: Vec<_> = sweepers
+        .into_iter()
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].jobs_removed, 40);
+    assert!(reports[0].complete);
+}
+
+/// The stamp is replaced whole: whoever reads it, at any moment, finds a
+/// stamp (the in-place write this replaces could be read empty, which
+/// means "due").
+#[test]
+fn the_stamp_is_never_read_half_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _clock) = ctx(dir.path());
+    old_stamp(&ctx);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (path, stop) = (ctx.paths.sweep_stamp(), stop.clone());
+        std::thread::spawn(move || {
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(retention::parse_stamp(&text).is_some(), "{text:?}");
+                reads += 1;
+            }
+            reads
+        })
+    };
+    for _ in 0..300 {
+        assert!(retention::sweep(&ctx, &Config::default()).complete);
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(reader.join().unwrap() > 0);
+    // And no temporary file is left beside it.
+    let left: Vec<_> = std::fs::read_dir(ctx.paths.state_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(".ttc-tmp."))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A sweep that has no time left does nothing, says so, and is tried again
+/// ten minutes later, not six hours.
+#[test]
+fn a_sweep_that_is_out_of_time_stops_and_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    finished_job(&ctx, "old", now - Span::days(4), now - Span::days(3));
+    history::append(
+        ctx.paths.history_file(),
+        &record("stale", now - Span::days(200)),
+    )
+    .unwrap();
+    old_stamp(&ctx);
+    let cfg = Config::default();
+    ctx.sweep_budget = Duration::ZERO;
+    let report = retention::sweep_if_due(&ctx, &cfg).expect("due");
+    assert!(!report.complete);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!((report.history_dropped, report.jobs_removed), (0, 0));
+    assert!(retention::sweep_if_due(&ctx, &cfg).is_none());
+    clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
+    ctx.sweep_budget = Duration::from_secs(3600);
+    let report = retention::sweep_if_due(&ctx, &cfg).expect("due again");
+    assert!(report.complete);
+    assert_eq!((report.history_dropped, report.jobs_removed), (1, 1));
+    // `gc` has no budget.
+    finished_job(&ctx, "old", now - Span::days(4), now - Span::days(3));
+    ctx.sweep_budget = Duration::ZERO;
+    assert_eq!(retention::sweep(&ctx, &cfg).jobs_removed, 1);
+}
+
+/// What a caller's supervisor says about a stop: asked for after `after`
+/// looks, or never; and one signal that arrives when the command has just
+/// exited, which is the caller's to take.
+#[derive(Default)]
+struct Stops {
+    looks: std::sync::atomic::AtomicUsize,
+    after: Option<usize>,
+    panics: bool,
+    late_signal: bool,
+    pending: std::sync::atomic::AtomicI32,
+}
+
+impl task_traffic_controller::Supervisor for Stops {
+    fn take_pending(&self) -> i32 {
+        self.pending.swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+    fn child_exited(&self) {
+        if self.late_signal {
+            self.pending
+                .store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn stop_pending(&self) -> bool {
+        assert!(!self.panics, "the supervisor fails");
+        let n = self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending.load(std::sync::atomic::Ordering::SeqCst) != 0
+            || self.after.is_some_and(|after| n >= after)
+    }
+}
+
+#[test]
+fn a_stop_keeps_the_sweep_from_starting_and_ends_one_that_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    for i in 0..100 {
+        finished_job(
+            &ctx,
+            &format!("j{i}"),
+            now - Span::days(4),
+            now - Span::days(3),
+        );
+    }
+    old_stamp(&ctx);
+    let cfg = Config::default();
+    let stopped = ctx.clone().with_supervisor(Arc::new(Stops {
+        after: Some(0),
+        ..Stops::default()
+    }));
+    assert!(retention::sweep_if_due(&stopped, &cfg).is_none());
+    assert_eq!(jobs::list(&ctx).unwrap().len(), 100);
+    // Asked for while it runs: it ends at the next item, and what is left
+    // is for the next sweep.
+    let later = ctx.clone().with_supervisor(Arc::new(Stops {
+        after: Some(60),
+        ..Stops::default()
+    }));
+    let report = retention::sweep_if_due(&later, &cfg).expect("due");
+    assert!(!report.complete);
+    assert!(
+        report.jobs_removed > 0 && report.jobs_removed < 100,
+        "{report:?}"
+    );
+    clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
+    let report = retention::sweep_if_due(&ctx, &cfg).expect("due again");
+    assert!(report.complete);
+    assert!(jobs::list(&ctx).unwrap().is_empty());
+}
+
+fn stale_history_and_a_due_stamp(ctx: &Context) {
+    let old = ctx.clock.now() - Span::days(400);
+    history::append(ctx.paths.history_file(), &record("stale", old)).unwrap();
+    old_stamp(ctx);
+}
+
+fn gated(ctx: &Context, dir: &Path, script: &str, hooks: &Hooks) -> Gated {
+    let opts = Opts {
+        weight: Some(1),
+        key: Some("k".into()),
+        argv: vec!["sh".into(), "-c".into(), script.into()],
+        cwd: dir.to_path_buf(),
+        ..Opts::default()
+    };
+    exec::run_gated(ctx, &Config::default(), &opts, "r", hooks).unwrap()
+}
+
+fn stale_left(ctx: &Context) -> usize {
+    history::for_key(ctx.paths.history_file(), "stale")
+        .unwrap()
+        .len()
+}
+
+/// No tidying up after a command that a signal ended: whoever stopped it
+/// wants the process gone.
+#[test]
+fn run_gated_does_not_sweep_after_a_command_that_a_signal_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _clock) = ctx(dir.path());
+    stale_history_and_a_due_stamp(&ctx);
+    let got = gated(&ctx, dir.path(), "kill -TERM $$", &Hooks::quiet());
+    assert!(matches!(
+        got,
+        Gated::Finished(task_traffic_controller::runner::Exit::Signal(libc::SIGTERM))
+    ));
+    assert_eq!(stale_left(&ctx), 1);
+    // The same command ending by itself: swept.
+    let got = gated(&ctx, dir.path(), "exit 3", &Hooks::quiet());
+    assert!(matches!(got, Gated::Finished(_)));
+    assert_eq!(stale_left(&ctx), 0);
+}
+
+/// A stop signal that arrives when the command has just exited belongs to
+/// the caller: `run_gated` does not sweep, and does not take the signal.
+#[test]
+fn run_gated_leaves_a_late_stop_signal_to_its_caller_and_does_not_sweep() {
+    use task_traffic_controller::Supervisor;
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _clock) = ctx(dir.path());
+    stale_history_and_a_due_stamp(&ctx);
+    let stops = Arc::new(Stops {
+        late_signal: true,
+        ..Stops::default()
+    });
+    let ctx = ctx.with_supervisor(stops.clone());
+    let got = gated(&ctx, dir.path(), "true", &Hooks::quiet());
+    assert!(matches!(got, Gated::Finished(_)));
+    assert_eq!(stale_left(&ctx), 1);
+    assert_eq!(stops.take_pending(), libc::SIGTERM);
+}
+
+/// A panic in the cleanup stays in the cleanup: the command's result is
+/// returned as it was, by `run_gated` and by `managed::finish`, and the
+/// failure is said once.
+#[test]
+fn a_panic_in_the_sweep_changes_nothing_for_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _clock) = ctx(dir.path());
+    stale_history_and_a_due_stamp(&ctx);
+    let ctx = ctx.with_supervisor(Arc::new(Stops {
+        panics: true,
+        ..Stops::default()
+    }));
+    let said = std::sync::Mutex::new(Vec::new());
+    let hooks = Hooks {
+        progress: &|line| said.lock().unwrap().push(line.to_string()),
+        ..Hooks::quiet()
+    };
+    let got = gated(&ctx, dir.path(), "exit 7", &hooks);
+    assert!(matches!(
+        got,
+        Gated::Finished(task_traffic_controller::runner::Exit::Code(7))
+    ));
+    let cleanup: Vec<String> = said
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("cleanup:"))
+        .cloned()
+        .collect();
+    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+    assert!(cleanup[0].contains("internal error"), "{cleanup:?}");
+    // Not said a second time in the same process.
+    let again = gated(&ctx, dir.path(), "exit 7", &hooks);
+    assert!(matches!(again, Gated::Finished(_)));
+    let lines = said.lock().unwrap();
+    assert_eq!(lines.iter().filter(|l| l.contains("cleanup:")).count(), 1);
+    drop(lines);
+
+    let spec = CommandSpec {
+        command_id: "c".into(),
+        spec_digest: "d".into(),
+        opts: Opts {
+            weight: Some(1),
+            key: Some("k".into()),
+            argv: vec!["true".into()],
+            cwd: dir.path().to_path_buf(),
+            ..Opts::default()
+        },
+        attempt: None,
+        services: vec![],
+    };
+    let managed::Registration::Registered(_, guard) =
+        managed::register(&ctx, &Config::default(), &spec).unwrap()
+    else {
+        panic!("not registered");
+    };
+    managed::finish(&ctx, guard, managed::TerminalKind::Exited { code: 0 }).unwrap();
+    assert_eq!(stale_left(&ctx), 1);
 }
 
 #[test]
@@ -727,10 +1057,7 @@ fn an_automatic_sweep_cuts_a_few_logs_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());
     let now = clock.now();
-    let cfg = Config {
-        jobs_log_max_mib: 1,
-        ..Config::default()
-    };
+    let cfg = config(&ctx, "jobs_log_max_mib = 1\n");
     let n = retention::AUTO_MAX_CUTS + 2;
     for i in 0..n {
         let id = format!("j{i}");
@@ -929,6 +1256,67 @@ fn appends_during_trims_are_not_lost() {
             .len(),
         WRITERS * EACH
     );
+}
+
+/// The same against appenders that do not take the history lock, as a
+/// released version does not. A record appended in the instant between the
+/// trim's last look and its rename is lost (the documented rest); what
+/// must hold is that the file never gets half a line, and no record twice.
+#[test]
+fn unlocked_appends_during_trims_leave_whole_lines_and_no_record_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    const WRITERS: usize = 4;
+    const EACH: usize = 150;
+    let trimmer = {
+        let (ctx, stop) = (ctx.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut trims = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                managed::append_record(&ctx, &record("stale", now - Span::days(400))).unwrap();
+                trims += managed::trim_history_aged(&ctx, 1_000_000, Some(now - Span::days(30)))
+                    .unwrap();
+            }
+            trims
+        })
+    };
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let path = ctx.paths.history_file().to_path_buf();
+            std::thread::spawn(move || {
+                for i in 0..EACH {
+                    let mut r = record("live", now);
+                    r.measurement_id = Some(format!("w{w}-{i}"));
+                    history::append(&path, &r).unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(trimmer.join().unwrap() > 0, "no trim rewrote the file");
+    let text = std::fs::read_to_string(ctx.paths.history_file()).unwrap();
+    assert!(
+        text.is_empty() || text.ends_with('\n'),
+        "ends in half a line"
+    );
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let r: Record =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("half a line: {line:?}: {e}"));
+        if r.key == "live" {
+            ids.push(r.measurement_id.unwrap());
+        }
+    }
+    let n = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "a record is there twice");
+    assert!(n <= WRITERS * EACH && n > 0);
 }
 
 /// A lease taken while a sweep removes lease files nobody holds must be a

@@ -159,14 +159,10 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
 }
 
 /// Record how the job ended. The log is cut to `jobs_log_max_mib` first,
-/// so that whoever sees the exit file reads the log in its final size
-/// (nothing is writing it any more; a failure to cut leaves it whole).
+/// so that whoever sees the exit file reads the log in its final size, and
+/// the watcher cuts nothing after it ([`jobs::end`]).
 fn end_job(ctx: &Context, cfg: &Config, id: &str, code: i32) {
-    if jobs::read_exit(ctx, id).is_some() {
-        return;
-    }
-    let _ = jobs::cap_log(ctx, id, log_max_bytes(cfg));
-    jobs::write_exit(ctx, id, code);
+    jobs::end(ctx, id, code, log_max_bytes(cfg));
 }
 
 fn log_max_bytes(cfg: &Config) -> u64 {

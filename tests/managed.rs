@@ -2742,8 +2742,8 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
             .unwrap();
     }
     std::fs::write(m.join("notes.txt"), b"x").unwrap();
-    // A launch that was begun, with no entry: only `resolve` settles it,
-    // however old. Another version's sidecar (JSON, but not ours): kept.
+    // A launch that was begun, with no entry, and another version's
+    // sidecar (JSON, but not ours): kept as long as a finished one is.
     let mut begun = sidecar(&ctx, "live");
     begun.command_id = "begun".into();
     begun.phase = task_traffic_controller::receipt::Phase::LaunchIntent;
@@ -2797,6 +2797,32 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
             ".tmpOLD",
             "begun.json",
             "foreign.json",
+            "in-ledger.json",
+            "notes.txt",
+            "recent.json"
+        ]
+    );
+    // `managed_keep_days` after they were last written, those two go as
+    // well: nothing has an entry for them, so nothing else ever would
+    // look at them again. A held lease keeps one.
+    let week_old = std::time::SystemTime::now() - Duration::from_secs(7 * 86_400 + 60);
+    for name in ["begun.json", "foreign.json"] {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(m.join(name))
+            .unwrap();
+        f.set_modified(week_old).unwrap();
+    }
+    let lease = task_traffic_controller::lock::take_lease(&ctx, "begun").unwrap();
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert!(m.join("begun.json").exists() && !m.join("foreign.json").exists());
+    drop(lease);
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert_eq!(
+        listing(),
+        [
+            ".tmpNEW",
+            ".tmpOLD",
             "in-ledger.json",
             "notes.txt",
             "recent.json"

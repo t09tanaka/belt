@@ -77,7 +77,16 @@ fn forward_from_handler(sig: libc::c_int) {
 /// SIGQUIT while the command runs: an ignored disposition would survive
 /// `exec` and leave the command unable to be interrupted, whereas a handler
 /// is reset to the default by `exec`.
-extern "C" fn ignore_in_wrapper(_sig: libc::c_int) {}
+///
+/// It notes that the signal came (an atomic store, nothing else), so that
+/// the wrapper does not start tidying up after a command the user stopped
+/// ([`Supervisor::stop_pending`]).
+extern "C" fn ignore_in_wrapper(_sig: libc::c_int) {
+    STOP_SEEN.store(true, Ordering::SeqCst);
+}
+
+/// A SIGINT or SIGQUIT came while the command ran.
+static STOP_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Signals that were `SIG_IGN` when the process started (one bit each),
 /// read once before the first handler is installed.
@@ -180,6 +189,10 @@ impl Supervisor for ProcessSignals {
                 return sig;
             }
         }
+    }
+
+    fn stop_pending(&self) -> bool {
+        PENDING.load(Ordering::SeqCst) != 0 || STOP_SEEN.load(Ordering::SeqCst)
     }
 
     fn child_started(&self, pid: u32, group: bool) {
