@@ -62,8 +62,10 @@ async fn a_retry_of_a_job_is_refused_when_the_job_that_needs_it_ended_with_the_e
         .await
         .unwrap_err();
     refusal_names(&error.message, &a, &b);
-    // Nothing ran again: b did not keep stale inputs without a word.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The refusal wrote nothing: no revision, no new attempt, nothing ran
+    // again, so b did not keep stale inputs without a word.
+    let snapshot = store.completion(Target::Run(run.clone())).unwrap();
+    assert_eq!(snapshot.control_revision, 0);
     assert_eq!(lines(marks.join("a")), ["ran"]);
     assert_eq!(lines(marks.join("b")), ["b saw 1"]);
     assert_eq!(store.attempts_of_task(&a).unwrap().len(), 1);
@@ -154,15 +156,26 @@ async fn failed_run(passes_at: u32) -> Failed {
     }
 }
 
-async fn settle(f: &Failed) {
-    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        control::wait(&f.spec, Target::Run(f.run.clone()), &mut signals),
-    )
+/// Wait for what the retry does: every job has the attempts it should (a
+/// new one for each job opened again) and all of them ended. The run is not
+/// asked, since it may still read as ended before the progression held the
+/// jobs again.
+async fn settle(f: &Failed, each: usize) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let done = ["a", "b", "c"].iter().all(|job| {
+                let task = task_of(&f.store, &f.run, job);
+                let list = f.store.attempts_of_task(&task).unwrap();
+                list.len() == each && list.iter().all(|a| a.state.is_terminal())
+            });
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("the jobs did not settle");
 }
 
 fn attempts(f: &Failed, job: &str) -> usize {
@@ -177,7 +190,7 @@ async fn a_retry_of_the_failed_job_runs_the_jobs_that_were_skipped_for_it_once_w
     control::retry(&f.spec, Target::Task(f.a.clone()))
         .await
         .unwrap();
-    settle(&f).await;
+    settle(&f, 2).await;
     assert_eq!(lines(f.marks.join("a")), ["ran", "ran"]);
     assert_eq!(lines(f.marks.join("b")), ["b saw 2"]);
     assert_eq!(lines(f.marks.join("c")), ["c ran"]);
@@ -190,7 +203,7 @@ async fn when_the_retried_job_fails_again_the_jobs_that_need_it_are_skipped_agai
     control::retry(&f.spec, Target::Task(f.a.clone()))
         .await
         .unwrap();
-    settle(&f).await;
+    settle(&f, 2).await;
     assert_eq!(lines(f.marks.join("a")), ["ran", "ran"]);
     assert!(lines(f.marks.join("b")).is_empty() && lines(f.marks.join("c")).is_empty());
     assert_eq!((attempts(&f, "b"), attempts(&f, "c")), (2, 2));
@@ -202,7 +215,29 @@ async fn a_retry_of_the_run_runs_the_jobs_that_were_skipped_for_the_failed_job()
     control::retry(&f.spec, Target::Run(f.run.clone()))
         .await
         .unwrap();
-    settle(&f).await;
+    settle(&f, 2).await;
     assert_eq!(lines(f.marks.join("b")), ["b saw 2"]);
     assert_eq!(lines(f.marks.join("c")), ["c ran"]);
+}
+
+/// `b` has a setup step and a step skipped by its own `if:`: its steps did
+/// not all run, but the job did not skip as a job, so it is a job that ran.
+const STEPS_SKIPPED: &str = "  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo a >> MARKS/a\n  b:\n    needs: a\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo b >> MARKS/b\n        if: \"false\"\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_whose_steps_were_all_skipped_by_their_own_if_is_a_job_that_ran() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(root.path(), &input, STEPS_SKIPPED);
+    start_resident(&spec).await;
+    let out = ci_command(&spec, &input).output().await.unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let (a, b) = (task_of(&store, &run, "a"), task_of(&store, &run, "b"));
+    assert!(lines(marks.join("b")).is_empty(), "the step was skipped");
+    let error = control::retry(&spec, Target::Task(a.clone()))
+        .await
+        .unwrap_err();
+    refusal_names(&error.message, &a, &b);
 }

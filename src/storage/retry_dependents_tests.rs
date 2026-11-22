@@ -83,8 +83,8 @@ impl Chain {
             .unwrap()
     }
 
-    /// The task ran and ended.
-    fn end(&self, task: &TaskId, outcome: Outcome) {
+    /// The task ran and ended, and left no result.
+    fn finish(&self, task: &TaskId, outcome: Outcome) {
         use crate::state::AttemptState::*;
         let a = self.attempt(task);
         for s in [Preparing, Ready, Starting, Active, Finalizing] {
@@ -99,9 +99,25 @@ impl Chain {
 
     /// The task ended without a step: the result of its attempt says every job
     /// of it was skipped.
+    /// The task ran and ended, with a result in which a job passed.
+    fn end(&self, task: &TaskId, outcome: Outcome) {
+        self.finish(task, outcome);
+        self.write_result(task, local_ci::task::JobStatus::Success);
+    }
+
     fn end_skipped(&self, task: &TaskId) {
-        use local_ci::task::{JobOutcome, JobStatus};
-        self.end(task, Outcome::Succeeded);
+        self.end_with_status(task, local_ci::task::JobStatus::Skipped);
+    }
+
+    /// The task ended and its result holds one job outcome of `status`, with
+    /// a reason (as a job that was refused has one too).
+    fn end_with_status(&self, task: &TaskId, status: local_ci::task::JobStatus) {
+        self.finish(task, Outcome::Succeeded);
+        self.write_result(task, status);
+    }
+
+    fn write_result(&self, task: &TaskId, status: local_ci::task::JobStatus) {
+        use local_ci::task::JobOutcome;
         let attempt = self.store.attempts_of_task(task).unwrap().pop().unwrap();
         let result = local_ci::WireTaskResult {
             schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
@@ -110,7 +126,7 @@ impl Chain {
             outcomes: vec![JobOutcome {
                 job: "t".into(),
                 variant: None,
-                status: JobStatus::Skipped,
+                status,
                 outputs: Default::default(),
                 skipped: Some("needs failed".into()),
                 ancestor_failed: true,
@@ -286,7 +302,7 @@ fn skipped_chain() -> Chain {
 fn jobs_that_were_skipped_for_the_failed_job_are_opened_again_with_its_retry() {
     let f = skipped_chain();
     let receipt = f.retry(Target::Task(f.a.clone()), 0).unwrap();
-    assert_eq!(receipt.task_count, 1);
+    assert_eq!(receipt.task_count, 3, "a, and b and c opened again");
     for task in [&f.b, &f.c] {
         let row = f.row(task);
         assert!(
@@ -332,4 +348,171 @@ fn a_retry_of_the_run_opens_the_skipped_jobs_again_and_keeps_the_one_that_ran() 
     let receipt = f.retry(Target::Run(f.run.clone()), 0).unwrap();
     assert_eq!(receipt.task_count, 1);
     assert!(f.row(&f.b).attempt.is_some());
+}
+
+fn plain(error: StorageError) -> String {
+    let StorageError::Immutable(text) = error else {
+        panic!("{error:?}")
+    };
+    text
+}
+
+#[test]
+fn a_job_that_was_refused_is_not_one_that_never_ran() {
+    use local_ci::task::JobStatus;
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.release(&f.b);
+    // A failed job that carries a reason (a task that could not be run).
+    f.end_with_status(&f.b, JobStatus::Failure);
+    refusal(
+        f.retry(Target::Task(f.a.clone()), 0).unwrap_err(),
+        &f.b,
+        &f.a,
+    );
+}
+
+#[test]
+fn a_job_whose_result_is_gone_refuses_the_retry_of_one_job_and_says_why() {
+    let f = skipped_chain();
+    std::fs::remove_dir_all(f._dir.path().join("results")).unwrap();
+    let text = plain(f.retry(Target::Task(f.a.clone()), 0).unwrap_err());
+    assert!(
+        text.contains(&format!("retry of {} would leave {}", f.a, f.b)),
+        "{text}"
+    );
+    assert!(
+        text.contains("its result is no longer available; retry the run"),
+        "{text}"
+    );
+    // The run is retried: what cannot be known not to have run is kept.
+    let receipt = f.retry(Target::Run(f.run.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(f.row(&f.b).attempt.is_some());
+}
+
+#[test]
+fn a_job_without_a_result_receipt_is_unavailable_too() {
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.release(&f.b);
+    f.finish(&f.b, Outcome::Succeeded);
+    let text = plain(f.retry(Target::Task(f.a.clone()), 0).unwrap_err());
+    assert!(text.contains("its result is no longer available"), "{text}");
+}
+
+impl Chain {
+    fn revision(&self) -> u64 {
+        self.store
+            .completion(Target::Run(self.run.clone()))
+            .unwrap()
+            .control_revision
+    }
+
+    fn set(&self, task: &TaskId, path: &str, value: &str) {
+        let (task, path, value) = (task.to_string(), path.to_string(), value.to_string());
+        self.store
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE task SET spec_json=json_set(spec_json,?2,json(?3)) WHERE task_id=?1",
+                    rusqlite::params![task, path, value],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_skipped_dynamic_or_discovered_job_is_not_opened_again() {
+    let f = skipped_chain();
+    f.set(&f.b, "$.ci.dynamic_origin", "true");
+    let receipt = f.retry(Target::Task(f.a.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(f.row(&f.b).attempt.is_some(), "its attempt still counts");
+    let f = skipped_chain();
+    f.set(
+        &f.b,
+        "$.ci.task.inputs.belt_discovery",
+        "{\"applied\":true}",
+    );
+    let receipt = f.retry(Target::Task(f.a.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(f.row(&f.b).attempt.is_some());
+}
+
+#[test]
+fn a_skipped_shard_is_opened_again_only_when_its_policy_allows_the_retry() {
+    let f = skipped_chain();
+    f.set(&f.b, "$.ci.shard_group", "\"g\"");
+    f.set(&f.b, "$.ci.shard_retry_forbidden", "true");
+    let text = plain(f.retry(Target::Task(f.a.clone()), 0).unwrap_err());
+    assert!(text.contains("allow_retry = true"), "{text}");
+    assert!(f.row(&f.b).attempt.is_some(), "nothing changed");
+    let f = skipped_chain();
+    f.set(&f.b, "$.ci.shard_group", "\"g\"");
+    f.set(&f.b, "$.ci.shard_retry_forbidden", "false");
+    let receipt = f.retry(Target::Task(f.a.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 3);
+}
+
+#[test]
+fn a_job_cancelled_before_it_had_an_attempt_runs_again_with_the_retry() {
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    // The progression could not make the inputs of b (so b is cancelled).
+    assert_eq!(
+        f.store
+            .fail_ci_tasks(&f.run, Some(&f.b), "inputs too large", 45)
+            .unwrap(),
+        vec![f.b.clone()]
+    );
+    assert!(f.row(&f.b).cancelled);
+    assert_eq!(f.spec(&f.b)["ci"]["unrunnable"], "inputs too large");
+    let receipt = f.retry(Target::Task(f.a.clone()), f.revision()).unwrap();
+    assert_eq!(receipt.task_count, 2, "a, and b let in again");
+    assert!(!f.row(&f.b).cancelled);
+    assert!(f.spec(&f.b)["ci"].get("unrunnable").is_none());
+    assert!(f.held(&f.b), "waits for the new result of a");
+    assert!(!f.row(&f.c).cancelled && f.held(&f.c));
+}
+
+#[test]
+fn a_job_the_user_cancelled_before_it_had_an_attempt_stays_cancelled() {
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.store.cancel_task(&f.b, 45).unwrap();
+    assert!(f.row(&f.b).cancelled);
+    let receipt = f.retry(Target::Task(f.a.clone()), f.revision()).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(
+        f.row(&f.b).cancelled,
+        "a cancel without a reason is the user's"
+    );
+}
+
+#[test]
+fn a_change_of_the_opened_jobs_between_prepare_and_commit_is_refused() {
+    let f = skipped_chain();
+    let prepared = match f
+        .store
+        .prepare_retry(Target::Run(f.run.clone()), 0, "drift".into())
+        .unwrap()
+    {
+        RetryPreparation::Prepared(p) => p,
+        RetryPreparation::Replay(_) => panic!("replay"),
+    };
+    // c's result receipt is gone: c is no longer known to be skipped.
+    let attempt = f.store.attempts_of_task(&f.c).unwrap().pop().unwrap();
+    let id = attempt.attempt_id.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute("DELETE FROM artifact_receipt WHERE attempt_id=?1", [id])?;
+            Ok(())
+        })
+        .unwrap();
+    let text = plain(f.store.commit_retry(prepared, false, 60).unwrap_err());
+    assert!(text.contains("snapshot changed"), "{text}");
 }
