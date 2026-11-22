@@ -134,6 +134,9 @@ pub struct HostFacts {
     /// answered predates the check.
     #[serde(default)]
     pub cli_jobs: Option<CliJobs>,
+    /// Why `cli_jobs` is `None` when this host tried and failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_jobs_error: Option<String>,
     pub docker: Docker,
     pub profile: ProfileFacts,
     /// Lingering of the service user. Only a host whose service is a systemd
@@ -273,25 +276,44 @@ fn scope(state_dir: &Path, config_file: &Path) -> Scope {
 /// Who holds the entries of one scope, read without writing anything. The
 /// lease is the library's own proof that an owner lives (a PID alone is
 /// reused), so no process is looked up or signalled here.
-fn cli_jobs(state_dir: &Path, config_file: &Path) -> Option<CliJobs> {
+fn cli_jobs(state_dir: &Path, config_file: &Path) -> Result<CliJobs, String> {
     let paths = Paths::new(state_dir, config_file);
     if std::fs::symlink_metadata(paths.ledger_file()).is_err() {
-        return Some(CliJobs::default());
+        return Ok(CliJobs::default());
     }
     let context = Context::new(paths);
-    let snapshot = lock::snapshot_read_only(&context).ok()?;
-    let mut jobs = CliJobs::default();
-    for entry in &snapshot.ledger.entries {
-        if context.paths.managed_file(&entry.id).exists() {
-            continue;
+    let snapshot = lock::snapshot_read_only(&context).map_err(|e| e.to_string())?;
+    let entries = &snapshot.ledger.entries;
+    let managed = |id: &str| context.paths.managed_file(id).exists();
+    // A nested `exec` inside a belt attempt has no sidecar of its own but
+    // belongs to the managed entry its parent chain leads to.
+    let belts = |entry: &task_traffic_controller::ledger::Entry| {
+        let mut at = entry;
+        for _ in 0..entries.len() {
+            if managed(&at.id) {
+                return true;
+            }
+            match at
+                .parent
+                .as_ref()
+                .and_then(|p| entries.iter().find(|e| &e.id == p))
+            {
+                Some(up) => at = up,
+                None => return false,
+            }
         }
+        false
+    };
+    let mut jobs = CliJobs::default();
+    for entry in entries.iter().filter(|e| !belts(e)) {
+        // A lease file the doctor user cannot open counts as stale.
         if snapshot.suspect_dead.contains(&entry.id) {
             jobs.stale += 1;
         } else {
             jobs.live += 1;
         }
     }
-    Some(jobs)
+    Ok(jobs)
 }
 
 fn traffic_cli(env: &BTreeMap<String, String>, runner: &mut dyn Runner) -> Option<TrafficCli> {
@@ -365,12 +387,17 @@ pub fn gather(
     let (worker_dir, worker_config) = worker_scope_paths(recorded);
     // The command the worker's steps run sees the recorded environment.
     let (cli_dir, cli_config) = cli_scope_paths(recorded);
+    let (cli_jobs, cli_jobs_error) = match cli_jobs(&cli_dir, &cli_config) {
+        Ok(jobs) => (Some(jobs), None),
+        Err(why) => (None, Some(why)),
+    };
     HostFacts {
         schema: 1,
         worker_scope: scope(&worker_dir, &worker_config),
         cli_scope: scope(&cli_dir, &cli_config),
         cli: traffic_cli(env, runner),
-        cli_jobs: cli_jobs(&cli_dir, &cli_config),
+        cli_jobs,
+        cli_jobs_error,
         docker: docker(env, runner),
         profile: profile(worker_state, env),
         linger: None,
@@ -457,9 +484,10 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             None => check(
                 "traffic_processes",
                 Level::NotChecked,
-                match facts.cli_scope.ledger_entries {
-                    None => "the command's ledger is unreadable, so its running jobs cannot be told".into(),
-                    Some(_) => "this host did not report the command's jobs (its helper predates the check); update it".into(),
+                match (&facts.cli_jobs_error, facts.cli_scope.ledger_entries) {
+                    (Some(why), _) => format!("the command's jobs could not be read ({why})"),
+                    (None, None) => "the command's ledger is unreadable, so its running jobs cannot be told".into(),
+                    (None, Some(_)) => "this host did not report the command's jobs (its helper predates the check); update it".into(),
                 },
             ),
             Some(jobs) if jobs.live > 0 => {

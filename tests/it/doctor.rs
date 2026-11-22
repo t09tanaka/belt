@@ -307,6 +307,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
                 error: None,
             },
             cli_jobs: None,
+            cli_jobs_error: None,
             linger: None,
         },
     }});

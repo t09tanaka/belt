@@ -382,6 +382,7 @@ fn healthy() -> HostFacts {
             error: None,
         },
         cli_jobs: Some(CliJobs::default()),
+        cli_jobs_error: None,
         linger: None,
     }
 }
@@ -1268,6 +1269,10 @@ fn the_jobs_of_the_command_are_judged_from_the_facts() {
     let (l, d) = judged(&facts);
     assert_eq!(l, Level::NotChecked);
     assert!(d.contains("predates the check"));
+    facts.cli_jobs_error = Some("permission denied".into());
+    let (l, d) = judged(&facts);
+    assert_eq!(l, Level::NotChecked);
+    assert!(d.contains("could not be read (permission denied)") && !d.contains("predates"));
     // Neither a command nor state: nothing could be running.
     facts.cli_scope.in_use = false;
     let (l, d) = judged(&facts);
@@ -1275,39 +1280,91 @@ fn the_jobs_of_the_command_are_judged_from_the_facts() {
     assert!(d.contains("none of its jobs can be running"));
 }
 
+fn listing(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in read.flatten() {
+            out.push(e.path());
+            if e.path().is_dir() {
+                todo.push(e.path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn ledger_entry(id: &str, parent: Option<&str>) -> task_traffic_controller::ledger::Entry {
+    let mut v = serde_json::json!({
+        "id": id, "pid": 1, "state": "running", "front": false, "weight": 1,
+        "predicted_rss": 0, "repo": "r", "argv": "a", "key": "k", "seq": 1,
+        "enqueued_at": "2026-01-01T00:00:00Z"
+    });
+    if let Some(p) = parent {
+        v["parent"] = p.into();
+    }
+    serde_json::from_value(v).unwrap()
+}
+
 #[test]
 fn the_jobs_of_a_scope_are_read_from_leases_and_sidecars_without_writing() {
-    use task_traffic_controller::ledger::Entry;
     let h = Host::new();
     let (state, config) = cli_scope_paths(&h.env);
-    // No ledger: nothing runs.
-    assert_eq!(cli_jobs(&state, &config), Some(CliJobs::default()));
+    // No ledger: nothing runs, and nothing is created.
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs::default()));
+    assert!(!state.exists());
     let paths = Paths::new(&state, &config);
     let context = Context::new(Paths::new(&state, &config));
-    let entry = |id: &str| -> Entry {
-        serde_json::from_value(serde_json::json!({
-            "id": id, "pid": 1, "state": "running", "front": false, "weight": 1,
-            "predicted_rss": 0, "repo": "r", "argv": "a", "key": "k", "seq": 1,
-            "enqueued_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap()
-    };
     fs::create_dir_all(paths.managed_dir()).unwrap();
     let ledger = Ledger {
-        entries: ["held", "gone", "managed"].map(entry).to_vec(),
+        version: 3,
+        entries: vec![
+            ledger_entry("held", None),
+            ledger_entry("gone", None),
+            ledger_entry("managed", None),
+            ledger_entry("nested", Some("managed")),
+            ledger_entry("deeper", Some("nested")),
+        ],
         ..Ledger::default()
     };
     ledger.save(&paths.ledger_file()).unwrap();
-    // `held` has an owner, `gone` has none, `managed` is belt's.
+    // `held` has an owner, `gone` has none, `managed` is belt's, and what
+    // runs inside it is belt's too.
     let _lease = lock::take_lease(&context, "held").unwrap();
+    let _nested = lock::take_lease(&context, "nested").unwrap();
     fs::write(paths.managed_file("managed"), "{}").unwrap();
-    assert_eq!(
-        cli_jobs(&state, &config),
-        Some(CliJobs { live: 1, stale: 1 })
-    );
-    // A ledger nobody can read is no answer.
+    let before = listing(&state);
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 1, stale: 1 }));
+    assert_eq!(listing(&state), before);
+    // A ledger nobody can read is no answer, and says why.
     fs::write(paths.ledger_file(), "not a ledger").unwrap();
-    assert_eq!(cli_jobs(&state, &config), None);
+    assert!(cli_jobs(&state, &config).is_err());
+}
+
+#[test]
+fn a_scope_with_a_ledger_but_no_lock_or_lease_files_gets_none_created() {
+    let h = Host::new();
+    let (state, config) = cli_scope_paths(&h.env);
+    let paths = Paths::new(&state, &config);
+    let ledger = Ledger {
+        entries: vec![ledger_entry("plain", None)],
+        ..Ledger::default()
+    };
+    ledger.save(&paths.ledger_file()).unwrap();
+    let before = listing(&state);
+    // A live, sidecar-less entry is a foreign job; with no lease it is stale.
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 0, stale: 1 }));
+    assert_eq!(listing(&state), before);
+    assert!(!paths.ledger_lock().exists());
+    assert!(!paths.lease_file("plain").exists());
+    // With the owner's lease it is live, under a command that knows managed entries.
+    let context = Context::new(Paths::new(&state, &config));
+    let _lease = lock::take_lease(&context, "plain").unwrap();
+    assert_eq!(cli_jobs(&state, &config), Ok(CliJobs { live: 1, stale: 0 }));
 }
 
 mod environment_diff {
