@@ -492,6 +492,9 @@ class Checks:
             'git -c user.name="S26 Harness" -c user.email=s26@example.invalid '
             '-c commit.gpgsign=false commit -qm "S26 fixture"')
         self.count += 1
+        config = "schema_version=1\n[coordinator]\nlocal_worker_priority=-100\nheartbeat_seconds=1\n"
+        ssh("m1", 'umask 077; test ! -e "$HOME/.config/belt/config.toml" && printf %s '
+            + shlex.quote(config) + ' > "$HOME/.config/belt/config.toml"')
         p = ssh("m1", USER_BUS + 'exec "$HOME/.config/belt/bin/current/belt" --json init',
                 check=False, timeout=180)
         stem = RUN / "evidence" / f"{self.count:04d}-m1-init"
@@ -649,18 +652,102 @@ kill -s CONT "$pid"
             raise RuntimeError(f"trial watcher on m1: {err.strip() or watcher.returncode}")
         return out.strip()
 
+    def connect_m1_to_w1(self):
+        name = json.loads((RUN / "resources.json").read_text())["containers"][HOSTS.index("w1")]
+        pub = ssh("m1", 'ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/s26-w1" && '
+                  'cat "$HOME/.ssh/s26-w1.pub"').stdout.strip()
+        ssh("w1", "printf '%s\\n' " + shlex.quote(pub) + ' >> "$HOME/.ssh/authorized_keys"')
+        host_key = ssh("w1", "cat /etc/ssh/ssh_host_ed25519_key.pub").stdout.strip()
+        config = (f"Host w1\n  HostName {name}\n  User belt\n  HostKeyAlias w1\n"
+                  "  IdentityFile ~/.ssh/s26-w1\n  IdentitiesOnly yes\n  BatchMode yes\n"
+                  "  StrictHostKeyChecking yes\n  ConnectTimeout 5\n")
+        ssh("m1", "umask 077; printf %s " + shlex.quote(config) + ' > "$HOME/.ssh/config"; '
+            + "printf '%s\\n' " + shlex.quote("w1 " + host_key) + ' >> "$HOME/.ssh/known_hosts"; '
+            + "ssh w1 true")
+        self.m1_belt("workers", "add", "w1", "--ssh", "w1")
+
+    def start_remote_attempt(self):
+        script = ('set -eu; mkdir -p "$HOME/s26-starts"; hostname >> "$HOME/s26-starts/$1"; '
+                  'for i in $(seq 1 420); do test ! -e "$HOME/s26-release-$1" || exit 0; sleep 1; done; exit 1')
+        until("w1 connected to m1", lambda: any(
+            w["id"] == "w1" and w["connection"] == "connected" for w in self.m1_belt("workers")["workers"]))
+        # A newly connected worker may still be staging the source. Let the
+        # local worker take its available slots while w1 becomes ready.
+        local = []
+        try:
+            for _ in range(4):
+                token = secrets.token_hex(8)
+                task = self.m1_belt("submit", "--", "sh", "-c", script, "s26", token)["task_id"]
+                def placed():
+                    attempts = self.m1_belt("show", task)["attempts"]["items"]
+                    if len(attempts) > 1:
+                        raise RuntimeError(f"expected one attempt for {task}: {attempts}")
+                    return attempts[0] if attempts else None
+                attempt = until(f"remote fixture {task} placed", placed, 60)
+                if attempt["worker_id"] == "w1":
+                    until("m1 command running on w1", lambda: self.starts(token) == {"w1": 1}, 60)
+                    return task, token, attempt["attempt_id"]
+                if attempt["worker_id"] != "m1":
+                    raise RuntimeError(f"unexpected worker for {task}: {attempt}")
+                local.append((task, token))
+            raise RuntimeError("no m1 submission reached w1")
+        finally:
+            for task, token in local:
+                ssh("m1", f'touch "$HOME/s26-release-{token}"')
+                self.m1_belt("wait", task, timeout=90)
+
+    def finish_remote_attempt(self, remote, evidence):
+        task, token, attempt_id = remote
+        ssh("w1", f'touch "$HOME/s26-release-{token}"')
+        self.m1_belt("wait", task, timeout=120)
+        after = self.m1_belt("show", task)["attempts"]["items"]
+        if (len(after) != 1 or after[0]["attempt_id"] != attempt_id or
+                after[0]["worker_id"] != "w1" or after[0]["collection_verdict"] != "complete" or
+                (after[0]["termination"] or {}).get("outcome") != "succeeded" or
+                self.starts(token) != {"w1": 1}):
+            raise RuntimeError(f"m1 failed to adopt the original remote attempt: {after}")
+        save(RUN / "evidence" / evidence,
+             {"before_attempt": attempt_id, "after": after, "starts": {"w1": 1}})
+
+    def rollback_databases(self):
+        paths = {}
+        for name in ("coordinator.db", "worker.db"):
+            found = ssh("m1", f'find "$HOME" -name {name} -not -path "*/upgrade/*"').stdout.splitlines()
+            if len(found) != 1:
+                raise RuntimeError(f"expected one live {name}, found {found}")
+            paths[name] = found[0]
+        return paths
+
+    def database_marker(self, paths, sql, expected):
+        # Write as the fixture service user; each DB should already exist.
+        values = {}
+        for name, path in paths.items():
+            output = ssh("m1", f"test -f {shlex.quote(path)} && " +
+                         " ".join(map(shlex.quote, ["sqlite3", "-batch", "-cmd", ".timeout 5000", path, sql])))
+            values[name] = output.stdout.strip()
+            if values[name] != expected:
+                raise RuntimeError(f"{name}: expected marker {expected!r}, got {values[name]!r}")
+        return values
+
     def a57_rollback(self):
         digests = self.a57_ready("n", "broken")
         if self.m1_link() != digests["n"]:
             raise RuntimeError("m1 must run N before the rollback check")
         before = self.m1_version_file(digests["n"])
+        self.connect_m1_to_w1()
+        remote = self.start_remote_attempt()
         task, token, batch = self.place_on_m1(20)
+        dbs = self.rollback_databases()
+        read = "SELECT value FROM s26_upgrade_probe;"
+        prior = self.database_marker(dbs, "CREATE TABLE s26_upgrade_probe(value TEXT NOT NULL); "
+                                     "INSERT INTO s26_upgrade_probe VALUES ('original'); " + read, "original")
         broken = "/home/belt/s26-bin/belt-broken"
         # The broken build's resident never answers health. The CLI is ended
         # once the broken version runs, so only the guard can restore.
         watcher = self.m1_watch(digests["broken"], "TERM", broken, True, 240)
         proc, stem = self.m1_upgrade("broken")
         self.watched(watcher, 260)
+        trial = self.database_marker(dbs, "UPDATE s26_upgrade_probe SET value='trial'; " + read, "trial")
         ended = time.monotonic()
         code, tail = self.ended(proc, stem, 60)
         if code == 0:
@@ -674,6 +761,10 @@ kill -s CONT "$pid"
         if self.m1_version_file(digests["n"]) != before:
             raise RuntimeError("the N version directory changed")
         self.m1_belt("ls")
+        self.finish_remote_attempt(remote, "a57-remote-adoption.json")
+        restored = self.database_marker(dbs, read, "original")
+        save(RUN / "evidence/a57-rollback-databases.json",
+             {"before": prior, "trial": trial, "after_rollback": restored})
         save(RUN / "evidence/a57-rollback.json", self.finished_once_on_m1(task, token, batch))
         return (f"broken N+1 not committed; with its CLI ended, the guard restored N "
                 f"{took:.0f}s later (deadline 45s from the start); N's directory untouched; "
@@ -697,6 +788,9 @@ kill -s CONT "$pid"
         if not self.m1_upgraded_away():
             raise RuntimeError("an upgrade record remains after the commit")
         save(RUN / "evidence/a57-commit.json", self.finished_once_on_m1(task, token, batch))
+        # N+1 submits to N in the reverse direction of the host-to-m1 check.
+        remote = self.start_remote_attempt()
+        self.finish_remote_attempt(remote, "a57-new-parent-old-worker.json")
         return (f"committed {current[:12]} -> {digests[key][:12]} while a host run was on m1; "
                 "bin/resident switched, old directory untouched, the run finished, started once")
 

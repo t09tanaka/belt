@@ -5,7 +5,7 @@ FROM debian:12.9-slim
 ENV container=docker
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus dbus-user-session libpam-systemd openssh-server git ca-certificates \
-    bash coreutils util-linux procps libgcc-s1 python3 \
+    bash coreutils util-linux procps libgcc-s1 python3 sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 --shell /bin/bash belt \
     && passwd -d belt \
