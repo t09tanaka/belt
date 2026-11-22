@@ -184,10 +184,27 @@ fn job_survives_submitter_and_records_history() {
     let (id, _) = env.submit(&[], "sleep 1; echo done");
     let out = env.run(&["wait", &id]);
     assert!(out.status.success());
-    let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
-    assert_eq!(hist.lines().count(), 1);
-    // The output was handed over by `wait`, so it is gone.
+    // The first `wait` prints the header and the output...
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (header, body) = text.split_once('\n').unwrap();
+    assert!(
+        header.starts_with(&format!("=== task-traffic-controller job {id} exit 0")),
+        "{header}"
+    );
+    assert_eq!(body, "done\n");
+    // ...and the output, handed over, is gone: a second `wait` still knows
+    // how the job ended, and has nothing more to print.
     assert!(!env.state().join(format!("jobs/{id}.log")).exists());
+    let again = env.run(&["wait", &id]);
+    assert!(again.status.success());
+    let text = String::from_utf8_lossy(&again.stdout).into_owned();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("exit 0"), "{text}");
+    // The runner records the run right after it has written the exit file.
+    let hist = env.state().join("history.jsonl");
+    assert!(wait_until(Duration::from_secs(10), || {
+        fs::read_to_string(&hist).is_ok_and(|h| h.lines().count() == 1)
+    }));
 }
 
 #[test]
@@ -307,11 +324,19 @@ fn exec_and_submit_clean_up_by_themselves_when_the_sweep_is_due() {
     // The first run only starts the clock.
     assert!(env.run(&["exec", "--", "true"]).status.success());
     assert!(orphan.exists());
-    fs::write(state.join("last-sweep"), "2000-01-01T00:00:00Z").unwrap();
-    assert!(env.run(&["exec", "--", "true"]).status.success());
+    let stale = r#"{"complete":"2000-01-01T00:00:00Z"}"#;
+    fs::write(state.join("last-sweep"), stale).unwrap();
+    // The sweep runs after the command, before `exec` returns.
+    let out = env.run(&["exec", "--", "sh", "-c", "test -e jobs-marker || echo ran"]);
+    assert!(out.status.success());
     assert!(!orphan.exists());
-    // submit does the same (the sweep removed the empty directory).
-    fs::create_dir_all(state.join("jobs")).unwrap();
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A job does the same from its runner, once the job is over: `submit`
+    // itself does nothing of the kind, and `wait` does not wait for it.
     fs::write(&orphan, "x").unwrap();
     fs::OpenOptions::new()
         .write(true)
@@ -319,10 +344,100 @@ fn exec_and_submit_clean_up_by_themselves_when_the_sweep_is_due() {
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
         .unwrap();
-    fs::write(state.join("last-sweep"), "2000-01-01T00:00:00Z").unwrap();
+    fs::write(state.join("last-sweep"), stale).unwrap();
+    let (id, _) = env.submit(&[], "true");
+    let out = env.run(&["wait", &id]);
+    assert!(out.status.success());
+    assert!(wait_until(Duration::from_secs(10), || !orphan.exists()));
+}
+
+#[test]
+fn gc_exits_2_after_doing_the_rest_when_a_step_failed() {
+    let env = TestEnv::new("budget = 4\njobs_keep_days = 0\n");
     let (id, _) = env.submit(&[], "true");
     assert!(env.run(&["wait", &id]).status.success());
-    assert!(!orphan.exists());
+    thread::sleep(Duration::from_millis(1100));
+    // The stamp can neither be read nor written.
+    let stamp = env.state().join("last-sweep");
+    let _ = fs::remove_file(&stamp);
+    fs::create_dir_all(&stamp).unwrap();
+    let out = env.run(&["gc"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("task-traffic-controller: gc: "), "{err}");
+    assert!(err.contains("last-sweep"), "{err}");
+    // The sweep itself ran.
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("removed 1 old jobs"), "{text}");
+}
+
+/// A job `wait` calls lost keeps its log: only output that was printed for
+/// a job with an exit record is removed.
+#[test]
+fn a_job_reported_as_lost_keeps_its_log() {
+    let env = TestEnv::new("budget = 4\n");
+    let jobs = env.state().join("jobs");
+    fs::create_dir_all(&jobs).unwrap();
+    // A descriptor whose runner is gone: no exit file, no ledger entry.
+    fs::write(
+        jobs.join("lostjob.json"),
+        r#"{"id":"lostjob","argv":["true"],"cwd":"/","weight":null,"front":false,"key":null,
+            "submitted_at":"2020-01-01T00:00:00Z","submitter_pid":1}"#,
+    )
+    .unwrap();
+    fs::write(jobs.join("lostjob.log"), "what it wrote before it died\n").unwrap();
+    let out = env.run(&["wait", "lostjob"]);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("lost (runner died before finishing)"),
+        "{text}"
+    );
+    assert!(text.ends_with("what it wrote before it died\n"), "{text}");
+    assert_eq!(
+        fs::read_to_string(jobs.join("lostjob.log")).unwrap(),
+        "what it wrote before it died\n"
+    );
+    assert!(!jobs.join("lostjob.exit").exists());
+}
+
+/// The log of a running job is cut while it runs. Between two looks of the
+/// runner (200 ms) it can pass the limit by what the job writes meanwhile;
+/// this job writes about 1 MiB a second, so twice the limit is far above
+/// that.
+#[test]
+fn the_log_of_a_running_job_stays_near_the_limit_while_it_runs() {
+    let env = TestEnv::new("budget = 4\njobs_log_max_mib = 1\n");
+    let script = "i=0; while [ $i -lt 80 ]; do \
+                  head -c 50000 /dev/zero | tr '\\0' x; echo; sleep 0.05; i=$((i+1)); done; \
+                  echo the-end";
+    let (id, _) = env.submit(&["--detach"], script);
+    let log = env.state().join(format!("jobs/{id}.log"));
+    let exit = env.state().join(format!("jobs/{id}.exit"));
+    let mut largest = 0;
+    let mut shrank = false;
+    let mut last = 0;
+    assert!(wait_until(Duration::from_secs(60), || {
+        let len = fs::metadata(&log).map_or(0, |m| m.len());
+        largest = largest.max(len);
+        shrank |= len < last;
+        last = len;
+        exit.exists()
+    }));
+    // 4 MB were written; the file never held anything like that.
+    assert!(shrank, "the log was never cut while the job ran");
+    assert!(largest < 2 << 20, "the log reached {largest} bytes");
+    let out = env.run(&["wait", &id]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("were cut"),
+        "{}",
+        &text[..300.min(text.len())]
+    );
+    assert!(text.trim_end().ends_with("the-end"));
+    assert!(text.len() < (1 << 20) + 1000, "{}", text.len());
 }
 
 #[test]

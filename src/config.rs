@@ -65,7 +65,8 @@ pub struct Config {
     /// that is running has run this long (0: it waits until it fits).
     pub nested_sibling_max_wait_secs: u64,
     /// The retention sweep (and `gc`) removes the files of a job that
-    /// finished, or was found dead, more than this many days ago.
+    /// finished, or was found dead, more than this many days ago. Must be 0
+    /// to 3650.
     pub jobs_keep_days: u64,
     /// A job log longer than this many MiB is cut to its last part when the
     /// job ends (and by the sweep, for a job that died). Must be 1 to
@@ -155,6 +156,11 @@ impl Config {
         if !(1..=3650).contains(&self.history_keep_days) {
             return Err(Error::Config(
                 "history_keep_days must be between 1 and 3650".into(),
+            ));
+        }
+        if self.jobs_keep_days > 3650 {
+            return Err(Error::Config(
+                "jobs_keep_days must be between 0 and 3650".into(),
             ));
         }
         if !(1..=1_048_576).contains(&self.jobs_log_max_mib) {
@@ -264,6 +270,10 @@ mod tests {
         assert!(Config::parse("history_keep_days = 3650").is_ok());
         assert!(Config::parse("history_keep_days = 0").is_err());
         assert!(Config::parse("history_keep_days = 3651").is_err());
+        assert!(Config::parse("jobs_keep_days = 0").is_ok());
+        assert!(Config::parse("jobs_keep_days = 3650").is_ok());
+        assert!(Config::parse("jobs_keep_days = 3651").is_err());
+        assert!(Config::parse("jobs_keep_days = 9223372036854775807").is_err());
         assert!(Config::parse("jobs_log_max_mib = 1").is_ok());
         assert!(Config::parse("jobs_log_max_mib = 1048576").is_ok());
         assert!(Config::parse("jobs_log_max_mib = 0").is_err());

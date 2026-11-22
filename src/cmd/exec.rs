@@ -47,7 +47,6 @@ pub fn run(ctx: &Context, cfg: &Config, mut opts: Opts, nested: Option<&str>) ->
         Nesting::Child(parent) => opts.parent = Some(parent),
         Nesting::Top => {}
     }
-    sweep_if_due(ctx, cfg);
     let id = exec::new_id();
     match run_gated(ctx, cfg, &opts, &id, &|| false)? {
         Gated::Finished(exit) => Ok(finish(exit)),
@@ -55,7 +54,9 @@ pub fn run(ctx: &Context, cfg: &Config, mut opts: Opts, nested: Option<&str>) ->
     }
 }
 
-/// [`exec::run_gated`] with progress lines on stderr.
+/// [`exec::run_gated`] with progress lines on stderr: the waiting lines,
+/// and after the command the `cleanup:` line of each step of the retention
+/// sweep that failed, when this run did the sweep.
 pub fn run_gated(
     ctx: &Context,
     cfg: &Config,
@@ -83,18 +84,6 @@ pub fn finish(exit: Exit) -> i32 {
             c
         }
         Exit::Signal(s) => reraise(s),
-    }
-}
-
-/// The retention sweep, when it is due ([`task_traffic_controller::retention`]).
-/// Run here as well as inside the library so a failure is reported, on
-/// stderr, by the one run that did the sweep; the library's own call then
-/// finds it fresh.
-pub fn sweep_if_due(ctx: &Context, cfg: &Config) {
-    if let Some(report) = task_traffic_controller::retention::sweep_if_due(ctx, cfg) {
-        for e in &report.errors {
-            eprintln!("task-traffic-controller: cleanup: {e}");
-        }
     }
 }
 

@@ -103,18 +103,19 @@ pub fn trim_aged(path: &Path, keep: usize, cutoff: Option<DateTime<Utc>>) -> Res
     Ok(trim_collect(path, keep, cutoff)?.0)
 }
 
-/// [`trim_aged`], also returning the `measurement_id` of every record it
-/// dropped, so the caller can remove their markers at once. A history left
-/// with no record is removed, not kept as an empty file.
-pub fn trim_collect(
-    path: &Path,
+/// Which of `all` (oldest first) a trim keeps, as indexes, and the
+/// `measurement_id`s that no kept record carries any more. An id that a
+/// kept record still carries is not returned, even when another record with
+/// it is dropped: its marker is what stops the measurement from being
+/// applied again.
+pub fn trim_plan(
+    all: &[Record],
     keep: usize,
     cutoff: Option<DateTime<Utc>>,
-) -> Result<(usize, Vec<String>)> {
-    let all = read_all(path)?;
+) -> (Vec<usize>, Vec<String>) {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut newest: HashMap<&str, DateTime<Utc>> = HashMap::new();
-    for r in &all {
+    for r in all {
         *counts.entry(r.key.as_str()).or_default() += 1;
         let t = newest.entry(r.key.as_str()).or_insert(r.started_at);
         if r.started_at > *t {
@@ -123,28 +124,94 @@ pub fn trim_collect(
     }
     let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut kept = Vec::new();
-    let mut gone_ids = Vec::new();
-    for r in &all {
+    let mut dropped = Vec::new();
+    for (i, r) in all.iter().enumerate() {
         let n = seen.entry(r.key.as_str()).or_default();
         *n += 1;
         let stale = cutoff.is_some_and(|c| newest[r.key.as_str()] < c);
         if !stale && counts[r.key.as_str()] - *n < keep {
-            kept.push(r);
-        } else if let Some(id) = &r.measurement_id {
-            gone_ids.push(id.clone());
+            kept.push(i);
+        } else {
+            dropped.push(i);
         }
     }
-    let dropped = all.len() - kept.len();
-    if dropped > 0 && kept.is_empty() {
-        std::fs::remove_file(path)?;
-    } else if dropped > 0 {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        for r in &kept {
-            let mut line = serde_json::to_string(r)?;
-            line.push('\n');
-            tmp.write_all(line.as_bytes())?;
+    let still: std::collections::HashSet<&str> = kept
+        .iter()
+        .filter_map(|&i| all[i].measurement_id.as_deref())
+        .collect();
+    let mut gone: Vec<String> = Vec::new();
+    for i in dropped {
+        if let Some(id) = all[i].measurement_id.as_deref() {
+            if !still.contains(id) && !gone.iter().any(|g| g == id) {
+                gone.push(id.to_string());
+            }
         }
+    }
+    (kept, gone)
+}
+
+fn parse(bytes: &[u8]) -> Vec<Record> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Record>(line).ok())
+        .collect()
+}
+
+/// What was appended to `path` after its first `from` bytes.
+fn appended_since(path: &Path, from: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut out = Vec::new();
+    f.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// [`trim_aged`], also returning the `measurement_id` of every record it
+/// dropped for good ([`trim_plan`]), so the caller can remove their markers
+/// at once. A history left with no record is removed, not kept as an empty
+/// file.
+///
+/// The file is replaced by a new one. Callers serialise with every writer
+/// of this version through the history lock; a released version appends
+/// without it, so what was appended while the new file was being written is
+/// carried over before the replacement. Only an append that lands between
+/// that last look and the rename (two system calls apart) is lost.
+pub fn trim_collect(
+    path: &Path,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<(usize, Vec<String>)> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(e) => return Err(e.into()),
+    };
+    let all = parse(&bytes);
+    let (kept, gone_ids) = trim_plan(&all, keep, cutoff);
+    let dropped = all.len() - kept.len();
+    if dropped == 0 {
+        return Ok((0, gone_ids));
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = crate::paths::temp_file_in(dir)?;
+    for &i in &kept {
+        let mut line = serde_json::to_string(&all[i])?;
+        line.push('\n');
+        tmp.write_all(line.as_bytes())?;
+    }
+    let mut at = bytes.len() as u64;
+    loop {
+        let more = appended_since(path, at)?;
+        if more.is_empty() {
+            break;
+        }
+        tmp.write_all(&more)?;
+        at += more.len() as u64;
+    }
+    if kept.is_empty() && at == bytes.len() as u64 {
+        std::fs::remove_file(path)?;
+    } else {
         tmp.persist(path).map_err(|e| e.error)?;
     }
     Ok((dropped, gone_ids))
@@ -236,6 +303,47 @@ mod tests {
             let got: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(got, v);
         }
+    }
+
+    #[test]
+    fn a_dropped_record_keeps_its_marker_while_a_kept_record_has_the_same_id() {
+        let with = |key: &str, id: Option<&str>| {
+            let mut r = rec(key, 1.0);
+            r.measurement_id = id.map(str::to_string);
+            r
+        };
+        // "dup" was appended twice (a resend that slipped through): the
+        // older copy is dropped, the newer one is kept, so its marker stays.
+        // "old" is only in a dropped record. "kept" is only in a kept one.
+        let all = [
+            with("a", Some("dup")),
+            with("a", Some("old")),
+            with("a", Some("old")),
+            with("a", None),
+            with("a", Some("dup")),
+            with("a", Some("kept")),
+        ];
+        let (kept, gone) = trim_plan(&all, 2, None);
+        assert_eq!(kept, [4, 5]);
+        assert_eq!(gone, ["old"]);
+        // Nothing dropped, nothing gone.
+        assert_eq!(trim_plan(&all, 6, None), ((0..6).collect(), vec![]));
+    }
+
+    #[test]
+    fn trim_carries_over_what_was_appended_without_the_lock_and_keeps_such_a_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        append(&p, &rec("a", 1.0)).unwrap();
+        append(&p, &rec("a", 2.0)).unwrap();
+        let len = std::fs::metadata(&p).unwrap().len();
+        append(&p, &rec("a", 3.0)).unwrap();
+        let more = appended_since(&p, len).unwrap();
+        assert_eq!(parse(&more).len(), 1);
+        assert_eq!(parse(&more)[0].wall_secs, 3.0);
+        assert!(appended_since(&p, std::fs::metadata(&p).unwrap().len())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -344,12 +344,12 @@ cancelled.
 The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
 directory. `wait` removes the job's log as soon as it has printed it (unless
-another `wait` is on the same job, or `--no-output` was given); the
-descriptor and exit code stay for `jobs` and a repeated `wait` until
-`jobs_keep_days` (see [Retention](#retention)). A job log longer than `jobs_log_max_mib`
-(default 16) is cut to its last part when the job ends, with a note on its
-first line saying how much was cut; a normal job's output reaches `wait`
-whole.
+another `wait` is on the same job, `--no-output` was given, or the job is
+reported as `lost`); the descriptor and exit code stay for `jobs` and a
+repeated `wait` until `jobs_keep_days` (see [Retention](#retention)). A job
+log longer than `jobs_log_max_mib` (default 16) is cut to its last part,
+while the job runs and when it ends, with a note on its first line saying
+how much was cut; a normal job's output reaches `wait` whole.
 
 ### `task-traffic-controller inspect --json` and `task-traffic-controller estimate --json -- <command>`
 
@@ -581,7 +581,7 @@ What is not found, and what follows:
 `config` prints the effective configuration (defaults merged with the
 file). `gc` runs the [retention](#retention) sweep now and prints what it
 did. The same sweep runs by itself; `gc` is for running it on demand and
-seeing its errors.
+seeing its errors (it exits 2 when a step failed, after doing the rest).
 
 ## Configuration
 
@@ -607,8 +607,8 @@ backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has
 nested_guard_max_wait_secs = 60 # the first nested exec of a command is held by the memory/CPU guards for at most this long
 nested_sibling_max_wait_secs = 600 # a nested exec that does not fit starts anyway after this, one per period (0: never)
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
-jobs_keep_days = 1          # an uncollected job's files are removed this long after it finished or was found dead
-jobs_log_max_mib = 16       # a job log is cut to its last part beyond this (1..1048576)
+jobs_keep_days = 1          # an uncollected job's files are removed this long after it finished or was found dead (0..3650)
+jobs_log_max_mib = 16       # a job log is cut to its last part beyond this, while it runs too (1..1048576)
 managed_keep_days = 7       # receipts of managed commands are removed this long after they ended (1..3650)
 
 [[pattern]]                 # glob over the full argv string, first match wins
@@ -865,51 +865,121 @@ again within 200 ms. Memory and the load average are read on every call.
 ## Retention
 
 Everything is removed at the moment nothing reads it any more; a sweep is
-only the backstop for what a crash left behind. The sweep runs by itself, at
-most once every 6 hours per state directory, from the commands that write
-state: `exec`, `submit`, and (for a program that embeds the library)
-`exec::run_gated` and `managed::register`. The first run in a state
-directory only starts the 6-hour clock. It never fails the command that
-started it; `gc` runs the same sweep on demand and prints its errors. Each
-command pays one read of the 25-byte `last-sweep` file; the sweep itself
-lists only small directories and reads `history.jsonl` once.
+only the backstop for what a crash left behind and for what only time makes
+old. The sweep runs by itself, at most once every 6 hours per state
+directory, **after** a command has finished and released its place in the
+queue: at the end of `exec`, at the end of a job (in its detached runner,
+after the exit code is written, so neither `submit` nor `wait` waits for
+it), and for a program that embeds the library at the end of
+`exec::run_gated` and `managed::finish`. Nothing is swept before a command
+starts or while it waits.
+
+The automatic sweep never delays or fails anything:
+
+- it takes no lock it would have to wait for. A stage whose lock is busy is
+  skipped, the sweep is not recorded as done, and it is tried again 10
+  minutes later;
+- it removes, marks or cuts at most 500 files a time (the rest 10 minutes
+  later) and looks at no process other than with signal 0;
+- a step that fails is reported on stderr once, as
+  `task-traffic-controller: cleanup: ...`, by the `exec` that ran the sweep,
+  and the other steps still run. A job's runner does not print them (its
+  stderr is the job's log); `gc` does.
+
+`gc` applies the same rules on demand, waits for the locks, has no limit,
+and exits 2 after printing every error.
+
+When the sweep is due is read from `last-sweep` (a few hundred bytes of
+JSON). Only a missing file starts the 6-hour clock (the first command in a
+new state directory). A file that is empty or cannot be read means "due",
+and when it cannot be written the sweep still runs, after every command,
+and says so each time: a full disk is when it is needed.
 
 | what | who reads it again | removed | at most |
 |---|---|---|---|
-| `leases/<id>.lock` | the queue's liveness test, while the command lives | when the command ends; the sweep for a crashed one | one per live entry |
-| `jobs/<id>.json`, `.exit` | `jobs`, `cancel`, and a repeated `wait` (the exit code lives nowhere else) | by the sweep, `jobs_keep_days` (1) after the job finished or was found dead: a day is how long a result can wait for its reader | a few hundred bytes per job in a day |
-| `jobs/<id>.log` | `wait`, which prints it | by `wait`, the moment it has printed it; else with the job. Cut to `jobs_log_max_mib` (16 MiB, which `wait` reads into memory) when the job ends | 16 MiB per job |
-| `jobs/<id>.waiter` | `wait`, while it runs | by `wait` when it reports; else with the job | one per job |
+| `leases/<id>.lock` | the queue's liveness test, while the command lives | by its command when it ends; by whoever reaps a dead entry; by the sweep an hour after a crash left one with no entry, and only while the sweep holds its lock | one per live entry |
+| `jobs/<id>.json`, `.exit` | `jobs`, `cancel`, and a repeated `wait` (the exit code lives nowhere else) | by the sweep, `jobs_keep_days` (1) after the job finished or was found dead, and never while a `wait` holds the job: a day is how long a result can wait for its reader | a few hundred bytes per job in a day |
+| `jobs/<id>.log` | `wait`, which prints it | by `wait`, the moment it has printed the output of a job that has its exit code (a job reported as `lost` keeps its log); else with the job | `jobs_log_max_mib` (16 MiB, which `wait` reads into memory) per job, while it runs too |
+| `jobs/<id>.waiter` | `wait`, while it runs | by the last `wait` when it has reported; else with the job | one per job |
 | `history.jsonl` | the weight learner (the newest 5 usable records of a key), `estimate`, `inspect`, `history` | each record beyond `history_keep` (50) per key, and every key not run for `history_keep_days` (30, the age at which the forecast already calls a sample stale), by the sweep; the file itself when nothing is left | 50 records for each key run in 30 days |
-| `measurements/<id>.applied` | `record_measurement`, to refuse a replay while the record exists | at the moment the history drops the record | one per kept record |
+| `measurements/<id>.applied` | `record_measurement`, to refuse a replay while a record with that id exists | at the moment the history drops the last record with that id | one per kept record |
 | `measurements/<id>.pending` | nobody (a dead attempt's) | at once when the append fails; the sweep for a crash. It becomes `.applied` if its record exists | none |
-| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it runs; the owner of the id sets how late it may retry, so this is the existing contract | per command in 7 days |
-| `.tmp*` files, job files with no descriptor | nobody | by the sweep, when an hour old | none |
-| empty `leases/`, `jobs/`, `measurements/`, `managed/` | nobody | by the sweep (every writer makes its directory again) | none |
-| `ledger.json`, `ledger.lock`, `history.lock`, `last-sweep` | every command | never: the queue itself, its two locks, and the sweep clock; removing a lock another process is about to take would need a re-check on every acquire for no saving | four small files |
+| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it has an entry or its owner holds the lease; one that records no end or cannot be read, and has neither, an hour after it was written (a crash between writing it and saving the ledger) | per command in 7 days |
+| temporary files (`.ttc-tmp.<pid>.*`) | nobody but the process that is writing one | by the sweep, when an hour old **and** process `<pid>` is gone (a writer stopped for longer keeps its file). The `.tmpXXXXXX` files of earlier versions name no process and go by age alone | none |
+| job files with no readable descriptor | nobody | by the sweep, when every file of that id is an hour old and the job has no entry, no held lease and no `wait` | none |
+| empty `measurements/`, `managed/` | nobody | when the last file in them goes | none |
+| `ledger.json`, `ledger.lock`, `history.lock`, `last-sweep`, and the directories `leases/` and `jobs/` | every command | never | four small files, two directories |
+
+Why the last row is fixed: several versions of this tool may run on one
+machine against the same state directory. The versions before this one
+create a directory and then open a file in it, and open a lock file and then
+lock it, without looking again. A directory or a lock that vanishes in
+between makes them fail, or leaves them holding a lock nobody else can see.
+So `leases/` and `jobs/` are never removed (`measurements/` and `managed/`
+are only made and removed under the lock that every version takes first),
+and a lock file is removed only by its owner or while the remover holds its
+lock; this version also checks, after taking any lock, that the name still
+points to the file it locked, and starts again if not. What remains with an
+older version: a lease file an hour old with no entry (a crash left it) may
+be removed in the instant between an older binary's open and its lock, when
+that binary registers the same command id again; the older binary then
+holds a lease nobody sees and its entry can be released early. Ids are
+random except for managed commands that are registered again.
 
 How a job is found dead: it has no exit file, no ledger entry, and nobody
-holds its lease (its runner holds the lease from registration to exit, so
-this is the same test the queue uses for a command), and it was submitted
-more than an hour ago. The sweep gives it the finish time it never got
-(`finished_at`, now), so `jobs_keep_days` later its files go. Until then
-`jobs` still shows it as `lost`.
+holds its lease (its runner holds the lease from registration until after
+the exit file is written, so this is the same test the queue uses for a
+command), and it was submitted more than an hour ago. The sweep gives it
+the finish time it never got (`finished_at`, now), so `jobs_keep_days` later
+its files go. Until then `jobs` still shows it as `lost`.
 
-A running job's log is not touched: it is cut when the job ends, so a job
-that writes without limit fills the disk while it runs.
+A job's log is bounded while the job runs. The runner looks at its size
+five times a second and, when it is over `jobs_log_max_mib`, cuts it to its
+last half behind a one-line note; at the end of the job it is cut to the
+limit. The cut is made in the file itself (the part to keep is copied aside,
+the file is truncated, the part is written back), so the job and anything it
+started keep writing to the same file, at its new end, and the space is free
+at once. What this costs: between two looks the log can pass the limit by
+what the job writes in 200 ms; the output written during the instant of a
+cut can be lost or land before the kept part; and a process that outlives
+its job and still holds the log open goes on writing to it. After `wait`
+has printed and removed the log, such a process writes to a file with no
+name, emptied at that moment: only what it writes from then on takes space,
+until it exits. Before that, the sweep cuts the log of a job that is over
+every time it runs.
+
+Programs with different configurations may share a state directory (this
+command, and a program that embeds the library with its own `Config`).
+Neither removes what the other asked to keep: for each of `history_keep`,
+`history_keep_days`, `jobs_keep_days`, `jobs_log_max_mib` and
+`managed_keep_days`, a sweep uses the larger of its own number and the one
+recorded in `last-sweep` by another sweep, and a recorded number stays in
+force for 30 days after the last sweep that asked for at least that much.
+Lowering a number therefore takes effect 30 days later when something else
+had asked for more, and at once otherwise.
+
+A measurement is applied once for as long as a record with its id is in the
+history. With `history_keep = 50`, a measurement sent again after 50 newer
+records of the same key (or after the key was not run for 30 days) is
+appended again; its first copy is gone by then, so no reader ever sees both
+(the learner reads the newest 5), but it is read as a recent sample. A
+program that may send again that late raises `history_keep`.
 
 Files the caller owns are not ours. `Opts::stdout_log` (the library's way
 to send a command's output to a file) is appended to by the library and
 never truncated, rotated or removed by it: its size and lifetime belong to
 the caller. A `history.jsonl` placed elsewhere with
-`Paths::with_history_file` is trimmed like any other, but the sweep does
-not look for leftover temporary files in its directory.
+`Paths::with_history_file` is trimmed like any other; in its directory the
+sweep removes only this version's own temporary files (`.ttc-tmp.<pid>.*`,
+an hour old, process gone). Files in the state directory with names that
+are not ours are never removed (before, anything in `managed/` that was not
+a sidecar went after `managed_keep_days`).
 
 A program that embeds the library gets the sweep from `run_gated` and
-`register`. One that writes state in other ways (only
+`managed::finish`. One that writes state in other ways (only
 `managed::record_measurement`, for example) calls
-`retention::sweep_if_due(&ctx, &cfg)` from its own entry points;
-`retention::sweep` runs it unconditionally.
+`retention::sweep_if_due(&ctx, &cfg)` from its own entry points, after its
+work; `retention::sweep` runs it unconditionally, as `gc` does.
 
 ## Platform support
 

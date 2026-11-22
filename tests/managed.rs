@@ -2716,7 +2716,8 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
     terminal_sidecar(&ctx, "old", now - days(10), false);
     terminal_sidecar(&ctx, "recent", now - days(1), false);
     let _owner = terminal_sidecar(&ctx, "in-ledger", now - days(10), true);
-    // Not terminal, however old: never removed.
+    // Not terminal and without an entry: what a crash between writing the
+    // sidecar and saving the ledger leaves. Kept while the file is young.
     let (_, g) = registered(
         managed::register(
             &ctx,
@@ -2739,23 +2740,56 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
         f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age * 86400 + 5))
             .unwrap();
     }
-    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 2);
-    let mut left: Vec<String> = std::fs::read_dir(&m)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    left.sort();
+    std::fs::write(m.join("notes.txt"), b"x").unwrap();
+    let listing = || {
+        let mut left: Vec<String> = std::fs::read_dir(&m)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        left
+    };
+    // Only sidecars are looked at here (temporary files are the retention
+    // sweep's, names that are not ours are nobody's).
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
     assert_eq!(
-        left,
+        listing(),
         [
             ".tmpNEW",
+            ".tmpOLD",
             "corrupt.json",
             "in-ledger.json",
             "live.json",
+            "notes.txt",
             "recent.json"
         ]
     );
     assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 0);
+    // An hour after they were written, the unreadable sidecar and the one
+    // that never got an entry go. A held lease keeps one.
+    let hour_old = std::time::SystemTime::now() - Duration::from_secs(3600 + 5);
+    for name in ["corrupt.json", "live.json"] {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(m.join(name))
+            .unwrap();
+        f.set_modified(hour_old).unwrap();
+    }
+    let lease = task_traffic_controller::lock::take_lease(&ctx, "live").unwrap();
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert!(m.join("live.json").exists() && !m.join("corrupt.json").exists());
+    drop(lease);
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert_eq!(
+        listing(),
+        [
+            ".tmpNEW",
+            ".tmpOLD",
+            "in-ledger.json",
+            "notes.txt",
+            "recent.json"
+        ]
+    );
     // Nothing to read at all is nothing to remove.
     let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
     assert_eq!(managed::gc_sidecars(&none, 7).unwrap(), 0);

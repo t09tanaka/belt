@@ -227,7 +227,7 @@ pub fn load_sidecar(ctx: &Context, id: &str) -> Loaded {
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = crate::paths::temp_file_in(dir)?;
     serde_json::to_writer_pretty(&mut tmp, value)?;
     tmp.write_all(b"\n")?;
     tmp.as_file().sync_all()?;
@@ -689,6 +689,9 @@ pub struct OwnerGuard {
     /// The recorder of the command's descendants failed in this process, so
     /// nothing can be ruled out: [`finish`] does not release.
     tracker_unknown: std::sync::atomic::AtomicBool,
+    /// The retention numbers of the configuration it was registered with,
+    /// for the sweep [`finish`] runs when one is due.
+    keep: Option<crate::retention::Keep>,
 }
 
 impl OwnerGuard {
@@ -698,7 +701,13 @@ impl OwnerGuard {
             id: id.to_string(),
             managed,
             tracker_unknown: std::sync::atomic::AtomicBool::new(false),
+            keep: None,
         }
+    }
+
+    fn with_keep(mut self, keep: crate::retention::Keep) -> Self {
+        self.keep = Some(keep);
+        self
     }
 
     pub fn command_id(&self) -> &str {
@@ -900,8 +909,6 @@ pub fn register(
     spec: &CommandSpec,
 ) -> Result<Registration> {
     check_id("command_id", &spec.command_id)?;
-    // At most every six hours; no lock is held yet.
-    let _ = crate::retention::sweep_if_due(ctx, cfg);
     if spec.spec_digest.is_empty() {
         return Err(Error::Conflict("spec_digest must not be empty".into()));
     }
@@ -929,7 +936,7 @@ pub fn register(
         Ok(Pushed::Existing { seq, sidecar }) => (seq, false, sidecar.phase, sidecar.boot_id),
         Ok(Pushed::Terminal(sc)) => {
             drop(lease);
-            let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+            lock::remove_if_unheld(&ctx.paths.lease_file(id));
             return Ok(Registration::AlreadyTerminal(sc));
         }
         Ok(Pushed::Interrupted(_)) => unreachable!("register passes no stop hook"),
@@ -937,7 +944,7 @@ pub fn register(
             drop(lease);
             // Only if nobody registered it meanwhile.
             if !matches!(e, Error::Conflict(_)) {
-                let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+                lock::remove_if_unheld(&ctx.paths.lease_file(id));
             }
             return Err(e);
         }
@@ -951,7 +958,7 @@ pub fn register(
             newly_registered: newly,
             boot_id,
         },
-        OwnerGuard::new(lease, id, true),
+        OwnerGuard::new(lease, id, true).with_keep(crate::retention::Keep::of(cfg)),
     ))
 }
 
@@ -1311,7 +1318,13 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
         })?;
     }
     exec::remove_entry(ctx, &id);
+    let keep = guard.keep;
     drop(guard);
+    // The command is over and its budget free: the retention sweep, when
+    // one is due, delays nobody here. It never fails the caller.
+    if let Some(keep) = keep {
+        let _ = crate::retention::sweep_if_due_keep(ctx, &keep);
+    }
     Ok(())
 }
 
@@ -1385,7 +1398,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
     if ledger.remove(id) {
         ledger.save(&ctx.paths.ledger_file())?;
     }
-    let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+    lock::remove_if_unheld(&ctx.paths.lease_file(id));
     Ok(())
 }
 
@@ -1593,12 +1606,27 @@ pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Resul
             if ledger.remove(id) {
                 ledger.save(&ctx.paths.ledger_file())?;
             }
-            let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+            lock::remove_if_unheld(&ctx.paths.lease_file(id));
         }
         _ => settle_by_hand(ctx, id, kind, &detail)?,
     }
     r.released = true;
     Ok(typed(r))
+}
+
+/// Append `rec` to the history under the history lock, so it cannot land
+/// between a trim's read and its replacement of the file. One flock per
+/// record. A lock that stays busy for a second is not waited for: the
+/// record is then appended without it (a trim carries over what was
+/// appended while it wrote, so only the instant of its rename is exposed).
+pub fn append_record(ctx: &Context, rec: &Record) -> Result<()> {
+    let _lock = lock::acquire(
+        &ctx.paths.history_lock(),
+        ctx.ledger_lock_timeout
+            .min(std::time::Duration::from_secs(1)),
+    )
+    .ok();
+    history::append(ctx.paths.history_file(), rec)
 }
 
 /// Trim the history to `keep` records per key, under the history lock so a
@@ -1617,6 +1645,15 @@ pub fn trim_history_aged(
     cutoff: Option<DateTime<Utc>>,
 ) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
+    trim_history_locked(ctx, keep, cutoff)
+}
+
+/// [`trim_history_aged`] for a caller that holds the history lock.
+pub(crate) fn trim_history_locked(
+    ctx: &Context,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<usize> {
     let (dropped, ids) = history::trim_collect(ctx.paths.history_file(), keep, cutoff)?;
     // A marker lives exactly as long as its record: remove it now, under
     // the same lock, not when a later sweep notices.
@@ -1641,6 +1678,11 @@ pub fn trim_history_aged(
 /// removed (a retry appends again). Returns how many files were removed.
 pub fn gc_measurements(ctx: &Context) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
+    gc_measurements_locked(ctx)
+}
+
+/// [`gc_measurements`] for a caller that holds the history lock.
+pub(crate) fn gc_measurements_locked(ctx: &Context) -> Result<usize> {
     let Ok(rd) = std::fs::read_dir(ctx.paths.measurements_dir()) else {
         return Ok(0);
     };
@@ -1678,46 +1720,71 @@ pub fn gc_measurements(ctx: &Context) -> Result<usize> {
     Ok(removed)
 }
 
-/// Remove the sidecars of managed commands that ended more than `keep_days`
-/// ago and have no ledger entry (the receipt of a finished run is only
-/// needed so a repeated registration finds its outcome), and temporary files
-/// an hour old that an interrupted write left behind. A sidecar that is not
-/// terminal, one that cannot be read, and one whose entry is still in the
-/// ledger are never removed. Returns how many files were removed.
+/// Remove the sidecars of managed commands that the retention rule says go
+/// ([`crate::retention::sidecar_due`]): one that ended more than
+/// `keep_days` ago (the receipt of a finished run is only needed so a
+/// repeated registration finds its outcome), and one an hour old that
+/// records no end or cannot be read and has neither a ledger entry nor a
+/// held lease (a crash between writing the sidecar and saving the ledger
+/// left it). One whose entry is in the ledger is never removed. Files that
+/// are not sidecars are not touched here. Returns how many were removed.
 pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
     // Under the ledger lock, so a registration cannot slip in between the
     // look at the ledger and the removal.
     let _guard = lock::ledger(ctx)?;
-    let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
-        return Ok(0);
-    };
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
-    let cutoff = ctx.clock.now() - chrono::Duration::days(keep_days as i64);
+    Ok(gc_sidecars_locked(ctx, &ledger, keep_days, &mut || true))
+}
+
+/// [`gc_sidecars`] for a caller that holds the ledger lock and has read
+/// `ledger` under it. `allow` is asked before each removal; false stops.
+pub(crate) fn gc_sidecars_locked(
+    ctx: &Context,
+    ledger: &Ledger,
+    keep_days: u64,
+    allow: &mut dyn FnMut() -> bool,
+) -> usize {
+    let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
+        return 0;
+    };
+    let now = ctx.clock.now();
     let mut removed = 0;
-    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
-        let old = match p.file_stem().and_then(|s| s.to_str()) {
-            Some(id) if p.extension().is_some_and(|x| x == "json") => match load_sidecar(ctx, id) {
-                Loaded::Ok(sc) => {
-                    sc.phase == Phase::Terminal
-                        && ledger.find(id).is_none()
-                        && sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at) < cutoff
-                }
-                _ => false,
-            },
-            // Not a sidecar: what a crashed atomic write leaves.
-            _ => p.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
-                DateTime::<Utc>::from(t)
-                    < ctx.clock.now()
-                        - chrono::Duration::seconds(crate::retention::STRAY_AFTER_SECS)
-            }),
+    for ent in rd.filter_map(|e| e.ok()) {
+        let p = ent.path();
+        let (Some(id), true) = (
+            p.file_stem().and_then(|s| s.to_str()),
+            p.extension().is_some_and(|x| x == "json"),
+        ) else {
+            continue;
         };
-        if old && std::fs::remove_file(&p).is_ok() {
+        let Ok(modified) = ent.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let view = crate::retention::SidecarView {
+            ended: match load_sidecar(ctx, id) {
+                Loaded::Ok(sc) if sc.phase == Phase::Terminal => {
+                    Some(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
+                }
+                _ => None,
+            },
+            in_ledger: ledger.find(id).is_some(),
+            lease_held: lock::lease_is_held(ctx, id),
+            modified: modified.into(),
+        };
+        if !crate::retention::sidecar_due(&view, now, keep_days) {
+            continue;
+        }
+        if !allow() {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
             removed += 1;
         }
     }
-    // Empty: remove it too (every creator of a sidecar holds this lock).
+    // Empty: remove it too. Every creator of a first sidecar, of this and
+    // of released versions, holds this lock while it makes the directory.
     let _ = std::fs::remove_dir(ctx.paths.managed_dir());
-    Ok(removed)
+    removed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
