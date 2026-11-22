@@ -33,15 +33,20 @@ pub(crate) fn prepare(spec: &crate::service::bootstrap::Spec, next: &Path) -> an
     }
     let dir = &spec.worker_state_dir;
     let binding = dir.join("worker-binding.json");
+    // A receiving-only member can rotate before it has ever run the
+    // persistent worker. Only an existing enrollment binding needs updating.
+    let binding_file = match resident::secure_file(&binding, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let cluster = spec
         .expected_cluster
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("worker group missing"))?;
     let current = expected(&spec.cluster_key_path, cluster, &spec.worker_id)?;
     let mut existing = Vec::new();
-    resident::secure_file(&binding, false)?
-        .take(LIMIT + 1)
-        .read_to_end(&mut existing)?;
+    binding_file.take(LIMIT + 1).read_to_end(&mut existing)?;
     reconcile(dir, &existing, &current)?;
     let next = expected(next, cluster, &spec.worker_id)?;
     let change = BindingChange {
