@@ -1844,9 +1844,24 @@ impl Agent {
         let setup_policy = Digest::of_bytes(
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
-        let report = match measured.into_inner().flatten() {
-            Some(report) => report,
-            None => profile.report(),
+        let (native, report) = if native.is_empty() {
+            (native, profile.report())
+        } else if requests.is_empty() {
+            // Nothing was waited for: the report that named the native tools.
+            let report = measured.into_inner().flatten();
+            (native, report.unwrap_or_else(|| profile.report()))
+        } else {
+            // An install may have taken long. What is native is decided again
+            // from the report of this moment, and the activation uses that
+            // same report: a tool that changed meanwhile is refused here.
+            let report = self.capabilities().ok_or_else(|| {
+                ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted base profile changed",
+                )
+            })?;
+            let again = self.toolchain_requests(bundle, &|| Some(report.clone()))?;
+            (again.native, report)
         };
         let activation = adapters::activate_with_native(
             &bundle.frozen,
