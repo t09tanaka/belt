@@ -306,7 +306,7 @@ pub async fn submit(
     // source would freeze, and for each task the `setup-*` inputs of its own
     // jobs. Every task carries its bundle, and the worker activates it
     // before the job's steps.
-    let toolchains = super::submit::freeze_resolved_tasks(
+    let (toolchains, notices) = super::submit::freeze_resolved_tasks(
         &context,
         &owner,
         &captured.manifest,
@@ -376,7 +376,8 @@ pub async fn submit(
             source_id,
             plan_digest,
             tasks: submitted,
-            warnings: captured.warnings,
+            // What the capture warned of, then what the freeze left out.
+            warnings: captured.warnings.into_iter().chain(notices).collect(),
         }),
         Reply::ControlError { error } => Err(error),
         Reply::Error { message } => Err(invalid(message)),

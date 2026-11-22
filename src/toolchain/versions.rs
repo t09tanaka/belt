@@ -296,17 +296,36 @@ pub fn requirement_scopes(declarations: &[Declaration]) -> Vec<Scope> {
     }
     scopes.into_iter().collect()
 }
-/// A version input that could not be resolved when the run was frozen.
+/// A version input of a setup step that names no version belt can read: no
+/// requirement comes from it, and the freeze of a CI run says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unresolved {
+pub struct Skipped {
     pub tool: ToolId,
-    pub expression: String,
+    /// The step the input is written in.
+    pub scope: Scope,
+    /// Why, as the code a diagnostic of it carries.
+    pub code: String,
+    /// The version or the file path as written, shortened.
+    pub value: String,
+    /// Where a diagnostic of it points: the step, or the version file.
     pub location: Location,
+    /// The step in its workflow.
+    pub step: Location,
 }
-/// `${{ <context>.<key> }}` and nothing else: the context and the key. Any
-/// other expression (an operator, a function, two references, text around it)
-/// is not one reference.
-pub fn context_reference(expression: &str) -> Option<(&str, &str)> {
+/// What the setup steps of the workflows declare, with the project's own
+/// declarations: the versions that were read, the inputs that were not, and
+/// the steps that run under an `if:` condition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupRead {
+    pub declarations: Vec<Declaration>,
+    pub skipped: Vec<Skipped>,
+    pub conditional: Vec<Scope>,
+}
+/// `${{ <context>.<key> }}` and nothing else: the context (in lower case: a
+/// context name is not case sensitive) and the key. Any other expression (an
+/// operator, a function, two references, text around it) is not one
+/// reference.
+pub fn context_reference(expression: &str) -> Option<(String, &str)> {
     let inner = expression
         .trim()
         .strip_prefix("${{")?
@@ -319,22 +338,26 @@ pub fn context_reference(expression: &str) -> Option<(&str, &str)> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     };
-    (name(context) && name(key)).then_some((context, key))
+    (name(context) && name(key)).then(|| (context.to_ascii_lowercase(), key))
 }
-/// The declarations one CI task runs under, and the scope they are frozen in:
-/// the project's own, and those of the setup steps of `jobs` in `workflow`,
-/// taken together as one requirement set (a task has one environment). A
-/// version that is one context reference takes the value `lookup` gives for
-/// the step it is written in; any other expression, a reference `lookup` does
-/// not know, and a version-file path that is an expression are unresolved.
-/// A task without a setup declaration keeps the project scope unchanged.
+/// The declarations one CI task runs under, the scope they are frozen in, and
+/// the inputs of its setup steps that are no requirement. The declarations
+/// are the project's own and those of the setup steps of `jobs` in
+/// `workflow`, taken together as one requirement set (a task has one
+/// environment). A version that is one context reference takes the value
+/// `lookup` gives for the step it is written in. What belt cannot interpret is
+/// no requirement: an input the reader skipped, a step under a condition, any
+/// other expression, a reference `lookup` does not know or whose value is no
+/// version, and a version-file path that is an expression. A job the task
+/// does not run has no part in any of this. A task without a setup
+/// requirement keeps the project scope unchanged.
 pub fn task_declarations(
-    declarations: &[Declaration],
+    read: &SetupRead,
     project: &str,
     workflow: &str,
     jobs: &[String],
     lookup: &dyn Fn(&Scope, &str, &str) -> Option<String>,
-) -> Result<(Scope, Vec<Declaration>), Unresolved> {
+) -> (Scope, Vec<Declaration>, Vec<Skipped>) {
     let whole = Scope::project(project);
     let narrow = Scope {
         project: project.into(),
@@ -342,41 +365,53 @@ pub fn task_declarations(
         job: Some(jobs.join(",")),
         step: None,
     };
+    let own = |scope: &Scope| {
+        scope.workflow.as_deref() == Some(workflow)
+            && scope.job.as_ref().is_some_and(|job| jobs.contains(job))
+    };
     let mut out = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    skipped.extend(read.skipped.iter().filter(|s| own(&s.scope)).cloned());
     let mut narrowed = false;
-    for d in declarations {
+    for d in &read.declarations {
         if d.scope == whole {
             out.push(d.clone());
             continue;
         }
-        if d.scope.workflow.as_deref() != Some(workflow)
-            || !d.scope.job.as_ref().is_some_and(|job| jobs.contains(job))
-        {
+        if !own(&d.scope) {
             continue;
         }
-        let unresolved = |expression: &str| Unresolved {
-            tool: d.tool.clone(),
-            expression: expression.into(),
-            location: d.location.clone(),
-        };
-        let constraint = match &d.constraint {
-            Constraint::VersionFileExpression(text) => return Err(unresolved(text)),
+        let resolved = match &d.constraint {
+            _ if read.conditional.contains(&d.scope) => Err("conditional_step"),
+            Constraint::VersionFileExpression(_) => Err("version_file_expression"),
             Constraint::Expression(text) => context_reference(text)
-                .and_then(|(context, key)| lookup(&d.scope, context, key))
+                .and_then(|(context, key)| lookup(&d.scope, &context, key))
                 .and_then(|value| Constraint::parse(&value).ok())
                 .filter(|c| !matches!(c, Constraint::Expression(_)))
-                .ok_or_else(|| unresolved(text))?,
-            other => other.clone(),
+                .ok_or("unresolved_expression"),
+            other => Ok(other.clone()),
         };
-        narrowed = true;
-        out.push(Declaration {
-            tool: d.tool.clone(),
-            constraint,
-            scope: narrow.clone(),
-            location: d.location.clone(),
-        });
+        match resolved {
+            Ok(constraint) => {
+                narrowed = true;
+                out.push(Declaration {
+                    tool: d.tool.clone(),
+                    constraint,
+                    scope: narrow.clone(),
+                    location: d.location.clone(),
+                });
+            }
+            Err(code) => skipped.push(Skipped {
+                tool: d.tool.clone(),
+                scope: d.scope.clone(),
+                code: code.into(),
+                value: d.constraint.describe(),
+                location: d.location.clone(),
+                step: d.location.clone(),
+            }),
+        }
     }
-    Ok((if narrowed { narrow } else { whole }, out))
+    (if narrowed { narrow } else { whole }, out, skipped)
 }
 /// Reject contradictory constraints in the selected scope. No file wins by
 /// accidental read order. Ranges intersect; unresolved aliases stay unresolved.

@@ -321,7 +321,7 @@ pub(super) async fn freeze_resolved(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     guard: crate::source::retention::Guard,
 ) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
-    let mut all =
+    let (mut all, _) =
         freeze_resolved_each(context, owner, manifest, digest, requirements, None, guard).await?;
     Ok(all.pop().flatten())
 }
@@ -329,7 +329,8 @@ pub(super) async fn freeze_resolved(
 /// [`freeze_resolved`] for the tasks of a CI plan, in plan order: each task
 /// carries the project's declarations and those of the `setup-*` steps of its
 /// own jobs (spec 22.1). Tasks that freeze to the same bundle are resolved
-/// once.
+/// once. The second value is the notices of the freeze: one line for each
+/// input of a setup step that is no requirement.
 pub(super) async fn freeze_resolved_tasks(
     context: &Context,
     owner: &super::resident::Client,
@@ -338,10 +339,16 @@ pub(super) async fn freeze_resolved_tasks(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     plan: &local_ci::FrozenPlan,
     guard: crate::source::retention::Guard,
-) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
+) -> Result<Frozen, ApiError> {
     let plan = Some(plan.clone());
     freeze_resolved_each(context, owner, manifest, digest, requirements, plan, guard).await
 }
+
+/// The bundle of each task, and the notices of the freeze.
+type Frozen = (
+    Vec<Option<crate::toolchain::contract::FrozenBundle>>,
+    Vec<String>,
+);
 
 async fn freeze_resolved_each(
     context: &Context,
@@ -351,7 +358,7 @@ async fn freeze_resolved_each(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     plan: Option<local_ci::FrozenPlan>,
     guard: crate::source::retention::Guard,
-) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
+) -> Result<Frozen, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     let (frozen, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
@@ -366,7 +373,7 @@ async fn freeze_resolved_each(
         .await
         .map_err(|e| invalid(e.to_string()))?
     };
-    let frozen = frozen?;
+    let (frozen, notices) = frozen?;
     let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
     for (index, bundle) in frozen.iter().enumerate() {
         // The same unresolved bundle is the same question to the owner.
@@ -378,7 +385,7 @@ async fn freeze_resolved_each(
         resolved.push(bundle);
     }
     drop(guard);
-    Ok(resolved)
+    Ok((resolved, notices))
 }
 
 async fn resolve_bundle(
@@ -439,7 +446,7 @@ fn freeze_toolchains(
     digest: Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     plan: Option<&local_ci::FrozenPlan>,
-) -> Result<Vec<Option<crate::toolchain::contract::FrozenBundle>>, ApiError> {
+) -> Result<Frozen, ApiError> {
     use crate::toolchain::{
         contract::{self, FrozenBundle},
         versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId},
@@ -457,36 +464,30 @@ fn freeze_toolchains(
     }
     let project = std::str::from_utf8(&manifest.cwd_relative.0)
         .map_err(|_| blocked("invalid toolchain project scope".into()))?;
-    let workflows = plan
-        .map(crate::ci::toolchains::workflows)
-        .unwrap_or_default();
-    let declarations =
-        crate::toolchain::snapshot::read_captured(&store, &manifest, project, &workflows)
-            .map_err(|e| blocked(if plan.is_some() { located(&e) } else { e.code }))?;
     // What each bundle is frozen from: the project as a whole for a plain
-    // command, the declarations of its own jobs for a task of a plan.
+    // command, the declarations of its own jobs for a task of a plan. An
+    // input of a setup step belt cannot interpret requires nothing and is
+    // told as a notice; the worker reads the same with the same function.
     let mut sets = Vec::new();
+    let mut notices: Vec<String> = Vec::new();
     match plan {
-        None => sets.push((String::new(), Scope::project(project), declarations)),
+        None => {
+            let declarations =
+                crate::toolchain::snapshot::read_captured(&store, &manifest, project, &[])
+                    .map_err(|e| blocked(e.code))?;
+            sets.push((String::new(), Scope::project(project), declarations));
+        }
         Some(plan) => {
             for task in &plan.tasks {
-                let (scope, own) =
-                    crate::ci::toolchains::task_declarations(plan, task, project, &declarations)
-                        .map_err(|u| {
-                            let b = crate::toolchain::envsync::expression_blocked(
-                                u.tool.as_str(),
-                                &u.expression,
-                            );
-                            blocked(format!(
-                                "task `{}` (job {}, {}:{}): {}: {}",
-                                task.id,
-                                task.jobs.join(", "),
-                                u.location.path,
-                                u.location.first_line,
-                                b.missing,
-                                b.steps
-                            ))
-                        })?;
+                let (scope, own, told) = crate::ci::toolchains::task_declarations(
+                    &store, &manifest, plan, task, project,
+                )
+                .map_err(|e| blocked(located(&e)))?;
+                for line in told {
+                    if !notices.contains(&line) {
+                        notices.push(line);
+                    }
+                }
                 let who = format!("task `{}` (job {}): ", task.id, task.jobs.join(", "));
                 sets.push((who, scope, own));
             }
@@ -559,7 +560,7 @@ fn freeze_toolchains(
         })?;
         bundles.push(Some(seal(context, &profile, frozen)?));
     }
-    Ok(bundles)
+    Ok((bundles, notices))
 }
 
 /// Seal what the source pins exactly, and take what the configured inventory

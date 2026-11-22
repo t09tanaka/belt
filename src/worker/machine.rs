@@ -182,15 +182,12 @@ pub fn check_toolchain_source(
         ),
         Some(ci) => {
             let (plan, task) = super::ci_task::plan_task(state_dir, ci)?;
-            let read = crate::toolchain::snapshot::read_captured(
-                store,
-                m,
-                project,
-                std::slice::from_ref(&task.workflow),
-            )
-            .map_err(|e| invalid(&e.code))?;
-            crate::ci::toolchains::task_declarations(&plan, &task, project, &read)
-                .map_err(|_| invalid("toolchain source declarations mismatch"))?
+            // The function the parent froze with: what it left out as not
+            // interpreted is left out here as well.
+            let (scope, own, _) =
+                crate::ci::toolchains::task_declarations(store, m, &plan, &task, project)
+                    .map_err(|e| invalid(&e.code))?;
+            (scope, own)
         }
     };
     if bundle.frozen.scope != scope {

@@ -1,41 +1,87 @@
 //! The version declarations one task of a frozen plan runs under (spec 22.1):
 //! the project's version files and the `*-version` inputs of the `setup-*`
 //! steps of the task's own jobs. The parent freezes from this and the worker
-//! derives the same from the delivered plan, so neither trusts the other's
-//! reading. Only steps written directly in a job are read: the inside of a
-//! reusable workflow or a composite action is not.
-use crate::toolchain::versions::{self, Declaration, Scope, Unresolved};
-use local_ci::{dag::ExecutionTask, FrozenPlan};
+//! derives the same from the delivered plan with the same function, so
+//! neither trusts the other's reading and both read alike. Only steps written
+//! directly in a job are read: the inside of a reusable workflow or a
+//! composite action is not.
+use crate::source::store::SourceStore;
+use crate::toolchain::snapshot::read_captured_task;
+use crate::toolchain::versions::{self, Declaration, Diagnostic, Scope, Skipped};
+use local_ci::{dag::ExecutionTask, source::SourceManifest, FrozenPlan};
 use serde_json::Value;
 
-/// The workflow files the tasks of `plan` run, each once, in plan order.
-pub fn workflows(plan: &FrozenPlan) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    for task in &plan.tasks {
-        if !files.contains(&task.workflow) {
-            files.push(task.workflow.clone());
-        }
-    }
-    files
-}
-
-/// `declarations` (read with the task's workflow) as `task` runs under them.
-/// A version written as `${{ matrix.<key> }}` is the value of the task's own
-/// matrix variant, and `${{ env.<NAME> }}` is the literal the workflow gives
-/// the step (`env:` of the step, the job, then the workflow). Nothing else is
-/// evaluated here.
+/// What `task` is frozen from: the scope, the declarations in it, and one
+/// notice for each input of its setup steps that is no requirement.
+///
+/// A version belt understands (a version, a range, a known alias) is a
+/// requirement. A version written as `${{ matrix.<key> }}` is the value of
+/// the task's own matrix variant, and `${{ env.<NAME> }}` is the literal the
+/// workflow gives the step (`env:` of the step, the job, then the workflow).
+/// Anything else is not interpreted: it requires nothing, and the notice says
+/// where it is written and why. A job the task does not run has no effect.
+/// An error is one of the project's own version files, as for a plain
+/// command.
 pub fn task_declarations(
+    store: &SourceStore,
+    manifest: &SourceManifest,
     plan: &FrozenPlan,
     task: &ExecutionTask,
     project: &str,
-    declarations: &[Declaration],
-) -> Result<(Scope, Vec<Declaration>), Unresolved> {
+) -> Result<(Scope, Vec<Declaration>, Vec<String>), Diagnostic> {
+    let (read, unread) = read_captured_task(store, manifest, project, &task.workflow)?;
     let lookup = |scope: &Scope, context: &str, key: &str| match context {
         "matrix" => scalar(task.variant.as_ref()?.values.get(key)?),
         "env" => env_literal(plan, scope, key),
         _ => None,
     };
-    versions::task_declarations(declarations, project, &task.workflow, &task.jobs, &lookup)
+    let (scope, own, skipped) =
+        versions::task_declarations(&read, project, &task.workflow, &task.jobs, &lookup);
+    let who = format!("task `{}` (job {}", task.id, task.jobs.join(", "));
+    let mut notices: Vec<String> = Vec::new();
+    if let Some(code) = unread {
+        notices.push(format!(
+            "{who}, {}): the workflow could not be read for its setup steps ({code}); no version is required from them",
+            task.workflow
+        ));
+    }
+    for skipped in &skipped {
+        let tool = skipped.tool.as_str();
+        let line = format!(
+            "{who}, {}:{}): {tool}: {}; no {tool} version is required from this step",
+            skipped.step.path,
+            skipped.step.first_line,
+            reason(skipped)
+        );
+        if !notices.contains(&line) {
+            notices.push(line);
+        }
+    }
+    Ok((scope, own, notices))
+}
+
+/// Why an input of a setup step is no requirement, for a person.
+fn reason(skipped: &Skipped) -> String {
+    let value = &skipped.value;
+    match skipped.code.as_str() {
+        "conditional_step" => "the step has an `if:` condition".into(),
+        "unresolved_expression" => {
+            format!("the version is the expression {value}, which is not known until the run")
+        }
+        "version_file_expression" => {
+            format!("the version file is the expression {value}, which is not known until the run")
+        }
+        "missing_version_file" => {
+            format!("the version file {value} is not a readable file of the captured source")
+        }
+        "invalid_version_file" => {
+            format!("the version file {value} is not a path inside the project")
+        }
+        crate::toolchain::declarations::STRUCTURED_VERSION_FILE => {
+            format!("the version file {value} is not a plain version file")
+        }
+        code => format!("`{value}` is not a version belt reads ({code})"),
+    }
 }
 
 /// A matrix value that is a version as written: a string or a number.
