@@ -5706,6 +5706,154 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
     shutdown(&load(&spec)).await;
 }
 
+/// What each task of the run carries: the job of its bundle's scope, its
+/// requirements, and the versions its bundle was frozen to.
+fn ci_task_selections(
+    spec: &Spec,
+    value: &serde_json::Value,
+) -> Vec<(Option<String>, Vec<String>, Vec<String>)> {
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    let mut carried: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let bundle: belt::toolchain::contract::FrozenBundle =
+                serde_json::from_value(row.spec["toolchains"].clone()).unwrap();
+            let frozen = &bundle.frozen;
+            let scope = serde_json::to_value(&frozen.scope).unwrap();
+            (
+                scope["job"].as_str().map(String::from),
+                frozen.requirements.iter().map(|r| r.describe()).collect(),
+                frozen
+                    .selections
+                    .iter()
+                    .map(|s| s.concrete.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    carried.sort();
+    carried
+}
+
+/// A range no registry resolves is frozen, for the task that asks for it, to
+/// the version this host's own tool reports when that version is in the
+/// range: the range of a setup step, and the range of the project's version
+/// file. The worker reads the same from the source, takes the bundle and
+/// runs the job on its own tool of exactly that version. An alias of a setup
+/// step in another job of the same run is no requirement, as before: that job
+/// is told so and runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_accepts_a_range_the_native_tool_satisfies_frozen_to_the_observed_version() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let job = |id: &str, version: &str| {
+        format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
+    };
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[job("range", "20"), job("alias", "lts/*")].concat(),
+    );
+    let output = ci_command(&spec, &input).output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    if output.status.code() != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(output.status.code(), Some(0), "{value} {stderr}");
+    assert_eq!(ci_marks(&marks, "range"), ["v20.11.1"]);
+    assert_eq!(ci_marks(&marks, "alias"), ["v20.11.1"]);
+    // The alias is told once; the range is a requirement and is not.
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is required from this step"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(notices[0].contains("job alias"), "{stderr}");
+    assert!(
+        notices[0].ends_with(
+            "node: `lts/*` names no concrete version; no node version is required from this step"
+        ),
+        "{stderr}"
+    );
+    let range = "node=>=20.0.0 <21.0.0-0".to_string();
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [
+            (None, Vec::<String>::new(), Vec::<String>::new()),
+            (
+                Some("range".to_string()),
+                vec![range.clone()],
+                vec!["20.11.1".to_string()]
+            ),
+        ]
+    );
+    // The same range written in the project's version file, for a job with
+    // no setup step.
+    std::fs::write(input.join(".nvmrc"), "20\n").unwrap();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node --version >> MARKS/plain\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    if code != Some(0) {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+    }
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "plain"), ["v20.11.1"]);
+    assert_eq!(
+        ci_task_selections(&spec, &value),
+        [(None, vec![range], vec!["20.11.1".to_string()])]
+    );
+    assert!(
+        !spec.worker_state_dir.join("toolchains").exists()
+            || std::fs::read_dir(spec.worker_state_dir.join("toolchains"))
+                .unwrap()
+                .count()
+                == 0,
+        "something was installed"
+    );
+    shutdown(&load(&spec)).await;
+}
+
+/// A range of a setup step that neither a registry resolves nor this host's
+/// own tool is in is refused when the run is submitted, with the words of a
+/// plain command, also when another job of the run names an alias: nothing is
+/// queued and no step runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_refuses_a_range_the_native_tool_does_not_satisfy() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let job = |id: &str, version: &str| {
+        format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
+    };
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[job("range", "18"), job("alias", "lts/*")].concat(),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = value.to_string();
+    assert_eq!(value["ok"], false, "{text}");
+    assert!(text.contains("environment_mismatch"), "{text}");
+    assert!(
+        text.contains(
+            "toolchain resolve required: no coherent worker proposal (node=>=18.0.0 <19.0.0-0)"
+        ),
+        "{text}"
+    );
+    assert!(ci_marks(&marks, "range").is_empty(), "a step ran anyway");
+    assert!(ci_marks(&marks, "alias").is_empty(), "a step ran anyway");
+    shutdown(&load(&spec)).await;
+}
+
 /// A worker that holds as many frozen plans as it may does not take one
 /// more. The run does not wait without a word: it gets the event
 /// `ci_plan_refused` once, the worker is left out of the placement by name
@@ -6266,6 +6414,24 @@ async fn worker_commands_find_the_embedded_helpers_before_standalone_tools() {
 }
 
 /// A worker with no toolchain registry whose profile has a `node` that reports
+/// `reported`. Returns the directory of that `node`.
+fn native_node_profile(root: &std::path::Path, spec: &Spec, reported: &str) -> std::path::PathBuf {
+    let host = root.join("native-tools");
+    let stubs = root.join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(
+        &host.join("node"),
+        &format!("#!/bin/sh\nprintf 'v{reported}\\n'\n"),
+    );
+    let profile_text = format!("schema_version=1\nactive='native'\n[profiles.native]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='native'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!spec.worker_state_dir.join("toolchains.toml").exists());
+    host
+}
+
+/// A worker with no toolchain registry whose profile has a `node` that reports
 /// `reported`, and a project whose only declaration is `.nvmrc` = `declared`.
 /// The project has a prepare command that records the version setup saw.
 /// Returns the outcome of the public submit of a command that checks that
@@ -6282,18 +6448,7 @@ async fn submit_with_native_node(
     std::path::PathBuf,
 ) {
     let (root, spec, input) = control_fixture();
-    let host = root.path().join("native-tools");
-    let stubs = root.path().join("tool-stubs");
-    std::fs::create_dir(&host).unwrap();
-    crate::common::write_executable(
-        &host.join("node"),
-        &format!("#!/bin/sh\nprintf 'v{reported}\\n'\n"),
-    );
-    let profile_text = format!("schema_version=1\nactive='native'\n[profiles.native]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='native'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
-    let profile_file = spec.worker_state_dir.join("profiles.toml");
-    std::fs::write(&profile_file, &profile_text).unwrap();
-    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(!spec.worker_state_dir.join("toolchains.toml").exists());
+    let host = native_node_profile(root.path(), &spec, reported);
     std::fs::write(input.join(".nvmrc"), format!("{declared}\n")).unwrap();
     let ran = host.join("ran-on");
     let script = format!(

@@ -887,6 +887,83 @@ mod tests {
     use crate::toolchain::{profile::Profile, registry::Registry};
     use std::os::unix::fs::{symlink, DirBuilderExt};
 
+    /// A refused bundle is first sealed from what this host observed, and
+    /// only then are the aliases of setup steps that are still open left
+    /// out: a range beside such an alias is not lost with it, the alias is
+    /// never sealed from an observation, and an alias no setup step wrote
+    /// (the project file names it) keeps the refusal.
+    #[test]
+    fn a_refused_bundle_is_sealed_from_the_observation_before_step_aliases_are_left_out() {
+        use super::{seal_after_refusal, unresolved_aliases};
+        use crate::error::{ApiError, BlockedReason};
+        use crate::ids::Digest;
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let source = Digest::of_bytes(b"source");
+        let (node, rust) = (
+            ToolId::parse("node").unwrap(),
+            ToolId::parse("rust").unwrap(),
+        );
+        let bundle = |declared: &[(&ToolId, &str)]| {
+            let scope = Scope::project("");
+            let declarations: Vec<Declaration> = declared
+                .iter()
+                .map(|(tool, constraint)| Declaration {
+                    tool: (*tool).clone(),
+                    constraint: Constraint::parse(constraint).unwrap(),
+                    scope: scope.clone(),
+                    location: Location {
+                        path: ".github/workflows/ci.yml".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                })
+                .collect();
+            let frozen = FrozenToolchains::freeze(
+                source.clone(),
+                Digest::of_bytes(b"parent"),
+                scope,
+                &declarations,
+                &[],
+                &Default::default(),
+                MatchPolicy::Exact,
+            );
+            FrozenBundle::seal_exact(frozen.unwrap()).unwrap()
+        };
+        // Both tools are observed: only the range is answered by that.
+        let seen: super::Observed = [
+            (node.clone(), VersionObservation::parse("20.11.1")),
+            (rust.clone(), VersionObservation::parse("1.89.0")),
+        ]
+        .into();
+        let refusal = || ApiError::blocked(BlockedReason::EnvironmentMismatch, "resolve required");
+        let mixed = bundle(&[(&node, "20"), (&rust, "stable")]);
+        // The alias keeps the sealed bundle open: the refusal comes back, and
+        // the alias of the step, not the range, is what is left out.
+        assert_eq!(
+            seal_after_refusal(mixed.clone(), &seen, &source, refusal()),
+            Err(refusal())
+        );
+        let steps = [rust.clone()];
+        assert_eq!(unresolved_aliases(&refusal(), Some(&mixed), &steps), steps);
+        // Asked again without the alias, the range is sealed.
+        let sealed =
+            seal_after_refusal(bundle(&[(&node, "20")]), &seen, &source, refusal()).unwrap();
+        sealed.validate(&source).unwrap();
+        assert_eq!(sealed.evidence[0].concrete.to_string(), "20.11.1");
+        // A range the observation is outside of is not an alias to leave out.
+        let unmet = bundle(&[(&node, "18")]);
+        assert_eq!(
+            seal_after_refusal(unmet.clone(), &seen, &source, refusal()),
+            Err(refusal())
+        );
+        assert!(unresolved_aliases(&refusal(), Some(&unmet), &[]).is_empty());
+        // An alias the project file wrote is no alias of a step.
+        assert!(unresolved_aliases(&refusal(), Some(&mixed), &[]).is_empty());
+        // Another error says nothing about the requirements.
+        let other = ApiError::blocked(BlockedReason::SecretUnavailable, "secret");
+        assert!(unresolved_aliases(&other, Some(&mixed), &steps).is_empty());
+    }
+
     #[test]
     fn the_worker_inventory_is_found_through_a_symlinked_state_directory() {
         let root = crate::test_tmp::tempdir().unwrap();
