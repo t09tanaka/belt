@@ -288,25 +288,39 @@ fn a50_ctrl_c_stops_the_command_and_removes_its_ledger_entry() {
     let fx = host(2);
     let cwd = fx.path("project");
     let started = cwd.join("started");
-    let script =
-        crate::fixture_process::script(&format!("touch '{}'; exec sleep 30", started.display()));
-    let mut command = belt(&fx, &cwd, &["exec", "--", "/bin/sh", "-c", &script]);
+    // Both commands are shell builtins. Once the marker exists the final
+    // process is already running, with no child spawn or exec left to race.
+    let mut command = belt(
+        &fx,
+        &cwd,
+        &[
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            ": > started; read -r line; exit 37",
+        ],
+    );
     command
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0);
-    let child = command.spawn().unwrap();
+    let mut child = command.spawn().unwrap();
+    let input = child.stdin.take().unwrap();
     let group = i32::try_from(child.id()).unwrap();
     assert!(group > 1);
     wait_for("the command to start", || started.exists());
     assert_eq!(entries(&fx).len(), 1);
-    let began = Instant::now();
     assert!(matches!(
         belt::platform::process::signal_process_group(group, libc::SIGINT),
         belt::platform::process::GroupSignal::Delivered
     ));
+    wait_for("Ctrl-C to terminate belt while stdin stays open", || {
+        child.try_wait().unwrap().is_some()
+    });
+    drop(input);
     let out = child.wait_with_output().unwrap();
-    assert!(began.elapsed() < Duration::from_secs(20));
     assert_eq!(out.status.code(), Some(128 + libc::SIGINT), "{out:?}");
     assert!(entries(&fx).is_empty());
 }

@@ -1,13 +1,19 @@
 # S26: Mac parent, two Linux workers and a Linux init member
 
 This is a disposable, real SSH/systemd harness, not a simulated worker test.
-It runs a native Mac parent and three `linux/arm64` Docker Desktop containers:
+It runs a native Mac parent and three Linux Docker Desktop containers (arm64 by default):
 w1 and w2 stay worker-only, and m1 becomes an `init` member (its own resident,
 parent and worker, as a lingering systemd user service).
 The parent uses the hidden foreground `belt daemon --input` entry point and a
 private bootstrap (the same contract used by `tests/it/remote_links.rs`). It
 never calls Mac `belt init` or registers a LaunchAgent; the public `init`
 service-registration path is exercised on Linux only, by m1.
+
+For x86_64 workers, export `S26_ARCH=amd64` before building, starting,
+running and cleaning up. This selects a native x86_64 compiler inside Docker,
+the `belt-linux-x86_64` artifacts and an architecture-specific image. The
+default base is `target/s26-amd64`; if setting `S26_BASE` explicitly, give
+each architecture its own base so the workers and evidence stay separate.
 
 ## Prerequisites and run
 
@@ -47,7 +53,12 @@ image uses `debian:12.9-slim`, real systemd PID 1, sshd/PAM, a lingering UID 100
 `belt` user, Git and shell/core utilities. The app supplies fast-worktree and
 portool for workspace hooks and commands. Rust/tool image tags and installed Rust tool versions
 are pinned; Debian apt security packages are intentionally not snapshot-pinned.
-The harness has no Docker socket mount in workers.
+Workers run with privileged systemd and share the Docker VM kernel. The worker
+image masks `systemd-binfmt.service` and its automount so that shutting down a
+worker preserves the VM's cross-architecture executable handlers. If an amd64
+build fails before the first Dockerfile command, check the runtime separately
+with `docker run --rm --platform linux/amd64 debian:12.9-slim dpkg --print-architecture`.
+It should print `amd64`. The harness has no Docker socket mount in workers.
 
 `up.sh` uses portool sync/check/exec against a harness-owned Git resource root
 under `target/s26/resources/`. It keeps generated configuration there and uses
@@ -74,7 +85,7 @@ The checks deliberately run in this order, so w2 joins an existing backlog:
 | A02 | Install only w1 using `workers add --ssh --install --binary`; submit 12 host-agnostic 90-second shell jobs. Observe active attempts on local and w1 plus tasks with **no attempts**. Save those task IDs, install w2, and require at least one of those exact tasks to finish successfully on w2. All 12 must finish and collect successfully. |
 | A45, part | Both installs occurred above; SSH verifies systemd PID 1, UID 1000, lingering and `systemctl --user is-active` on exactly one installed belt worker unit. `belt doctor` must exit successfully, report healthy, and contain checks for both workers with no failure or unverified result. |
 | A01 | Submit nine more 10-second shell jobs with no host selectors. `belt wait` must succeed for all; `belt show --json` must report one successful, completely collected attempt per task and the worker-ID set exactly `local`, `w1`, `w2`. |
-| A34, part | `belt workers stop w2` followed by SSH user-service state `inactive` (exit 3); `belt workers start w2` followed by state `active` (exit 0). SSH failures cannot count as stopped. |
+| A34 | Stop and start w2, switch to a second binary digest, interrupt its bridge health probe and verify rollback. Retry successfully, verify a repeated upgrade reports `already_current`, and compare the original executable’s inode, mode, size and digest. |
 | M1 init member | The host runs `workers add m1 --ssh m1 --install --binary`, then m1 runs `belt init` over SSH as UID 1000 (the spec's order: install, then init, so no `--move`). Exactly one `io.github.t09tanaka.belt.local.*` user unit is active, no worker-only unit is, lingering is on, `bin/resident` names the installed binary's SHA-256 and the unit's main process runs it, `belt group` on m1 reports the host's group, and a host submission placed on m1 succeeds with its command started exactly once. |
 | A57 rollback | m1 runs N. A host run is placed on m1, then `belt upgrade --binary <broken N+1>`; once the broken version runs, the upgrade CLI (identified by its pid file, executable and argv) gets SIGTERM, so only the guard can decide. The guard must restore N (`bin/resident`, record removed, main process N) within 90 s, N's directory unchanged, and the host run finishes, started once. Each database contains an original marker before the trial and a changed marker during it. Both must revert. A second task submitted by m1 stays running on w1 across rollback, retains its attempt ID, and is collected with one observed command start. |
 | A57 commit | A host run is placed on m1, then `belt upgrade --binary <N+1>` must exit 0. `bin/resident` and the main process name N+1, the old version directory is unchanged (inode, mtime, size, mode, digest), no upgrade record remains, and the run finishes, started once. The upgraded m1 then submits a task to w1 running the older binary and collects its result. |
@@ -147,18 +158,77 @@ Expect roughly **5–10 minutes** for a warm acceptance run; cold Rust/image bui
 can take **10–30+ minutes**, depending on Docker resources and network. These are
 estimates, not measured results. The first SSH readiness deadline is 90 seconds.
 
-Not covered: a physical Mac mini / two real Macs (goal 12), Linux x86_64, reboot
-or boot ID, suspend/clock/process identity/sleep inhibition, A35 system-user mode,
-A34 `workers upgrade`, A37 a real project, or goal 16 multi-submitter/failover.
-This proves only the listed parts of A45/A34 if it actually passes. Docker
-Desktop's cgroup/systemd behavior remains an environment-specific prerequisite;
-there is no fallback to a fake service or ephemeral worker.
+On arm64 Docker workers, A34 recovered the original worker after a failed
+post-switch SSH health check. A second upgrade succeeded and its repeat
+returned `already_current`. In the dedicated A35 run, the system unit
+remained enabled, its PID changed after restart, the parent completed the
+bridge handshake and the non-root worker ran a job. The A37 timings below
+record the separate project CI comparison.
+
+Physical Mac startup, suspend and boot identity still need hardware.
+Docker Desktop runs the containers on a shared Linux kernel.
 
 Authoring validation: Bash syntax, ShellCheck, and Python syntax can run without
 Docker. Real Docker/SSH/systemd acceptance must be run on the host; a sandbox
 that denies the Docker socket cannot establish those results.
 
-### A46 ephemeral worker over SSH
+## Compare a project's CI on one and multiple workers
+
+On a fresh `up.sh` allocation, set `S26_PROJECT_CI` to the absolute path of a
+trusted local Git checkout and use the normal `run.sh` entry. This mode clones
+its committed HEAD into the private harness directory. It executes that commit's
+CI twice on the local worker, installs w1 and w2, then executes it twice more.
+The project must have independent jobs that can run on both platforms, with
+their tools available in the harness environments.
+
+Use `run/evidence/project-ci.json` to compare elapsed time, placement and
+collection timestamps. The first and repeat measurements on each topology are
+reported separately. The local worker keeps its cache when the other workers
+join. A distributed run must place work on at least two workers and return the
+same job outcomes as the local baseline. Copy the evidence before `down.sh`.
+
+### Project comparison measured on 2026-11-22
+
+The workload was the 15 pytest tests in `t09tanaka/project-backlog` at
+`f5fb10b75002ee16049296ead798cf78d93410cf`. Its checkout had no CI workflow.
+A private comparison commit (`7eae2c56abff378920798dfc8d39fc720e0895bf`)
+added four independent jobs, one per test module, and vendored pytest 7.4.4
+and its dependencies. All four runs below used that same commit. Each job
+ran `PYTHONPATH=vendor python3 -m pytest -q tests/test_<module>.py`.
+The parent was macOS and the w1/w2 workers were arm64 Linux containers on
+the same machine.
+
+The native timing build was `15aef9e` on macOS 27.0.1 arm64. The first
+parent run started with a fresh allocation. The group inherited the parent's
+cache and added two fresh arm64 Debian workers over SSH; the resident stayed
+running throughout. Each topology ran the same four independent jobs twice.
+
+| Configuration | Elapsed (s) | Preparation (s) | Input delivery (s) | Resource wait (s) | Work (s) | Collection (s) | Workers executing jobs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Parent, first | 25.86 | 9.065 | 8.136 | 0.035 | 5.624 | 0.768 | local |
+| Parent, repeat | 16.84 | 7.924 | 0.000 | 0.037 | 5.054 | 0.891 | local |
+| Group, first | 13.20 | 5.846 | 3.334 | 0.053 | 5.409 | 1.412 | local, w1 |
+| Group, repeat | 12.70 | 11.495 | 0.002 | 0.293 | 5.182 | 2.873 | local, w1, w2 |
+
+All four job outcomes matched on every run. The first-run elapsed-time ratio
+was 1.96× and the repeat ratio was 1.33×. Preparation spans worker acceptance
+to command registration. Delivery includes source forwarding and frozen-plan
+delivery, measured on the parent. Cached source delivery takes zero forwarding
+time. Resource wait and work come from the collected job artifacts. Collection
+spans terminal status to closed collection. These phase totals sum observations
+across jobs or workers that can overlap; elapsed time is measured once per run.
+A physical LAN and four independent cold worker caches were outside this sample.
+
+## Dedicated system service
+
+On a fresh allocation, set `S26_SYSTEM_WORKER=1` for both `up.sh` and
+`run.sh`. This case uses w1 only. It stages the worker as the SSH user,
+registers the unit with a trusted administrator copy of belt inside w1,
+enables it in the system manager and finishes enrollment from the parent.
+A job must then complete on that worker while its service runs as the
+non-root belt account. The evidence is in `run/evidence/system-worker.json`.
+
+## A46 ephemeral worker over SSH
 
 Use a fresh `up.sh` run for `S26_BELT=/absolute/path/to/belt scripts/s26/run.sh --a46`. This check uses the run's disposable w1 guest as an ephemeral worker and connects through an OpenSSH local forward. It removes that forward while a task runs, observes one unknown attempt, runs `workers forget`, and reconnects the same live agent. The command must have started once, its original attempt must be interrupted, and the old agent must receive the retirement notice. A second worker start must have a new instance identity. See `run/evidence/a46.json` and the two agent logs before running `down.sh`.
 

@@ -141,6 +141,11 @@ fn switch(spec: &Spec, generation: &Generation) -> Result<(), ApiError> {
         if group::fingerprint(&next) != generation.fingerprint {
             return Err(earlier());
         }
+        crate::service::worker::rotation_binding::prepare(
+            spec,
+            &group::next_key_path(&spec.cluster_key_path),
+        )
+        .map_err(internal)?;
         group::switch_to_next(&spec.cluster_key_path).map_err(internal)?;
         std::fs::File::open(
             spec.cluster_key_path
@@ -154,6 +159,7 @@ fn switch(spec: &Spec, generation: &Generation) -> Result<(), ApiError> {
             "requested next key is missing; rerun distribution",
         ));
     }
+    crate::service::init::finish_key_change(spec).map_err(internal)?;
     store(spec)?
         .observe_group_key(&generation.fingerprint)
         .map_err(internal)?;

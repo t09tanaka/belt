@@ -11,7 +11,7 @@ use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
 use crate::worker::{agent::Agent, serve::serve_local_connection};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -86,8 +86,7 @@ pub enum Operation {
     },
     Ping,
     Health,
-    /// Re-read the private worker registration and dial workers added since
-    /// startup. Never disconnects or changes a worker that is already dialed.
+    /// Re-read private registrations. An unchanged worker keeps its connection.
     ReloadWorkers,
     ListWorkers {
         names: Vec<WorkerId>,
@@ -927,16 +926,42 @@ impl Resident {
         // Connection failures stay inside each owner and never terminate the resident.
         let mut remotes = JoinSet::new();
         let mut agent_connections = JoinSet::new();
-        let mut dialed = BTreeSet::new();
+        let mut dialed = BTreeMap::new();
+        let dial = self.dial.clone();
+        let remote_coordinator = self.coordinator.clone();
+        let captured = self.captured.clone();
+        let mut connect = |config: Arc<ResolvedConfig>,
+                           worker: crate::config::resolve::WorkerSpec| {
+            if dialed
+                .get(&worker.id)
+                .is_some_and(|(old, _, _)| old == &worker)
+            {
+                return false;
+            }
+            let (stop_worker, stopped) = watch::channel(false);
+            let (finished, done) = oneshot::channel();
+            let previous = dialed.insert(worker.id.clone(), (worker.clone(), stop_worker, done));
+            let ready = previous.map(|(_, stop, done)| {
+                let _ = stop.send(true);
+                done
+            });
+            let connect = dial.clone();
+            let coordinator = remote_coordinator.clone();
+            let captured = captured.clone();
+            remotes.spawn(async move {
+                // Let the prior session detach before publishing a new link for this ID.
+                if let Some(ready) = ready {
+                    let _ = ready.await;
+                }
+                if !*stopped.borrow() {
+                    connect(config, worker, coordinator, captured, stopped).await;
+                }
+                let _ = finished.send(());
+            });
+            true
+        };
         for worker in self.remote_config.workers.clone() {
-            dialed.insert(worker.id.clone());
-            remotes.spawn((self.dial)(
-                self.remote_config.clone(),
-                worker,
-                self.coordinator.clone(),
-                self.captured.clone(),
-                rx.clone(),
-            ));
+            connect(self.remote_config.clone(), worker);
         }
         let (reload_tx, mut reload_rx) = mpsc::channel::<Control>(4);
         let (base, env, local) = (
@@ -1087,9 +1112,8 @@ impl Resident {
                             let fresh = Arc::new(fresh);
                             let mut connecting = Vec::new();
                             for worker in fresh.workers.clone() {
-                                if dialed.insert(worker.id.clone()) {
+                                if connect(fresh.clone(), worker.clone()) {
                                     connecting.push(worker.id.clone());
-                                    remotes.spawn((self.dial)(fresh.clone(), worker, self.coordinator.clone(), self.captured.clone(), stop.subscribe()));
                                 }
                             }
                             Reply::WorkersReloaded { connecting }
@@ -1129,6 +1153,9 @@ impl Resident {
         *admission.lock().await = true;
         let _ = stop.send(true);
         let _ = delivery_stop.send(true);
+        for (_, stop_worker, _) in dialed.values() {
+            let _ = stop_worker.send(true);
+        }
         while let Some(result) = requests.join_next().await {
             if let Err(e) = result {
                 failure.get_or_insert(e.into());

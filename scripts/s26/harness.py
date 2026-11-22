@@ -15,10 +15,11 @@ import time
 
 ROOT = Path(os.environ["S26_ROOT"])
 BASE = Path(os.environ["S26_BASE"])
+LINUX_BINARY = "belt-linux-" + os.environ["S26_MACHINE"]
 RUN = Path(os.environ["S26_RUN"])
 LABEL = "io.belt.s26.run"
 # w1 and w2 stay worker-only (installed by the host); m1 becomes an init member.
-HOSTS = ("w1", "w2", "m1")
+HOSTS = ("w1",) if os.environ.get("S26_SYSTEM_WORKER") == "1" else ("w1", "w2", "m1")
 USER_BUS = ('export XDG_RUNTIME_DIR=/run/user/1000; '
             'export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; ')
 CONFIG = """schema_version=1
@@ -103,14 +104,14 @@ def up():
     command(["docker", "network", "create", "--label", f"{LABEL}={token}", prefix])
     for host, name in zip(HOSTS, manifest["containers"]):
         port = os.environ["S26_" + host.upper() + "_PORT"]
-        command(["docker", "run", "-d", "--platform", "linux/arm64",
+        command(["docker", "run", "-d", "--platform", "linux/" + os.environ["S26_ARCH"],
                  "--privileged", "--cgroupns=host", "--tmpfs", "/run",
                  "--tmpfs", "/run/lock", "--tmpfs", "/tmp",
                  "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
                  "--label", f"{LABEL}={token}", "--name", name,
                  "--hostname", host, "--network", prefix,
                  "-p", f"127.0.0.1:{port}:22",
-                 "belt-s26-worker:debian12.9-embedded"])
+                 os.environ["S26_IMAGE"]])
         command(["docker", "cp", RUN / "id_ed25519.pub",
                  f"{name}:/home/belt/.ssh/authorized_keys"])
         command(["docker", "exec", name, "sh", "-ec",
@@ -120,7 +121,7 @@ def up():
             host, 'test "$(cat /proc/1/comm)" = systemd && '
             'test "$(loginctl show-user 1000 -p Linger --value)" = yes && '
             'test -S /run/user/1000/bus', check=False).returncode == 0)
-    print(f"w1, w2 and m1 ready. Evidence and private SSH files: {RUN}")
+    print(f"{', '.join(HOSTS)} ready. Evidence and private SSH files: {RUN}")
 
 
 class Checks:
@@ -128,7 +129,7 @@ class Checks:
         binary = Path(os.environ["S26_BELT"])
         if not binary.is_absolute() or not binary.is_file():
             raise RuntimeError("S26_BELT must name an existing absolute native binary")
-        if not (BASE / "belt-linux-aarch64").is_file():
+        if not (BASE / LINUX_BINARY).is_file():
             raise RuntimeError("run build-linux.sh first")
         if len(os.fsencode(RUN / "state/parent/request.sock")) >= 104:
             raise RuntimeError("checkout path is too long for macOS Unix sockets; use a shorter checkout path")
@@ -201,21 +202,25 @@ class Checks:
                                        stdout=log, stderr=log)
         log.close()
 
+        spec = json.loads(self.input.read_text())
+
         def ready():
             if self.parent.poll() is not None:
                 raise RuntimeError("parent exited; see evidence/parent.log")
             if not (RUN / "state/parent/request.sock").is_socket():
                 return False
             try:
-                self.belt("ls")
-                return True
+                if spec.get("expected_cluster") is None:
+                    # The first start creates the cluster ID needed to authenticate top.
+                    self.belt("ls")
+                    return True
+                return self.belt("top").get("resident_observed") is True
             except RuntimeError:
                 return False
         until("foreground parent ready", ready, 30)
         # `belt init` would record the group identity; this foreground parent
         # skips init (no LaunchAgent), so record the cluster the parent just
         # created and start it again with it, as init does.
-        spec = json.loads(self.input.read_text())
         if spec.get("expected_cluster") is None:
             import sqlite3
             db = RUN / "state" / "coordinator.db"
@@ -231,7 +236,7 @@ class Checks:
 
     def install(self, host):
         self.belt("workers", "add", host, "--ssh", host, "--install", "--binary",
-                  str(BASE / "belt-linux-aarch64"), timeout=180)
+                  str(BASE / LINUX_BINARY), timeout=180)
         self.service(host, "active")
 
     def service(self, host, expected, kind="worker"):
@@ -302,6 +307,9 @@ class Checks:
     def a45(self):
         for host in ("w1", "w2"):
             self.service(host, "active")
+            machine = ssh(host, "uname -m").stdout.strip()
+            if machine != os.environ["S26_MACHINE"]:
+                raise RuntimeError(f"{host}: expected {os.environ['S26_MACHINE']}, observed {machine}")
             p = ssh(host, 'test "$(id -u)" = 1000 && '
                     'test "$(cat /proc/1/comm)" = systemd && '
                     'test "$(loginctl show-user 1000 -p Linger --value)" = yes')
@@ -351,7 +359,8 @@ class Checks:
         self.service("w2", "inactive")
         self.belt("workers", "start", "w2")
         self.service("w2", "active")
-        return "workers stop/start changed w2 user service inactive -> active"
+        from worker_upgrade import verify
+        return verify(self, RUN, BASE / LINUX_BINARY, "w2", command, ssh, sha256, save)
 
     # m1: an init member. The host installs it as a worker, then `belt init`
     # runs there as its user, so its one resident (parent and worker) is a
@@ -399,10 +408,28 @@ class Checks:
         return ssh("m1", f'f="$HOME/.config/belt/bin/{digest}/belt"; '
                    'stat -c "%i %Y %s %a" "$f" && sha256sum "$f"').stdout
 
+    # Rosetta supplies the interpreter as /proc/PID/exe. Validate the guest
+    # executable against an executable mapping of the same path and inode.
+    PROCESS_EXE = r'''process_exe() {
+  local interpreter guest inode
+  interpreter=$(readlink "/proc/$1/exe") || return 1
+  if [ "$interpreter" != /run/rosetta/rosetta ]; then
+    printf '%s\n' "$interpreter"
+    return
+  fi
+  IFS= read -r -d '' guest < "/proc/$1/cmdline" || return 1
+  case "$guest" in /*) ;; *) return 1 ;; esac
+  guest=$(readlink -f "$guest") || return 1
+  inode=$(stat -c %i "$guest") || return 1
+  awk -v file="$guest" -v ino="$inode" '$2 ~ /x/ && $5 == ino && $6 == file {found=1} END {exit !found}' "/proc/$1/maps" || return 1
+  printf '%s\n' "$guest"
+}
+'''
+
     def m1_main_exe(self):
-        p = self.m1_exec('set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service; '
+        p = self.m1_exec(self.PROCESS_EXE + 'set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service; '
                          'pid=$(systemctl --user -M belt@ show -p MainPID --value "$(basename "$1")"); '
-                         '[ "$pid" -gt 1 ] && readlink "/proc/$pid/exe"', check=False)
+                         '[ "$pid" -gt 1 ] && process_exe "$pid"', check=False)
         return p.stdout.strip() if p.returncode == 0 else None
 
     def m1_upgraded_away(self):
@@ -451,16 +478,18 @@ class Checks:
         return views
 
     def m1(self):
-        n = BASE / "belt-linux-aarch64"
+        n = BASE / LINUX_BINARY
         # The spec's order for a host that becomes a member: an existing
         # member installs it as a worker, then `init` runs there.
         self.install("m1")
         name = self.m1_container()
         command(["docker", "exec", name, "install", "-d", "-o", "belt", "-g", "belt", "-m", "700",
                  "/home/belt/project", "/home/belt/s26-bin"])
-        command(["docker", "cp", self.project / "job.sh", f"{name}:/home/belt/project/job.sh"])
-        command(["docker", "exec", name, "chown", "belt:belt", "/home/belt/project/job.sh"])
-        ssh("m1", 'cd "$HOME/project" && git init -q && git add job.sh && '
+        for filename in ("job.sh", ".portool.toml"):
+            command(["docker", "cp", self.project / filename, f"{name}:/home/belt/project/{filename}"])
+        command(["docker", "exec", name, "chown", "belt:belt",
+                 "/home/belt/project/job.sh", "/home/belt/project/.portool.toml"])
+        ssh("m1", 'cd "$HOME/project" && git init -q && git add job.sh .portool.toml && '
             'git -c user.name="S26 Harness" -c user.email=s26@example.invalid '
             '-c commit.gpgsign=false commit -qm "S26 fixture"')
         self.count += 1
@@ -504,8 +533,8 @@ class Checks:
     # A57: `belt upgrade` on m1 (§24.8). These need a Linux build with the
     # upgrade subcommand and the variants from `build-linux.sh --upgrade`.
 
-    VARIANTS = {"n": "belt-linux-aarch64", "n1": "belt-linux-aarch64-n1",
-                "broken": "belt-linux-aarch64-n1-broken"}
+    VARIANTS = {"n": LINUX_BINARY, "n1": LINUX_BINARY + "-n1",
+                "broken": LINUX_BINARY + "-n1-broken"}
 
     def a57_ready(self, *need):
         if not self.m1_ready:
@@ -574,7 +603,7 @@ class Checks:
     # the pid file: STOP holds the trial open, TERM ends the CLI so that only
     # the guard can decide. The process is identified by its executable and
     # argv first; with --binary the CLI is the one child of the named pid.
-    WATCH = r'''set -eu
+    WATCH = PROCESS_EXE + r'''set -eu
 marker="$1/upgrade-trial.json"; want="$HOME/.config/belt/bin/$2/belt"
 sig=$3; exe=$4; child=$5; deadline=$((SECONDS + $6))
 set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service
@@ -582,7 +611,7 @@ unit=$(basename "$1")
 while :; do
   if [ -e "$marker" ]; then
     main=$(systemctl --user -M belt@ show -p MainPID --value "$unit" 2>/dev/null || echo 0)
-    if [ "${main:-0}" -gt 1 ] && [ "$(readlink "/proc/$main/exe" 2>/dev/null)" = "$want" ]; then break; fi
+    if [ "${main:-0}" -gt 1 ] && [ "$(process_exe "$main" 2>/dev/null)" = "$want" ]; then break; fi
   fi
   [ "$SECONDS" -lt "$deadline" ] || { echo "no trial of $want seen" >&2; exit 3; }
   sleep 0.02
@@ -591,17 +620,17 @@ pid=$(cat "$HOME/s26-bin/upgrade.pid")
 if [ "$child" = yes ]; then pid=$(pgrep -P "$pid"); fi
 case "$pid" in ''|*[!0-9]*) echo "no single upgrade process: '$pid'" >&2; exit 4 ;; esac
 [ "$pid" -gt 1 ] || exit 4
-[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || { echo "pid $pid is not $exe" >&2; exit 4; }
+[ "$(process_exe "$pid")" = "$(readlink -f "$exe")" ] || { echo "pid $pid is not $exe" >&2; exit 4; }
 tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || { echo "pid $pid is not an upgrade" >&2; exit 4; }
 kill -s "$sig" "$pid"
 echo "$pid"
 '''
 
-    SIGNAL = r'''set -eu
+    SIGNAL = PROCESS_EXE + r'''set -eu
 pid=$1; exe=$2
 case "$pid" in ''|*[!0-9]*) exit 4 ;; esac
 [ "$pid" -gt 1 ] || exit 4
-[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || exit 4
+[ "$(process_exe "$pid")" = "$(readlink -f "$exe")" ] || exit 4
 tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || exit 4
 kill -s CONT "$pid"
 '''
@@ -870,11 +899,21 @@ kill -s CONT "$pid"
 def run():
     checks = Checks()
     try:
+        if os.environ.get("S26_SYSTEM_WORKER") == "1":
+            from system_worker import verify
+            checks.check("A35 Docker system worker",
+                         lambda: verify(checks, RUN, BASE / LINUX_BINARY, command, save, until))
+            return 0 if checks.results[-1]["pass"] else 1
+        if repo := os.environ.get("S26_PROJECT_CI"):
+            from project_ci import compare
+            checks.check("A37 Docker project comparison",
+                         lambda: compare(checks, repo, RUN, command, save, until))
+            return 0 if checks.results[-1]["pass"] else 1
         checks.start()
         checks.check("A02", checks.a02)
         checks.check("A45 (part)", checks.a45)
         checks.check("A01", checks.a01)
-        checks.check("A34 (part)", checks.a34)
+        checks.check("A34 worker lifecycle and upgrade", checks.a34)
         checks.check("M1 init member", checks.m1)
         # A57 needs `belt upgrade` (R68); each check skips, with its reason,
         # when the Linux belt on m1 has no such subcommand.

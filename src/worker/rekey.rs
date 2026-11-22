@@ -98,7 +98,14 @@ pub(crate) fn finish(state: &Path, key_path: &Path, store: &WorkerStore) -> anyh
         }
     };
     let text: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    write(key_path, format!("{text}\n").as_bytes())?;
+    let mut staged = tempfile::NamedTempFile::new_in(
+        key_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("key parent missing"))?,
+    )?;
+    staged.write_all(format!("{text}\n").as_bytes())?;
+    staged.as_file().sync_all()?;
+    crate::service::init::install_key(staged.path(), key_path)?;
     match std::fs::remove_file(crate::group::next_key_path(key_path)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

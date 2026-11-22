@@ -435,12 +435,11 @@ fn the_bridge_runs_the_registered_absolute_binary_or_the_bare_name() {
 async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
     let root = crate::test_tmp::tempdir().unwrap();
     let mut resident = resident(root.path()).await;
-    let dialed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let record = dialed.clone();
-    // No real ssh: the dial only records who it was asked to reach.
+    let (record, mut dialed) = tokio::sync::mpsc::unbounded_channel();
+    // No real ssh: report when each connection owner starts.
     resident.dial = Arc::new(move |config, worker, _, _, _| {
         assert!(config.workers.iter().any(|w| w.id == worker.id));
-        record.lock().unwrap().push(worker.id.clone());
+        record.send(worker.id).unwrap();
         Box::pin(async {})
     });
     let client = resident.client();
@@ -457,6 +456,13 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n",
     );
     assert_eq!(reload(client.clone()).await, ["remote-a"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), dialed.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "remote-a"
+    );
     // Asking again dials nothing twice.
     assert!(reload(client.clone()).await.is_empty());
     write_registration(
@@ -464,7 +470,13 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n[[workers]]\nid='remote-b'\nssh='peer-b'\n",
     );
     assert_eq!(reload(client.clone()).await, ["remote-b"]);
-    assert_eq!(*dialed.lock().unwrap(), ["remote-a", "remote-b"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), dialed.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "remote-b"
+    );
     // An unusable registration is an answer, not a crash.
     write_registration(root.path(), "not toml [");
     match client.request(Operation::ReloadWorkers).await.unwrap() {
@@ -480,6 +492,55 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn reload_redials_a_registered_worker_after_install_supplies_its_binary() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut resident = resident(root.path()).await;
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    resident.dial = Arc::new(move |_, worker, _, _, mut stop| {
+        let events = events.clone();
+        Box::pin(async move {
+            events.send((worker.binary.clone(), true)).unwrap();
+            if !*stop.borrow() {
+                let _ = stop.changed().await;
+            }
+            events.send((worker.binary, false)).unwrap();
+        })
+    });
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let registration = "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n";
+    let binary = "/home/worker/.config/belt/bin/current/belt";
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    for entry in [
+        registration.to_owned(),
+        format!("{registration}binary='{binary}'\n"),
+    ] {
+        write_registration(root.path(), &entry);
+        assert!(
+            matches!(client.request(Operation::ReloadWorkers).await.unwrap(),
+            Reply::WorkersReloaded { connecting } if connecting == ["remote-a"])
+        );
+        if entry == registration {
+            assert_eq!(next().await, (None, true));
+        } else {
+            assert_eq!(next().await, (None, false));
+            assert_eq!(next().await, (Some(binary.into()), true));
+        }
+    }
+    assert!(
+        matches!(client.request(Operation::ReloadWorkers).await.unwrap(),
+        Reply::WorkersReloaded { connecting } if connecting.is_empty())
+    );
+    client.request(Operation::Shutdown).await.unwrap();
+    runner.await.unwrap().unwrap();
 }
 
 #[tokio::test]

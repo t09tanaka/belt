@@ -181,11 +181,12 @@ pub fn load_keys(key_path: &Path) -> crate::secrets::Result<Keys> {
 /// new one. Returns whether there was a next key to switch to; without one
 /// nothing changes (the switch was already made).
 pub fn switch_to_next(key_path: &Path) -> std::io::Result<bool> {
-    match std::fs::rename(next_key_path(key_path), key_path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+    let staged = next_key_path(key_path);
+    if !staged.try_exists()? {
+        return Ok(false);
     }
+    crate::service::init::install_key(&staged, key_path).map_err(std::io::Error::other)?;
+    Ok(true)
 }
 
 /// Whether the key with `fingerprint` is one this member still holds (its

@@ -206,6 +206,8 @@ struct Journal {
     binary_hash: String,
     spec: Spec,
     files: Vec<Proof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switching_key: Option<Proof>,
     pending: Option<Pending>,
     plist: Option<macos::Receipt>,
     database: Option<Proof>,
@@ -227,13 +229,34 @@ impl Journal {
         }
     }
 }
-fn read_journal(path: &Path) -> anyhow::Result<Journal> {
+fn read_raw_journal(path: &Path) -> anyhow::Result<Journal> {
     let mut bytes = Vec::new();
     resident::secure_file(path, false)?
         .take(LIMIT + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
     Ok(serde_json::from_slice(&bytes)?)
+}
+fn read_journal(path: &Path) -> anyhow::Result<Journal> {
+    let mut journal = read_raw_journal(path)?;
+    if let Some(next) = &journal.switching_key {
+        ensure!(
+            next.path == journal.spec.cluster_key_path,
+            "unexpected key receipt"
+        );
+        let previous = journal
+            .files
+            .iter_mut()
+            .find(|p| p.path == next.path)
+            .context("previous key receipt missing")?;
+        if next.verify().is_ok() {
+            *previous = next.clone();
+            journal.switching_key = None;
+        } else {
+            previous.verify()?;
+        }
+    }
+    Ok(journal)
 }
 
 struct JournalFile {
@@ -657,12 +680,7 @@ async fn initialize_prepared<L: Launcher>(
         proof: None,
     };
     let mut j = if paths.journal.try_exists()? {
-        let mut bytes = Vec::new();
-        resident::secure_file(&paths.journal, false)?
-            .take(LIMIT + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
-        let j: Journal = serde_json::from_slice(&bytes)?;
+        let j = read_journal(&paths.journal)?;
         check_name(name, &j.spec.worker_id)?;
         validate_journal(&j, &paths, uid, &digest)?;
         jf.proof = Some(Proof::read(&paths.journal)?);
@@ -715,6 +733,7 @@ async fn initialize_prepared<L: Launcher>(
             } else {
                 vec![]
             },
+            switching_key: None,
             pending: None,
             systemd: paths.backend == Backend::Systemd,
             plist: None,
@@ -1087,12 +1106,7 @@ fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
         *journal == config.join("init.json"),
         "managed journal locator mismatch"
     );
-    let mut bytes = Vec::new();
-    resident::secure_file(journal, false)?
-        .take(LIMIT + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= LIMIT, "managed journal too large");
-    let j: Journal = serde_json::from_slice(&bytes)?;
+    let j = read_journal(journal)?;
     let mut paths = Paths::resolve_for(&spec.env, j.backend())?;
     if j.spec.cluster_key_path == paths.config.join("worker-cluster.key") {
         paths.key = j.spec.cluster_key_path.clone();
@@ -1463,7 +1477,9 @@ pub fn command(name: Option<&str>) -> Result<ResultReceipt, ApiError> {
 #[cfg(test)]
 mod tests;
 
+mod key_change;
 mod membership_undo;
+pub(crate) use key_change::{finish_key_change, install_key};
 mod takeover;
 pub mod upgrade;
 
