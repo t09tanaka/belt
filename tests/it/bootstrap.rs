@@ -5989,19 +5989,23 @@ async fn native_task_waiting(
     after: usize,
 ) -> serde_json::Value {
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
-    for _ in 0..600 {
-        let waiting = owner
-            .events_after(0, 512)
-            .unwrap()
-            .into_iter()
+    let limit = Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let events = owner.events_after(0, 512).unwrap();
+        let waiting = events
+            .iter()
             .skip(after)
             .find(|e| e.kind == "task_waiting" && e.payload["task"] == task.as_str());
         if let Some(waiting) = waiting {
-            return waiting.payload;
+            return waiting.payload.clone();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let kinds: Vec<_> = events.iter().map(|e| e.kind.as_str()).collect();
+            panic!("task {task} was not reported as waiting within {limit:?}; events after {after}: {kinds:?}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the task must be reported as waiting");
 }
 
 /// The one attempt of the task: the version its bundle was frozen to, and

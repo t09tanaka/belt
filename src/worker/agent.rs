@@ -399,6 +399,26 @@ struct ProvidedToolchains {
     requests: Vec<crate::toolchain::preparation::PreparationRequest>,
     native: Vec<crate::toolchain::contract::NativeTool>,
 }
+/// The refusal of an activation: its code, or, when a managed install would
+/// run in place of a native tool, the two tools by name.
+fn activation_refused(
+    code: &'static str,
+    native: &[crate::toolchain::contract::NativeTool],
+    plans: &[crate::toolchain::adapters::InstallPlan],
+) -> ApiError {
+    let shadowed = (code == "activation_native_mismatch")
+        .then(|| {
+            crate::toolchain::adapters::shadowed_native(native, &plans.iter().collect::<Vec<_>>())
+        })
+        .flatten();
+    ApiError::blocked(
+        crate::error::BlockedReason::EnvironmentMismatch,
+        match shadowed {
+            Some(shadowed) => format!("{code}: {shadowed}"),
+            None => code.into(),
+        },
+    )
+}
 /// The identity of the profile shell's real file. A profile may name its shell
 /// through a symlink (`/bin/sh` is one on many Linux hosts) and already
 /// measures the resolved file for its fingerprint, so a retargeted link is
@@ -1682,8 +1702,11 @@ impl Agent {
         )
         .map_err(|e| internal("execution binding", e))?;
         use crate::toolchain::{adapters, contract::observations};
-        let ProvidedToolchains { requests, native } =
-            self.toolchain_requests(&bundle, &|| self.capabilities())?;
+        // One report decides what is native and is what the activation is
+        // checked against.
+        let measured = std::cell::OnceCell::new();
+        let measure = || measured.get_or_init(|| self.capabilities()).clone();
+        let ProvidedToolchains { requests, native } = self.toolchain_requests(&bundle, &measure)?;
         let mut receipts = Vec::with_capacity(requests.len());
         for request in &requests {
             match self.toolchains.as_ref().map(|r| r.detect(request)) {
@@ -1701,7 +1724,7 @@ impl Agent {
             .capability_profile
             .as_ref()
             .ok_or_else(|| invalid("toolchain profile unavailable"))?;
-        let report = self.capabilities().ok_or_else(|| {
+        let report = measure().ok_or_else(|| {
             ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
                 "accepted base profile changed",
@@ -1732,7 +1755,7 @@ impl Agent {
             setup_policy,
             &shell,
         )
-        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        .map_err(|e| activation_refused(e, &native, &plans))?;
         if current != binding.activation {
             return Err(ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
@@ -1764,8 +1787,13 @@ impl Agent {
             .map_err(|e| internal("execution binding", e))?;
             return Ok(Some(Some(binding)));
         }
-        let ProvidedToolchains { requests, native } =
-            self.toolchain_requests(bundle, &|| self.capabilities())?;
+        // The report that decides what is native is the one the activation is
+        // made from: two probes could differ and refuse a tool that did not
+        // change. With no native tool nothing is measured here.
+        let measured = std::cell::OnceCell::new();
+        let ProvidedToolchains { requests, native } = self.toolchain_requests(bundle, &|| {
+            measured.get_or_init(|| self.capabilities()).clone()
+        })?;
         let profile = self
             .cfg
             .capability_profile
@@ -1816,17 +1844,21 @@ impl Agent {
         let setup_policy = Digest::of_bytes(
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
+        let report = match measured.into_inner().flatten() {
+            Some(report) => report,
+            None => profile.report(),
+        };
         let activation = adapters::activate_with_native(
             &bundle.frozen,
             &installed,
             &native,
             self.cfg.profile_fingerprint.clone(),
-            &observations(&profile.report()),
+            &observations(&report),
             profile.environment(),
             setup_policy,
             &shell,
         )
-        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        .map_err(|e| activation_refused(e, &native, &plans))?;
         let binding = ExecutionBinding { activation };
         let path = self.execution_binding_path(&rec.attempt_id);
         if path.exists() {

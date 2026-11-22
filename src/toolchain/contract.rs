@@ -672,6 +672,72 @@ mod tests {
             open
         );
     }
+    /// How a probe may spell what it saw: a leading `v` is the same version,
+    /// a prerelease is another one. Neither a range nor a pin takes the
+    /// prerelease for the release.
+    #[test]
+    fn a_prefixed_or_prerelease_observation_is_exactly_the_version_it_names() {
+        let node = ToolId::parse("node").unwrap();
+        let observed = |version| seen("node", VersionObservation::parse(version));
+        let report = |version| native_report(&[("node", version, b"a")]);
+        // The range is sealed to the version the prefixed spelling names.
+        let sealed = bundle("20").seal_observed(&observed("v20.11.1"));
+        assert_eq!(sealed.evidence[0].concrete.to_string(), "20.11.1");
+        let pinned = bundle("20.11.1");
+        assert_eq!(pinned.clone().seal_observed(&observed("v20.11.1")), pinned);
+        assert_eq!(
+            native_tool(&pinned.frozen, &node, &report("v20.11.1"))
+                .unwrap()
+                .version
+                .to_string(),
+            "20.11.1"
+        );
+        // A nightly of 20.11.1 is not in the range and is not the pin.
+        let open = bundle("20");
+        assert_eq!(
+            open.clone().seal_observed(&observed("20.11.1-nightly")),
+            open
+        );
+        assert_eq!(
+            pinned.clone().seal_observed(&observed("20.11.1-nightly")),
+            pinned
+        );
+        assert_eq!(pinned.evidence[0].concrete.to_string(), "20.11.1");
+        assert_eq!(
+            native_tool(&pinned.frozen, &node, &report("20.11.1-nightly")),
+            None
+        );
+    }
+    /// `rustc` and `cargo` are one tool; `dart` and `flutter` are two, though
+    /// a Flutter SDK ships a `dart`: neither observation stands for the other.
+    #[test]
+    fn dart_and_flutter_are_observed_as_separate_tools() {
+        let dart = ToolId::parse("dart").unwrap();
+        let flutter = ToolId::parse("flutter").unwrap();
+        let both = native_report(&[("dart", "3.5.2", b"d"), ("flutter", "3.24.0", b"f")]);
+        assert_eq!(
+            observations(&both),
+            BTreeMap::from([
+                (dart.clone(), VersionObservation::parse("3.5.2")),
+                (flutter.clone(), VersionObservation::parse("3.24.0")),
+            ])
+        );
+        let only_flutter = native_report(&[("flutter", "3.5.2", b"f")]);
+        assert_eq!(observations(&only_flutter).get(&dart), None);
+        let pinned = bundle_for("dart", "3.5.2");
+        assert_eq!(native_tool(&pinned.frozen, &dart, &only_flutter), None);
+        let native = native_tool(&pinned.frozen, &dart, &both).unwrap();
+        assert_eq!(native.tool, dart);
+        // The flutter beside it is no part of the identity of the dart.
+        assert_eq!(
+            native_tool(
+                &pinned.frozen,
+                &dart,
+                &native_report(&[("dart", "3.5.2", b"d"), ("flutter", "3.19.0", b"other")]),
+            ),
+            Some(native)
+        );
+    }
     fn native_report(
         tools: &[(&str, &str, &[u8])],
     ) -> crate::toolchain::capability::WorkerCapabilities {

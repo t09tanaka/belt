@@ -62,11 +62,13 @@ pub enum Unavailable {
 }
 impl Unavailable {
     /// No managed install can serve the selection, so the tool the worker's
-    /// own profile already has may. Every other refusal stays a refusal.
+    /// own profile already has may: at exactly the selected version nothing
+    /// is left to install, by belt or by a person. Every other refusal stays
+    /// a refusal.
     pub fn allows_native(&self) -> bool {
         matches!(
             self,
-            Self::Unconfigured | Self::Unsupported | Self::NotInInventory
+            Self::Unconfigured | Self::Unsupported | Self::NotInInventory | Self::ManualRequired(_)
         )
     }
 }

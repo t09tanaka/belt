@@ -649,15 +649,52 @@ fn only_the_lack_of_a_managed_install_leaves_room_for_a_native_tool() {
         Unavailable::Unconfigured,
         Unavailable::Unsupported,
         Unavailable::NotInInventory,
+        Unavailable::ManualRequired("xcode"),
     ] {
         assert!(open.allows_native(), "{open:?}");
     }
     for closed in [
-        Unavailable::ManualRequired("xcode"),
         Unavailable::ResolveRequired,
         Unavailable::BaselineCheckRequired,
         Unavailable::Invalid("parent_resolution_mismatch"),
     ] {
         assert!(!closed.allows_native(), "{closed:?}");
     }
+}
+
+/// A tool only a person can install (Xcode) follows the one rule with a
+/// registry configured too: the profile's own tool at exactly the selected
+/// version serves the selection, and any other version leaves the refusal
+/// that names the manual step.
+#[test]
+fn a_manual_tool_is_served_by_an_exact_native_match_with_a_registry_present() {
+    use crate::toolchain::capability::ToolObservation;
+    use crate::toolchain::contract::{native_tool, FrozenBundle};
+    let mut f = Fixture::new(AdapterKind::Nodenv, "node");
+    let registry = f.load().unwrap();
+    f.config.recipes[0].tool = ToolId::parse("xcode").unwrap();
+    let xcode = f.config.recipes[0].tool.clone();
+    let bundle = FrozenBundle::seal_exact(f.frozen("16.2.0", b"source")).unwrap();
+    let refused = registry
+        .request(&bundle.frozen, &xcode, Some(&bundle.evidence[0]))
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        Unavailable::ManualRequired("install_xcode_and_accept_license_manually")
+    );
+    assert!(refused.allows_native());
+    let report = |version: &str| {
+        let mut report = f.profile.report();
+        report.tools.insert(
+            "xcode".into(),
+            ToolObservation::Available {
+                version: version.into(),
+                identity: Digest::of_bytes(b"xcodebuild"),
+            },
+        );
+        report
+    };
+    let native = native_tool(&bundle.frozen, &xcode, &report("16.2")).unwrap();
+    assert_eq!(native.version.to_string(), "16.2.0");
+    assert_eq!(native_tool(&bundle.frozen, &xcode, &report("16.1")), None);
 }

@@ -454,6 +454,7 @@ pub(crate) fn inspect_installation<'a>(
 pub(crate) fn prospective_activation(
     frozen: &FrozenToolchains,
     installed: &[VerifiedInstallation<'_>],
+    native: &[super::super::contract::NativeTool],
     base_profile: Digest,
     observations: &BTreeMap<ToolId, super::super::versions::VersionObservation>,
     base_env: &BTreeMap<String, String>,
@@ -475,7 +476,7 @@ pub(crate) fn prospective_activation(
     compose_activation(
         frozen,
         &pairs,
-        &[],
+        native,
         base_profile,
         observations,
         base_env,
