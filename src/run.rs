@@ -641,7 +641,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let mut full_plan = full.to_plan();
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
-    store.prune(stamp);
+    cache::prune_all(&cache.join("results"), stamp);
     let sha = full
         .source
         .execution_commit
