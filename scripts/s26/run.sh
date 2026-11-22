@@ -3,14 +3,19 @@ set -euo pipefail
 # shellcheck source=scripts/s26/common.sh
 source "$(dirname "$0")/common.sh"
 safe_paths
-TTC=$(tool task-traffic-controller)
-PORTOOL=$(tool portool)
-: "${S26_BELT:?Set S26_BELT to an absolute path to the native Mac belt binary}"
 case "${1:-}" in
     "") action=run ;;
     --a46) action=a46 ;;
-    *) echo "usage: run.sh [--a46]" >&2; exit 2 ;;
+    --peers) action=peers ;;
+    *) echo "usage: scripts/s26/run.sh [--a46|--peers]" >&2; exit 2 ;;
 esac
+if (( $# > 1 )); then
+    echo "usage: scripts/s26/run.sh [--a46|--peers]" >&2
+    exit 2
+fi
+TTC=$(tool task-traffic-controller)
+PORTOOL=$(tool portool)
+: "${S26_BELT:?Set S26_BELT to an absolute path to the native Mac belt binary}"
 cd "$S26_BASE/resources"
 "$PORTOOL" sync --quiet
 "$PORTOOL" check

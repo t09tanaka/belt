@@ -30,6 +30,16 @@ S26_BELT="$PWD/target/s26/native/release/belt" scripts/s26/run.sh
 scripts/s26/down.sh
 ```
 
+For the two-submitter and group-key checks, use a fresh `up.sh` and pass
+`--peers` to `run.sh`. The host and m1 submit concurrently and verify the
+run listings on each parent. While m1's service is stopped, the host finishes
+work on the same w1 worker. After restarting, m1 collects its original attempt
+with a single command start. Group rotation then keeps an active attempt
+running, restarts a receiving-only worker with its new key, and restores a
+skipped peer with `send-key`. Finally, `--remove w2` checks the removal guidance
+and the remaining SSH access notices from both `group` and `doctor`.
+The per-check results are in `run/evidence/peer-summary.json`.
+
 The Linux build uses the official `rust:1.93.0-bookworm` image, with Cargo
 downloads and artifacts in `target/s26/linux-cache/`; output is
 `target/s26/belt-linux-aarch64`. No host cross-compiler is used. The worker
@@ -66,8 +76,8 @@ The checks deliberately run in this order, so w2 joins an existing backlog:
 | A01 | Submit nine more 10-second shell jobs with no host selectors. `belt wait` must succeed for all; `belt show --json` must report one successful, completely collected attempt per task and the worker-ID set exactly `local`, `w1`, `w2`. |
 | A34, part | `belt workers stop w2` followed by SSH user-service state `inactive` (exit 3); `belt workers start w2` followed by state `active` (exit 0). SSH failures cannot count as stopped. |
 | M1 init member | The host runs `workers add m1 --ssh m1 --install --binary`, then m1 runs `belt init` over SSH as UID 1000 (the spec's order: install, then init, so no `--move`). Exactly one `io.github.t09tanaka.belt.local.*` user unit is active, no worker-only unit is, lingering is on, `bin/resident` names the installed binary's SHA-256 and the unit's main process runs it, `belt group` on m1 reports the host's group, and a host submission placed on m1 succeeds with its command started exactly once. |
-| A57 rollback | m1 runs N. A host run is placed on m1, then `belt upgrade --binary <broken N+1>`; once the broken version runs, the upgrade CLI (identified by its pid file, executable and argv) gets SIGTERM, so only the guard can decide. The guard must restore N (`bin/resident`, record removed, main process N) within 90 s, N's directory unchanged, and the host run finishes, started once. |
-| A57 commit | A host run is placed on m1, then `belt upgrade --binary <N+1>` must exit 0. `bin/resident` and the main process name N+1, the old version directory is unchanged (inode, mtime, size, mode, digest), no upgrade record remains, and the run finishes, started once. |
+| A57 rollback | m1 runs N. A host run is placed on m1, then `belt upgrade --binary <broken N+1>`; once the broken version runs, the upgrade CLI (identified by its pid file, executable and argv) gets SIGTERM, so only the guard can decide. The guard must restore N (`bin/resident`, record removed, main process N) within 90 s, N's directory unchanged, and the host run finishes, started once. Each database contains an original marker before the trial and a changed marker during it. Both must revert. A second task submitted by m1 stays running on w1 across rollback, retains its attempt ID, and is collected with one observed command start. |
+| A57 commit | A host run is placed on m1, then `belt upgrade --binary <N+1>` must exit 0. `bin/resident` and the main process name N+1, the old version directory is unchanged (inode, mtime, size, mode, digest), no upgrade record remains, and the run finishes, started once. The upgraded m1 then submits a task to w1 running the older binary and collects its result. |
 | A57 trial refusal | m1 submits its own run with `--requires macos` (so it stays unplaced), then runs `upgrade` with the other version directly (what `--binary` delegates to). When the new version runs during the trial, the upgrade process gets SIGSTOP; within 8 s m1's `belt cancel` must be answered `OVERLOADED` and nothing saved; then SIGCONT, the upgrade must commit, and the same cancel must take effect. A missed window fails as incomplete, never PASS. |
 | A57 slow drain | A 75-second host run is placed on m1, then the upgrade must wait for it (longer than the 45 s commit deadline) and still commit, with the run started once. |
 
