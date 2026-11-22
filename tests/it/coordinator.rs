@@ -698,6 +698,7 @@ pub(crate) fn spec() -> TaskSpec {
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,
+        local: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -2637,6 +2638,37 @@ async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_
     }
     assert_eq!(attempts(&c, &task).len(), 1);
     assert!(remote.holds().is_empty());
+}
+
+/// A50: `exec --local` is placed only on the submitting member's own local
+/// worker, even when another worker could take it.
+#[tokio::test]
+async fn a50_a_local_task_is_placed_only_on_the_parent_local_worker() {
+    let f = fx();
+    let remote = f.worker("a-remote", (1, 0));
+    let local = f.worker("z-local", (1, 0));
+    let c = f.open(&[&remote, &local]);
+    let task = TaskId::generate();
+    let mut input = spec();
+    input.local = true;
+    assert!(input.pinned_local() && !input.in_place);
+    c.enqueue(RunId::generate(), source(&c), vec![(task.clone(), input)])
+        .await
+        .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(remote.holds().is_empty());
+    c.set_parent_local(local.id.clone());
+    c.tick().await.unwrap();
+    let attempt = only(&c, &task);
+    assert_eq!(attempt.worker_id, local.id);
+    assert!(remote.holds().is_empty());
+    // Without the flag the other worker takes the next task (the local one is full).
+    let other = TaskId::generate();
+    c.enqueue(RunId::generate(), source(&c), vec![(other.clone(), spec())])
+        .await
+        .unwrap();
+    c.tick().await.unwrap();
+    assert_eq!(only(&c, &other).worker_id, remote.id);
 }
 
 /// An in-place task is not placed again by itself, so the refusal of its

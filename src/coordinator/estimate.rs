@@ -206,10 +206,12 @@ impl Coordinator {
                                 .into(),
                         );
                     }
-                    if spec.is_some_and(|spec| spec.in_place)
+                    if spec.is_some_and(TaskSpec::pinned_local)
                         && parent_local.as_ref() != Some(&worker_id)
                     {
-                        unmet.push("in-place task requires the parent-local worker".into());
+                        unmet.push(
+                            "an in-place or --local task requires the parent-local worker".into(),
+                        );
                     }
                     if let Some(why) = spec.and_then(|spec| policy::unmet_ci(spec, link.as_ref())) {
                         unmet.push(why.to_string());
@@ -244,7 +246,7 @@ impl Coordinator {
                     let readiness = match following {
                         None => Some(None),
                         Some((_, spec))
-                            if spec.in_place && parent_local.as_ref() != Some(&worker_id) =>
+                            if spec.pinned_local() && parent_local.as_ref() != Some(&worker_id) =>
                         {
                             None
                         }
@@ -771,6 +773,7 @@ mod tests {
             outputs: vec![],
             requirements: Default::default(),
             in_place: false,
+            local: false,
             setup: None,
             plan_digest: Digest::of_bytes(b"plan"),
             manifest_digest: Digest::of_bytes(b"manifest"),

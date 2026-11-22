@@ -871,6 +871,60 @@ pub fn worker_diff(
     diff_checks(host, items.as_deref().map_err(String::as_str))
 }
 
+/// What `belt exec` uses when no resident runs (direct execution): the
+/// scope of this shell's environment, read by the embedded core. It shares
+/// one budget with the resident only when the two scopes are the same.
+pub fn direct_checks(env: &BTreeMap<String, String>, resident: &Scope) -> Vec<Check> {
+    let check = |id: &str, level, detail: String| Check::new("parent", id, level, detail);
+    let scope = match crate::config::traffic::resolve(env) {
+        Ok(scope) => scope,
+        Err(e) => {
+            return vec![check(
+                "direct_exec_scope",
+                Level::Notice,
+                format!("`belt exec` without a resident cannot run in this shell: {e}"),
+            )]
+        }
+    };
+    let state = scope.state_dir.to_string_lossy();
+    let config = scope.config_file.to_string_lossy();
+    let mut out = vec![
+        if state == resident.state_dir && config == resident.config_file {
+            check(
+                "direct_exec_scope",
+                Level::Ok,
+                format!("`belt exec` without a resident shares the resident's scope: {state}"),
+            )
+        } else {
+            check(
+            "direct_exec_scope",
+            Level::Notice,
+            format!(
+                "`belt exec` without a resident uses {state} (this shell's environment) and the resident uses {}: two ledgers, so two budgets",
+                resident.state_dir
+            ),
+        )
+        },
+    ];
+    let ledger = Paths::new(&scope.state_dir, &scope.config_file).ledger_file();
+    out.push(match Ledger::load(&ledger) {
+        Ok(_) => check(
+            "direct_exec_ledger",
+            Level::Ok,
+            format!("the embedded task-traffic-controller reads {}", ledger.display()),
+        ),
+        Err(e) => check(
+            "direct_exec_ledger",
+            Level::Fail,
+            format!(
+                "the embedded task-traffic-controller cannot read {} ({e}), so `belt exec` without a resident refuses to run and leaves it unchanged; a newer task-traffic-controller may have written it: update belt, or let that command's jobs finish",
+                ledger.display()
+            ),
+        ),
+    });
+    out
+}
+
 /// Everything `doctor` looks at. `env` is the invoking environment (it
 /// locates the user configuration); `spec` is the initialized coordinator.
 pub fn run(
@@ -933,6 +987,7 @@ pub fn run(
         );
     }
     checks.extend(evaluate("parent", &local));
+    checks.extend(direct_checks(env, &local.worker_scope));
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
     // Every worker is looked at at the same time (up to a bound), each on its
     // own ssh processes; what is printed keeps the order of the registrations.

@@ -4,6 +4,7 @@ pub mod ci_run;
 pub mod completion;
 pub mod context;
 pub mod control;
+pub mod direct;
 pub mod doctor;
 pub mod estimate;
 mod forward;

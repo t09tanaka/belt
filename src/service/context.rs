@@ -12,6 +12,7 @@ pub struct Context {
     pub config: ResolvedConfig,
     pub repo_root: Option<PathBuf>,
     pub bootstrap: Spec,
+    existing_resident: bool,
 }
 impl Context {
     /// Loading never creates configuration, identities, keys or coordinator epochs.
@@ -68,6 +69,7 @@ impl Context {
         let config = crate::config::load::load(&env, Some(project), overlay)
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
         Ok(Self {
+            existing_resident: false,
             env,
             cwd,
             config,
@@ -114,6 +116,7 @@ impl Context {
         )
         .map_err(|e| invalid(e.to_string()))?;
         Ok(Self {
+            existing_resident: false,
             env,
             cwd,
             config,
@@ -127,7 +130,16 @@ impl Context {
     pub async fn readonly(&self) -> Result<super::query::Reader, super::query::Error> {
         super::query::Reader::open(self.bootstrap.clone()).await
     }
+    /// Foreground exec and submit must not relaunch a resident that exited
+    /// between mode selection and durable submission.
+    pub(crate) fn require_existing_resident(mut self) -> Self {
+        self.existing_resident = true;
+        self
+    }
     pub async fn owner(&self) -> anyhow::Result<super::resident::Client> {
+        if self.existing_resident {
+            return super::bootstrap::load_client(&self.bootstrap);
+        }
         super::bootstrap::ensure(self.bootstrap.clone()).await
     }
 }
