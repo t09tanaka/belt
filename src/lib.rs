@@ -45,6 +45,10 @@ pub mod tree;
 pub mod wire;
 pub mod workflow;
 
+#[cfg(test)]
+#[path = "../tests/common/fake_exec.rs"]
+mod fake_exec;
+
 pub use complete::{validate_run_result, verify_task_result, Completeness, Verdict};
 pub use context::{CancelHandle, ExecContext};
 pub use demand::{plan_task_demand, TaskDemand};

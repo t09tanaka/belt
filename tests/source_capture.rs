@@ -1334,12 +1334,11 @@ fn a_clean_repository_with_converted_line_endings_is_head_and_posts_its_status()
     let bin = w.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let log = w.home.join("gh.log");
-    std::fs::write(
-        bin.join("gh"),
+    common::fake_exec::write_executable(
+        &bin.join("gh"),
         format!("#!/bin/sh\necho \"$@\" > {}\n", log.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     let gc = ExecContext::new(
         [
             (
@@ -2241,12 +2240,11 @@ fn a_worker_without_the_program_of_a_filter_is_refused_with_a_typed_error() {
     let (f, _oid, _payload) = lfs_fixture(true, true);
     let tool = f.home.join("bin");
     std::fs::create_dir_all(&tool).unwrap();
-    std::fs::write(
-        tool.join("git-lfs"),
+    common::fake_exec::write_executable(
+        &tool.join("git-lfs"),
         "#!/bin/sh\ncat >/dev/null\nprintf 'pointer\\n'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(tool.join("git-lfs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     git(
         &f.dir,
         &["config", "filter.lfs.clean", "git-lfs clean -- %f"],
@@ -4717,8 +4715,7 @@ fn shim_ctx(home: &Path, name: &str, refuse: &str) -> (ExecContext, PathBuf) {
         "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in\n{refuse}) echo 'shim: refused' >&2; exit 128 ;;\nesac\nPATH='{TEST_PATH}' exec git \"$@\"\n",
         log.display()
     );
-    std::fs::write(bin.join("git"), script).unwrap();
-    std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::fake_exec::write_executable(&bin.join("git"), script, 0o755);
     let c = ExecContext::new(
         [
             ("PATH", format!("{}:{TEST_PATH}", bin.display())),

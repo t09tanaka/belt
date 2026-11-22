@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Quiet, Target};
-use std::{cell::RefCell, os::unix::fs::PermissionsExt, process::Command};
+use std::{cell::RefCell, process::Command};
 
 type SpawnObserver = Box<dyn FnMut(&Child)>;
 thread_local! { static SPAWN: RefCell<Option<SpawnObserver>> = RefCell::new(None); }
@@ -296,8 +296,7 @@ fn fake_context(script: &str) -> (tempfile::TempDir, ExecContext) {
         .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
         .unwrap();
     let path = area.path().join("git");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::fake_exec::write_executable(&path, script, 0o700);
     let ctx = ExecContext::new(
         [
             (

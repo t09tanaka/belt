@@ -338,7 +338,6 @@ fn compose_down_with_budgets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     // Parent-owned receipts do not depend on the stub being scheduled before
     // a short deadline. Selected adversarial fixtures additionally establish
@@ -432,12 +431,11 @@ mod tests {
     fn fixture(script: &str) -> (tempfile::TempDir, ExecContext) {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("docker");
-        std::fs::write(
+        crate::fake_exec::write_executable(
             &file,
             format!("#!/bin/sh\necho \"$*\" >> \"$HOME/calls\"\n{script}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let ctx = ExecContext::new(
             [
                 ("HOME".into(), dir.path().display().to_string()),
@@ -493,11 +491,11 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
-        std::fs::write(
-            dir.path().join("docker"),
+        crate::fake_exec::write_executable(
+            &dir.path().join("docker"),
             "#!/bin/sh\necho \"$*\" >> \"$HOME/calls\"\nif [ \"$1\" = ps ]; then for arg do case \"$arg\" in id=*) echo \"${arg#id=}\";; esac; done; fi\nexit 0\n",
-        )
-        .unwrap();
+            0o755,
+        );
         assert!(docker_control(&ctx, &["logs"], Duration::from_millis(250)).is_err());
         assert!(!calls(&dir).lines().any(|line| line == "logs"));
         assert!(run(&ctx).is_empty());
