@@ -3340,7 +3340,57 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
     ).unwrap();
     start_resident(&spec).await;
-    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap_or_else(|elapsed| {
+    // The command holds until the test releases it: what the worker accepted
+    // is read meanwhile, because once the parent acknowledges a result the
+    // worker keeps no copy of it.
+    let hold = root.path().join("profile-hold");
+    let gate = root.path().join("profile-gate");
+    let script = format!("test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; : > '{hold}'; i=0; while [ ! -f '{gate}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{gate}' || exit 98; exit 23", hold = hold.display(), gate = gate.display());
+    let expected = ExecutionRequirements::parse(Some("node22".into()), &["node".into()]).unwrap();
+    let held = |what: &'static str| {
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while !hold.exists() {
+            assert!(std::time::Instant::now() < end, "{what} never started");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // The attempt that is held now: the only directory the worker has that was
+    // not there before.
+    let attempt_dirs = || -> Vec<String> {
+        std::fs::read_dir(spec.worker_state_dir.join("attempts"))
+            .map(|d| d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default()
+    };
+    let view = |known: &[String]| {
+        let fresh: Vec<String> = attempt_dirs().into_iter().filter(|d| !known.contains(d)).collect();
+        assert_eq!(fresh.len(), 1, "{fresh:?}");
+        let attempt = belt::ids::AttemptId::parse(&fresh[0]).unwrap();
+        let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+        let accepted = worker.get(&attempt).unwrap().unwrap();
+        let payload: belt::wire::AttemptPayload =
+            serde_json::from_value(accepted.spec.clone()).unwrap();
+        assert_eq!(payload.requirements, expected);
+        assert_eq!(payload.outputs.len(), 1);
+        assert_eq!(payload.outputs[0].name, "report");
+        assert!(!accepted.spec["_worker_profile_fingerprint"].is_null());
+        fresh
+    };
+    start_resident(&spec).await;
+    let known_before = attempt_dirs();
+    let child = tokio::process::Command::new(&spec.executable)
+        .args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c",&script])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v)))
+        .envs(&spec.env)
+        .current_dir(&input)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    held("the first attempt");
+    let first_dir = view(&known_before);
+    std::fs::write(&gate, "").unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await.unwrap_or_else(|elapsed| {
         diagnose_coordinator(&spec);
         diagnose_worker(&spec);
         panic!("named-profile exec did not finish: {elapsed}");
@@ -3358,7 +3408,8 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     let initial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let run = belt::ids::RunId::parse(initial["result"]["target"]["id"].as_str().unwrap()).unwrap();
     let task = belt::ids::TaskId::parse(initial["result"]["task_id"].as_str().unwrap()).unwrap();
-    let expected = ExecutionRequirements::parse(Some("node22".into()), &["node".into()]).unwrap();
+    std::fs::remove_file(&hold).unwrap();
+    std::fs::remove_file(&gate).unwrap();
     std::fs::write(input.join(".belt.toml"), "invalid [ config").unwrap();
     let retry = tokio::process::Command::new(&spec.executable)
         .args(["--json", "retry", run.as_str()])
@@ -3374,6 +3425,9 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
+    held("the retry");
+    view(&first_dir);
+    std::fs::write(&gate, "").unwrap();
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let report = tokio::time::timeout(
         Duration::from_secs(30),
@@ -3386,18 +3440,10 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let attempts = owner.attempts_of_task(&task).unwrap();
     assert_eq!(attempts.len(), 2);
-    let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
     for attempt in attempts {
-        let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
-        let payload: belt::wire::AttemptPayload =
-            serde_json::from_value(accepted.spec.clone()).unwrap();
-        assert_eq!(payload.requirements, expected);
-        assert_eq!(payload.outputs.len(), 1);
-        assert_eq!(payload.outputs[0].name, "report");
         let artifacts = owner.persisted_artifacts(&attempt.attempt_id).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].0, "report");
-        assert!(!accepted.spec["_worker_profile_fingerprint"].is_null());
     }
     shutdown(&load(&spec)).await;
 }
@@ -4190,6 +4236,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
         })
         .await
         .unwrap();
+        let waiting_task = waiting.task_id.clone();
         let accepted = owner
             .attempts_of_task(&waiting.task_id)
             .unwrap()
@@ -4217,6 +4264,9 @@ bin="$NODENV_ROOT/versions/$version/bin"
         if recover {
             ensure(spec.clone()).await.unwrap();
         }
+        // The binding is read while the attempt is held: once the refusal is
+        // acknowledged the worker keeps nothing of it.
+        assert_eq!(std::fs::read(&binding_path).unwrap(), original_binding);
         std::fs::write(&release, "release").unwrap();
         let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
         let refused = tokio::time::timeout(
@@ -4230,8 +4280,15 @@ bin="$NODENV_ROOT/versions/$version/bin"
             shutdown(&load(&spec)).await;
             panic!("a waiting/recovered consumer used a replaced installation receipt");
         }
-        assert!(worker.launches(&accepted.attempt_id).unwrap().is_empty());
-        assert_eq!(std::fs::read(binding_path).unwrap(), original_binding);
+        // The worker no longer has the attempt, so what is left to show is the
+        // parent's record: the command never registered or ran.
+        let record = owner
+            .attempts_of_task(&waiting_task)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(record.receipts.command_registered_at_ms.is_none());
+        assert!(record.receipts.running_at_ms.is_none());
         assert_eq!(std::fs::read_to_string(host.join("calls")).unwrap(), calls);
     }
     // A running supervisor keeps its accepted immutable execution binding even
@@ -4288,7 +4345,13 @@ bin="$NODENV_ROOT/versions/$version/bin"
     .unwrap()
     .unwrap();
     assert_eq!(adopted.cli_exit_code, 23);
-    assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
+    // The launch count above was read while the command was held and after
+    // the owner's recovery; the worker keeps nothing once the result is
+    // acknowledged, so what is left is that the same attempt ended, once.
+    let attempts = owner.attempts_of_task(&adopting.task_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_id, active.attempt_id);
+    assert!(attempts[0].receipts.running_at_ms.is_some());
     // Invalid bytes still block a new task without repair/install, independently
     // of the valid replacement receipt checks above.
     crate::common::write_executable(&node20, "#!/bin/sh\necho v99.0.0\n");
