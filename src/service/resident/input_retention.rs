@@ -13,6 +13,9 @@ struct Driver {
     source: RetentionCursor,
     vault: VaultCursor,
     abandon: AbandonCursor,
+    /// The completed claim rows of an older version are all gone (spec
+    /// 25.8 5b (h)3): a bounded number of pages per pass until then.
+    claims_done: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -101,6 +104,15 @@ impl Driver {
         sample: Sample,
     ) -> anyhow::Result<Report> {
         let mut report = Report::default();
+        // The parent store's completed claim rows (inert, kept by an older
+        // version): here and not at start, because this pass is the parent's
+        // one maintenance loop and runs on its own cadence, a few pages at a
+        // time; a busy store is tried again on the next pass.
+        if !self.claims_done {
+            if let Ok(done) = captured.sources.forget_completed_claims() {
+                self.claims_done = done;
+            }
+        }
         // Every pass first looks at the owner rows of captures that were not
         // submitted (spec 25.4 (b)): as many rows as there are captures in
         // progress or abandoned, usually none. This deletion follows an
@@ -518,6 +530,39 @@ mod tests {
         assert!(f.captured.sources.capture_owner(&live).unwrap().is_some());
         // The files both captures held are the live one's now.
         assert!(f.manifest_path(&live).exists());
+    }
+
+    /// Spec 25.8 5b (h)3 on the parent's store: the completed claim rows an
+    /// older version kept go, a bounded number of pages per pass.
+    #[test]
+    fn the_driver_pass_forgets_completed_claim_rows_of_the_parent_store() {
+        let f = Fixture::new();
+        let db =
+            rusqlite::Connection::open(f.captured.sources.root().join("retention.db")).unwrap();
+        db.execute_batch("BEGIN").unwrap();
+        for i in 0..8_500 {
+            db.execute(
+                "INSERT INTO source_delete_claim VALUES(?1,1,'{}',1)",
+                [format!("b:{i:064x}")],
+            )
+            .unwrap();
+        }
+        db.execute_batch("COMMIT").unwrap();
+        let left = || -> i64 {
+            db.query_row(
+                "SELECT count(*) FROM source_delete_claim WHERE done=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mut driver = Driver::default();
+        f.ticks(&mut driver, 1, 0);
+        assert_eq!(left(), 500, "one pass deletes at most eight pages");
+        assert!(!driver.claims_done);
+        f.ticks(&mut driver, 1, 1);
+        assert_eq!(left(), 0);
+        assert!(driver.claims_done);
     }
 
     #[test]

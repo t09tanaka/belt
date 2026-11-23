@@ -389,19 +389,22 @@ impl Index {
     }
     /// Completed claim rows an older version kept (`done=1`): inert, they
     /// only kept their object's publication row. Deleted a page of
-    /// `limit` at a time; returns how many went.
-    pub(crate) fn forget_completed_claims(&self, limit: u32) -> Result<u64> {
+    /// `limit` at a time, at most `pages` pages per call (the rest goes on
+    /// the next call); returns how many went. Fewer than `limit * pages`
+    /// means none are left.
+    pub(crate) fn forget_completed_claims(&self, limit: u32, pages: u32) -> Result<u64> {
         let mut gone = 0;
-        loop {
+        for _ in 0..pages {
             let n = self.connect()?.execute(
                 "DELETE FROM source_delete_claim WHERE rowid IN (SELECT rowid FROM source_delete_claim WHERE done=1 LIMIT ?1)",
                 [limit],
             )?;
             gone += n as u64;
             if n < limit as usize {
-                return Ok(gone);
+                break;
             }
         }
+        Ok(gone)
     }
     pub(crate) fn received_row(&self, id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(
@@ -445,9 +448,15 @@ impl Index {
         c.busy_timeout(timeout)?;
         Ok(c)
     }
+    /// The root of a publication that is being registered. A root that an
+    /// earlier settlement abandoned (with no source) is pending again: the
+    /// publication that crashes after this makes new graph and member rows
+    /// under it, which start-up settlement must pick up (it selects only
+    /// `pending`).
     pub(crate) fn pending(&self, id: &str) -> Result<()> {
         self.connect()?.execute(
-            "INSERT OR IGNORE INTO root(id,kind) VALUES(?1,'pending')",
+            "INSERT INTO root(id,kind) VALUES(?1,'pending')
+             ON CONFLICT(id) DO UPDATE SET kind='pending' WHERE kind='abandoned' AND source IS NULL",
             [id],
         )?;
         Ok(())
@@ -4307,6 +4316,38 @@ mod tests {
         assert_eq!(kind, "abandoned");
     }
     #[test]
+    fn publishing_again_into_an_abandoned_root_makes_it_pending_for_settlement() {
+        let f = Fixture::new();
+        let (receiver, _m, _want, _bytes) = received_fixture(&f);
+        let root = format!("receive:{}", "a".repeat(64));
+        let c = receiver.retention.connect().unwrap();
+        c.execute("INSERT INTO root(id,kind) VALUES(?1,'abandoned')", [&root])
+            .unwrap();
+        receiver.retention.pending(&root).unwrap();
+        let kind = |r: &str| -> String {
+            c.query_row("SELECT kind FROM root WHERE id=?1", [r], |x| x.get(0))
+                .unwrap()
+        };
+        assert_eq!(kind(&root), "pending");
+        // a received root, and one that has a source, are left as they are
+        let other = format!("receive:{}", "b".repeat(64));
+        c.execute(
+            "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',?2)",
+            [&other, &"b".repeat(64)],
+        )
+        .unwrap();
+        receiver.retention.pending(&other).unwrap();
+        assert_eq!(kind(&other), "abandoned");
+        let done = format!("receive:{}", "c".repeat(64));
+        c.execute(
+            "INSERT INTO root(id,kind,source) VALUES(?1,'received',?2)",
+            [&done, &"c".repeat(64)],
+        )
+        .unwrap();
+        receiver.retention.pending(&done).unwrap();
+        assert_eq!(kind(&done), "received");
+    }
+    #[test]
     fn a_root_whose_registration_fails_is_abandoned_and_the_rest_settled() {
         let f = Fixture::new();
         let (receiver, m, want, bytes) = received_fixture(&f);
@@ -4356,7 +4397,8 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(f.store.retention.forget_completed_claims(2).unwrap(), 5);
+        assert_eq!(f.store.retention.forget_completed_claims(2, 2).unwrap(), 4);
+        assert_eq!(f.store.retention.forget_completed_claims(2, 2).unwrap(), 1);
         let left: Vec<String> = c
             .prepare("SELECT object FROM source_delete_claim")
             .unwrap()

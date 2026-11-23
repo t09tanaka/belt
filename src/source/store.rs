@@ -72,6 +72,8 @@ impl Inventory for Peer<'_> {
 }
 
 /// Where the commit of a source is kept (local-ci's names).
+/// Pages of completed claim rows one call deletes (spec 25.8 5b (h)3).
+const CLAIM_PAGES: u32 = 8;
 const SNAPSHOTS: &str = "refs/local-ci/snapshots/";
 /// Where the commit around the index tree of a source is kept.
 const INDEXES: &str = "refs/local-ci/index/";
@@ -781,12 +783,14 @@ impl SourceStore {
         }
         Ok(self.inner.manifest_path(id).is_file())
     }
-    /// At the worker's start: the completed claim rows an older version kept
-    /// (`done=1`) are deleted, a page of 1,000 per transaction (spec 25.8
-    /// 5b (h)3). They are inert, so the shared lock is enough.
-    pub fn forget_completed_claims(&self) -> Result<u64> {
+    /// The completed claim rows an older version kept (`done=1`) are
+    /// deleted, a page of 1,000 per transaction and at most
+    /// [`CLAIM_PAGES`] pages per call (spec 25.8 5b (h)3). They are inert,
+    /// so the shared lock is enough. `Ok(true)` when none are left.
+    pub fn forget_completed_claims(&self) -> Result<bool> {
         let _held = self.mutation_guard()?;
-        self.retention.forget_completed_claims(1000)
+        let gone = self.retention.forget_completed_claims(1000, CLAIM_PAGES)?;
+        Ok(gone < 1000 * u64::from(CLAIM_PAGES))
     }
     /// At the worker's start, under `agent.lock` and before anything is
     /// received (spec 25.8 5b (h)1 (ii)): the `receive:%` roots with no

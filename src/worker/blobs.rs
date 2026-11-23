@@ -1988,8 +1988,8 @@ impl BlobSink for Incoming {
         // its gate stays closed meanwhile; its failure is reported after
         // the 5a cleanup below, which runs in any case)
         let settled = self.store.settle_empty_receive_roots();
-        // (and the claim rows an older version kept, (h)3; a busy store
-        // leaves them for the next start)
+        // (and the claim rows an older version kept, (h)3; a bounded number
+        // of pages, and a busy store leaves the rest for the next start)
         let _ = self.store.forget_completed_claims();
         let forgotten = self.store.forget_unowned_imports(&owned);
         settled.map_err(|e| internal("source store", format!("{e:#}")))?;

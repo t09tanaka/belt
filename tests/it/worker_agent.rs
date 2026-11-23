@@ -193,7 +193,7 @@ impl Host for DirHost {
             Some(Some(why)) => Ok(ToolPreparationPoll::Failed(PreparationFailure(why))),
         }
     }
-    fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+    fn secret_paths(&self, _: &AttemptPayload, _: bool) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
             return Err(e);
         }
@@ -3188,8 +3188,8 @@ impl Host for RealButCore {
     fn setup_release(&self, a: &AttemptId) {
         self.0.setup_release(a)
     }
-    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
-        self.0.secret_paths(p)
+    fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p, w)
     }
     fn place_secrets(
         &self,

@@ -404,8 +404,8 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
-    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
-        self.0.secret_paths(p)
+    fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p, w)
     }
     fn place_secrets(
         &self,

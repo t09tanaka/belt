@@ -95,12 +95,6 @@ impl Machine {
         manifest_in(&self.store, &payload, Wait::Yes)
     }
 
-    /// `manifest` at acceptance, which never waits (spec 25.8 5b (a)): a
-    /// busy store gives today's answer.
-    fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
-        manifest_in(&self.store, payload, Wait::No)
-    }
-
     /// Prepare the setup steps of attempts once per worker (spec chapter 8):
     /// `cfg` says how builders are run. Without it a payload's setup is not
     /// looked at and every attempt runs all of its commands. Before the
@@ -498,8 +492,13 @@ impl Host for Machine {
         }
     }
 
-    fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
-        match self.manifest_of(payload) {
+    fn secret_paths(
+        &self,
+        payload: &AttemptPayload,
+        wait: bool,
+    ) -> Result<Option<Vec<String>>, ApiError> {
+        let wait = if wait { Wait::Yes } else { Wait::No };
+        match manifest_in(&self.store, payload, wait) {
             Ok(m) => Ok(Some(
                 m.secret_files.iter().map(|s| s.path.display()).collect(),
             )),
@@ -629,28 +628,87 @@ mod tests {
         })
     }
 
+    fn digest_of(s: &str) -> Digest {
+        Digest::parse(&if s.starts_with("sha256:") {
+            s.to_string()
+        } else {
+            format!("sha256:{s}")
+        })
+        .unwrap()
+    }
+
+    /// A machine over the store of a captured source, and the payload that
+    /// names that source.
+    fn machine_with_source(
+        f: &crate::ci::execute::tests::Fixture,
+        toolchains: Option<Box<crate::toolchain::contract::FrozenBundle>>,
+    ) -> (Machine, AttemptPayload) {
+        let machine = Machine::open(
+            &f.area.join("state"),
+            std::env::vars().collect(),
+            f.area.join("key"),
+        )
+        .unwrap();
+        let mut p = payload();
+        p.source_id = crate::source::classify::source_id_of_ci(&f.manifest.source_id).unwrap();
+        p.manifest_digest = digest_of(&f.manifest.manifest_digest);
+        p.toolchains = toolchains;
+        (machine, p)
+    }
+
     #[test]
     fn acceptance_does_not_wait_for_a_step_and_an_attempt_reader_does() {
-        let dir = crate::test_tmp::tempdir().unwrap();
-        let store = SourceStore::open(dir.path()).unwrap();
-        let p = payload();
-        let holder = step(&store, 600);
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let (machine, p) = machine_with_source(&f, None);
+        // Acceptance: the answer under a held step is the untyped store
+        // error at once (a source that is not here would be NotFound).
+        let holder = step(&f.store, 600);
         let started = Instant::now();
-        assert!(manifest_in(&store, &p, Wait::No).is_err());
+        let e = machine.secret_paths(&p, false).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+        assert!(e.message.starts_with("source store"), "{e:?}");
         assert!(started.elapsed() < Duration::from_millis(500));
         holder.join().unwrap();
-        let holder = step(&store, 300);
+        // The accepted attempt's `prepare` reads on after the step.
+        let holder = step(&f.store, 300);
         let started = Instant::now();
-        let e = manifest_in(&store, &p, Wait::Yes).unwrap_err();
+        let paths = machine.secret_paths(&p, true).unwrap();
+        assert_eq!(paths, Some(Vec::new()));
         assert!(started.elapsed() >= Duration::from_millis(250));
-        assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
         holder.join().unwrap();
     }
 
     #[test]
     fn the_toolchain_check_of_prepare_waits_for_a_step() {
-        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
-        let p = payload();
+        use crate::toolchain::versions::*;
+        let f = crate::ci::execute::tests::fixture_with(
+            crate::ci::execute::tests::WORKFLOW,
+            |project| std::fs::write(project.join(".node-version"), "20.0.0\n").unwrap(),
+        );
+        // A bundle of the declarations the source holds: checking it reads
+        // the version file's blob (a verified, try-only open).
+        let declarations =
+            crate::toolchain::snapshot::read_captured(&f.store, &f.manifest, "", &[]).unwrap();
+        assert_eq!(declarations.len(), 1);
+        let source = digest_of(&f.manifest.manifest_digest);
+        let bundle = crate::toolchain::contract::FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                source,
+                Digest::of_bytes(b"parent"),
+                Scope::project(""),
+                &declarations,
+                &[],
+                &Default::default(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (_machine, p) = machine_with_source(&f, Some(Box::new(bundle)));
+        // Without the waited lock the blob read fails under a step.
+        let holder = step(&f.store, 300);
+        assert!(check_toolchain_source(&f.store, f.area.as_path(), &f.manifest, &p).is_err());
+        holder.join().unwrap();
         let holder = step(&f.store, 300);
         let started = Instant::now();
         check_toolchain_waiting(&f.store, f.area.as_path(), &f.manifest, &p).unwrap();
