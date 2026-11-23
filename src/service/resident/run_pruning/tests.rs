@@ -417,6 +417,13 @@ impl Fixture {
 fn a_run_past_its_retention_leaves_nothing_of_itself() {
     let mut f = Fixture::new();
     let made = f.run(2, true);
+    // The owner row of its capture, as a submit that was killed before it
+    // released the row leaves it.
+    f.inputs().sources.own_capture(&made.run).unwrap();
+    assert!(f
+        .indexed(&made.ids())
+        .iter()
+        .any(|row| row.starts_with("capture_owner:")));
     // What the run has on disk before: every kind of entry the steps name.
     let before = f.named(&made.ids());
     for expected in [
