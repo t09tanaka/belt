@@ -603,3 +603,34 @@ fn the_refusal_of_a_marked_state_names_it_and_the_way_out() {
     assert!(error.contains("belt worker --ephemeral"), "{error}");
     assert!(error.contains(&state.display().to_string()), "{error}");
 }
+
+/// The locks prove something about the directory that was examined, not
+/// about whatever its path names by the time they are taken.
+#[test]
+fn a_state_replaced_while_it_is_examined_is_kept_and_so_is_its_replacement() {
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    let aside = fx.root.path().join("aside");
+    let before = tree(&state);
+    let error = reclaim(&state, false, local, &|step| {
+        if step == Step::Examined {
+            // Another start cleared the path and made its own state there.
+            std::fs::rename(&state, &aside).unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&state)
+                .unwrap();
+            private(&state.join("worker.db"), b"new");
+        }
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("replaced while it was examined"), "{error}");
+    assert!(error.contains("is kept"), "{error}");
+    let moved: Vec<_> = before
+        .iter()
+        .map(|(path, size)| (aside.join(path.strip_prefix(&state).unwrap()), *size))
+        .collect();
+    assert_eq!(tree(&aside), moved);
+    assert_eq!(std::fs::read(state.join("worker.db")).unwrap(), b"new");
+}
