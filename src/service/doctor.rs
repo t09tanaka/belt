@@ -1037,6 +1037,15 @@ pub fn direct_checks(env: &BTreeMap<String, String>, resident: &Scope) -> Vec<Ch
 /// nothing is created, locked or changed.
 pub fn capture_checks(spec: &Spec) -> Vec<Check> {
     let check = |level, detail: String| Check::new("parent", "unsubmitted_captures", level, detail);
+    // A host without a source index has no capture to count.
+    if !spec
+        .state_dir
+        .join("sources")
+        .join("retention.db")
+        .is_file()
+    {
+        return Vec::new();
+    }
     let Ok(store) = super::bootstrap::read_only_store(spec) else {
         return vec![check(
             Level::NotChecked,
