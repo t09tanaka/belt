@@ -274,6 +274,9 @@ pub struct Agent {
     /// Released records a submit's handling let go of where no database
     /// write may run (a drop on the async runtime): forgotten by the tick.
     ripe_later: Mutex<super::release::Ripe>,
+    /// Where the retry of unfinished releases goes on: entries that keep
+    /// failing never stop the ones after them (it wraps at the end).
+    dropped_cursor: Mutex<String>,
     /// When this agent started (wall clock): the rows acknowledged before it
     /// are an older version's (spec 25.6 (c2)).
     started_ms: u64,
@@ -756,6 +759,7 @@ impl Agent {
             submitting: Mutex::default(),
             releases: super::release::Releases::default(),
             ripe_later: Mutex::default(),
+            dropped_cursor: Mutex::default(),
             started_ms,
             old_acks: AtomicBool::new(false),
             ticking: AtomicBool::new(false),
@@ -2211,8 +2215,15 @@ impl Agent {
         // The init resident runs this pass and not `tick`: a warm-up nobody
         // asks about must be let go here too, or its install is never stopped.
         self.reap_warmups();
+        // An operator's stop with `--cancel-running` reaches the attempts of
+        // an init host here, as `tick` does on a worker-only host.
+        self.apply_control();
         self.supervise_attempts();
         self.cleanup_terminal(32);
+        // The deletions time drives (the ack wait, rows an older version
+        // acknowledged, retried teardowns, events of no attempt) run on an
+        // init host only through this pass; each is bounded.
+        self.retire_rows();
         self.drop_stale_incoming();
     }
 
@@ -2281,6 +2292,11 @@ impl Agent {
         self.clean_ended();
         self.retire_rows();
         self.drop_stale_incoming();
+        self.collect_garbage();
+    }
+
+    /// One retention GC pass ([`Self::gc`]); a failure goes to the journal.
+    pub fn collect_garbage(&self) {
         if let Err(e) = self.gc() {
             self.note_global(
                 "agent_gc_failed",
@@ -2299,21 +2315,31 @@ impl Agent {
         let batch = crate::storage::RELEASE_BATCH;
         let at = now();
         let mut ids = Vec::new();
-        // The ack wait judges by the wall clock only through chapter 23's
-        // Hold rule: a step of the clock deletes nothing until a full wait
-        // has passed on the monotonic clock.
+        // The ack wait judges by a wall time that advances only with uptime
+        // (`release_clock_step`): a step of the wall clock or a reboot never
+        // brings a deletion earlier.
         let cutoff = self.store.release_clock_cutoff(
             self.cfg.boot_id.as_str(),
             at,
             platform::monotonic_ms(),
             self.cfg.ack_wait_ms,
         );
-        let expired = match cutoff {
-            Ok(Some(cut)) => self
+        let cut = match cutoff {
+            Ok(cut) => cut,
+            Err(e) => {
+                self.note_global(
+                    "agent_release_failed",
+                    "ack_wait",
+                    json!({ "error": e.to_string() }),
+                );
+                None
+            }
+        };
+        let expired = match cut {
+            Some(cut) => self
                 .store
                 .expire_unreleased(cut, self.cfg.ack_wait_ms, batch),
-            Ok(None) => Ok(Vec::new()),
-            Err(e) => Err(e),
+            None => Ok(Vec::new()),
         };
         match expired {
             Ok(v) => ids.extend(v),
@@ -2341,18 +2367,31 @@ impl Agent {
         }
         // What a release could not finish (a lock a supervisor still held
         // while it exited) is tried again, a few at a time.
-        if let Ok(left) = self.store.dropped_attempts(DROPPED_PER_TICK) {
-            ids.extend(left);
+        {
+            let mut cursor = lock(&self.dropped_cursor);
+            if let Ok(left) = self.store.dropped_attempts_after(&cursor, DROPPED_PER_TICK) {
+                *cursor = if left.len() < DROPPED_PER_TICK as usize {
+                    String::new()
+                } else {
+                    left.last().cloned().unwrap_or_default()
+                };
+                ids.extend(left);
+            }
         }
         ids.sort();
         ids.dedup();
         for id in ids {
             self.remove_dropped(&id);
         }
-        if let Err(e) = self
-            .store
-            .prune_unowned_events(at.saturating_sub(self.cfg.retention_ms), batch)
-        {
+        // Events of no attempt go by age on the same clock: not while it is
+        // held (spec 25.6 (e)).
+        let pruned = match cut {
+            Some(cut) => self
+                .store
+                .prune_unowned_events(cut.saturating_sub(self.cfg.retention_ms), batch),
+            None => Ok(0),
+        };
+        if let Err(e) = pruned {
             self.note_global(
                 "agent_release_failed",
                 "events",
@@ -4113,18 +4152,24 @@ fn hold_unended(
     else {
         return Ok(Unended::Alive);
     };
-    let ended = store
-        .get(attempt)
-        .map_err(api)?
-        .is_none_or(|r| r.termination.is_some());
-    if !ended {
+    let row = store.get(attempt).map_err(api)?;
+    let Some(rec) = row else {
+        // No row: the file this look made (or found) belongs to no attempt.
+        match fs::remove_file(crate::supervisor::lock::lock_path(state, attempt)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(internal("supervisor lock", e)),
+        }
+        drop(held);
+        return Ok(Unended::Ended);
+    };
+    if rec.termination.is_none() {
         return Ok(Unended::Held(held));
     }
-    match fs::remove_file(crate::supervisor::lock::lock_path(state, attempt)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(internal("supervisor lock", e)),
-    }
+    // A terminal row keeps its file: a supervisor that opened it and has
+    // not locked it yet would otherwise lock an orphan inode and go on, and
+    // an acknowledgement or a release would read "no file, no supervisor".
+    // The file goes with the release (`SupervisorLock::remove`).
     drop(held);
     Ok(Unended::Ended)
 }
@@ -4206,10 +4251,13 @@ mod settle_lock_tests {
     use crate::supervisor::lock::lock_path;
 
     fn accepted(store: &WorkerStore) -> AttemptId {
+        accepted_by(&store.for_member(&CoordinatorId::generate()))
+    }
+
+    fn accepted_by(store: &WorkerStore) -> AttemptId {
         let a = AttemptId::generate();
         let hash = format!("sha256:{}", "a".repeat(64));
         store
-            .for_member(&CoordinatorId::generate())
             .submit(
                 NewAcceptance {
                     attempt_id: a.clone(),
@@ -4283,8 +4331,39 @@ mod settle_lock_tests {
         drop(held);
     }
 
-    /// No row (or a terminal one): nothing to settle, and no lock file is
-    /// left behind by the look.
+    /// L6: a terminal row keeps its lock file (a supervisor may have opened
+    /// it and not locked it yet); the release removes it.
+    #[test]
+    fn a_settle_of_a_terminal_attempt_keeps_its_lock_file() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = WorkerStore::open(dir.path(), &WorkerId::parse("w").unwrap()).unwrap();
+        let m = store.for_member(&CoordinatorId::generate());
+        let a = accepted_by(&m);
+        for state in [
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ] {
+            m.transition(&a, state, 1).unwrap();
+        }
+        let t = Termination::new(
+            crate::state::Outcome::Succeeded,
+            Some(crate::state::Exit::Code(0)),
+            None,
+        )
+        .unwrap();
+        m.finalize(&a, t, 1).unwrap();
+        assert!(matches!(
+            hold_unended(dir.path(), &store, &a).unwrap(),
+            Unended::Ended
+        ));
+        assert!(lock_path(dir.path(), &a).exists());
+    }
+
+    /// No row: nothing to settle, and no lock file is left behind by the
+    /// look.
     #[test]
     fn a_settle_of_a_gone_attempt_leaves_no_lock_file() {
         let dir = crate::test_tmp::tempdir().unwrap();

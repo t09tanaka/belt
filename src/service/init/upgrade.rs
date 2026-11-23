@@ -373,8 +373,13 @@ fn rollback<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::Result<bool
         stop_resident(&plan, &named, launcher)?;
         let mut j = from.clone();
         if record.backed_up {
-            // Never under a coordinator that still runs.
+            // Never under a coordinator that still runs, nor under a
+            // `belt group forget` that is deleting rows.
             let _owner = crate::storage::ProcessLock::acquire(&paths.state, "coordinator.lock")?;
+            let _forget = crate::storage::ProcessLock::acquire(
+                &paths.worker,
+                crate::service::group::FORGET_LOCK,
+            )?;
             restore_database(
                 &paths.state.join("coordinator.db"),
                 &kept(paths, KEPT_PARENT_DB),
@@ -614,6 +619,12 @@ pub fn begin<L: Launcher>(
         {
             // Both databases at one moment, with nothing running on them.
             let _owner = crate::storage::ProcessLock::acquire(&paths.state, "coordinator.lock")?;
+            // A `belt group forget` deletes rows only before this copy or
+            // after it reads the trial, never in between.
+            let _forget = crate::storage::ProcessLock::acquire(
+                &paths.worker,
+                crate::service::group::FORGET_LOCK,
+            )?;
             keep_database(
                 &paths.state.join("coordinator.db"),
                 &kept(&paths, KEPT_PARENT_DB),
@@ -622,11 +633,11 @@ pub fn begin<L: Launcher>(
                 &paths.worker.join("worker.db"),
                 &kept(&paths, KEPT_WORKER_DB),
             )?;
+            record.backed_up = true;
+            write_record(&paths, &record)?;
+            // From here the version that starts promises nothing until the commit.
+            control::begin_trial(&paths.worker)?;
         }
-        record.backed_up = true;
-        write_record(&paths, &record)?;
-        // From here the version that starts promises nothing until the commit.
-        control::begin_trial(&paths.worker)?;
         let mut j = retargeted(&paths, &from, &to);
         j.files.retain(|p| p.path != from.spec.executable);
         j.files.push(Proof::read(&j.spec.executable)?);

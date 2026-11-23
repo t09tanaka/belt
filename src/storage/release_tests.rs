@@ -367,22 +367,23 @@ fn an_event_of_an_attempt_whose_row_went_is_not_written() {
 }
 
 #[test]
-fn the_ack_wait_judges_the_wall_clock_only_through_the_hold_rule() {
+fn the_ack_wait_judges_the_wall_clock_only_through_uptime() {
+    const W: u64 = 100_000;
     let t = store();
-    // The first sample holds; then the wall clock that follows the
-    // monotonic one is used; a forward step holds again.
-    assert_eq!(t.own.release_clock_cutoff("b", 1_000, 0, 0).unwrap(), None);
-    assert_eq!(
-        t.own.release_clock_cutoff("b", 1_010, 10, 0).unwrap(),
-        Some(1_010)
-    );
-    assert_eq!(
-        t.own.release_clock_cutoff("b", 10_000_000, 20, 5).unwrap(),
-        None
-    );
-    // A new boot holds too.
-    assert_eq!(
-        t.own.release_clock_cutoff("c", 10_000_010, 1, 0).unwrap(),
-        None
-    );
+    let c =
+        |boot: &str, wall: u64, mono: u64| t.own.release_clock_cutoff(boot, wall, mono, W).unwrap();
+    // The first sample waits a full wait of uptime.
+    assert_eq!(c("b", 1_000_000, 0), None);
+    assert_eq!(c("b", 1_060_000, 60_000), None);
+    // A reboot carries the clock over; the downtime (a day of wall clock)
+    // is not counted, and two short boots add up to the wait.
+    assert_eq!(c("c", 87_460_000, 5), None);
+    assert_eq!(c("c", 87_480_000, 30_005), None);
+    assert_eq!(c("c", 87_500_005, 40_005), Some(1_100_000));
+    // A forward step of the wall clock alone (same wait, same uptime
+    // rate) moves the cutoff only by the uptime.
+    assert_eq!(c("c", 900_000_000, 50_005), Some(1_110_000));
+    // A step back is followed down, and the step forward again is not.
+    assert_eq!(c("c", 1_000_000, 60_005), Some(1_000_000));
+    assert_eq!(c("c", 900_000_000, 70_005), Some(1_010_000));
 }

@@ -376,3 +376,81 @@ async fn a_release_whose_cleanup_failed_is_finished_by_a_later_tick() {
     assert!(f.store().dropped_attempts(10).unwrap().is_empty());
     agent.shutdown();
 }
+
+// An init host runs only `supervise` (src/service/resident.rs): the ack wait
+// and the retry of a failed teardown must happen in that pass too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_supervise_pass_of_an_init_host_expires_rows_and_finishes_failed_teardowns() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.ack_wait_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let waited = AttemptId::generate();
+    submit(&c, &waited, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&waited), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&waited).is_empty());
+    wait_for("the ack wait turns the row into a record", || {
+        agent.supervise();
+        f.store().get(&waited).unwrap().is_none()
+    });
+    assert!(recorded(&f, &waited).is_some());
+    assert!(!f.state().join("attempts").join(waited.as_str()).exists());
+
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo y")).await;
+    wait_for("the row goes", || {
+        agent.supervise();
+        f.store().get(&a).unwrap().is_none() && f.supervisors(&a).is_empty()
+    });
+    let dir = f.state().join("attempts").join(a.as_str());
+    assert!(dir.join("cleanup-pending").exists(), "the teardown is kept");
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    wait_for("a later supervise pass finishes the teardown", || {
+        agent.supervise();
+        !dir.exists()
+    });
+    assert!(!lock_of(&f, &a).exists());
+    assert!(f.store().dropped_attempts(10).unwrap().is_empty());
+    agent.shutdown();
+}
+
+// L3: entries whose directories cannot be removed never keep the ones after
+// them waiting: the retry goes on from where the last pass stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_unfinished_releases_do_not_hold_back_the_ones_after_them() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let agent = f.start("boot-a");
+    let root = f.state().join("attempts");
+    let mut stuck = Vec::new();
+    for _ in 0..33 {
+        let a = AttemptId::generate();
+        let sealed = root.join(a.as_str()).join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("f"), b"").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        stuck.push(sealed);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let good = AttemptId::generate();
+    std::fs::create_dir_all(root.join(good.as_str())).unwrap();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    for dir in &stuck {
+        let id = dir.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        db.execute("INSERT INTO dropped_attempt VALUES (?1)", [id])
+            .unwrap();
+    }
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [good.as_str()])
+        .unwrap();
+    drop(db);
+    agent.supervise();
+    agent.supervise();
+    let gone = !root.join(good.as_str()).exists();
+    for dir in &stuck {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(gone, "the entry after 33 failing ones was reached");
+    agent.shutdown();
+}

@@ -2352,7 +2352,7 @@ unlinkを行うのは、`dropped_attempt` の続きを行う処理（`remove_dro
 
 **解放の後片付けが失敗したとき。** 解放の受理の後のworkspaceの片付け（fast-worktreeの削除、置いたsecret fileの消去）が失敗し、`cleanup-pending` か `workspace.json` が残ったら、attemptのdirectoryと `dropped_attempt` の行を残す。tickが32件ずつやり直し（`DROPPED_PER_TICK`）、片付けが済んでから、directory・lock・`dropped_attempt` の行を消す。
 
-**ack_waitの時計。** `ack_wait` の判定は、壁時計を第23章のHoldの規則（結果の回収の時計と同じ `clock_policy::step`。状態はworker DBの `release_clock`）を通して読む。初回・別のboot・壁時計の段差の後は、monotonicで `ack_wait` が経つまで何も消さない。
+**ack_waitの時計。** `ack_wait` の判定と、attemptを持たないeventの期間（(e)）は、壁時計をそのまま使わず、稼働時間だけ進む時刻（`effective`）で読む（`release_clock_step`。状態はworker DBの `release_clock`）。`effective` はmonotonicの経過だけ進み、壁時計を越えない（前への段差には付いて行かず、後ろへの段差には付いて下がる）。別のbootでは `effective` と残りの待ちを持ち越し、止まっていた間は数えない。したがって、どの行も、書かれてから稼働時間で `ack_wait` が経つ前には消えず、7日続けて動かないmachineでも、稼働時間の合計が7日になれば消える。初回だけは、見たことのない時計で書かれた行があるので、稼働時間で `ack_wait` が経つまで何も消さない。状態を書くのは、bootが変わったとき・初回の待ちが終わったとき・壁時計が `effective` を1秒より多く引き下げたとき・前に書いてから稼働時間で1分経ったときだけで、ふだんは1分に1回である（書かなかった分は、次の読み出しが同じmonotonicの差から求め直す。再起動で失うのは高々1分で、削除が遅れるだけである）。表が無いDB（段階3の早い版が作ったもの）では、初めの読み出しが作る。
 
 ### (c) 重複防止の記録
 
@@ -2767,7 +2767,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | - | - | - | - | - |
 | 親の保持driver（resident） | 起動直後に1回、以後60秒に1回まで。重ならない | 結果・入力・Vaultの削除（既存）、放棄された取り込み、印のあるrunの続き、条件を満たしたrunの刈り取り、runに属さないevent、`ci_test_timing` | runは32件、参照・pathは32件、検証は64 MiB、行は1,000行/transaction | 既存、1、2 |
 | 親の出来事の処理 | 相手の `ready`、提出の拒否、行の無いrunへのcancelを放棄を理由に断ったとき、回収の打ち切り、更新のcommit、刈り取りの最後、接続の確立 | bundle、放棄された取り込み（in-placeのbindingを含む）、古いbinary、`release_attempt`、照合 | 対象の件数だけ。照合は500件/page | 既存、1、3、4 |
-| workerのagentのtick | 既存の監視の周期 | terminalの片付け、`ack_wait`、workerのevent、`incoming/` の24時間。受け取ったsourceの削除とcloneのrefの削除（60秒に1回まで）、cloneのgc（1日1回まで）、objectのbytesの埋め戻し | GCのbatch（既存）、eventは1,000行。sourceは32件・検証64 MiB/pass、排他は候補1つの間だけ。埋め戻しは1,000行/pass | 既存、3、5a、5b |
+| workerのagentのtick（`init` のhostでは、residentの監視の周期の `supervise` が同じ削除と、60秒に1回のGCを行う） | 既存の監視の周期 | terminalの片付け、`ack_wait`、workerのevent、`incoming/` の24時間。受け取ったsourceの削除とcloneのrefの削除（60秒に1回まで）、cloneのgc（1日1回まで）、objectのbytesの埋め戻し | GCのbatch（既存）、eventは1,000行。sourceは32件・検証64 MiB/pass、排他は候補1つの間だけ。埋め戻しは1,000行/pass | 既存、3、5a、5b |
 | workerの出来事の処理 | ACK・`release_attempt` の受理、submitの処理の終了、接続が済んだとき、builderとそのhelperの終了、attemptのterminal | attemptの行とdirectoryとlock、解放済みの重複防止の記録、toolchainの参照、rootの削除 | 対象の件数だけ | 3、4 |
 | 起動時の走査（resident、worker） | processの起動ごとに1回。役割のlock（`coordinator.lock`・`agent.lock`）を持って行う | 下 | 下 | 1〜5a |
 | commandの開始時 | `logs`、計画、検査、`init`・`group`・`workers`・`upgrade` | その場所の、持ち主の居ない一時file | そのdirectoryの `readdir` 1回 | 1 |

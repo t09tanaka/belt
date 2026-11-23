@@ -174,3 +174,87 @@ async fn no_release_is_sent_while_a_submit_of_the_attempt_waits_for_its_answer()
     f.c.release_on(&worker(), std::slice::from_ref(&a)).await;
     assert_eq!(link.released(), vec![a]);
 }
+
+/// A worker that lists `unreleased` two at a time from `after` and refuses
+/// the release of `refused` for now.
+struct Paged {
+    unreleased: Vec<AttemptId>,
+    refused: AttemptId,
+    sent: Mutex<Vec<Request>>,
+}
+
+impl WorkerLink for Paged {
+    fn call(&self, request: Request) -> LinkFuture<'_> {
+        self.sent.lock().unwrap().push(request.clone());
+        let answer = match request {
+            Request::ListUnreleased(r) => {
+                let rest: Vec<AttemptId> = self
+                    .unreleased
+                    .iter()
+                    .filter(|a| r.after.as_ref().is_none_or(|after| *a > after))
+                    .cloned()
+                    .collect();
+                Ok(Response::ListUnreleased(ListUnreleasedResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    attempts: rest.iter().take(2).cloned().collect(),
+                    more: rest.len() > 2,
+                }))
+            }
+            Request::ReleaseAttempt(r) if r.attempt_id == self.refused => {
+                Err(LinkError::Remote(crate::error::ApiError::new(
+                    crate::error::ErrorCode::Overloaded,
+                    "a supervisor holds its lock",
+                )))
+            }
+            Request::ReleaseAttempt(r) => Ok(Response::ReleaseAttempt(ReleaseAttemptResponse {
+                schema_version: SchemaVersion::CURRENT,
+                attempt_id: r.attempt_id,
+            })),
+            _ => Err(LinkError::Unconfirmed),
+        };
+        Box::pin(async move { answer })
+    }
+    fn attempt_release_negotiated(&self) -> bool {
+        true
+    }
+}
+
+impl Paged {
+    fn released(&self) -> Vec<AttemptId> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                Request::ReleaseAttempt(r) => Some(r.attempt_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+// L1, L2: a refused release stops the page and the next pass goes on past
+// it, so the later pages are reached; a pass that began at a cursor and
+// reached the end stays due, and the next one reads the front again.
+#[tokio::test]
+async fn a_refused_release_does_not_keep_the_later_pages_unread_and_the_wrap_reads_the_front() {
+    let f = fx();
+    let mut ids: Vec<AttemptId> = (0..5).map(|_| AttemptId::generate()).collect();
+    ids.sort();
+    let link = Arc::new(Paged {
+        unreleased: ids.clone(),
+        refused: ids[0].clone(),
+        sent: Mutex::new(Vec::new()),
+    });
+    f.c.attach(worker(), link.clone()).await;
+    // The first pass: the refusal stops it after one release.
+    f.c.reconcile_unreleased(soon()).await.unwrap();
+    assert_eq!(link.released(), vec![ids[0].clone()]);
+    // The next goes on after the refused one, to the end.
+    f.c.reconcile_unreleased(soon()).await.unwrap();
+    assert_eq!(link.released(), ids);
+    // It began at a cursor: still due, and it reads the front again.
+    link.sent.lock().unwrap().clear();
+    f.c.reconcile_unreleased(soon()).await.unwrap();
+    assert_eq!(link.released(), vec![ids[0].clone()]);
+}

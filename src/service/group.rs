@@ -215,6 +215,10 @@ pub fn command(json_output: bool) -> i32 {
 /// delete every record of a member that is not coming back, and refuse its
 /// coordinator id for good. Refused while the member is on this machine's
 /// list, or has attempts here that are not terminal.
+/// The lock `belt group forget` and the start (and the undoing) of an
+/// upgrade's trial share in the worker's state directory.
+pub(crate) const FORGET_LOCK: &str = "forget.lock";
+
 pub(crate) fn forget(
     env: &BTreeMap<String, String>,
     spec: &Spec,
@@ -222,7 +226,16 @@ pub(crate) fn forget(
 ) -> Result<Value, ApiError> {
     // Spec 25.1 rule 8: no deletion while an upgrade is on trial (a
     // rollback would restore a database whose rows lost their directories,
-    // and the refusal of the member with it).
+    // and the refusal of the member with it). Held to the end: an upgrade
+    // takes the same lock to copy the databases and begin its trial (and to
+    // put them back), so the look below cannot go stale under it.
+    let _trial = crate::storage::ProcessLock::acquire(&spec.worker_state_dir, FORGET_LOCK)
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::Conflict,
+                "an upgrade of this worker is starting or rolling back; forget the member later",
+            )
+        })?;
     if crate::worker::control::in_trial(&spec.worker_state_dir) {
         return Err(ApiError::new(
             ErrorCode::Conflict,
@@ -374,6 +387,13 @@ mod tests {
         let e = forget(&env, &spec, &member).unwrap_err();
         assert!(e.message.contains("on trial"), "{e:?}");
         // Nothing was written: no database, no refusal.
+        assert!(!root.path().join("worker.db").exists());
+        // An upgrade between its copy of the databases and its trial (or
+        // putting them back) holds the lock: refused too.
+        std::fs::remove_file(crate::worker::control::trial_path(root.path())).unwrap();
+        let _upgrade = crate::storage::ProcessLock::acquire(root.path(), FORGET_LOCK).unwrap();
+        let e = forget(&env, &spec, &member).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
         assert!(!root.path().join("worker.db").exists());
     }
 

@@ -72,25 +72,37 @@ pub fn judge_unreleased(row: bool, verdict: Option<Verdict>) -> Unreleased {
     }
 }
 
+/// What [`release_over`] got done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Released {
+    /// Every attempt is released (or the link does not have the feature).
+    All,
+    /// The rest went, but a submit of one was in flight: it is sent again.
+    Later,
+    /// The worker refused `.0` for now (`OVERLOADED`: a supervisor still
+    /// holds the attempt's lock, a trial); the ones after it were not sent,
+    /// since the same refusal would answer them.
+    Refused(AttemptId),
+    /// The worker did not answer; the rest is not asked now.
+    Lost,
+}
+
 /// Send `release_attempt` for each of `attempts` over `link`, unless a
 /// submit of it is in flight or the link did not agree the feature. A
 /// worker that has nothing of the attempt any more (`NOT_FOUND`) has what
-/// the release asks for. `false` when something is to be sent again: the
-/// worker did not answer (the rest is not asked now), or it refused one for
-/// now (`OVERLOADED`: a supervisor still holds the attempt's lock, a trial)
-/// or a submit of it was in flight; the caller keeps the worker due.
+/// the release asks for. Anything but [`Released::All`] keeps the worker due.
 pub async fn release_over(
     link: &dyn WorkerLink,
     submits: &InFlight,
     attempts: &[AttemptId],
-) -> bool {
+) -> Released {
     if !link.attempt_release_negotiated() {
-        return true;
+        return Released::All;
     }
-    let mut all = true;
+    let mut all = Released::All;
     for attempt in attempts {
         if submits.contains(attempt) {
-            all = false;
+            all = Released::Later;
             continue;
         }
         let answer = link
@@ -101,11 +113,11 @@ pub async fn release_over(
             }))
             .await;
         match answer {
-            Err(crate::coordinator::LinkError::Unconfirmed) => return false,
+            Err(crate::coordinator::LinkError::Unconfirmed) => return Released::Lost,
             Err(crate::coordinator::LinkError::Remote(e))
                 if e.code == crate::error::ErrorCode::Overloaded =>
             {
-                all = false;
+                return Released::Refused(attempt.clone());
             }
             _ => {}
         }
@@ -131,7 +143,7 @@ impl Coordinator {
     /// 7). One that is not attached lists them at its next connection.
     pub async fn release_on(&self, worker: &WorkerId, attempts: &[AttemptId]) {
         if let Some(link) = self.link_of(worker) {
-            if !release_over(link.as_ref(), &self.submits, attempts).await {
+            if release_over(link.as_ref(), &self.submits, attempts).await != Released::All {
                 self.reconcile_due(worker);
             }
         }
@@ -194,11 +206,15 @@ impl Coordinator {
     }
 
     /// One worker, from where its last pass stopped; `true` when the pass
-    /// reached the end of the list (a pass that began at a cursor then
-    /// wraps: the next one, if any is due, starts at the front). A page
-    /// whose releases are to be sent again is read again by the next pass.
+    /// read the whole list from the front and everything went. A pass that
+    /// began at a cursor and reached the end wraps and stays due, so the
+    /// front is read by the next pass. A page the worker did not answer is
+    /// read again; a refusal (`OVERLOADED`) moves the cursor past the
+    /// refused attempt, so the pages after it are reached, and the wrap
+    /// comes back to it.
     async fn reconcile_one(&self, worker: &WorkerId, link: &dyn WorkerLink) -> Result<bool> {
         let mut after = self.cursor().get(worker).cloned();
+        let mut whole = after.is_none();
         for _ in 0..PAGES {
             let answer = link
                 .call(Request::ListUnreleased(ListUnreleasedRequest {
@@ -230,14 +246,22 @@ impl Coordinator {
                     Ok(out)
                 })
                 .await?;
-            if !release_over(link, &self.submits, &judged).await {
-                self.keep_cursor(worker, after);
-                return Ok(false);
+            match release_over(link, &self.submits, &judged).await {
+                Released::All => {}
+                Released::Later => whole = false,
+                Released::Refused(at) => {
+                    self.keep_cursor(worker, Some(at));
+                    return Ok(false);
+                }
+                Released::Lost => {
+                    self.keep_cursor(worker, after);
+                    return Ok(false);
+                }
             }
             let next = page.attempts.last().cloned();
             if !page.more || next.is_none() {
                 self.cursor().remove(worker);
-                return Ok(true);
+                return Ok(whole);
             }
             after = next;
         }

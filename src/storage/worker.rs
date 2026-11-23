@@ -1940,6 +1940,19 @@ impl WorkerStore {
         })
     }
 
+    /// [`Self::dropped_attempts`] after `after` in id order: a caller that
+    /// keeps the last id goes through every entry, whichever keep failing.
+    pub fn dropped_attempts_after(&self, after: &str, limit: u32) -> Result<Vec<String>> {
+        let after = after.to_string();
+        self.db.call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT attempt_id FROM dropped_attempt WHERE attempt_id > ?1 ORDER BY attempt_id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, limit], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+        })
+    }
+
     /// Whether any member has an attempt with this id now.
     pub fn attempt_id_held(&self, attempt_id: &str) -> Result<bool> {
         let a = attempt_id.to_string();

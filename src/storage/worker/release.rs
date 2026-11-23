@@ -335,20 +335,23 @@ impl WorkerStore {
         })
     }
 
-    /// The wall time the ack wait may judge by now (chapter 23's Hold
-    /// rule, as the result collection's clock): `None` while the clock is
-    /// held (first sample, a new boot, a step of the wall clock), in which
-    /// case nothing expires. The state is kept in the worker database.
+    /// The wall time the ack wait may judge by now ([`release_clock_step`]):
+    /// `None` until the first wait of uptime has passed. The state is kept
+    /// in the worker database and written only when it changes meaningfully.
     pub fn release_clock_cutoff(
         &self,
         boot: &str,
         wall: u64,
         mono: u64,
-        retention: u64,
+        wait: u64,
     ) -> Result<Option<u64>> {
-        use crate::results::clock_policy::{step, ClockState};
         let boot = boot.to_string();
         self.db.write(move |tx| {
+            // A database a build of stage 3 made before this table existed
+            // gets it here; its migration step has already run.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS release_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state_json TEXT NOT NULL);",
+            )?;
             let previous: Option<String> = tx
                 .query_row(
                     "SELECT state_json FROM release_clock WHERE singleton = 1",
@@ -356,16 +359,15 @@ impl WorkerStore {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let previous = previous
-                .as_deref()
-                .map(|s| from_json::<ClockState>("release clock", s))
-                .transpose()?;
-            let next = step(previous.as_ref(), Some(&boot), wall, mono, retention);
-            if let Some(state) = next.state {
+            // A state of an earlier shape starts the clock again: that only
+            // delays a deletion.
+            let previous = previous.and_then(|s| serde_json::from_str::<ReleaseClock>(&s).ok());
+            let next = release_clock_step(previous.as_ref(), &boot, wall, mono, wait);
+            if let (Some(state), true) = (&next.state, next.write) {
                 tx.execute(
                     "INSERT INTO release_clock VALUES (1, ?1)
                      ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
-                    [serde_json::to_string(&state)
+                    [serde_json::to_string(state)
                         .map_err(|e| StorageError::Invalid(e.to_string()))?],
                 )?;
             }
@@ -555,5 +557,133 @@ impl WorkerStore {
             )?;
             Ok(attempts)
         })
+    }
+}
+
+/// The clock of the ack wait (spec 25.6 (b)), kept across restarts and
+/// reboots: `effective` is a wall time that advances only by the monotonic
+/// clock (time the machine was down is not counted) and never past the wall
+/// clock; `pending` is the uptime still to pass before anything expires.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReleaseClock {
+    pub boot: String,
+    pub effective: u64,
+    pub mono: u64,
+    pub pending: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseClockStep {
+    pub state: Option<ReleaseClock>,
+    /// Whether `state` must be stored: a new boot, the first wait ending, the
+    /// wall clock holding `effective` back by more than a second, or a
+    /// minute of uptime since the stored sample. Otherwise the stored state
+    /// gives the same answer next time (at most once a minute per agent).
+    pub write: bool,
+    pub cutoff: Option<u64>,
+}
+
+/// Uptime between two stored samples of the same boot.
+const RELEASE_CLOCK_WRITE_MS: u64 = 60_000;
+/// How far the wall clock may hold `effective` back without a write.
+const RELEASE_CLOCK_SLACK_MS: u64 = 1_000;
+
+/// One sample of the ack wait's clock. No row may expire before the wait has
+/// passed in uptime after it was stamped: `effective` never runs ahead of the
+/// monotonic clock (a forward step of the wall clock is not followed) and
+/// never ahead of the wall clock (a backward step is followed down). A new
+/// boot carries `effective` and `pending` over, so a machine that never runs
+/// a full wait in one boot still expires rows; the first sample ever waits
+/// a full wait of uptime, since the rows it finds were stamped by a clock it
+/// never saw.
+pub(crate) fn release_clock_step(
+    previous: Option<&ReleaseClock>,
+    boot: &str,
+    wall: u64,
+    mono: u64,
+    wait: u64,
+) -> ReleaseClockStep {
+    let hold = || ReleaseClockStep {
+        state: previous.cloned(),
+        write: false,
+        cutoff: None,
+    };
+    if wall == 0 || wall > i64::MAX as u64 || mono == u64::MAX {
+        return hold();
+    }
+    let (state, write) = match previous {
+        None => (
+            ReleaseClock {
+                boot: boot.to_string(),
+                effective: wall,
+                mono,
+                pending: wait,
+            },
+            true,
+        ),
+        Some(old) if old.boot != boot => (
+            ReleaseClock {
+                boot: boot.to_string(),
+                effective: old.effective.min(wall),
+                mono,
+                pending: old.pending.min(wait),
+            },
+            true,
+        ),
+        Some(old) => {
+            let Some(elapsed) = mono.checked_sub(old.mono) else {
+                return hold();
+            };
+            let ahead = old.effective.saturating_add(elapsed);
+            let effective = ahead.min(wall);
+            let pending = old.pending.min(wait).saturating_sub(elapsed);
+            let write = (old.pending > 0 && pending == 0)
+                || ahead - effective > RELEASE_CLOCK_SLACK_MS
+                || elapsed >= RELEASE_CLOCK_WRITE_MS;
+            (
+                ReleaseClock {
+                    boot: boot.to_string(),
+                    effective,
+                    mono,
+                    pending,
+                },
+                write,
+            )
+        }
+    };
+    let cutoff = (state.pending == 0).then_some(state.effective);
+    ReleaseClockStep {
+        state: Some(state),
+        write,
+        cutoff,
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::{release_clock_step as step, ReleaseClock};
+
+    #[test]
+    fn the_ack_wait_clock_is_written_only_when_it_changes_meaningfully() {
+        let s = step(None, "b", 1_000, 0, 10).state.unwrap();
+        // A tick within the minute is answered from the stored sample.
+        let n = step(Some(&s), "b", 1_005, 5, 10);
+        assert!(!n.write);
+        assert_eq!(n.cutoff, None);
+        // The end of the wait, a held-back wall clock, a minute and a reboot are.
+        assert!(step(Some(&s), "b", 1_010, 10, 10).write);
+        assert!(step(Some(&s), "b", 1, 2_000, 10).write);
+        assert!(step(Some(&s), "b", 70_000, 60_000, 10).write);
+        let r = step(Some(&s), "c", 5, 1, 10);
+        assert!(r.write);
+        assert_eq!(
+            r.state.unwrap(),
+            ReleaseClock {
+                boot: "c".into(),
+                effective: 5,
+                mono: 1,
+                pending: 10
+            }
+        );
     }
 }
