@@ -2090,3 +2090,27 @@ fn removed_members_warn_without_registration_and_remain_after_failed_probe() {
         .contains("cannot be checked"));
     assert!(path.exists());
 }
+
+#[test]
+fn wrong_content_files_kept_because_another_root_holds_them_are_shown() {
+    let none = UnjudgedCaptures::default();
+    assert_eq!(capture_detail(&none).0, Level::Ok);
+    let held = UnjudgedCaptures {
+        corrupt_held: 2,
+        ..Default::default()
+    };
+    let (level, detail) = capture_detail(&held);
+    assert_eq!(level, Level::Notice);
+    assert!(
+        detail.contains("2 file(s)") && detail.contains("cannot remove them while they are held"),
+        "{detail}"
+    );
+    assert_eq!(
+        capture_detail(&UnjudgedCaptures {
+            elsewhere: 1,
+            ..none
+        })
+        .0,
+        Level::Notice
+    );
+}

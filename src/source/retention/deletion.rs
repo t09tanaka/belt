@@ -6,7 +6,11 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 mod abandon;
+mod scratch;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+pub(in crate::source) use scratch::Reserved;
+#[cfg(test)]
+pub(super) use scratch::STAGING;
 
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;
@@ -185,6 +189,15 @@ impl Index {
         Ok((parent, leaf, identities))
     }
     fn proof(&self, object: &str, path: &str, budget: &mut u64) -> Result<Claim> {
+        let (claim, verified) = self.examine(object, path, budget)?;
+        verified?;
+        Ok(claim)
+    }
+    /// Read the file of `object` in full, as [`Index::proof`] does. The outer
+    /// error is a file that cannot be examined (it is kept); the inner one is
+    /// a file that was read whole and stably and is not the content its name
+    /// says: a positive finding, with the claim of exactly that file.
+    fn examine(&self, object: &str, path: &str, budget: &mut u64) -> Result<(Claim, Result<()>)> {
         let (parent, name, parents) = self.open_claim_parent(object, path)?;
         let mut file: File = rustix::fs::openat(
             &parent,
@@ -210,19 +223,22 @@ impl Index {
             "source changed during validation"
         );
         let digest = format!("{:x}", Sha256::digest(&bytes));
-        if let Some(hash) = object.strip_prefix("b:") {
-            ensure!(digest == hash, "source blob content identity mismatch");
-        } else {
-            let manifest: local_ci::source::SourceManifest = serde_json::from_slice(&bytes)?;
-            ensure!(
-                Some(manifest.source_id.as_str()) == object.strip_prefix("m:"),
-                "source manifest identity mismatch"
-            );
-            super::super::store::verify_manifest(&manifest)?;
-        }
+        let verified = (|| -> Result<()> {
+            if let Some(hash) = object.strip_prefix("b:") {
+                ensure!(digest == hash, "source blob content identity mismatch");
+            } else {
+                let manifest: local_ci::source::SourceManifest = serde_json::from_slice(&bytes)?;
+                ensure!(
+                    Some(manifest.source_id.as_str()) == object.strip_prefix("m:"),
+                    "source manifest identity mismatch"
+                );
+                super::super::store::verify_manifest(&manifest)?;
+            }
+            Ok(())
+        })();
         let incarnation = i64::try_from(self.publication(object)?.get())?;
         ensure!(incarnation < i64::MAX, "source incarnation overflow");
-        Ok(Claim {
+        let claim = Claim {
             object: object.into(),
             path: path.into(),
             incarnation,
@@ -231,7 +247,8 @@ impl Index {
             leaf,
             digest,
             abandoned: false,
-        })
+        };
+        Ok((claim, verified))
     }
     fn drain_claim(&self, c: &mut Connection, claim: &Claim, budget: &mut u64) -> Result<()> {
         ensure!(
@@ -331,8 +348,10 @@ impl Index {
 }
 /// What became of one membership of a root that is being released.
 pub(super) enum Released {
-    /// Another root holds the object: only the membership was removed.
-    Shared,
+    /// Another root holds the object: only the membership was removed. The
+    /// file stays; `true` when it is a reservation's and was read and found
+    /// not to be its content (for `doctor`).
+    Shared(bool),
     /// The file could not be proven: the membership and the file stay.
     Unproven(String),
     /// The claim is durable and the membership removed; the result of the
@@ -345,6 +364,13 @@ impl Index {
     /// loses this membership; a file no other root holds is proven, claimed
     /// durably and unlinked. Half of `budget` remains for the revalidation
     /// of the unlink.
+    ///
+    /// A `reservation` (a member of a root that never got its source) may
+    /// name a file its capture did not install: one that was there with
+    /// other content and stopped the install (spec 25.4 (b)). Such a file,
+    /// read whole and stably and found not to be its content, is claimed as
+    /// well when no other root holds it; one another root holds stays.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn release_member(
         &self,
         c: &mut Connection,
@@ -353,6 +379,7 @@ impl Index {
         path: &str,
         budget: &mut u64,
         abandoned: bool,
+        reservation: bool,
     ) -> Result<Released> {
         let shared: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
@@ -360,15 +387,26 @@ impl Index {
             |r| r.get(0),
         )?;
         if shared {
+            let half = *budget / 2;
+            let mut look = half;
+            let corrupt =
+                reservation && matches!(self.examine(object, path, &mut look), Ok((_, Err(_))));
+            *budget -= half - look;
             c.execute(
                 "DELETE FROM member WHERE root=?1 AND object=?2",
                 params![root, object],
             )?;
-            return Ok(Released::Shared);
+            return Ok(Released::Shared(corrupt));
         }
         // Half the page budget remains for immediate content revalidation.
         let mut proof_budget = *budget / 2;
-        let claim = match self.proof(object, path, &mut proof_budget) {
+        let examined = if reservation {
+            self.examine(object, path, &mut proof_budget)
+                .map(|(claim, _)| claim)
+        } else {
+            self.proof(object, path, &mut proof_budget)
+        };
+        let claim = match examined {
             Ok(claim) => Claim { abandoned, ..claim },
             Err(error) => return Ok(Released::Unproven(format!("{error:#}"))),
         };
@@ -581,11 +619,16 @@ impl SourceStore {
         report.examined = objects.len() as u32;
         for (object, path) in &objects {
             cursor.object = object.clone();
-            match self
-                .retention
-                .release_member(&mut c, &run, object, path, &mut budget, false)?
-            {
-                Released::Shared => report.shared += 1,
+            match self.retention.release_member(
+                &mut c,
+                &run,
+                object,
+                path,
+                &mut budget,
+                false,
+                false,
+            )? {
+                Released::Shared(_) => report.shared += 1,
                 Released::Unproven(error) => {
                     report.unknown += 1;
                     report.errors.push(error);

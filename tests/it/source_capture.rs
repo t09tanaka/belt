@@ -1141,11 +1141,11 @@ fn a_commit_capture_holds_what_was_committed_and_nothing_else() {
     )
     .unwrap();
     assert_eq!(again.manifest.source_id, m.source_id);
-    // no scratch checkout is left behind
-    let left: Vec<_> = std::fs::read_dir(store.root().join("tmp"))
+    // no scratch checkout is left behind: it is in the scratch directory of
+    // its capture, which the capture removes
+    let left: Vec<_> = std::fs::read_dir(store.root().join("staging"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
-        .filter(|n| n.to_string_lossy().starts_with("commit-"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }

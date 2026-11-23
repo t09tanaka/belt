@@ -6,14 +6,16 @@
 //! run row is committed. So while this code runs no capture writes, and no
 //! run row appears. What is deleted is named by one `capture_owner` row (the
 //! run ID and the pending root it carries) and by nothing else: no directory
-//! is listed here. A capture is deleted only when its owner wrote `given_up`,
+//! is listed here but the capture's own scratch directory. A capture is deleted only when its owner wrote `given_up`,
 //! is proven gone, or had its enqueue refused by this resident, and only
 //! after the parent database said, again, that the run has no row.
 //!
 //! The order is the order of the spec's list: the parent rows of the run's
 //! cancel, the Vault bundle, the plaintext bundle, the in-place binding, the
-//! run record, the roots with their objects, the run lock, and last the owner
-//! row. Each step is idempotent, and a step that cannot finish (a file that
+//! run record, the scratch directory of the capture, the roots with their
+//! objects, the run lock, and last the owner row. The scratch directory is
+//! the one directory that is listed: it is named by the row, and removed
+//! whole. Each step is idempotent, and a step that cannot finish (a file that
 //! cannot be proven ours, a busy Vault, the page budget) leaves the owner row,
 //! so a later pass continues from the row.
 use super::*;
@@ -51,6 +53,9 @@ pub struct AbandonReport {
     /// Object and manifest files claimed in this call (at most 32).
     pub paths: u32,
     pub unknown: u32,
+    /// Files a reservation named that another root holds and that are not
+    /// their content: kept, for `doctor`.
+    pub corrupt_held: u32,
     pub errors: Vec<String>,
 }
 
@@ -276,16 +281,23 @@ impl SourceStore {
         self.retention
             .unlink_run_file("runs", false, run.as_str())?;
         fault("abandon_after_files")?;
-        // 6. The run root and the pending root, with what only they hold.
+        // 6. The scratch directory of the capture, whole, before any file of
+        // the store: a file whose install was cut short still has its staged
+        // name, and a file with two names is not provably ours.
+        if let Some(root) = row.root.as_deref() {
+            self.retention.remove_scratch(root)?;
+        }
+        fault("abandon_after_scratch")?;
+        // 7. The run root and the pending root, with what only they hold.
         if !self.abandon_roots(c, &run, row.root.as_deref(), budget, cursor, report)? {
             return Ok(Some(Outcome::Continuing));
         }
         fault("abandon_after_roots")?;
-        // 7. The run lock: only the capture of this run opens it, and that
+        // 8. The run lock: only the capture of this run opens it, and that
         // capture is over (25.1 (A)).
         self.retention
             .unlink_run_file("runs", false, &format!("{run}.lock"))?;
-        // 8. Last, the row that named all of it.
+        // 9. Last, the row that named all of it.
         forget_owner(c)?;
         Ok(Some(Outcome::Finished))
     }
@@ -438,6 +450,13 @@ impl SourceStore {
                 cursor.root = root.to_owned();
                 cursor.object.clear();
             }
+            // A root that never got its source holds reservations: files its
+            // capture was about to install. One that was not installed is
+            // not there, and there is nothing of it to prove or to unlink.
+            let unfinished: bool =
+                c.query_row("SELECT source IS NULL FROM root WHERE id=?1", [root], |r| {
+                    r.get(0)
+                })?;
             loop {
                 let objects: Vec<(String, String)> = {
                     let mut s = c.prepare("SELECT m.object,o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT 32")?;
@@ -450,6 +469,26 @@ impl SourceStore {
                         return Ok(false);
                     }
                     cursor.object = object.clone();
+                    if unfinished && self.retention.destination_absent(object, path) {
+                        // The object a reservation alone named goes with it:
+                        // no member is left, and no claim was ever made.
+                        let tx = c.transaction()?;
+                        tx.execute(
+                            "DELETE FROM member WHERE root=?1 AND object=?2",
+                            params![root, object],
+                        )?;
+                        let unheld = "NOT EXISTS(SELECT 1 FROM member WHERE object=?1) AND NOT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1)";
+                        tx.execute(
+                            &format!("DELETE FROM object WHERE id=?1 AND {unheld}"),
+                            [object],
+                        )?;
+                        tx.execute(
+                            &format!("DELETE FROM publication WHERE object=?1 AND {unheld}"),
+                            [object],
+                        )?;
+                        tx.commit()?;
+                        continue;
+                    }
                     match self.retention.release_member(
                         c,
                         root,
@@ -457,8 +496,19 @@ impl SourceStore {
                         path,
                         &mut budget.bytes,
                         true,
+                        unfinished,
                     )? {
-                        Released::Shared => {}
+                        Released::Shared(corrupt) => {
+                            if corrupt {
+                                report.corrupt_held += 1;
+                                // One row, for `doctor`, which reads the
+                                // index and not this report.
+                                c.execute(
+                                    "INSERT INTO meta VALUES('corrupt_held','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+                                    [],
+                                )?;
+                            }
+                        }
                         Released::Unproven(error) => {
                             report.unknown += 1;
                             report.errors.push(error);

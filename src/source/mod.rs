@@ -1,9 +1,11 @@
 //! Input snapshots (working tree, commit, directory) and transfer (spec
 //! chapter 6).
 //!
-//! The capture itself is local-ci's [`capture_source`] / [`capture_directory`]
-//! (verified copy into a private content-addressed store, at most three
-//! passes, atomic manifest publication, an original that is never written).
+//! The capture itself is local-ci's staged capture (verified copy, at most
+//! three passes, an original that is never written): every new file of the
+//! store is written under the capture's own scratch directory, recorded as a
+//! reservation of the capture's pending root, and only then installed (spec
+//! 25.4 (b)).
 //! This module puts them under the runner's state directory, binds a capture
 //! to a run (one capture per run), maps refusals to the runner's error codes,
 //! and adds the receiving side: difference planning, verified blob intake,
@@ -23,7 +25,8 @@ pub mod store;
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::RunId;
 use local_ci::source::{
-    capture_directory, capture_source, CaptureOptions, Hook, SecretSpec, SourceKind,
+    capture_directory_staged, capture_source_staged, CaptureOptions, Hook, Intent, SecretSpec,
+    SourceKind, StagedInstallError, Staging,
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
@@ -140,6 +143,28 @@ fn capture_of(
         .capture_pending_root(run)
         .map_err(|e| classify::api_error_of(&e))?;
     retention::stop_point("pending");
+    // The root, and with it the name of the scratch directory, is committed:
+    // from here on everything this capture writes is under that directory or
+    // reserved by that root.
+    let scratch = Scratch::create(store, &retention_root)?;
+    let reserved = std::sync::Arc::new(std::sync::Mutex::new(retention::Reserved::new()));
+    let staging = Staging {
+        scratch_dir: scratch.path.clone(),
+        before_install: {
+            let (index, root, reserved) = (
+                store.retention.clone(),
+                retention_root.clone(),
+                reserved.clone(),
+            );
+            std::sync::Arc::new(move |intents: &[Intent]| {
+                retention::stop_point("staged");
+                let rows = index.reserve_capture(&root, intents)?;
+                *reserved.lock().unwrap_or_else(|e| e.into_inner()) = rows;
+                retention::stop_point("reserved");
+                Ok(())
+            })
+        },
+    };
     let ctx = ExecContext::new(env.clone());
     let opts = CaptureOptions {
         store: Some(store.root().to_path_buf()),
@@ -153,18 +178,13 @@ fn capture_of(
         max_attempts: classify::attempt_budget(params.max_attempts),
         hook: params.hook.clone(),
     };
-    let ci_err = |e: anyhow::Error| classify::api_error_of(&e);
-    let snap = match request {
-        SourceRequest::Worktree { dir } => capture_source(&ctx, dir, &opts).map_err(ci_err)?,
+    let staged = match request {
+        SourceRequest::Worktree { dir } => capture_source_staged(&ctx, dir, &opts, &staging),
         SourceRequest::Commit { dir, rev } => {
-            let co = commit::checkout(
-                env,
-                &store.root().join("tmp"),
-                dir,
-                rev,
-                params.base.as_deref(),
-            )
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("{e:#}")))?;
+            // the checkout is a part of this capture: it goes with the
+            // scratch directory, whoever removes that
+            let co = commit::checkout(env, &scratch.path, dir, rev, params.base.as_deref())
+                .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("{e:#}")))?;
             // the scratch repository has the base as a commit, not as a ref
             // the clean checkout has no ignored files: the secret files are
             // chosen and read in the worktree the commit came from
@@ -173,10 +193,49 @@ fn capture_of(
                 secret_root: Some(dir.clone()),
                 ..opts
             };
-            capture_source(&ctx, &co.cwd, &o).map_err(ci_err)?
+            capture_source_staged(&ctx, &co.cwd, &o, &staging)
         }
-        SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts).map_err(ci_err)?,
+        SourceRequest::Directory { dir } => capture_directory_staged(&ctx, dir, &opts, &staging),
     };
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            // An install that stopped part-way created only what it lists as
+            // installed. The rest is given back now: a file that was there
+            // already with this content (a dedup hit) is not this capture's,
+            // and one that was not reached does not exist. What was installed
+            // stays reserved, for the abandonment to release, and so does the
+            // first file the install did not account for: the one it stopped
+            // at, which may be there with other content. The abandonment
+            // finds out which: not there, the content, or a file no root
+            // holds that is not its content, which it removes.
+            if let Some(part) = error.downcast_ref::<StagedInstallError>() {
+                let rows = reserved.lock().unwrap_or_else(|e| e.into_inner());
+                let kept: std::collections::HashSet<&PathBuf> = part.installed.iter().collect();
+                let stopped = rows
+                    .iter()
+                    .map(|(to, _)| to)
+                    .find(|to| !kept.contains(to) && !part.reused.contains(to));
+                let keys: Vec<&str> = rows
+                    .iter()
+                    .filter(|(to, _)| !kept.contains(to) && Some(to) != stopped)
+                    .map(|(_, key)| key.as_str())
+                    .collect();
+                // best effort, on the way out of an error: a reservation
+                // that stays is released by the abandonment
+                let _ = store.retention.unreserve_capture(&retention_root, &keys);
+            }
+            return Err(classify::api_error_of(&error));
+        }
+    };
+    retention::stop_point("installed");
+    let snap = staged.snapshot;
+    // The scratch directory is removed by the capture that made it: after
+    // the hand-over nothing names it.
+    if let Err(error) = scratch.remove() {
+        remove_secret_copy(snap.secrets.as_deref());
+        return Err(classify::api_error_of(&error));
+    }
     // from here on the store holds a plaintext secret bundle: every way out
     // that does not hand it to the caller removes it
     let ci_manifest = std::sync::Arc::new(snap.manifest);
@@ -207,6 +266,44 @@ fn capture_of(
     })
 }
 
+/// The scratch directory of one capture (`staging/<ulid>` of the store, named
+/// after the pending root). A capture that returns removes it; one that is
+/// killed leaves it to the abandonment, which names it from the owner row.
+struct Scratch {
+    index: retention::Index,
+    root: String,
+    path: PathBuf,
+    removed: bool,
+}
+
+impl Scratch {
+    fn create(store: &SourceStore, root: &str) -> Result<Self, ApiError> {
+        let path = store
+            .retention
+            .create_scratch(root)
+            .map_err(|e| classify::api_error_of(&e))?;
+        Ok(Self {
+            index: store.retention.clone(),
+            root: root.to_owned(),
+            path,
+            removed: false,
+        })
+    }
+    fn remove(mut self) -> anyhow::Result<()> {
+        self.removed = true;
+        self.index.remove_own_scratch(&self.root)
+    }
+}
+
+impl Drop for Scratch {
+    /// The way out of an error, which this must not replace.
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.index.remove_own_scratch(&self.root);
+        }
+    }
+}
+
 /// Remove the store's plaintext secret bundle, if there is one. Best effort:
 /// it is called on the way out of an error, which it must not replace; a copy
 /// that stays is found by the sweep at start
@@ -220,7 +317,8 @@ fn remove_secret_copy(path: Option<&Path>) {
 /// A submodule that was not initialized in the original has no files to
 /// capture, only a revision: a source made so would not hold what the
 /// repository holds, so it is refused, with the path. (The refused capture
-/// leaves its manifest in the store, unreferenced; nothing is bound to it.)
+/// leaves its manifest and objects in the store, reserved by its pending
+/// root; the abandonment of the capture releases them.)
 fn refuse_uninitialized_submodules(
     store: &SourceStore,
     m: &local_ci::source::SourceManifest,
