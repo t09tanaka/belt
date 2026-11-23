@@ -58,6 +58,10 @@ pub struct RowsPage {
     /// The attempts whose rows this transaction deleted, with their worker:
     /// read before the delete, and kept in memory only (spec 25.5, step 7).
     pub attempts: Vec<(WorkerId, AttemptId)>,
+    /// Events of the attempts this transaction deleted that name another
+    /// run: kept, as that run's. No writer of this version makes one
+    /// (every writer names the run of its attempt).
+    pub kept_events: u32,
 }
 
 /// The rows of a run below its attempts, children first (spec 25.5, "段6の
@@ -65,8 +69,10 @@ pub struct RowsPage {
 /// transaction's bound. Every statement finds its rows by an index.
 const BELOW_ATTEMPTS: &[&str] = &[
     "DELETE FROM event WHERE seq IN (SELECT seq FROM event WHERE run_id=?1 ORDER BY seq LIMIT ?2)",
-    // The events that name an attempt and no run (`Coordinator::note`).
-    "DELETE FROM event WHERE seq IN (SELECT e.seq FROM task t JOIN attempt a USING(task_id) JOIN event e ON e.attempt_id=a.attempt_id WHERE t.run_id=?1 LIMIT ?2)",
+    // The events that name an attempt and no run (`Coordinator::note`). An
+    // event of an attempt of this run that names another run is that run's,
+    // and stays (counted in `RowsPage::kept_events`).
+    "DELETE FROM event WHERE seq IN (SELECT e.seq FROM task t JOIN attempt a USING(task_id) JOIN event e ON e.attempt_id=a.attempt_id WHERE t.run_id=?1 AND (e.run_id IS NULL OR e.run_id=?1) LIMIT ?2)",
     "DELETE FROM blob_ref WHERE ref_id IN (SELECT b.ref_id FROM task t JOIN attempt a USING(task_id) JOIN blob_ref b ON b.attempt_id=a.attempt_id WHERE t.run_id=?1 LIMIT ?2)",
     "DELETE FROM workflow_download WHERE (consumer,action_key) IN (SELECT d.consumer,d.action_key FROM task t JOIN attempt a USING(task_id) JOIN workflow_download d ON d.consumer=a.attempt_id WHERE t.run_id=?1 LIMIT ?2)",
     "DELETE FROM workflow_upload_inflight WHERE (producer,action_key) IN (SELECT u.producer,u.action_key FROM task t JOIN attempt a USING(task_id) JOIN workflow_upload_inflight u ON u.producer=a.attempt_id WHERE t.run_id=?1 LIMIT ?2)",
@@ -449,6 +455,14 @@ impl CoordinatorStore {
                         id("attempt_id", AttemptId::parse(&attempt))?,
                     ));
                 }
+            }
+            for (_, attempt) in &page.attempts {
+                let kept: u32 = tx.query_row(
+                    "SELECT count(*) FROM event WHERE attempt_id=?1 AND run_id IS NOT NULL AND run_id<>?2",
+                    params![attempt.as_str(), run],
+                    |r| r.get(0),
+                )?;
+                page.kept_events += kept;
             }
             let n = page.attempts.len() as u32;
             page.rows += n;

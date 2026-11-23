@@ -788,3 +788,38 @@ fn an_event_of_an_attempt_without_a_row_is_refused() {
     ));
     assert_eq!(count(&store, "SELECT count(*) FROM event"), before);
 }
+
+/// An event of an attempt of a pruned run that names another run is that
+/// run's: it stays, and is counted. (No writer of this version makes one;
+/// without the restriction the trigger of the journal would abort every
+/// transaction of the run.)
+#[test]
+fn an_event_of_its_attempt_that_names_another_run_stays_and_is_counted() {
+    let (_dir, store) = store();
+    let (run, _, attempt) = ended_run(&store, 5);
+    let (other, _, _) = ended_run(&store, 5);
+    store
+        .append_event(Some(&other), Some(&attempt), "odd", &json!({}), 6)
+        .unwrap();
+    store.mark_pruning_for_test(&run);
+    let mut kept = 0;
+    loop {
+        let page = store
+            .prune_rows(&run, ROWS_PER_TRANSACTION, Some(&exclusive(&store)))
+            .unwrap();
+        kept += page.kept_events;
+        if page.state == RowsState::Done {
+            break;
+        }
+    }
+    assert_eq!(kept, 1);
+    assert!(!store.has_run(&run).unwrap());
+    assert_eq!(
+        count(
+            &store,
+            format!("SELECT count(*) FROM event WHERE run_id='{other}' AND attempt_id='{attempt}'")
+                .leak()
+        ),
+        1
+    );
+}

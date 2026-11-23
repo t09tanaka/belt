@@ -25,6 +25,9 @@ pub(super) fn pruning_held(report: &run_pruning::PruneReport) -> String {
         "run pruning held (validation/I/O); kept={}; continuing={}",
         report.unknown, report.continuing
     );
+    if report.kept_events > 0 {
+        line.push_str(&format!("; kept_events={}", report.kept_events));
+    }
     if !report.gates.is_empty() {
         let gates: Vec<String> = report
             .gates
@@ -94,7 +97,7 @@ pub(super) async fn run(
         .await?;
         (cursor, pruning) = next;
         match pruned {
-            Some(Ok(report)) if report.unknown > 0 || !report.gates.is_empty() => {
+            Some(Ok(report)) if report.unknown > 0 || report.kept_events > 0 || !report.gates.is_empty() => {
                 eprintln!("{}", pruning_held(&report))
             }
             // Never the error itself: it can name a private path.

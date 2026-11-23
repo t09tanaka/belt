@@ -73,6 +73,8 @@ pub(super) struct PruneReport {
     pub unknown: u32,
     /// Runs held at step 4, by the gate that held them.
     pub gates: std::collections::BTreeMap<Gate, u32>,
+    /// Events of a pruned run's attempts that name another run: kept.
+    pub kept_events: u32,
     pub events: u32,
     pub timings: u32,
 }
@@ -250,6 +252,7 @@ fn prune(
         budget.transactions -= 1;
         let page = owner.prune_rows(run, ROWS_PER_TRANSACTION, source.as_ref())?;
         ended.extend(page.attempts);
+        report.kept_events += page.kept_events;
         match page.state {
             RowsState::More => fault("during_rows")?,
             RowsState::Results => return Ok(false),
