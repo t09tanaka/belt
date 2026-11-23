@@ -375,8 +375,8 @@ impl Index {
         let mut over = match (filled, total) {
             (true, Some(total)) => {
                 let leaving: i64 = c.query_row(
-                    "SELECT coalesce(sum(b.bytes),0) FROM object_bytes b WHERE EXISTS(SELECT 1 FROM member m JOIN root r ON r.id=m.root WHERE m.object=b.id AND r.id LIKE 'drop:%')
-                     AND NOT EXISTS(SELECT 1 FROM member m JOIN root r ON r.id=m.root WHERE m.object=b.id AND r.id NOT LIKE 'drop:%')",
+                    "SELECT coalesce(sum(b.bytes),0) FROM object_bytes b WHERE b.id IN (SELECT m.object FROM member m WHERE m.root>='drop:' AND m.root<'drop;')
+                     AND NOT EXISTS(SELECT 1 FROM member o WHERE o.object=b.id AND NOT (o.root>='drop:' AND o.root<'drop;'))",
                     [],
                     |r| r.get(0),
                 )?;
