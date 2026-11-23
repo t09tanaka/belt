@@ -567,6 +567,27 @@ impl Agent {
                     opened = Some((s, e));
                 }
                 Step::StoreSecretCopies => host.sweep_store_copies()?,
+                Step::IncomingImports => {
+                    // Not while a version is on trial (spec 25.1, 8). A
+                    // failure keeps the rows and does not stop the start
+                    // (25.11): the next start tries again.
+                    if let Some(blobs) = host
+                        .blobs()
+                        .filter(|_| !super::control::in_trial(&cfg.state_dir))
+                    {
+                        if let Err(e) = blobs.forget_unowned() {
+                            let s = store.expect("the store is open");
+                            let payload = json!({ "code": e.code, "message": e.message });
+                            let _ = s.append_event(
+                                None,
+                                None,
+                                "agent_incoming_tokens_kept",
+                                &payload,
+                                now(),
+                            );
+                        }
+                    }
+                }
                 Step::Vault => host.sweep_vault()?,
                 Step::PlacedSecrets => {
                     let s = store.expect("the store is open");
@@ -2123,6 +2144,19 @@ impl Agent {
         self.reap_warmups();
         self.supervise_attempts();
         self.cleanup_terminal(32);
+        self.drop_stale_incoming();
+    }
+
+    /// Sources nobody added to for 24 hours go, every pass and not only
+    /// when the 16 staging places are taken (spec 25.8, 25.10). Not while a
+    /// version is on trial (25.1, 8).
+    fn drop_stale_incoming(&self) {
+        if super::control::in_trial(&self.cfg.state_dir) {
+            return;
+        }
+        if let Some(blobs) = self.host.blobs() {
+            blobs.drop_stale(&self.cfg.blobs);
+        }
     }
 
     /// An operator's stop request: cancel whatever is live. Cancellation is
@@ -2175,6 +2209,7 @@ impl Agent {
         self.reap_warmups();
         self.supervise_attempts();
         self.clean_ended();
+        self.drop_stale_incoming();
         if let Err(e) = self.gc() {
             self.note_global(
                 "agent_gc_failed",

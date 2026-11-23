@@ -53,6 +53,7 @@ use crate::platform::{free_bytes, open_beneath, wall_ms};
 use crate::protocol::chunk::clamp_chunk;
 use crate::source::classify::{ci_id_of, source_id_of_ci};
 use crate::source::diff::{is_blob_hash, BlobWant};
+use crate::source::retention::{is_import_token_id, ForgetReport, ImportToken};
 use crate::source::store::{verify_manifest, ImportRef, ObjectsRepo};
 use crate::source::SourceStore;
 use crate::storage::WorkerStore;
@@ -81,11 +82,24 @@ pub trait BlobSink: Send + Sync {
         limits: &BlobLimits,
         r: &BlobVerifyRequest,
     ) -> Result<BlobVerifyResponse, ApiError>;
+    /// Every tick: drop the sources nobody added to for
+    /// [`BlobLimits::stale_ms`] (spec 25.8, 25.10). Waits for no lock.
+    fn drop_stale(&self, _limits: &BlobLimits) {}
+    /// At the agent's start, under `agent.lock` and before anything is
+    /// received: remove the import tokens no receiving directory records
+    /// (spec 25.8, 4). `None`: this sink keeps no tokens.
+    fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {
+        Ok(None)
+    }
 }
 
 /// The file in a source's staging directory that holds its reservation.
 const RESERVED: &str = "reserved";
 const RESERVED_TMP: &str = "reserved.tmp";
+/// The file in a source's staging directory that records the import token
+/// its publication takes (spec 25.8, 1): the directory owns the token.
+const IMPORT_TOKEN: &str = "import-token";
+const IMPORT_TOKEN_TMP: &str = "import-token.tmp";
 /// Where the files of a source wait: part-way, and whole.
 const PARTS: &str = "parts";
 const FILES: &str = "files";
@@ -420,6 +434,24 @@ fn read_reserved(dir: &Path) -> Option<Reservation> {
 
 /// The bytes the staged files of a source hold on the disk: what is there,
 /// not what their names announce.
+/// The id of the import token the staging directory `dir` records. `Ok(None)`
+/// when it records none; an error when the record cannot be read or names
+/// no token.
+fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
+    let text = match fs::read_to_string(dir.join(IMPORT_TOKEN)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !is_import_token_id(&text) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the import token record names no token",
+        ));
+    }
+    Ok(Some(text))
+}
+
 fn staged_bytes(dir: &Path) -> u64 {
     let mut sum = 0u64;
     for d in [dir.to_path_buf(), dir.join(PARTS), dir.join(FILES)] {
@@ -576,6 +608,14 @@ impl Incoming {
             .unwrap_or_else(|e| e.into_inner())
             .remove(source);
         let dir = self.root.join(source);
+        // The owner of the token ends: its rows go first (spec 25.8, 3).
+        // Should that fail, the rows stay until the next start removes
+        // them as unrecorded (25.8, 4); the directory goes all the same.
+        if let Ok(Some(id)) = recorded_token(&dir) {
+            let _ = self.store.release_import(&id);
+        }
+        remove_staged(&dir.join(IMPORT_TOKEN_TMP));
+        remove_staged(&dir.join(IMPORT_TOKEN));
         for sub in [dir.join(PARTS), dir.join(FILES), dir.clone()] {
             for f in listing(&sub).unwrap_or_default() {
                 remove_staged(&sub.join(f.name));
@@ -695,12 +735,27 @@ impl Incoming {
         if may_stage_source(limits, self.staged_sources()?.len()) {
             return Ok(());
         }
+        self.drop_stale_locked(limits, Some(source))?;
+        if may_stage_source(limits, self.staged_sources()?.len()) {
+            return Ok(());
+        }
+        Err(overloaded("too many sources are being received"))
+    }
+
+    /// Drop the sources nobody added to for a long time, each under its own
+    /// lock and only when that lock is free. The caller holds the lock over
+    /// all sources, and the lock of `held` when it names one.
+    fn drop_stale_locked(
+        &self,
+        limits: &BlobLimits,
+        held: Option<&SourceId>,
+    ) -> Result<(), ApiError> {
         let now = wall_ms();
         for other in self.staged_sources()? {
             if !is_stale(limits, now, Self::newest_ms(&self.root.join(&other))) {
                 continue;
             }
-            if lock_shard(&other) == lock_shard(source.as_str()) {
+            if held.is_some_and(|s| lock_shard(&other) == lock_shard(s.as_str())) {
                 self.discard(&other);
                 continue;
             }
@@ -709,10 +764,25 @@ impl Incoming {
                 self.discard(&other);
             }
         }
-        if may_stage_source(limits, self.staged_sources()?.len()) {
-            return Ok(());
+        Ok(())
+    }
+
+    /// The token the publication of the source staged in `dir` takes: the
+    /// one the directory records while its row is pending, else a new one,
+    /// recorded before any blob goes in with it (spec 25.8, 1). Call under
+    /// the source's lock.
+    fn import_token(&self, dir: &Path) -> Result<ImportToken, ApiError> {
+        let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
+        if let Some(id) = recorded_token(dir).map_err(io_err)? {
+            if let Some(token) = self.store.resume_import(&id).map_err(store_err)? {
+                return Ok(token);
+            }
         }
-        Err(overloaded("too many sources are being received"))
+        let token = self.store.begin_import().map_err(store_err)?;
+        let tmp = dir.join(IMPORT_TOKEN_TMP);
+        fs::write(&tmp, SourceStore::import_token_id(&token)).map_err(io_err)?;
+        fs::rename(&tmp, dir.join(IMPORT_TOKEN)).map_err(io_err)?;
+        Ok(token)
     }
 
     /// Let the source take `total` bytes in all ([`source_total`]) and
@@ -1412,6 +1482,7 @@ impl Incoming {
             ));
         }
         let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
+        let mut token = None;
         for (hash, size) in &st.wanted {
             let path = waiting(hash, *size);
             if stored.contains(hash) {
@@ -1423,7 +1494,13 @@ impl Incoming {
                 size: *size,
             };
             let mut f = File::open(&path).map_err(io_err)?;
-            self.store.ingest_blob(&want, &mut f).map_err(store_err)?;
+            if token.is_none() {
+                token = Some(self.import_token(&dir)?);
+            }
+            let token = token.as_ref().expect("taken above");
+            self.store
+                .ingest_blob_with_token(token, &want, &mut f)
+                .map_err(store_err)?;
             remove_staged(&path);
         }
         for id in st.leaf_first(root_id) {
@@ -1667,6 +1744,36 @@ impl BlobSink for Incoming {
         let result = self.verify_locked(r, &root_id, ready, &st);
         self.keep(&r.source_id, st);
         result
+    }
+
+    fn drop_stale(&self, limits: &BlobLimits) {
+        if !self.root.is_dir() {
+            return;
+        }
+        let Ok(all) = self.lock_file("all") else {
+            return;
+        };
+        // (the next tick looks again)
+        if all.try_lock().is_ok() {
+            let _ = self.drop_stale_locked(limits, None);
+        }
+    }
+
+    fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {
+        // Every record must be read: one that cannot be may name a token
+        // in use, and then nothing is removed (fail closed).
+        let mut owned = BTreeSet::new();
+        if self.root.is_dir() {
+            for source in self.staged_sources()? {
+                if let Some(id) = recorded_token(&self.root.join(source)).map_err(io_err)? {
+                    owned.insert(id);
+                }
+            }
+        }
+        self.store
+            .forget_unowned_imports(&owned)
+            .map(Some)
+            .map_err(|e| internal("source store", format!("{e:#}")))
     }
 }
 

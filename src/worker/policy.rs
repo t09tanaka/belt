@@ -585,6 +585,8 @@ pub enum Step {
     Store,
     /// Plaintext secret bundles a crashed capture left in the store.
     StoreSecretCopies,
+    /// Import tokens no receiving directory records (spec 25.8, 4).
+    IncomingImports,
     /// Stale files of the bundle vault.
     Vault,
     /// Secret files of attempts that ended or are unknown.
@@ -601,12 +603,13 @@ pub enum Step {
 /// is read; every sweep runs before an attempt is resumed (a new workspace's
 /// scratch directory would look like a leftover); the boot ID is recorded
 /// last, so a start that died half-way sees the change again.
-pub const STARTUP_ORDER: [Step; 10] = [
+pub const STARTUP_ORDER: [Step; 11] = [
     Step::StateDir,
     Step::CoreDumps,
     Step::Lock,
     Step::Store,
     Step::StoreSecretCopies,
+    Step::IncomingImports,
     Step::Vault,
     Step::PlacedSecrets,
     Step::Workspaces,
@@ -1488,6 +1491,7 @@ mod tests {
         let at = |s: Step| STARTUP_ORDER.iter().position(|x| *x == s).unwrap();
         for sweep in [
             Step::StoreSecretCopies,
+            Step::IncomingImports,
             Step::Vault,
             Step::PlacedSecrets,
             Step::Workspaces,

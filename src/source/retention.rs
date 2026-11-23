@@ -3,11 +3,13 @@
 mod capture_owner;
 mod deletion;
 mod foreground;
+mod import_owner;
 pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{inspect_corrupt_held, inspect_owners, CaptureOwner, CaptureVerdict};
 pub(in crate::source) use deletion::Reserved;
 pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
 pub(crate) use foreground::ForegroundBusy;
+pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
