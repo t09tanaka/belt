@@ -134,6 +134,8 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
     root: PathBuf,
+    /// Set by the staged capture entry points: new files go there first.
+    staging: Option<std::sync::Arc<super::staging::Stager>>,
 }
 
 impl ObjectStore {
@@ -148,15 +150,50 @@ impl ObjectStore {
             std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("cannot restrict {}", root.join(d).display()))?;
         }
-        Ok(ObjectStore { root })
+        Ok(ObjectStore {
+            root,
+            staging: None,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// The same store, with the new files of a capture staged first.
+    pub(crate) fn with_staging(&self, st: std::sync::Arc<super::staging::Stager>) -> Self {
+        ObjectStore {
+            root: self.root.clone(),
+            staging: Some(st),
+        }
+    }
+
+    /// Where temporary files go: the store's `tmp/`, or the staging's.
     pub(crate) fn tmp_dir(&self) -> PathBuf {
-        self.root.join("tmp")
+        match &self.staging {
+            Some(st) => st.tmp_dir(),
+            None => self.root.join("tmp"),
+        }
+    }
+
+    /// What a failed attempt has to remove: see [`Stager::reset_to`].
+    pub(crate) fn stage_mark(&self) -> usize {
+        self.staging.as_ref().map_or(0, |s| s.mark())
+    }
+
+    pub(crate) fn stage_reset(&self, mark: usize) {
+        if let Some(s) = &self.staging {
+            s.reset_to(mark);
+        }
+    }
+
+    /// The file that holds the object: the staged one when this capture
+    /// staged it, else the store's.
+    pub(crate) fn locate(&self, hash: &str) -> PathBuf {
+        self.staging
+            .as_ref()
+            .and_then(|s| s.object_path(hash))
+            .unwrap_or_else(|| self.object_path(hash))
     }
 
     pub(crate) fn git_dir(&self, key: &str) -> PathBuf {
@@ -174,6 +211,9 @@ impl ObjectStore {
     /// Store what `r` yields; returns its hash and size. Content that is
     /// already there is not written again.
     pub fn put_reader(&self, r: &mut impl Read) -> Result<(String, u64)> {
+        if let Some(st) = &self.staging {
+            return st.put_reader(r);
+        }
         let tmp = tmp_name(&self.tmp_dir(), "obj");
         let res = (|| -> Result<(String, u64)> {
             let mut f = std::fs::OpenOptions::new()
@@ -218,7 +258,7 @@ impl ObjectStore {
         if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
             bail!("not a content hash: {hash}");
         }
-        std::fs::read(self.object_path(hash))
+        std::fs::read(self.locate(hash))
             .with_context(|| format!("object {hash} is not in the source store"))
     }
 
@@ -234,8 +274,22 @@ impl ObjectStore {
 
     /// Make the manifest visible, all at once.
     pub(crate) fn publish_manifest(&self, m: &SourceManifest) -> Result<()> {
+        if let Some(st) = &self.staging {
+            return st.stage_manifest(m);
+        }
         let bytes = serde_json::to_vec_pretty(m)?;
         write_atomic(&self.manifest_path(&m.source_id), &bytes, 0o644)
+    }
+
+    /// Save the secret bundle of `source_id` (staged when the capture is);
+    /// returns where it will be.
+    pub(crate) fn save_secrets(&self, source_id: &str, b: &super::SecretBundle) -> Result<PathBuf> {
+        let path = self.secrets_path(source_id);
+        match &self.staging {
+            Some(st) => st.stage_secrets(source_id, b)?,
+            None => b.save(&path)?,
+        }
+        Ok(path)
     }
 
     /// A published manifest; `None` when there is none (not captured, or a
