@@ -906,3 +906,90 @@ async fn a57_ctrl_c_while_work_finishes_lifts_the_hold_and_switches_nothing() {
     assert!(!h.exe(&h.new).exists());
     assert_eq!(h.resident_link(), Path::new(&h.old));
 }
+
+/// Place `digest`'s version directory an hour back, as a version installed
+/// earlier is.
+fn placed_long_ago(h: &Host, digest: &str) {
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::open(h.exe(digest).parent().unwrap())
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+}
+
+/// Upgraded while the previous version was placed moments ago (so the
+/// commit kept it), and then placed long ago: only what a test adds names it.
+fn upgraded_recently(h: &Host) -> Fake {
+    let mut fake = h.fake.clone();
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(h.exe(&h.old).exists());
+    placed_long_ago(h, &h.old);
+    fake
+}
+
+/// Spec 25.7 (a) acceptance (i): after the commit the previous version and
+/// its tool link are gone, and the new version stays.
+#[tokio::test]
+async fn s25_7_the_commit_removes_the_previous_version_and_its_tool_link() {
+    let h = Host::new().await;
+    placed_long_ago(&h, &h.old);
+    let tool = h.paths.worker.join("tool-bin").join("old");
+    fs::create_dir_all(&tool).unwrap();
+    std::os::unix::fs::symlink(h.exe(&h.old), tool.join("portool")).unwrap();
+    let mut fake = h.fake.clone();
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(!h.exe(&h.old).parent().unwrap().exists());
+    assert!(!tool.exists());
+    assert_eq!(fs::read(h.exe(&h.new)).unwrap(), b"new version");
+}
+
+/// Spec 25.7 (a) acceptance (ii), the guard registered with the service
+/// manager while its definition file is gone: the previous version stays.
+#[tokio::test]
+async fn s25_7_a_guard_left_registered_without_its_file_keeps_the_previous_version() {
+    let h = Host::new().await;
+    let mut fake = upgraded_recently(&h);
+    assert!(!guard_present(&h.paths.config, &mut fake).unwrap());
+    fake.0
+        .borrow_mut()
+        .loaded
+        .insert(h.guard.clone(), String::new());
+    assert!(guard_present(&h.paths.config, &mut fake).unwrap());
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(h.exe(&h.old).exists());
+    fake.0.borrow_mut().loaded.remove(&h.guard);
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(!h.exe(&h.old).exists());
+}
+
+/// Spec 25.7 (a) acceptance (ii), the guard's definition file left while
+/// the service manager no longer has it: the previous version stays.
+#[tokio::test]
+async fn s25_7_a_guard_definition_left_unregistered_keeps_the_previous_version() {
+    let h = Host::new().await;
+    let mut fake = upgraded_recently(&h);
+    let definition = h.paths.services.join(format!("{}.plist", h.guard));
+    fs::write(&definition, b"<plist/>").unwrap();
+    assert!(guard_present(&h.paths.config, &mut fake).unwrap());
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(h.exe(&h.old).exists());
+    fs::remove_file(&definition).unwrap();
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(!h.exe(&h.old).exists());
+}

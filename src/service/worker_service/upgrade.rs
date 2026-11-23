@@ -582,6 +582,15 @@ pub fn commit<L: Launcher>(
         journal.drained_by_upgrade = false;
         save_journal(&paths, &journal)?;
     }
+    // Spec 25.7 (a): this host's commit removes the versions nothing names.
+    let places = crate::service::old_binaries::Places::of(env, launcher.backend())?;
+    let config = paths.config.clone();
+    crate::service::old_binaries::sweep(
+        &places,
+        &mut || crate::service::init::upgrade::guard_present(&config, &mut launcher),
+        true,
+        std::time::SystemTime::now(),
+    );
     let plan = plan(&paths, &journal)?;
     let ready = agent_reachable(&paths.state);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)

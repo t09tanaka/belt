@@ -676,6 +676,7 @@ pub fn commit<L: Launcher>(trial: &Trial, launcher: &mut L) -> anyhow::Result<Up
         .context("service receipt missing")?;
     remove_guard(paths, &guard_plan(paths, &trial.from)?, &named, launcher)?;
     forget(paths)?;
+    sweep_old_versions(paths, launcher);
     let (from, to) = trial.versions();
     Ok(Upgraded {
         from: from.to_string(),
@@ -792,6 +793,43 @@ fn watch(config: &Path) -> anyhow::Result<Watch> {
         named,
         guard,
     })
+}
+
+/// Spec 25.7 (a): whether the upgrade guard can still run the previous
+/// version: its definition file is there, or the service manager has its
+/// label. Both are asked, because `commit` is final even when removing the
+/// guard failed. A host without a resident journal never had a guard.
+pub(crate) fn guard_present<L: Launcher>(config: &Path, launcher: &mut L) -> anyhow::Result<bool> {
+    if !config.join("init.json").try_exists()?
+        && !config.join("upgrade").join(KEPT_JOURNAL).try_exists()?
+    {
+        return Ok(false);
+    }
+    let Watch {
+        paths,
+        named,
+        guard,
+    } = watch(config)?;
+    Ok(paths.services.join(guard.filename()).try_exists()?
+        || launcher.loaded_state(&guard, &named) != LoadedState::Absent)
+}
+
+/// Remove the versions nothing names any more (spec 25.7 (a)), after the
+/// commit removed the guard.
+fn sweep_old_versions<L: Launcher>(paths: &Paths, launcher: &mut L) {
+    let places = crate::service::old_binaries::Places {
+        config: paths.config.clone(),
+        worker_state: paths.worker.clone(),
+        parent_state: Some(paths.state.clone()),
+        services: vec![paths.services.clone()],
+    };
+    let config = paths.config.clone();
+    let _ = crate::service::old_binaries::sweep(
+        &places,
+        &mut || guard_present(&config, launcher),
+        false,
+        std::time::SystemTime::now(),
+    );
 }
 
 /// A trial record that no guard watches: the CLI died after the record and
