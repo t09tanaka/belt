@@ -602,9 +602,9 @@ dependencies = [
 
 [[package]]
 name = "fast-worktree"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37abc7c1a7b7d2093079e012ab6bf34de4f9a3e8b0108227e7ef9cdcbbc7f2ce"
+checksum = "0eb672e46608aa503af947add945656c9f933a32b73e2c5296ee09b9db09d8b2"
 dependencies = [
  "clap",
  "globset",
@@ -1383,9 +1383,9 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "portool"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd66c51b0103479efb6e34c815d2e78266498cbd1f10c541f78eac7adaecbc1"
+checksum = "acca58dd13ae5710e66c155fff693828b03913a4947a3896ae2135d4890ae5b1"
 dependencies = [
  "chrono",
  "clap",
