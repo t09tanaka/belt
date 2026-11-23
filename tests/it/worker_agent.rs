@@ -194,7 +194,12 @@ impl Host for DirHost {
             Some(Some(why)) => Ok(ToolPreparationPoll::Failed(PreparationFailure(why))),
         }
     }
-    fn secret_paths(&self, _: &AttemptPayload, _: bool) -> Result<Option<Vec<String>>, ApiError> {
+    fn secret_paths(
+        &self,
+        _: &AttemptPayload,
+        _: bool,
+        _: Option<&belt::source::retention::Guard>,
+    ) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
             return Err(e);
         }
@@ -3214,8 +3219,19 @@ impl Host for RealButCore {
     fn setup_release(&self, a: &AttemptId) {
         self.0.setup_release(a)
     }
-    fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
-        self.0.secret_paths(p, w)
+    fn hold_source(&self) -> Result<Option<belt::source::retention::Guard>, ApiError> {
+        self.0.hold_source()
+    }
+    fn source_used(&self, held: &belt::source::retention::Guard, p: &AttemptPayload) {
+        self.0.source_used(held, p)
+    }
+    fn secret_paths(
+        &self,
+        p: &AttemptPayload,
+        w: bool,
+        h: Option<&belt::source::retention::Guard>,
+    ) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p, w, h)
     }
     fn place_secrets(
         &self,
@@ -3234,6 +3250,86 @@ impl Host for RealButCore {
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.0.cleanup(a, ws)
     }
+}
+
+/// Spec 25.8 5b (a), (c): a new attempt's acceptance takes the shared
+/// source lock without waiting. While a deleting step holds it exclusively
+/// the answer is `OVERLOADED` (`source_store`) and nothing is stored; once
+/// it is free the attempt is accepted and its source's root gets the time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_answers_a_busy_source_store_with_overloaded_and_records_the_use() {
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let f = fx();
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("x.txt"), "x\n").unwrap();
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let id = captured.manifest.ci_source_id.clone();
+    crate::common::publish_as_received(&store, &id);
+    let index = rusqlite::Connection::open(state.join("sources/retention.db")).unwrap();
+    let used = |c: &rusqlite::Connection| -> Option<i64> {
+        c.query_row(
+            "SELECT used_ms FROM root WHERE id='receive:'||?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    index
+        .execute("UPDATE root SET used_ms=1 WHERE id='receive:'||?1", [&id])
+        .unwrap();
+    let machine =
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+    let mut p = payload("true");
+    p.run_id = run;
+    p.source_id = captured.manifest.source_id.clone();
+    let digest = &captured.manifest.manifest_digest;
+    p.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
+
+    // A deleting step holds the lock (as its pass takes it: exclusive).
+    let lock = std::fs::File::open(state.join("sources/mutation.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let a = AttemptId::generate();
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded, "{e:?}");
+    assert_eq!(
+        e.overloaded_reason,
+        Some(belt::error::OverloadedReason::SourceStore)
+    );
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(f.store().tombstone(&a).unwrap().is_none());
+    assert_eq!(used(&index), Some(1));
+
+    // Free again: the same attempt is accepted, and the source was used.
+    lock.unlock().unwrap();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert!(used(&index).unwrap() > 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

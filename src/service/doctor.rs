@@ -148,6 +148,12 @@ pub struct HostFacts {
     /// the host predates the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned_imports: Option<AbandonedImports>,
+    /// Why the worker's source store mutation lock cannot be taken (not
+    /// because it is busy): every new acceptance on this worker then fails
+    /// as INTERNAL (spec 25.8 5b (a)). `None`: fine, or the host predates
+    /// the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lock_problem: Option<String>,
 }
 
 /// Abandoned token roots, their memberships, and the bytes of the files
@@ -437,6 +443,7 @@ pub fn gather(
         profile: profile(worker_state, env),
         linger: None,
         abandoned_imports: abandoned_imports(worker_state),
+        source_lock_problem: crate::source::retention::mutation_lock_problem(worker_state),
     }
 }
 
@@ -687,6 +694,15 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
     });
     if let Some(linger) = &facts.linger {
         out.push(linger::check(host, linger));
+    }
+    if let Some(why) = &facts.source_lock_problem {
+        out.push(check(
+            "source_lock",
+            Level::Fail,
+            format!(
+                "the source store's mutation lock {why}: this worker refuses every new attempt (INTERNAL) and the coordinator keeps it on this worker to retry later; fix or remove sources/mutation.lock"
+            ),
+        ));
     }
     if let Some(a) = facts
         .abandoned_imports

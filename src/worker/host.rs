@@ -71,6 +71,18 @@ pub trait Host: Send + Sync {
         }
         Ok(())
     }
+    /// The shared source mutation lock, taken without waiting by a new
+    /// attempt's acceptance and held until its commit (spec 25.8 5b (a)):
+    /// while it is held no deleting pass's step runs, so a source found here
+    /// stays until the attempt that names it is terminal. A busy store is
+    /// `OVERLOADED` (`source_store`). `None`: this host has no source store.
+    fn hold_source(&self) -> Result<Option<crate::source::retention::Guard>, ApiError> {
+        Ok(None)
+    }
+    /// The acceptance of an attempt that names the payload's source is
+    /// committed: the source's `received` root gets the time (spec 25.8 5b
+    /// (c)). Called under the lock of [`Self::hold_source`]; best effort.
+    fn source_used(&self, _held: &crate::source::retention::Guard, _payload: &AttemptPayload) {}
     /// Once, before any secret is read (process-wide).
     fn disable_core_dumps(&self) -> Result<(), ApiError>;
     /// Plaintext secret bundles a crashed capture left in the source store.
@@ -118,11 +130,14 @@ pub trait Host: Send + Sync {
     /// `.worktreeinclude` matched. `None` while that source is not in this
     /// worker's store. `wait`: whether the read waits for a deleting pass's
     /// step (the accepted attempt's `prepare`) or not (acceptance, which
-    /// never waits, spec 25.8 5b (a)).
+    /// never waits, spec 25.8 5b (a)). `held`: the shared source lock the
+    /// caller already holds (acceptance), read under instead of taking a
+    /// second one.
     fn secret_paths(
         &self,
         payload: &AttemptPayload,
         wait: bool,
+        held: Option<&crate::source::retention::Guard>,
     ) -> Result<Option<Vec<String>>, ApiError>;
     /// Place the files of a `secret_bundle_put` in the attempt's workspace.
     /// Returns how many are in place.

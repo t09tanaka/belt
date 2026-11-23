@@ -67,6 +67,9 @@ pub(crate) struct Index {
     page_pause: Arc<std::sync::Mutex<Option<PagePause>>>,
     #[cfg(test)]
     foreground_waits: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many times a lock take synced the lock file (tests only).
+    #[cfg(test)]
+    lock_syncs: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -102,7 +105,8 @@ const DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
     .union(rustix::fs::OFlags::DIRECTORY)
     .union(rustix::fs::OFlags::NOFOLLOW)
     .union(rustix::fs::OFlags::CLOEXEC);
-fn open_permanent_file(root: &File, name: &str) -> Result<File> {
+/// The file and whether this call created it.
+fn open_permanent_file(root: &File, name: &str) -> Result<(File, bool)> {
     let flags =
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
     // Give first creation one atomic winner instead of racing nonexclusive
@@ -113,13 +117,40 @@ fn open_permanent_file(root: &File, name: &str) -> Result<File> {
         flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
         rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
     ) {
-        Ok(file) => Ok(file),
+        Ok(file) => Ok((file, true)),
         Err(rustix::io::Errno::EXIST) => {
-            rustix::fs::openat(root, name, flags, rustix::fs::Mode::empty())
+            rustix::fs::openat(root, name, flags, rustix::fs::Mode::empty()).map(|f| (f, false))
         }
         Err(error) => Err(error),
     }?;
-    Ok(file.into())
+    Ok((file.0.into(), file.1))
+}
+/// Why the store's mutation lock cannot be taken for a reason other than
+/// being busy (read only, makes nothing): the file is not a plain file of
+/// this user with one link and no group or other access, or cannot be
+/// opened. `None`: there is no lock file yet, or it is fine. A store like
+/// this refuses every acceptance as INTERNAL (spec 25.8 5b (a)).
+pub fn mutation_lock_problem(state_dir: &Path) -> Option<String> {
+    let path = state_dir.join("sources").join("mutation.lock");
+    let m = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("cannot be examined: {e}")),
+    };
+    if !m.is_file() {
+        return Some("is not a plain file".into());
+    }
+    if m.nlink() != 1 || m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o077 != 0 {
+        return Some("has another owner, more than one link, or group/other access".into());
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(_) => None,
+        Err(e) => Some(format!("cannot be opened: {e}")),
+    }
 }
 impl Index {
     pub(crate) fn open(root: &Path) -> Result<Self> {
@@ -149,6 +180,8 @@ impl Index {
             page_pause: Default::default(),
             #[cfg(test)]
             foreground_waits: Default::default(),
+            #[cfg(test)]
+            lock_syncs: Default::default(),
         };
         let guard = if foreground {
             this.foreground_guard()
@@ -878,9 +911,19 @@ impl Index {
         );
         Ok(())
     }
+    fn sync_lock_created(&self, file: &File) -> Result<()> {
+        #[cfg(test)]
+        self.lock_syncs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        file.sync_all().context("sync source mutation lock")?;
+        self.root
+            .sync_all()
+            .context("sync source mutation parent")?;
+        Ok(())
+    }
     pub(crate) fn guard(&self, exclusive: bool) -> Result<Guard> {
         self.current().context("check source root for lock")?;
-        let file = open_permanent_file(&self.root, "mutation.lock")
+        let (file, created) = open_permanent_file(&self.root, "mutation.lock")
             .context("open source mutation lock")?;
         let m = file.metadata()?;
         ensure!(
@@ -911,10 +954,15 @@ impl Index {
             (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino),
             "source lock changed"
         );
-        file.sync_all().context("sync source mutation lock")?;
-        self.root
-            .sync_all()
-            .context("sync source mutation parent")?;
+        // Durability: the lock file holds no data, only its existence matters,
+        // and a crash that loses it just has the next take create it again.
+        // So the file and its directory entry are synced once, by the take
+        // that created it, not by every take: acceptance takes the shared
+        // lock on each request and must not pay two fsyncs (F_FULLFSYNC on
+        // macOS) under `submitting`.
+        if created {
+            self.sync_lock_created(&file)?;
+        }
         Ok(Guard {
             _file: Arc::new(LockedFile(file)),
             root: self.path.clone(),
@@ -1023,6 +1071,16 @@ impl Index {
             [id],
             |r| r.get(0),
         )?)
+    }
+    /// The time of the root `receive:<id>` when it is `received` (spec 25.8
+    /// 5b (c), an acceptance). Only that root: a carried submodule is kept
+    /// by its parent's graph row.
+    pub(crate) fn touch_received(&self, id: &str, at_ms: u64) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE root SET used_ms=MAX(COALESCE(used_ms,0),?2) WHERE id='receive:'||?1 AND source=?1 AND kind='received'",
+            params![id, i64::try_from(at_ms)?],
+        )?;
+        Ok(())
     }
     pub(crate) fn legacy_registration_pending(&self) -> Result<bool> {
         Ok(self.connect()?.query_row(
@@ -1267,7 +1325,7 @@ impl Index {
     /// refs of all of them.
     fn mark_published(c: &Connection, root: &str, repository: Option<&str>) -> Result<()> {
         c.execute(
-            "UPDATE root SET used_ms=?2 WHERE id=?1",
+            "UPDATE root SET used_ms=MAX(COALESCE(used_ms,0),?2) WHERE id=?1",
             params![root, crate::platform::clock::wall_ms() as i64],
         )?;
         if let Some(repository) = repository {
@@ -2810,6 +2868,7 @@ mod tests {
                 verifications: Default::default(),
                 page_pause: Default::default(),
                 foreground_waits: Default::default(),
+                lock_syncs: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let guards = std::thread::scope(|scope| {
@@ -2860,6 +2919,7 @@ mod tests {
                 verifications: Default::default(),
                 page_pause: Default::default(),
                 foreground_waits: Default::default(),
+                lock_syncs: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let identities = std::thread::scope(|scope| {
@@ -4950,6 +5010,77 @@ mod tests {
         // done: a later page reads nothing
         assert!(receiver.retention.fill_bytes(1000).unwrap());
         assert_eq!(receiver.store_bytes().unwrap().unwrap(), expected);
+    }
+    #[test]
+    fn a_used_time_never_goes_back_with_the_wall_clock() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let far = i64::MAX / 4;
+        let c = receiver.retention.connect().unwrap();
+        c.execute(
+            "UPDATE root SET used_ms=?2 WHERE id='receive:'||?1",
+            params![&m.source_id, far],
+        )
+        .unwrap();
+        let used = || -> i64 {
+            c.query_row(
+                "SELECT used_ms FROM root WHERE id='receive:'||?1",
+                [&m.source_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        receiver.retention.touch_received(&m.source_id, 5).unwrap();
+        assert_eq!(used(), far);
+        receiver.publish_received(&m, None).unwrap();
+        assert_eq!(used(), far);
+        // forward still moves it
+        receiver
+            .retention
+            .touch_received(&m.source_id, far as u64 + 7)
+            .unwrap();
+        assert_eq!(used(), far + 7);
+    }
+    #[test]
+    fn a_mutation_lock_that_cannot_be_taken_is_reported_but_a_busy_one_is_not() {
+        let f = Fixture::new();
+        let state = f.store.retention.path.parent().unwrap().to_path_buf();
+        let lock = state.join("sources").join("mutation.lock");
+        assert_eq!(mutation_lock_problem(&state), None);
+        // busy (an exclusive step holds it) is not a problem
+        let held = f.store.retention.guard(true).unwrap();
+        assert_eq!(mutation_lock_problem(&state), None);
+        drop(held);
+        std::fs::set_permissions(&lock, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+            .unwrap();
+        assert!(mutation_lock_problem(&state).unwrap().contains("access"));
+        assert!(f.store.retention.guard(false).is_err());
+        std::fs::set_permissions(&lock, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        assert_eq!(mutation_lock_problem(&state), None);
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(mutation_lock_problem(&state), None);
+    }
+    #[test]
+    fn only_the_take_that_creates_the_lock_file_syncs_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let f = Fixture::new();
+        let index = &f.store.retention;
+        let lock = index.path.join("mutation.lock");
+        // an earlier take created it and synced it
+        drop(index.guard(false).unwrap());
+        let before = index.lock_syncs.load(SeqCst);
+        let a = index.guard(false).unwrap();
+        let b = index.guard(false).unwrap();
+        drop((a, b));
+        drop(index.guard(true).unwrap());
+        assert_eq!(index.lock_syncs.load(SeqCst), before);
+        // a take that has to create it syncs once
+        std::fs::remove_file(&lock).unwrap();
+        drop(index.guard(false).unwrap());
+        assert_eq!(index.lock_syncs.load(SeqCst), before + 1);
     }
     #[test]
     fn publication_records_used_time_and_the_clone_refs_of_its_graph() {
