@@ -39,6 +39,13 @@ pub mod code {
 
 /// Start `exe supervise --spec <spec>` detached from the caller: own session
 /// and process group, null stdio.
+///
+/// Descriptors of the caller that are not close-on-exec are inherited, and
+/// the supervisor passes them on to the setup builder and the command the
+/// same way. An ephemeral worker relies on this: its `ephemeral.lock`
+/// descriptor travels to every process of the attempt, which keeps the lock
+/// held for as long as any of them lives (spec 25.4 (d)). Nothing on this
+/// path may close descriptors it does not know.
 pub fn spawn_detached(exe: &Path, spec: &Path) -> std::io::Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.arg("supervise")

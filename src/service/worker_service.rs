@@ -206,6 +206,13 @@ impl Paths {
     pub fn journal_path(env: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
         Ok(Self::home_and_config(env)?.1.join("worker-service.json"))
     }
+    /// The journals of everything that runs a persistent worker on this
+    /// host's worker state: the worker service's, and the combined `init`
+    /// resident's (`init.json`, in the same configuration directory).
+    pub fn resident_journals(env: &BTreeMap<String, String>) -> anyhow::Result<[PathBuf; 2]> {
+        let config = Self::home_and_config(env)?.1;
+        Ok([config.join("worker-service.json"), config.join("init.json")])
+    }
     pub fn resolve_for(
         env: &BTreeMap<String, String>,
         backend: policy::Backend,
@@ -875,6 +882,9 @@ pub fn install<L: Launcher>(
 ) -> anyhow::Result<Status> {
     ensure!(request.schema == 1, "unsupported install request schema");
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    // Before the first write, on every path (the `init` handover too): an
+    // ephemeral worker's state is never installed over, nor swept.
+    super::worker::ephemeral::refuse_marked(&paths.state)?;
     sweep_written_directories(&paths);
     // The worker will share the scope of the user's CLI: refuse here, at
     // install, an environment it would refuse at start. Only here: stop,
@@ -1066,6 +1076,9 @@ pub fn start<L: Launcher>(
     ready_timeout: Duration,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    // Before the first write (the control file below, the lock): the service
+    // would refuse this state when it runs; nothing is written into it first.
+    super::worker::ephemeral::refuse_marked(&paths.state)?;
     if paths.config.join("init.json").try_exists()? {
         return super::init::worker_lifecycle(env, launcher, None, ready_timeout);
     }

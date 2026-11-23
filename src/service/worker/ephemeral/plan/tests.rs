@@ -28,7 +28,6 @@ fn plan_with(
         os_boot: "0f0f0f0f-aaaa-bbbb-cccc-000000000000",
         instance: INSTANCE,
         resident_journal: false,
-        state_exists: false,
     };
     adjust(&mut request, &mut host);
     plan(&request, &host)
@@ -76,7 +75,7 @@ fn the_start_identity_needs_an_instance_and_a_valid_name() {
 }
 
 #[test]
-fn a_resident_or_existing_state_is_never_taken_over() {
+fn a_resident_is_never_taken_over() {
     let env = env();
     let resident = plan_with(&env, |_, h| h.resident_journal = true)
         .err()
@@ -85,8 +84,135 @@ fn a_resident_or_existing_state_is_never_taken_over() {
         resident.contains("persistent worker is installed"),
         "{resident}"
     );
-    let leftover = plan_with(&env, |_, h| h.state_exists = true).err().unwrap();
-    assert!(leftover.contains("starts clean"), "{leftover}");
+}
+
+fn apfs() -> Filesystem {
+    Filesystem::Name("apfs".into())
+}
+
+#[test]
+fn only_the_listed_local_filesystems_are_local() {
+    for magic in [
+        0xEF53u64,
+        0x5846_5342,
+        0x9123_683E,
+        0x2FC1_2FC1,
+        0x0102_1994,
+        0x794C_7630,
+    ] {
+        assert!(local_filesystem(&Filesystem::Magic(magic)), "{magic:#x}");
+    }
+    // NFS, SMB, CIFS, 9p, FUSE (virtiofs reports the same), and unknown ones.
+    for magic in [
+        0x6969u64,
+        0x517B,
+        0xFF53_4D42,
+        0x0102_1997,
+        0x6573_5546,
+        0,
+        0xEF54,
+    ] {
+        assert!(!local_filesystem(&Filesystem::Magic(magic)), "{magic:#x}");
+    }
+    for name in ["apfs", "hfs"] {
+        assert!(local_filesystem(&Filesystem::Name(name.into())), "{name}");
+    }
+    for name in [
+        "nfs", "smbfs", "webdav", "macfuse", "virtiofs", "exfat", "", "APFS", "apfs2",
+    ] {
+        assert!(!local_filesystem(&Filesystem::Name(name.into())), "{name}");
+    }
+    assert!(!local_filesystem(&Filesystem::Unknown));
+}
+
+fn seen_local() -> Recorded {
+    recorded(&apfs())
+}
+
+#[test]
+fn a_state_left_behind_is_examined_by_marker_then_filesystem_then_resident() {
+    let local = seen_local();
+    let local = Some(&local);
+    assert_eq!(examined(&Marker::Ephemeral, local, &apfs(), false), Ok(()));
+    assert_eq!(
+        examined(&Marker::Ephemeral, local, &Filesystem::Magic(0xEF53), false),
+        Ok(())
+    );
+    let absent = examined(&Marker::Absent, local, &apfs(), false).unwrap_err();
+    assert!(absent.contains("no ephemeral.json"), "{absent}");
+    assert!(absent.contains("starts clean"), "{absent}");
+    let unreadable = examined(&Marker::Unreadable, local, &apfs(), false).unwrap_err();
+    assert!(unreadable.contains("cannot be read"), "{unreadable}");
+    let other = examined(&Marker::OtherKind, local, &apfs(), false).unwrap_err();
+    assert!(
+        other.contains("not of the ephemeral worker kind"),
+        "{other}"
+    );
+    for filesystem in [
+        Filesystem::Magic(0x6969),
+        Filesystem::Name("nfs".into()),
+        Filesystem::Unknown,
+    ] {
+        let remote = examined(&Marker::Ephemeral, local, &filesystem, false).unwrap_err();
+        assert!(remote.contains("not on a local filesystem"), "{remote}");
+    }
+    let resident = examined(&Marker::Ephemeral, local, &apfs(), true).unwrap_err();
+    assert!(
+        resident.contains("persistent worker is installed"),
+        "{resident}"
+    );
+    // The first condition that fails is the one named.
+    let first = examined(&Marker::Absent, None, &Filesystem::Unknown, true).unwrap_err();
+    assert!(first.contains("no ephemeral.json"), "{first}");
+    let second = examined(&Marker::Ephemeral, None, &Filesystem::Unknown, true).unwrap_err();
+    assert!(second.contains("does not record"), "{second}");
+    let third = examined(&Marker::Ephemeral, local, &Filesystem::Unknown, true).unwrap_err();
+    assert!(third.contains("not on a local filesystem"), "{third}");
+}
+
+/// The creator and the start that clears can see the same directory through
+/// different filesystems (a container's bind mount of its host's directory):
+/// both must have seen a local one.
+#[test]
+fn a_state_its_creator_did_not_see_as_local_is_never_proven() {
+    for seen in [
+        Filesystem::Name("virtiofs".into()),
+        Filesystem::Magic(0x6573_5546),
+        Filesystem::Magic(0x6969),
+        Filesystem::Unknown,
+    ] {
+        let record = recorded(&seen);
+        assert!(!record.local, "{record:?}");
+        let error = examined(&Marker::Ephemeral, Some(&record), &apfs(), false).unwrap_err();
+        assert!(
+            error.contains("the worker that created it did not see it on a local filesystem"),
+            "{error}"
+        );
+        assert!(error.contains(&record.kind), "{error}");
+    }
+    assert_eq!(recorded(&Filesystem::Magic(0x6969)).kind, "0x6969");
+    assert_eq!(recorded(&Filesystem::Unknown).kind, "unknown");
+    assert_eq!(
+        recorded(&apfs()),
+        Recorded {
+            local: true,
+            kind: "apfs".into()
+        }
+    );
+    // A marker without the record proves nothing, wherever it is now.
+    let error = examined(&Marker::Ephemeral, None, &apfs(), false).unwrap_err();
+    assert!(error.contains("does not record the filesystem"), "{error}");
+}
+
+#[test]
+fn a_state_is_unused_only_with_both_locks_taken() {
+    assert_eq!(unused(true, true), Ok(()));
+    let running = unused(false, true).unwrap_err();
+    assert!(running.contains("ephemeral.lock is held"), "{running}");
+    let agent = unused(true, false).unwrap_err();
+    assert!(agent.contains("agent.lock is held"), "{agent}");
+    let both = unused(false, false).unwrap_err();
+    assert!(both.contains("ephemeral.lock is held"), "{both}");
 }
 
 #[test]
@@ -193,4 +319,52 @@ fn a_count_taken_before_the_stop_cannot_settle_an_attempt_accepted_after_it() {
     assert_eq!(next(true, false, false), Wait);
     assert_eq!(next(true, true, false), Wait);
     assert_eq!(next(true, true, false), Settled);
+}
+
+#[test]
+fn an_unmarked_state_is_an_unfinished_creation_only_with_its_two_names_at_most() {
+    let apfs = Filesystem::Name("apfs".into());
+    let (lock, part): (&[u8], &[u8]) = (b"ephemeral.lock", b"ephemeral.json.part");
+    assert_eq!(UNFINISHED_NAMES, ["ephemeral.lock", "ephemeral.json.part"]);
+    for names in [&[][..], &[lock], &[part], &[lock, part], &[part, lock]] {
+        assert_eq!(unfinished(names, &apfs, false), Ok(()), "{names:?}");
+    }
+    // Any other name, alone or beside them, and the marker itself.
+    for other in [
+        &b"agent.lock"[..],
+        b"worker.db",
+        b"ephemeral.json",
+        b"ephemeral.lock2",
+        b"ephemeral",
+        b"",
+    ] {
+        for names in [
+            &[other][..],
+            &[lock, other],
+            &[other, part],
+            &[lock, part, other],
+        ] {
+            let error = unfinished(names, &apfs, false).unwrap_err();
+            assert!(error.contains("no ephemeral.json"), "{names:?}: {error}");
+            assert!(error.contains("starts clean"), "{names:?}: {error}");
+        }
+    }
+    // Only where a lock reaches every start that could be creating it.
+    for filesystem in [
+        Filesystem::Name("nfs".into()),
+        Filesystem::Magic(0x6969),
+        Filesystem::Unknown,
+    ] {
+        let error = unfinished(&[lock], &filesystem, false).unwrap_err();
+        assert!(error.contains("not on a local filesystem"), "{error}");
+        assert!(error.contains("killed while creating it"), "{error}");
+    }
+    // Never beside a persistent worker.
+    let error = unfinished(&[], &apfs, true).unwrap_err();
+    assert!(error.contains("persistent worker is installed"), "{error}");
+    // In that order: the names, the filesystem, the journal.
+    let first = unfinished(&[b"worker.db"], &Filesystem::Unknown, true).unwrap_err();
+    assert!(first.contains("no ephemeral.json"), "{first}");
+    let second = unfinished(&[], &Filesystem::Unknown, true).unwrap_err();
+    assert!(second.contains("not on a local filesystem"), "{second}");
 }

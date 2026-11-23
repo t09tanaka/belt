@@ -20,10 +20,9 @@ pub struct Host<'a> {
     pub os_boot: &'a str,
     /// Fresh per start; never reused.
     pub instance: &'a str,
-    /// A persistent worker's service journal exists on this host.
+    /// A persistent worker's journal exists on this host: the worker
+    /// service's, or the combined `init` resident's.
     pub resident_journal: bool,
-    /// The canonical worker state directory already exists.
-    pub state_exists: bool,
 }
 
 pub struct Plan {
@@ -52,14 +51,7 @@ pub fn plan(request: &Request<'_>, host: &Host<'_>) -> Result<Plan, String> {
     // An ephemeral worker never takes over a resident's place. The persistent
     // worker owns this state directory and its identity.
     if host.resident_journal {
-        return Err(
-            "a persistent worker is installed on this host; an ephemeral worker would share its state".into(),
-        );
-    }
-    if host.state_exists {
-        return Err(
-            "worker state already exists on this host; an ephemeral worker starts clean and never resumes it".into(),
-        );
+        return Err(RESIDENT.into());
     }
     let home = host
         .env
@@ -84,6 +76,187 @@ pub fn plan(request: &Request<'_>, host: &Host<'_>) -> Result<Plan, String> {
             config: "schema_version = 1\n".into(),
         },
     })
+}
+
+const RESIDENT: &str =
+    "a persistent worker is installed on this host; an ephemeral worker would share its state";
+
+/// The `kind` an ephemeral worker writes into `ephemeral.json`.
+pub const MARKER_KIND: &str = "ephemeral_worker";
+
+/// What `ephemeral.json` of a state left behind says (spec 25.4 (d), proof 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Marker {
+    /// Readable, and written by an ephemeral worker.
+    Ephemeral,
+    /// There is no marker: the state was not made by an ephemeral worker,
+    /// or by one that was killed before its marker existed (`unfinished`).
+    Absent,
+    /// It exists but could not be read safely or parsed.
+    Unreadable,
+    /// Readable, of another kind.
+    OtherKind,
+}
+
+/// The filesystem a state directory is on, as `statfs` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filesystem {
+    /// Linux: `f_type`, the superblock magic.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Magic(u64),
+    /// macOS: `f_fstypename`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Name(String),
+    /// It could not be asked.
+    Unknown,
+}
+
+/// Local filesystems, where a `flock` excludes every process that can reach
+/// the state: ext2/3/4, xfs, btrfs, zfs, tmpfs, overlayfs (the magic numbers
+/// of linux/magic.h and OpenZFS) and APFS, HFS+. Network filesystems, the
+/// ones shared between a host and its guest, and every kind not listed here
+/// are not: a lock there says nothing about another kernel's processes.
+pub fn local_filesystem(filesystem: &Filesystem) -> bool {
+    const LOCAL_MAGIC: [u64; 6] = [
+        0xEF53,      // ext2, ext3, ext4
+        0x5846_5342, // xfs
+        0x9123_683E, // btrfs
+        0x2FC1_2FC1, // zfs
+        0x0102_1994, // tmpfs
+        0x794C_7630, // overlayfs
+    ];
+    match filesystem {
+        Filesystem::Magic(magic) => LOCAL_MAGIC.contains(magic),
+        Filesystem::Name(name) => name == "apfs" || name == "hfs",
+        Filesystem::Unknown => false,
+    }
+}
+
+/// What the worker that created a state saw of the filesystem under it,
+/// as it wrote it into `ephemeral.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recorded {
+    /// The writer's own `local_filesystem` verdict.
+    pub local: bool,
+    /// The kind it saw, for the person reading a refusal.
+    pub kind: String,
+}
+
+/// The record a worker creating a state on `filesystem` writes.
+pub fn recorded(filesystem: &Filesystem) -> Recorded {
+    Recorded {
+        local: local_filesystem(filesystem),
+        kind: match filesystem {
+            Filesystem::Magic(magic) => format!("{magic:#x}"),
+            Filesystem::Name(name) => name.clone(),
+            Filesystem::Unknown => "unknown".into(),
+        },
+    }
+}
+
+/// Proofs 1 to 3 that a state left behind may be cleared by the next
+/// ephemeral start: what can be read without writing anything. `Err` names
+/// the condition that failed; then nothing is opened for writing, nothing is
+/// locked and nothing is removed.
+///
+/// Proof 2 has two halves. The same directory can be a local filesystem to
+/// the start that clears it and a shared one to the worker that lives in it
+/// (a container's bind mount of a directory of its host; an NFS server and
+/// its client), and a lock taken on one side need not reach the other. So
+/// both the creator's recorded verdict and the one seen now must be local; a
+/// marker that records none proves nothing.
+pub fn examined(
+    marker: &Marker,
+    recorded: Option<&Recorded>,
+    filesystem: &Filesystem,
+    resident_journal: bool,
+) -> Result<(), String> {
+    match marker {
+        Marker::Ephemeral => {}
+        Marker::Absent => return Err(ABSENT.into()),
+        Marker::Unreadable => {
+            return Err("its ephemeral.json cannot be read as an ephemeral worker's marker".into())
+        }
+        Marker::OtherKind => {
+            return Err("its ephemeral.json is not of the ephemeral worker kind".into())
+        }
+    }
+    match recorded {
+        Some(recorded) if recorded.local => {}
+        Some(recorded) => {
+            return Err(format!(
+                "the worker that created it did not see it on a local filesystem (it saw {}; a lock taken here does not show that no process on that side uses it)",
+                recorded.kind
+            ))
+        }
+        None => {
+            return Err(
+                "its ephemeral.json does not record the filesystem its creator saw it on".into(),
+            )
+        }
+    }
+    if !local_filesystem(filesystem) {
+        return Err(
+            "it is not on a local filesystem (a lock on a network or shared filesystem does not show that no other host uses it)".into(),
+        );
+    }
+    if resident_journal {
+        return Err(RESIDENT.into());
+    }
+    Ok(())
+}
+
+const ABSENT: &str = "it has no ephemeral.json, so it was not created by an ephemeral worker; an ephemeral worker starts clean and never resumes it";
+
+/// The names a start that was killed before its marker existed can leave in
+/// the directory it made: the lock, and the marker while it is written.
+pub const UNFINISHED_NAMES: [&str; 2] = ["ephemeral.lock", "ephemeral.json.part"];
+
+/// Whether a state without a marker is only what an ephemeral start left
+/// that was killed while it created the state, and may be removed by the
+/// next one: `names` (everything in the directory) are at most the two a
+/// creation makes before its marker, the directory is on a local filesystem
+/// now (there is no marker to say what its creator saw; elsewhere a start
+/// on another host may be creating it, and a lock here would not show it),
+/// and no persistent worker is installed. `Err` names what failed; then
+/// nothing is written, locked or removed.
+pub fn unfinished(
+    names: &[&[u8]],
+    filesystem: &Filesystem,
+    resident_journal: bool,
+) -> Result<(), String> {
+    let only_a_creation = names.iter().all(|name| {
+        UNFINISHED_NAMES
+            .iter()
+            .any(|known| known.as_bytes() == *name)
+    });
+    if !only_a_creation {
+        return Err(ABSENT.into());
+    }
+    if !local_filesystem(filesystem) {
+        return Err(
+            "it holds only what an ephemeral start that was killed while creating it leaves, but it is not on a local filesystem (a start on another host may be creating it, and a lock here does not show that)".into(),
+        );
+    }
+    if resident_journal {
+        return Err(RESIDENT.into());
+    }
+    Ok(())
+}
+
+/// Proofs 4 and 5: both locks were taken, without waiting. `ephemeral.lock`
+/// held by someone means a process the earlier start launched still runs;
+/// `agent.lock` means an agent or an operation on this state does.
+pub fn unused(ephemeral_lock_taken: bool, agent_lock_taken: bool) -> Result<(), String> {
+    if !ephemeral_lock_taken {
+        return Err(
+            "its ephemeral.lock is held: a process started by the earlier ephemeral worker is still running".into(),
+        );
+    }
+    if !agent_lock_taken {
+        return Err("its agent.lock is held: a worker still uses this state".into());
+    }
+    Ok(())
 }
 
 /// State goes away only when nothing is left running in it. A read that

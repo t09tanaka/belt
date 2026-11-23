@@ -178,6 +178,8 @@ pub(super) async fn initialize<L: Launcher>(
     launcher: &mut L,
     durability: &mut impl Durability,
 ) -> anyhow::Result<ResultReceipt> {
+    // Before the first lock file or write (spec 25.4 (d)).
+    crate::service::worker::ephemeral::refuse_marked(&worker.state)?;
     let _switch = worker_service::switch_lock(&worker, true, Duration::from_secs(2))?
         .context("worker service switch is running; retry init when it finishes")?;
     let enrollment = worker_service::enrollment(&worker).context("invalid worker enrollment")?;

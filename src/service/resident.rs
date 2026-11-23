@@ -562,6 +562,10 @@ impl StartupParts {
         inputs: Inputs,
         binding: Option<(ClusterId, CoordinatorId)>,
     ) -> anyhow::Result<Self> {
+        // The combined resident runs a worker on `worker.state_dir`. Before
+        // anything is created: an ephemeral worker's state is never taken
+        // over, and nothing is written into it.
+        super::worker::ephemeral::refuse_marked(&inputs.worker.state_dir)?;
         private_dir(&inputs.state_dir)?;
         // Refuse symlinked existing state entries before storage follows them.
         reject_symlinks(&inputs.state_dir)?;

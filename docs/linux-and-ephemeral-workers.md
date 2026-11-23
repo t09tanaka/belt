@@ -116,11 +116,39 @@ worker from a cell:
 - Each start has its own identity: the worker name stays, and the identity it
   reports changes with every start, so a restarted worker is never taken for
   the one before it.
-- It starts clean. It refuses to run if worker state already exists in
-  `~/.belt`, or if a persistent worker is installed on the host.
+- It starts clean. It refuses to run if a persistent worker is installed on
+  the host (a worker service, or a parent set up with `belt init`), or if
+  `~/.belt` holds state that an ephemeral worker did not create (no
+  `ephemeral.json` in it).
 - Stop it with SIGTERM or by interrupting the cell. It removes its own state
-  directory, unless work is still recorded in it (then the state is kept and
-  the next start refuses until you deal with it).
+  directory, unless work is still recorded in it (then the state is kept).
+- If it was killed (SIGKILL, a container that was killed, power loss), its
+  state stays in `~/.belt`. The next `belt worker --ephemeral` clears it by
+  itself and starts under a new identity, once nothing uses it any more: the
+  earlier worker, its supervisors and every command it started are gone. It
+  knows this from `ephemeral.lock`, which all of them hold. While one of
+  them still runs, the start exits with 1, says which condition failed,
+  removes nothing and signals nothing; stop that process (or wait for it)
+  and start again. A command that started a long-lived helper (a build
+  daemon, for example) keeps the lock held until that helper is gone.
+- This self-clearing needs `~/.belt` on a local filesystem (APFS, HFS+, ext4,
+  xfs, btrfs, zfs, tmpfs, overlayfs). On a network filesystem or one shared
+  between a host and its guest (NFS, SMB, 9p, virtiofs, FUSE; a Docker
+  Desktop bind mount is one), a lock says nothing about the other machine, so
+  the start refuses and you remove the directory yourself. Both sides count:
+  the worker writes into `ephemeral.json` what filesystem it saw `~/.belt`
+  on, and a later start clears the state only if that was a local one and
+  what it sees itself is a local one too. So a state made inside a container
+  on a bind mount is not cleared by a start on the host, where the same
+  directory looks local.
+- A start that was killed in the instant between creating `~/.belt` and
+  writing `ephemeral.json` leaves a directory without the marker (empty, or
+  with only `ephemeral.lock` and `ephemeral.json.part`). It is refused like
+  any state without the marker; remove the directory.
+- A persistent worker refuses a state that has `ephemeral.json`, and writes
+  nothing into it: `belt worker`, installing or starting the worker service,
+  and the parent's own resident. Start `belt worker --ephemeral` once to
+  clear it, or remove the directory.
 
 ### On the parent
 

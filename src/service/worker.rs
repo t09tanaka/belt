@@ -108,6 +108,15 @@ pub fn read_input(path: &Path) -> anyhow::Result<WorkerSpec> {
 }
 
 fn private_lock(state: &Path, name: &str) -> anyhow::Result<File> {
+    let file = open_private_lock(state, name)?;
+    file.try_lock()
+        .map_err(|e| anyhow::anyhow!("worker owner already held or unsafe: {e}"))?;
+    Ok(file)
+}
+
+/// The private lock file `name` of a worker state, created when missing and
+/// not yet locked.
+fn open_private_lock(state: &Path, name: &str) -> std::io::Result<File> {
     let path = state.join(name);
     match OpenOptions::new()
         .write(true)
@@ -118,12 +127,9 @@ fn private_lock(state: &Path, name: &str) -> anyhow::Result<File> {
     {
         Ok(file) => drop(file),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     }
-    let file = resident::secure_file(&path, true)?;
-    file.try_lock()
-        .map_err(|e| anyhow::anyhow!("worker owner already held or unsafe: {e}"))?;
-    Ok(file)
+    resident::secure_file(&path, true)
 }
 
 /// Durable cluster binding is separate from the coordinator database. Existing
@@ -385,6 +391,10 @@ async fn run(
     boot_id: Option<WorkerBootId>,
 ) -> anyhow::Result<()> {
     let ephemeral = boot_id.is_some();
+    // Before anything is created or locked in it.
+    if !ephemeral {
+        ephemeral::refuse_marked(&spec.state_dir)?;
+    }
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
