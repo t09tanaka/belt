@@ -449,7 +449,7 @@ fn check_artifacts_not_secret(
 /// anybody else could read or that somebody else wrote.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("a file has a parent");
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = crate::platform::owned_temp::file_in(dir)?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     tmp.write_all(bytes)?;
@@ -1983,7 +1983,11 @@ impl Agent {
         if let Ok(rd) = fs::read_dir(self.attempt_dir(attempt)) {
             for ent in rd.flatten() {
                 let is_file = ent.file_type().is_ok_and(|t| t.is_file());
-                if is_file && ent.file_name().to_string_lossy().starts_with(".tmp") {
+                if is_file
+                    && crate::supervisor::spool_plan::is_tmp_name(
+                        &ent.file_name().to_string_lossy(),
+                    )
+                {
                     let _ = fs::remove_file(ent.path());
                 }
             }

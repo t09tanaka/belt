@@ -203,7 +203,7 @@ pub(super) fn publish_definition(
     owner: u32,
 ) -> anyhow::Result<PathBuf> {
     let path = root.join(plan.filename());
-    let mut temp = tempfile::NamedTempFile::new_in(root)?;
+    let mut temp = crate::platform::owned_temp::file_in(root)?;
     temp.write_all(plan.plist().as_bytes())?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o644))?;

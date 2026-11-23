@@ -617,9 +617,7 @@ impl SourceStore {
         // transaction that binds the blob to this transfer.
         self.retention.import_blob(token, &want.hash)?;
         // hash first, in a scratch copy: a wrong blob must not enter the store
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".recv.")
-            .tempfile_in(self.inner.root().join("tmp"))?;
+        let mut tmp = crate::platform::owned_temp::file_in(self.inner.root().join("tmp"))?;
         let mut r = r.take(want.size.saturating_add(1));
         let mut h = Sha256::new();
         let mut n = 0u64;
@@ -784,9 +782,7 @@ impl SourceStore {
             }
         }
         let bytes = serde_json::to_vec_pretty(m)?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".manifest.")
-            .tempfile_in(self.inner.root().join("tmp"))?;
+        let mut tmp = crate::platform::owned_temp::file_in(self.inner.root().join("tmp"))?;
         tmp.write_all(&bytes)?;
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o644))?;
@@ -1008,6 +1004,61 @@ impl SourceStore {
         Ok(f)
     }
 
+    /// Spec 25.4 (a): clear what a killed process left in `tmp/`: single
+    /// files named by [`crate::platform::owned_temp::file_in`] and the scratch
+    /// checkouts (`commit-*/`, with a marker). Only with the store's mutation
+    /// lock taken exclusively without waiting: every writer of `tmp/` holds it
+    /// shared. `None` when the lock is busy.
+    pub fn sweep_temporaries(&self) -> Result<Option<usize>> {
+        match self.retention.guard(true) {
+            Ok(_guard) => Ok(Some(self.sweep_tmp_dir())),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The sweep itself; the caller holds the exclusive mutation lock.
+    pub(crate) fn sweep_tmp_dir(&self) -> usize {
+        let tmp = self.inner.root().join("tmp");
+        crate::platform::owned_temp::sweep_files(&tmp).removed
+            + crate::platform::owned_temp::sweep(&tmp, "commit-")
+    }
+
+    /// Spec 25.4 (a): remove the `.secrets.tmp-*` files local-ci's bundle
+    /// write left in `secrets/`, when `secrets.lock` is taken exclusively
+    /// without waiting: every writer of one holds that lock, so what is
+    /// there is a remnant. Returns how many were removed.
+    pub fn sweep_secret_tmp_if_free(&self) -> usize {
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.inner.root().join("secrets.lock"))
+        else {
+            return 0;
+        };
+        if lock.try_lock().is_err() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(self.inner.root().join("secrets")) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|e| crate::secrets::capture::is_bundle_tmp(&e.file_name().to_string_lossy()))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|e| std::fs::remove_file(e.path()).is_ok())
+            .count()
+    }
+
     /// What a run captured, if anything (spec: one capture per run).
     pub fn run_record(&self, run: &RunId) -> Result<Option<RunRecord>> {
         match std::fs::read(self.run_record_path(run)) {
@@ -1037,9 +1088,7 @@ impl SourceStore {
             bail!("not a source id: {}", record.ci_source_id);
         }
         let dest = self.run_record_path(run);
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".run.")
-            .tempfile_in(self.inner.root().join("tmp"))?;
+        let mut tmp = crate::platform::owned_temp::file_in(self.inner.root().join("tmp"))?;
         tmp.write_all(&serde_json::to_vec_pretty(record)?)?;
         tmp.as_file().sync_all()?;
         // a hard link fails when the record exists: the first writer wins
@@ -1189,4 +1238,62 @@ pub fn verify_manifest(m: &CiManifest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod temp_sweep_tests {
+    use super::*;
+    use crate::platform::owned_temp::testing::{dead_name, live_name, marker_dir};
+
+    fn store() -> (tempfile::TempDir, SourceStore) {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let store = SourceStore::open(root.path()).unwrap();
+        (root, store)
+    }
+
+    /// Spec 25.4 (a), `sources/tmp/`: files and scratch checkouts of dead
+    /// owners go, under the exclusive mutation lock only.
+    #[test]
+    fn tmp_leftovers_of_dead_owners_are_swept_under_the_exclusive_lock_only() {
+        let (_root, store) = store();
+        let tmp = store.inner.root().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dead_file = tmp.join(dead_name("dddddddddd01"));
+        let live_file = tmp.join(live_name("dddddddddd02"));
+        let old_style = tmp.join(".recv.AbCdEf");
+        for f in [&dead_file, &live_file, &old_style] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let dead_dir = marker_dir(&tmp, "commit-0123456789ab-", true);
+        let live_dir = marker_dir(&tmp, "commit-0123456789ab-", false);
+        {
+            // a capture is running: it holds the lock shared
+            let _shared = store.retention.guard(false).unwrap();
+            assert_eq!(store.sweep_temporaries().unwrap(), None);
+            assert!(dead_file.exists() && dead_dir.exists());
+        }
+        assert_eq!(store.sweep_temporaries().unwrap(), Some(2));
+        assert!(!dead_file.exists() && !dead_dir.exists());
+        assert!(live_file.exists() && live_dir.exists() && old_style.exists());
+    }
+
+    /// Spec 25.4 (a), `sources/secrets/.secrets.tmp-*`: removed only by the
+    /// pass that takes `secrets.lock` without waiting.
+    #[test]
+    fn a_plain_secret_tmp_is_removed_only_when_secrets_lock_is_free() {
+        let (_root, store) = store();
+        let dir = store.inner.root().join("secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(".secrets.tmp-AbC123");
+        let bundle = dir.join(format!("{}.json", RunId::generate()));
+        std::fs::write(&tmp, b"plain").unwrap();
+        std::fs::write(&bundle, b"bundle").unwrap();
+        {
+            let _writer = store.lock_secrets().unwrap();
+            assert_eq!(store.sweep_secret_tmp_if_free(), 0);
+            assert!(tmp.exists());
+        }
+        assert_eq!(store.sweep_secret_tmp_if_free(), 1);
+        assert!(!tmp.exists() && bundle.exists());
+    }
 }

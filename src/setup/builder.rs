@@ -1728,7 +1728,7 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("a file has a parent");
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = crate::platform::owned_temp::file_in(dir)?;
     tmp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     tmp.write_all(bytes)?;

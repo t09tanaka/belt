@@ -41,7 +41,7 @@ pub(crate) fn record_refusal(
     resident::check_private_dir(state)?;
     let path = refusal_path(state, member);
     if let Some(reason) = reason {
-        let mut staged = tempfile::NamedTempFile::new_in(state)?;
+        let mut staged = crate::platform::owned_temp::file_in(state)?;
         staged.write_all(refusal_code(reason).as_bytes())?;
         staged.as_file().sync_all()?;
         staged.persist(path).map_err(|e| e.error)?;

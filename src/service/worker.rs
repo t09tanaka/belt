@@ -167,7 +167,7 @@ fn bind(spec: &WorkerSpec) -> anyhow::Result<()> {
             "worker enrollment binding missing for existing state; explicit migration required"
         );
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(&spec.state_dir)?;
+    let mut temporary = crate::platform::owned_temp::file_in(&spec.state_dir)?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
     match temporary.persist_noclobber(&path) {
@@ -244,10 +244,12 @@ fn publish_socket(
 ) -> anyhow::Result<(tokio::net::UnixListener, OwnedSocket)> {
     // A crash before the durable receipt never leaves an unreceipted canonical
     // socket. Abandoned unpublished staging directories are left for reconciliation.
-    let stage = tempfile::Builder::new().prefix(".s").tempdir_in(state)?;
-    std::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o700))?;
-    // .sXXXXXX/s is no longer than agent.sock on Unix socket paths.
-    let staged = stage.path().join("s");
+    // A marker names the owner, so a later start removes what a crash left.
+    crate::platform::owned_temp::sweep(state, ".s");
+    let stage = crate::platform::owned_temp::OwnedTemp::new_in(state, ".s")?;
+    std::fs::set_permissions(stage.outer(), std::fs::Permissions::from_mode(0o700))?;
+    // .sXXXXXX/s (beside the marker) is no longer than agent.sock on Unix socket paths.
+    let staged = stage.outer().join("s");
     let listener = crate::protocol::transport::listen_unix(&staged)?;
     let meta = std::fs::symlink_metadata(&staged)?;
     let receipt = SocketReceipt {
@@ -260,7 +262,7 @@ fn publish_socket(
     if receipt_path.try_exists()? {
         resident::secure_file(&receipt_path, false)?;
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(state)?;
+    let mut temporary = crate::platform::owned_temp::file_in(state)?;
     temporary.write_all(&serde_json::to_vec(&receipt)?)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&receipt_path)?;
@@ -388,6 +390,8 @@ async fn run(
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
     let agent_gate = private_lock(&spec.state_dir, "agent.lock")?;
     let socket = spec.state_dir.join("agent.sock");
+    // Spec 25.4 (a): under `agent.lock`, what a killed process left beside the state files.
+    crate::platform::owned_temp::sweep_files(&spec.state_dir);
     // Enrollment is checked before any recorded old listener can be removed.
     bind(&spec)?;
     reconcile_socket(

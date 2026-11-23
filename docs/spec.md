@@ -2006,7 +2006,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 ### (a) 一時fileと一時directory
 
-**今の挙動。** beltの一時fileの大半は `tempfile` の既定の名前（`.tmpXXXXXX`）で、作ったprocessがSIGKILLや電源断で終わると残る。受け皿があるのは、profileの検査用directory（`src/platform/owned_temp.rs` の所有marker）、鍵の一時file（600秒）、Vaultの一時file（数えるだけ）、`bin/.resident.<pid>` だけである。
+**今の挙動（段階1の (a) の実装後）。** 規則と、表の各場所の走査は入った（名前は `owned_temp::file_in`・`new_file_name`、走査は `sweep_files`、directoryは `OwnedTemp` と `sweep`。`doctor` は残った件数を `leftover_temporaries` で示す）。規則の外に残るのは2つで、どちらも所有を証明する名前にしていない: 再開できる受け渡しの `incoming-*.part`（`worker/ci_task.rs`。名前が決まっていて、持ち主の `sweep_plans` が消す）と、`setup/store.rs` の `.tmp-<ulid>`（workerの起動時の `sweep` が、`agent.lock` の下で消す）。他のuidのfileに触れないことは、試験では確かめていない（別のuidのfileを作れないため）。
 
 **規則。** beltが作る一時のfile・directoryは、例外なく次のどちらかにする。
 
@@ -2505,19 +2505,19 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日。ただし、attemptの無いtaskを含むrunでは消えない（25.3） | 同じ（終点を直す） | 既存（修正は0） | 索引に参照が無いこと、排他lock |
 | 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | 行を消さない。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
 | runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 消さない | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
-| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る（親では、片付ける処理が呼ばれていない） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
+| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る。一時fileは、保持driverが `sources/secrets.lock` を待たずに排他で取れたpassと、workerの起動（`sweep_store_copies`）で消す | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
 | bundle | `sources/bundles/<source>-<32hex>.bundle` | 進行中の配送（offsetからの再開） | sourceごとに4個まで。配送の成功時に消す。失敗・放棄では残る | 加えて、そのsourceを参照するrunが無くなったときに消す | 2 | 索引に参照するrunが無いこと |
 | 親のGit領域 | `sources/git/<key>.git`（`refs/local-ci/snapshots/<source>`・`index/<source>`・`heads/*` とGit object） | bundleの作成、次の取り込み | 消さない | refはsourceが在る間。objectはrefを消してから最長14日と24時間（25.5）。`heads/*` と、refを消す関数は未決（25.16） | 2（関数があれば） | refが無いこと、Gitの猶予 |
-| 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残るものは、そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | 共有の固定lock | `sources/secrets.lock`、sourceの変更lock | 取り込み | 固定 | unlinkしない | 既存 | 該当なし |
-| 計画の下書き | `ci-plan-*/` | 書いたcommandだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 同上 |
+| 計画の下書き | `ci-plan-*/` | 書いたcommandだけ | 正常終了で消える。crashで残るものは、計画の開始がmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 同上 |
 | 親Vault | `secrets/<run>.json`、`parent-retention.json`、lock | 配送、`retry` | runが終わった時点で消す。提出されなかったrunのものは残る | 加えて、放棄された取り込みのものを消す | 既存、1（放棄） | 第23章のC、25.4の (b) |
-| Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 所有を証明できないものは数えるだけで残す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 名前（`.belt-tmp.…`）が所有を証明し、排他leaseの下で持ち主が居ないものを消す。名前を解釈できないものは数えるだけで残す（古い形の名前は、排他leaseの下で消す） | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | FrozenPlan | `ci-plans/<digest>` | CI runの進行 | 名指す待ちのtaskが無くなって `retention_days` 日 | 同じ | 既存 | 名指すtaskが無いこと |
 | in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときだけ消す | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
 | 実測 | `stats/costs-v1.sqlite`（`costs`・`preparation_namespaces`・`preparation_receipts`・`cost_eviction`） | 配置の見積 | `costs` 4,096行、`preparation_namespaces` 4,096 | 同じ | 既存 | 順位 |
 | 更新の試用 | `upgrade/`（`record.json`、退避したDBと設定） | rollback | 試用の間。同時に1つ | 同じ | 既存 | commitの記録 |
-| DBの準備の途中 | `.init-*` | `init` の続き | `init` とrollbackが片付ける | 加えて25.4の (a) | 1 | `init.json` に無いことと、持ち主 |
+| DBの準備の途中 | `.init-*` | `init` の続き | `init` とrollbackが片付ける。名前が所有を証明し、`init` などの開始が持ち主の居ないものを消す | 加えて25.4の (a) | 1 | `init.json` に無いことと、持ち主 |
 | 固定のfile | `coordinator.json`、`init.json`、`control.json`、`group-rotation.json`、`membership-undo.json`、`membership-restart`、`traffic-hold.json`、`upgrade-hold.json`、`request.sock`、`owner.token` | それぞれの操作と起動 | 各1個。上書きする | 同じ | 既存 | 各操作の規則 |
 | 固定のlock | 25.1の表の最後の行のうち、親のもの | すべてのcommand | 各1個 | unlinkしない | 既存 | 該当なし |
 
@@ -2540,7 +2540,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | `import_session`・`root(kind='pending')`・`member` が、受け取ったblobごとに増える | 公開か放棄で消す | 5a | 25.8 |
 | clone | `clones/<repo>` | bundleの展開、workspaceの準備 | 消さない。refは、受け取りを拒否したときだけ消す | 未確定（25.9） | 5b | なし |
 | 受け取り途中 | `incoming/<source>/` | 送り手の再開 | 16個、合計64 GiB、1つ32 GiB。24時間進まなかったものは、16個に達したときだけ消す | 24時間進まなければ、tickで消す | 5a | 進んでいないこと |
-| 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | `agent.lock` と持ち主 |
+| 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残るものは、workerの起動（`agent.lock` の下）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | `agent.lock` と持ち主 |
 | setup template | `setup/templates/<key>/` と、最後に使った時刻のstamp `<key>.used` | setupの適用 | 20 GiB、14日、run scopeは1時間。stampは、templateの無いものを片付けのときに消す | 同じ | 既存 | copy中でないこと、pin |
 | setup builder | `setup/builders/<id>/` | そのbuilder | 終了時と起動時に消す | 同じ | 既存 | 持ち主のprocessが居ないこと |
 | toolchainのroot | `toolchains/<identity>/`（`install.lock`・`receipt.json` を含む） | attempt、setup、導入のhelper | 消さない | 14日、20 GiB。参照が無いとき。段階4より前のrootは、最初の起動で行を得る | 4 | 25.7の (b) |
@@ -2550,7 +2550,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 更新の試用 | `upgrade/`、`<config>/bin/<digest>/worker.db.saved` | rollback | 試用の間 | 同じ | 既存 | commitの記録 |
 | 一時workerのmarkerとlock | `ephemeral.json`、`ephemeral.lock` | 次の一時workerの起動 | 無い | stateと一緒 | 1 | 25.4の (d) |
 | 外したメンバー（workerだけのhost） | `removed-members.json` | 接続の拒否 | 1個。coordinator DBが無いhostでは正 | 同じ | 既存 | 利用者の操作 |
-| 固定のfile | `worker.json`、`boot_id`（起動の記録）、`control.json`、`upgrade-hold.json`、`traffic-hold.json`、`worker-service.json`、`worker-binding.json` とその更新の予定、`worker-socket.json`、`upgrade-trial*.json`、`agent.sock`、グループ鍵と次の鍵 | 起動、接続 | 各1個。上書きする。鍵の一時fileは600秒で消す | 同じ | 既存 | 各操作の規則 |
+| 固定のfile | `worker.json`、`boot_id`（起動の記録）、`control.json`、`upgrade-hold.json`、`traffic-hold.json`、`worker-service.json`、`worker-binding.json` とその更新の予定、`worker-socket.json`、`upgrade-trial*.json`、`agent.sock`、グループ鍵と次の鍵 | 起動、接続 | 各1個。上書きする。鍵の一時fileは、名前が所有を証明するので持ち主が居なければ次の起動で消す（古い名前は600秒） | 同じ | 既存 | 各操作の規則 |
 | 受け取りのlock | `incoming/locks/<0〜63>.lock`、`incoming/locks/all.lock` | sourceの受け取り | 65個で頭打ち（source IDのhashで割り振る） | unlinkしない | 既存 | 該当なし |
 | 固定のlock | 25.1の表の最後の行のうち、workerのもの | workerの処理 | 各1個 | unlinkしない | 既存 | 該当なし |
 
@@ -2570,10 +2570,10 @@ task-traffic-controllerの台帳と履歴の置き場は、製品では単独CLI
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
 | beltのbinary | `bin/<digest>/belt`、link `bin/current`・`bin/resident` | serviceの入口、supervisor、builder、番人 | 版ごとに1つ増え、消さない | 名指すものが無い版を消す | 4 | 25.7の (a) |
-| 切替の途中のlink | `bin/.resident.<pid>`、`bin/.current.<pid>` | 切替の処理 | `.resident.<pid>` は、pidのprocessが居なければ消す。`.current.<pid>` は、同じpidの次の切替が消す | 25.4の (a) の名前にする | 1 | 持ち主のprocessが居ないこと |
-| 設定と鍵 | `profiles.toml`、`cluster.key`、`worker-cluster.key`、次の鍵、ユーザー設定 | 起動 | 各1個。鍵の一時fileは600秒で消す | 同じ | 既存 | 各操作の規則 |
-| 設定とjournalの一時file | config directoryの中の `.tmp*` | 書いたcommandだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
-| serviceの定義 | LaunchAgentのplist、systemdのunit（OSの置き場）と、その一時file | OS | hostごとに1つ。一時fileはcrashで残る | 定義は同じ。一時fileは25.4の (a) | 既存、1 | 利用者の操作、持ち主 |
+| 切替の途中のlink | `bin/.resident.<pid>`、`bin/.current.<pid>` | 切替の処理 | 名前が所有を証明し、`upgrade`・`init` の開始とresident・workerの起動が、持ち主の居ないものを消す | 25.4の (a) の名前にする | 1 | 持ち主のprocessが居ないこと |
+| 設定と鍵 | `profiles.toml`、`cluster.key`、`worker-cluster.key`、次の鍵、ユーザー設定 | 起動 | 各1個。鍵の一時fileは、名前が所有を証明するので持ち主が居なければ次の起動で消す（古い名前は600秒） | 同じ | 既存 | 各操作の規則 |
+| 設定とjournalの一時file | config directoryの中の `.belt-tmp.*` | 書いたcommandだけ | 正常終了で消える。crashで残るものは、各commandの開始が名前で所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| serviceの定義 | LaunchAgentのplist、systemdのunit（OSの置き場）と、その一時file | OS | hostごとに1つ。一時fileはcrashで残るものを、serviceの定義を書くcommandの開始が、`.belt-tmp.` で始まる名前だけ見て消す | 定義は同じ。一時fileは25.4の (a) | 既存、1 | 利用者の操作、持ち主 |
 
 ### 利用者のrepository
 
@@ -2583,7 +2583,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
-| `logs` のcursor | `$TMPDIR/belt-log-reader-*/` | その `logs` だけ | 正常終了で消える。killで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| `logs` のcursor | `$TMPDIR/belt-log-reader-*/` | その `logs` だけ | 正常終了で消える。killで残るものは、`logs` の開始がmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | profileの検査 | `$TMPDIR/` の検査用directory | その検査だけ | 所有markerつき。次の検査の開始時に消す | 同じ | 既存 | 同上 |
 
 ### 開発用の道具
@@ -2657,7 +2657,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
 | 第23章 | Git・bundleの片付けは後続の作業 | 2 | 25.5の段4 |
 | 第23章 | Future expiry of received roots also requires per-import pending ownership | 5a | 25.8が持ち主を定める。受け取ったrootの期限切れそのものは未確定（25.9） |
-| 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 名前で所有を証明する |
+| 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 実装済み: 名前（`.belt-tmp.…`）で所有を証明し、排他leaseの下で消す。解釈できない名前は残す |
 | 24.4 | 受理したattemptのtombstoneは消さない | 3 | 重複防止の記録に置き換える |
 | 24.8 | 試用中のworkerとcoordinatorが行わないことの一覧 | 3 | `release_attempt` を足す |
 

@@ -255,7 +255,7 @@ pub(crate) fn remove_if_present(path: &Path) -> anyhow::Result<()> {
 pub(crate) fn copy_private(from: &Path, to: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let directory = to.parent().context("file parent")?;
-    let temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let temporary = crate::platform::owned_temp::file_in(directory)?;
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -427,12 +427,9 @@ fn point_current(paths: &Paths, digest: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let directory = link.parent().context("link parent")?;
-    let temporary = directory.join(format!(".current.{}", std::process::id()));
-    match fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    // A name that proves its owner (spec 25.4 (a)).
+    crate::platform::owned_temp::sweep_files(directory);
+    let temporary = directory.join(crate::platform::owned_temp::new_file_name());
     std::os::unix::fs::symlink(digest, &temporary)?;
     fs::rename(&temporary, &link)?;
     File::open(directory)?.sync_all()?;

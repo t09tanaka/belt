@@ -34,6 +34,7 @@ pub use plan::FwFailure;
 
 use crate::error::{ApiError, BlockedReason, ErrorCode};
 use crate::ids::AttemptId;
+use crate::platform::owned_temp::OwnedTemp;
 use crate::source::classify::api_error_of;
 use crate::source::{ObjectsRepo, SourceStore};
 use git::Env;
@@ -168,9 +169,7 @@ impl Workspaces {
             }
         } else {
             // build beside, move into place: a crash leaves no half clone
-            let tmp = tempfile::Builder::new()
-                .prefix(".clone.")
-                .tempdir_in(&root)
+            let tmp = OwnedTemp::new_in(&root, ".clone.")
                 .map_err(|e| io_err("cannot make a scratch directory", e))?;
             let work = tmp.path().join("c");
             match seed {
@@ -214,17 +213,12 @@ impl Workspaces {
     /// is empty when there is no clone yet. It is gone when the returned
     /// directory is dropped; one a worker that died left is cleared by
     /// [`Self::sweep_orphans`].
-    pub fn rehearsal(
-        &self,
-        repository_id: &str,
-    ) -> Result<(tempfile::TempDir, ObjectsRepo), ApiError> {
+    pub fn rehearsal(&self, repository_id: &str) -> Result<(OwnedTemp, ObjectsRepo), ApiError> {
         let root = self.clones_root();
         std::fs::create_dir_all(&root)
             .map_err(|e| io_err("cannot create the clones directory", e))?;
         let clone = root.join(plan::clone_dir_name(repository_id));
-        let tmp = tempfile::Builder::new()
-            .prefix(".clone.")
-            .tempdir_in(&root)
+        let tmp = OwnedTemp::new_in(&root, ".clone.")
             .map_err(|e| io_err("cannot make a scratch directory", e))?;
         let work = tmp.path().join("r");
         if clone.join(".git").exists() {
@@ -444,9 +438,7 @@ impl Workspaces {
     /// directory included), then lay it over the worktree and check the
     /// working directory again.
     fn lay_source(&self, store: &SourceStore, m: &CiManifest, dest: &Path) -> Result<(), ApiError> {
-        let staging = tempfile::Builder::new()
-            .prefix(".staging.")
-            .tempdir_in(self.workspaces_root())
+        let staging = OwnedTemp::new_in(&self.workspaces_root(), ".staging.")
             .map_err(|e| io_err("cannot make a scratch directory", e))?;
         store.materialize(m, staging.path()).map_err(internal)?;
         overlay::overlay(staging.path(), dest).map_err(internal)?;
@@ -766,8 +758,14 @@ impl Workspaces {
                     plan::Entry::Attempt(_) if scratch_only => continue,
                     plan::Entry::Attempt(a) if has_record(&a) => continue,
                     plan::Entry::Attempt(a) => self.sweep_attempt(&clones, &a),
-                    plan::Entry::Scratch => remove_any(&path)
-                        .map_err(|e| io_err("cannot remove a scratch directory", e)),
+                    // A marker proves the owner gone (spec 25.4 (a)); one
+                    // that cannot be proven is kept.
+                    plan::Entry::Scratch => {
+                        if crate::platform::owned_temp::remove_if_owner_gone(&path) {
+                            report.removed.push(path);
+                        }
+                        continue;
+                    }
                 };
                 match done {
                     Ok(()) => report.removed.push(path),

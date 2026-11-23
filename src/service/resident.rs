@@ -839,6 +839,8 @@ impl Resident {
                 .await?,
             "stopped while waiting for another task-traffic-controller scope to drain"
         );
+        // Spec 25.4 (a): what a killed process left beside the state files.
+        crate::platform::owned_temp::sweep_files(&inputs.worker.state_dir);
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
             StartupParts::prepare(config_owned, inputs, binding)

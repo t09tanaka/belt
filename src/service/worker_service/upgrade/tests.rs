@@ -527,7 +527,9 @@ fn the_current_link_moves_by_rename_and_is_left_alone_when_right() {
     let stale = link
         .parent()
         .unwrap()
-        .join(format!(".current.{}", std::process::id()));
+        .join(crate::platform::owned_temp::testing::dead_name(
+            "dddddddddddd",
+        ));
     std::os::unix::fs::symlink("stale", &stale).unwrap();
     point_current(&paths, &h.new).unwrap();
     assert_eq!(h.current(), Path::new(&h.new));

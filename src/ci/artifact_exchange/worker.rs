@@ -41,7 +41,7 @@ impl Host {
                 .map(|(_, v)| v.as_str())
                 .filter(|v| !v.trim().is_empty())
         };
-        let scratch = tempfile::tempdir_in(&self.root)?;
+        let scratch = crate::platform::owned_temp::OwnedTemp::new_in(&self.root, ".belt-xchg.")?;
         let area = Area {
             root: scratch.path().join("artifacts"),
             plan_digest: req.area.plan_digest.clone(),

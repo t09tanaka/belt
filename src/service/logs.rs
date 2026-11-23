@@ -26,13 +26,14 @@ fn query_error(error: super::query::Error) -> ApiError {
 /// created inside a mode-0700 TempDir before SQLite opens it (no symlink race).
 struct Cursors {
     db: Connection,
-    _directory: tempfile::TempDir,
+    _directory: crate::platform::owned_temp::OwnedTemp,
 }
 impl Cursors {
     fn new() -> Result<Self, ApiError> {
-        let directory = tempfile::Builder::new()
-            .prefix("belt-log-reader-")
-            .tempdir()
+        let tmp = std::env::temp_dir();
+        // What a `logs` that was killed left (spec 25.4 (a)): one `readdir`.
+        crate::platform::owned_temp::sweep(&tmp, "belt-log-reader-");
+        let directory = crate::platform::owned_temp::OwnedTemp::new_in(&tmp, "belt-log-reader-")
             .map_err(internal)?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(internal)?;

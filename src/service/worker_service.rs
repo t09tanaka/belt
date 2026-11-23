@@ -354,7 +354,7 @@ fn read_journal(paths: &Paths) -> anyhow::Result<Option<Journal>> {
 }
 
 fn save_journal(paths: &Paths, journal: &Journal) -> anyhow::Result<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(&paths.config)?;
+    let mut temporary = crate::platform::owned_temp::file_in(&paths.config)?;
     temporary.write_all(&serde_json::to_vec(journal)?)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&paths.journal).map_err(|e| e.error)?;
@@ -450,7 +450,7 @@ fn private_dir(home: &Path, leaf: &Path) -> anyhow::Result<()> {
 /// registration (no receipt) may be overwritten, so a re-run can finish.
 fn publish_exact(path: &Path, bytes: &[u8], mode: u32, replace: bool) -> anyhow::Result<()> {
     let parent = path.parent().context("file parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = crate::platform::owned_temp::file_in(parent)?;
     temporary.write_all(bytes)?;
     temporary
         .as_file()
@@ -530,9 +530,7 @@ pub(crate) fn place_binary_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let temporary = tempfile::Builder::new()
-        .prefix(".part")
-        .tempfile_in(directory)?;
+    let temporary = crate::platform::owned_temp::file_in(directory)?;
     std::io::copy(&mut File::open(current)?, &mut temporary.as_file())?;
     temporary
         .as_file()

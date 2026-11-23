@@ -329,9 +329,7 @@ impl DirectoryFiles {
         let (tmp, receipt) = (|| -> anyhow::Result<_> {
             let target = self.root.join(plan.filename());
             // Never claim or overwrite a pre-existing file, even if bytes match.
-            let mut tmp = tempfile::Builder::new()
-                .prefix(".init-")
-                .tempfile_in(&self.root)?;
+            let mut tmp = crate::platform::owned_temp::file_in(&self.root)?;
             tmp.as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
             tmp.write_all(plan.plist().as_bytes())?;

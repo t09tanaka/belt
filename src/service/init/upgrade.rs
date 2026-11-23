@@ -142,7 +142,7 @@ fn read_record(paths: &Paths) -> anyhow::Result<Option<Record>> {
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let directory = path.parent().context("file parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut temporary = crate::platform::owned_temp::file_in(directory)?;
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;

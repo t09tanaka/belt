@@ -1251,10 +1251,34 @@ fn the_sweeper_clears_what_no_record_names() {
         .join("workspaces")
         .join(AttemptId::generate().as_str());
     std::fs::create_dir_all(plain.join("sub")).unwrap();
+    // scratch directories carry a marker: only those of a gone owner go
+    let mut ended = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let ended_start = match belt::platform::process_start_identity(ended.id()) {
+        belt::platform::StartIdentity::Identity(s) | belt::platform::StartIdentity::Zombie(s) => s,
+        other => panic!("{other:?}"),
+    };
+    let ended_pid = ended.id();
+    ended.wait().unwrap();
+    let marked = |dir: &std::path::Path, pid: u32, start: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        belt::platform::owned_temp::OwnedTemp::write_marker_of(dir, pid, start).unwrap();
+    };
     let scratch = f.state.join("workspaces/.staging.abc");
-    std::fs::create_dir_all(&scratch).unwrap();
+    marked(&scratch, ended_pid, &ended_start);
     let half_clone = f.state.join("clones/.clone.xyz");
-    std::fs::create_dir_all(&half_clone).unwrap();
+    marked(&half_clone, ended_pid, &ended_start);
+    let me = std::process::id();
+    let my_start = match belt::platform::process_start_identity(me) {
+        belt::platform::StartIdentity::Identity(s) => s,
+        other => panic!("{other:?}"),
+    };
+    let live_scratch = f.state.join("workspaces/.staging.live");
+    marked(&live_scratch, me, &my_start);
+    let unmarked_scratch = f.state.join("clones/.clone.unmarked");
+    std::fs::create_dir_all(&unmarked_scratch).unwrap();
     let foreign = f.state.join("workspaces/notes.txt");
     std::fs::write(&foreign, "mine").unwrap();
     // a leftover that holds a directory it cannot read
@@ -1271,7 +1295,7 @@ fn the_sweeper_clears_what_no_record_names() {
     assert!(report.failed.is_empty(), "{:?}", report.failed);
     assert_eq!(report.removed.len(), 4, "{:?}", report.removed);
     assert!(kept.root.exists());
-    assert!(foreign.exists());
+    assert!(foreign.exists() && live_scratch.exists() && unmarked_scratch.exists());
     for gone in [&lost.root, &plain, &scratch, &half_clone] {
         assert!(!gone.exists(), "{gone:?}");
     }

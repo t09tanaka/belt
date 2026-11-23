@@ -415,9 +415,7 @@ impl CoordinatorStore {
             );
             return Ok(());
         }
-        let stage = tempfile::Builder::new()
-            .prefix(".init-")
-            .tempfile_in(state_dir)?;
+        let stage = crate::platform::owned_temp::file_in(state_dir)?;
         let db = Db::open(stage.path(), DbKind::Coordinator, Access::ReadWrite)?;
         let cl = cluster.clone();
         let co = coordinator.clone();

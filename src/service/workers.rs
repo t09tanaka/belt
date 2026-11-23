@@ -917,7 +917,7 @@ fn write_config(path: &Path, text: &str) -> Result<(), ApiError> {
         .parent()
         .ok_or_else(|| invalid("configuration parent"))?;
     std::fs::create_dir_all(parent).map_err(io)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io)?;
+    let mut temporary = crate::platform::owned_temp::file_in(parent).map_err(io)?;
     temporary.write_all(text.as_bytes()).map_err(io)?;
     temporary.as_file().sync_all().map_err(io)?;
     temporary.persist(path).map_err(|e| io(e.error))?;

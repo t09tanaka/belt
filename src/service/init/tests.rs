@@ -386,7 +386,7 @@ async fn binary_stage_directory_barrier_precedes_pending_and_os_actions() {
                     e.unwrap()
                         .file_name()
                         .to_string_lossy()
-                        .starts_with(".init-")
+                        .starts_with(crate::platform::owned_temp::FILE_PREFIX)
                 })
             {
                 let j: Journal = serde_json::from_slice(&fs::read(&self.journal)?).unwrap();

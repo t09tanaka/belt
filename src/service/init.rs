@@ -278,7 +278,7 @@ impl JournalFile {
         let bytes = serde_json::to_vec(journal)?;
         ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
         let mut tmp =
-            tempfile::NamedTempFile::new_in(self.path.parent().context("journal parent")?)?;
+            crate::platform::owned_temp::file_in(self.path.parent().context("journal parent")?)?;
         tmp.write_all(&bytes)?;
         tmp.as_file().sync_all()?;
         if self.proof.is_some() {
@@ -406,7 +406,7 @@ fn recover(
                     .path
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with(".init-")),
+                    .is_some_and(|s| s.starts_with(crate::platform::owned_temp::FILE_PREFIX)),
             "invalid pending stage"
         );
         if p.target.try_exists()? {
@@ -462,7 +462,7 @@ fn stage_path(target: &Path) -> PathBuf {
     target
         .parent()
         .expect("absolute target")
-        .join(format!(".init-{}", ulid::Ulid::new()))
+        .join(crate::platform::owned_temp::new_file_name())
 }
 fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     resident::validate_components(path)?;
@@ -966,12 +966,10 @@ fn link_resident(executable: &Path, durability: &mut impl Durability) -> anyhow:
     if fs::read_link(&link).ok().as_deref() == Some(Path::new(digest)) {
         return Ok(());
     }
-    let staged = bin.join(format!(".resident.{}", std::process::id()));
-    match fs::remove_file(&staged) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    // A name that proves its owner (spec 25.4 (a)): a crash here leaves a link
+    // that a later start of `upgrade`, `init` or the resident removes.
+    crate::platform::owned_temp::sweep_files(bin);
+    let staged = bin.join(crate::platform::owned_temp::new_file_name());
     std::os::unix::fs::symlink(digest, &staged)?;
     fs::rename(&staged, &link)?;
     durability.sync_directory(bin)?;
@@ -1297,7 +1295,8 @@ pub(crate) fn handover<L: Launcher>(
             replacements.push((paths.input.clone(), serde_json::to_vec(&journal.spec)?));
         }
         for (path, bytes) in replacements {
-            let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("file parent")?)?;
+            let mut temp =
+                crate::platform::owned_temp::file_in(path.parent().context("file parent")?)?;
             temp.write_all(&bytes)?;
             temp.as_file().sync_all()?;
             temp.persist(&path).map_err(|e| e.error)?;

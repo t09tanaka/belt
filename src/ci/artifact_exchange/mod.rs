@@ -47,7 +47,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(bytes.len() <= MAX_MESSAGE, "artifact message is too large");
     let dir = path.parent().context("artifact message parent")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = crate::platform::owned_temp::file_in(dir)?;
     tmp.write_all(&bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path)?;

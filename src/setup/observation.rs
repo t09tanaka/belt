@@ -115,7 +115,7 @@ pub(crate) fn record_node(spec: &SuperviseSpec, index: usize, seconds: f64) -> O
     if bytes.len() as u64 > MAX_FILE {
         return None;
     }
-    let mut tmp = tempfile::NamedTempFile::new_in(&spec.state_dir).ok()?;
+    let mut tmp = crate::platform::owned_temp::file_in(&spec.state_dir).ok()?;
     tmp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))
         .ok()?;
