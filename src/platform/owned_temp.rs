@@ -73,9 +73,10 @@ fn machine_of(text: &str) -> Option<String> {
 /// The identity of this machine, which a host name is not: two hosts that
 /// share a directory (a home on NFS) may have the same name, and then one
 /// would take the other's live files for those of an earlier boot of its
-/// own. macOS: the host UUID. Linux: the machine ID (`/etc/machine-id`, else
-/// the one of D-Bus). `None` when the system has none that can be read: then
-/// this process records nothing and proves nothing.
+/// own. macOS: the host UUID. Linux: the machine ID of `/etc/machine-id`
+/// only: the D-Bus copy is often baked into an image, so every container of
+/// that image would share it. `None` when the system has none that can be
+/// read: then this process records nothing and proves nothing.
 fn machine_id() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -91,9 +92,7 @@ fn machine_id() -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-            .iter()
-            .find_map(|path| machine_of(fs::read_to_string(path).ok()?.trim()))
+        machine_of(fs::read_to_string("/etc/machine-id").ok()?.trim())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
