@@ -1601,7 +1601,11 @@ The parent source store exposes an explicit synchronous retention page separatel
 EX before any coordinator actor operation and retains it through unlink, parent fsync and claim completion. The
 writable configured coordinator, current physical state/source directories, actual SQLite main-file identity,
 exact durable run binding and sealed source-ref digest must agree. All execution generations require typed known
-termination and closed mandatory collection, including recorded closed failure verdicts. Eligibility scans the
+termination and closed mandatory collection, including recorded closed failure verdicts. An attempt whose retire
+was confirmed is not waited for and has no termination to check. The retention is counted from the latest of: an
+attempt ended, was retired or had its collection closed, a task was cancelled, the run was closed. A run whose
+coordinator record cannot be read keeps its inputs and is counted as unknown; the page moves on to the next run
+and reads that run again on the next pass. Eligibility scans the
 run's generation history and is not a constant-time SQL proof. Direct task/attempt creation holds source SH through
 commit and rejects an expired run; worker terminal/result processing is unchanged.
 
