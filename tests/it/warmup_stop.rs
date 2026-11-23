@@ -46,10 +46,11 @@ fn fixture() -> (crate::common::DaemonRoot, Spec, PathBuf) {
 set -eu
 printf '%s\n' "$1" >> '{host}/calls'
 if [ -e '{host}/hold' ]; then
-  /bin/sleep 300 &
+  while [ -d '{host}' ]; do /bin/sleep 0.05; done &
   printf '%s %s\n' "$$" "$!" >> '{host}/pids'
   while [ -e '{host}/hold' ]; do /bin/sleep 0.05; done
 fi
+[ -d '{host}' ] || exit 0
 version="$1"
 bin="$NODENV_ROOT/versions/$version/bin"
 /bin/mkdir -p "$bin"

@@ -105,7 +105,8 @@ async fn stop_with_live_attempt(pre: &str, tail: &str, bound: Duration) {
     .unwrap();
     let marker = home.join("command.pid");
     let script = format!(
-        "{pre}echo $$ > '{m}.tmp' && mv '{m}.tmp' '{m}' && {tail}",
+        "fixture_dir='{guard}'; {pre}echo $$ > '{m}.tmp' && mv '{m}.tmp' '{m}' && {tail}",
+        guard = home.display(),
         pre = pre,
         tail = tail,
         m = marker.display()
@@ -246,7 +247,7 @@ async fn a_live_attempt_is_stopped_and_the_state_erased_on_sigterm() {
 async fn a_command_that_ignores_term_ends_by_kill_within_the_bound() {
     stop_with_live_attempt(
         "trap '' TERM; ",
-        "while :; do /bin/sleep 1; done",
+        "while [ -d \"$fixture_dir\" ]; do /bin/sleep 0.05; done",
         Duration::from_secs(25),
     )
     .await;

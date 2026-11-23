@@ -614,10 +614,11 @@ fn finish(child: &mut std::process::Child) -> std::process::ExitStatus {
 }
 
 /// A command that records the signal it gets and exits with a code that
-/// names it, once the marker says its handlers are installed.
+/// names it, once the marker says its handlers are installed. The shell
+/// starts in the fixture directory, so $PWD disappears on fixture cleanup.
 fn signal_script() -> &'static str {
     "trap 'echo TERM > got; exit 41' TERM; trap 'echo INT > got; exit 42' INT; \
-     trap 'echo HUP > got; exit 43' HUP; : > started; while :; do sleep 0.05; done"
+     trap 'echo HUP > got; exit 43' HUP; : > started; while [ -d \"$PWD\" ]; do sleep 0.05; done"
 }
 
 /// A signal sent to belt alone (not to a process group) is forwarded to the
@@ -742,7 +743,7 @@ fn sigint_and_sigquit_ignored_at_start_stay_ignored_for_belt_and_the_command() {
     let cwd = fx.path("project");
     let script = "trap 'echo INT >> got; exit 42' INT; trap 'echo QUIT >> got; exit 44' QUIT; \
                   trap 'echo TERM >> got; exit 41' TERM; kill -QUIT $$; : > started; \
-                  while :; do sleep 0.05; done";
+                  while [ -d \"$PWD\" ]; do sleep 0.05; done";
     let mut child = spawn_with_dispositions(&fx, &cwd, script, true);
     wait_for("the command to start", || cwd.join("started").exists());
     // Only the process this test started, never a group.

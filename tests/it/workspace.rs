@@ -1504,8 +1504,9 @@ fn a_hook_that_never_ends_is_killed_with_its_children() {
     let (_bin, env) = fake_tool(
         &f,
         &crate::fixture_process::script(&format!(
-            "echo starting >&2\nsleep 300 &\necho $! > '{}'\nwait",
-            pidfile.display()
+            "echo starting >&2\nwhile [ -d '{guard}' ]; do sleep 0.05; done &\necho $! > '{}'\nwait",
+            pidfile.display(),
+            guard = f.root.display()
         )),
     );
     // Allow the real shell and descendant to start under instrumented CI.
