@@ -97,7 +97,9 @@ pub(super) async fn run(
         .await?;
         (cursor, pruning) = next;
         match pruned {
-            Some(Ok(report)) if report.unknown > 0 || report.kept_events > 0 || !report.gates.is_empty() => {
+            Some(Ok(report))
+                if report.unknown > 0 || report.kept_events > 0 || !report.gates.is_empty() =>
+            {
                 eprintln!("{}", pruning_held(&report))
             }
             // Never the error itself: it can name a private path.

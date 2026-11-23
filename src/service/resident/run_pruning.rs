@@ -213,7 +213,10 @@ fn prune(
     wall: u64,
 ) -> anyhow::Result<bool> {
     // 2. The secret bundle in the parent Vault.
-    if !sources.prune_run_vault(owner, vault, run, &mut budget.inputs)?.done {
+    if !sources
+        .prune_run_vault(owner, vault, run, &mut budget.inputs)?
+        .done
+    {
         return Ok(false);
     }
     fault("after_vault")?;

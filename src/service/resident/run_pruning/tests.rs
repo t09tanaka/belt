@@ -689,14 +689,14 @@ fn many_runs_share_the_bound_of_input_paths_of_a_pass() {
         })
         .collect();
     f.register();
-    let before = f.regular_files("sources/objects").len()
-        + f.regular_files("sources/manifests").len();
+    let before =
+        f.regular_files("sources/objects").len() + f.regular_files("sources/manifests").len();
     assert!(before > 32, "{before} input files");
     f.pass().unwrap();
     let report = f.pass().unwrap();
     assert_eq!(report.marked, 20);
-    let after = f.regular_files("sources/objects").len()
-        + f.regular_files("sources/manifests").len();
+    let after =
+        f.regular_files("sources/objects").len() + f.regular_files("sources/manifests").len();
     assert!(before - after <= 32, "{} input files went", before - after);
     assert!(report.continuing > 0, "{report:?}");
     assert_eq!(f.prune(), 20 - report.finished);
@@ -771,7 +771,9 @@ fn nothing_of_a_run_without_the_mark_is_deleted_by_any_step() {
     assert!(db.prune_claim_results(&made.run, 32, 9).is_err());
     assert!(db.prune_pending_results(&made.run, 32).is_err());
     assert!(db.prune_pin(&made.run).is_err());
-    assert!(db.prune_rows(&made.run, ROWS_PER_TRANSACTION, None).is_err());
+    assert!(db
+        .prune_rows(&made.run, ROWS_PER_TRANSACTION, None)
+        .is_err());
     assert_eq!(
         (
             f.paths(),
