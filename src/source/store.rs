@@ -200,10 +200,17 @@ impl ObjectsRepo {
         // Is the commit here, is the ref here, is the one below the other:
         // each a question Git answers with 0 or 1. Whatever else Git fails
         // with says nothing about the source.
-        for rev in [commit, r.as_str()] {
-            if self.ref_value(&format!("{rev}^{{commit}}"))?.is_none() {
-                return Err(unreachable());
+        if self.ref_value(&format!("{commit}^{{commit}}"))?.is_none() {
+            return Err(unreachable());
+        }
+        // The commit is here and the ref is not: someone removed the ref
+        // (spec 25.8 5b (h)8). The receipt is not refused for it.
+        if self.ref_value(&format!("{r}^{{commit}}"))?.is_none() {
+            return Err(InputGone {
+                source: ci_source_id.to_string(),
+                missing: Vec::new(),
             }
+            .into());
         }
         let below = git_says(
             &self.env,
@@ -354,6 +361,34 @@ fn remove_if_there(p: &Path) -> Result<bool> {
 
 fn corrupt(what: impl Into<String>) -> anyhow::Error {
     SourceError::Corrupt { what: what.into() }.into()
+}
+
+/// A publication found something its manifest names gone from the store
+/// (spec 25.8 5b (b), (h)8): a blob that is not there or is claimed for
+/// deletion, a child source that is not received, or the snapshot ref of a
+/// carried source that is not there while its commit is. Not a fault of what
+/// was sent: the receipt is kept and the sender delivers again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputGone {
+    /// The source (CI id) whose input is gone.
+    pub source: String,
+    /// The blobs (`sha256:` digests) that are not there.
+    pub missing: Vec<String>,
+}
+impl std::fmt::Display for InputGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: input is no longer in the store", self.source)?;
+        if !self.missing.is_empty() {
+            write!(f, " (blobs {})", self.missing.join(", "))?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for InputGone {}
+
+/// The [`InputGone`] in `e`'s chain, if any.
+pub fn input_gone(e: &anyhow::Error) -> Option<&InputGone> {
+    e.chain().find_map(|c| c.downcast_ref::<InputGone>())
 }
 
 /// Verified descriptor and immutable transfer identity. Hashing never holds the
@@ -955,6 +990,10 @@ impl SourceStore {
         mutation.ensure_sdk_available()?;
         mutation.ensure_source_available(&m.source_id)?;
         verify_manifest(m)?;
+        // Blobs that are not there are gathered: the answer names them all
+        // (spec 25.8 5b (b)). A pending deletion claim fences the whole
+        // publication above (`ensure_sdk_available`), which is retried.
+        let mut missing = Vec::new();
         for e in &m.object_manifest.entries {
             mutation.ensure_blob_available(&e.hash)?;
             let p = self.inner.object_path(&e.hash);
@@ -968,22 +1007,33 @@ impl SourceStore {
                         e.size
                     )))
                 }
-                Err(_) => {
-                    return Err(corrupt(format!(
-                        "blob {} ({}) is not in the store",
+                Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(e.hash.clone());
+                }
+                Err(e2) => {
+                    return Err(anyhow::Error::new(e2).context(format!(
+                        "blob {} ({})",
                         e.hash,
                         e.path.display()
                     )))
                 }
             }
         }
+        if !missing.is_empty() {
+            return Err(InputGone {
+                source: m.source_id.clone(),
+                missing,
+            }
+            .into());
+        }
         for s in &m.submodules {
             if let Some(id) = &s.source_id {
                 if !self.received(&mutation, id)? {
-                    return Err(corrupt(format!(
-                        "submodule {}: {id} is not in the store",
-                        s.path.display()
-                    )));
+                    return Err(InputGone {
+                        source: id.clone(),
+                        missing: Vec::new(),
+                    }
+                    .into());
                 }
             }
         }

@@ -518,6 +518,28 @@ impl Host for Machine {
         }
     }
 
+    fn source_ended(&self, source: &crate::ids::SourceId) {
+        let Some(id) = ci_id_of(source) else {
+            return;
+        };
+        if let Ok(held) = self.store.mutation_guard() {
+            let _ = self.store.touch_received(&held, &id);
+        }
+    }
+
+    fn source_present(
+        &self,
+        held: &crate::source::retention::Guard,
+        payload: &AttemptPayload,
+    ) -> Result<bool, ApiError> {
+        let Some(id) = ci_id_of(&payload.source_id) else {
+            return Ok(true);
+        };
+        self.store
+            .received(held, &id)
+            .map_err(|e| internal("source store", format!("{e:#}")))
+    }
+
     fn secret_paths(
         &self,
         payload: &AttemptPayload,

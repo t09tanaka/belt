@@ -235,6 +235,9 @@ async fn serve_proven(
     let release = negotiated_features
         .iter()
         .any(|f| f == crate::wire::ATTEMPT_RELEASE_FEATURE);
+    let input_missing = negotiated_features
+        .iter()
+        .any(|f| f == crate::wire::INPUT_MISSING_FEATURE);
     // Spec 25.6 (c): the submits this connection takes are counted until
     // they are handled; the connection is closed in the tracker however
     // this loop ends.
@@ -288,6 +291,7 @@ async fn serve_proven(
         });
         let link = super::agent::Link {
             release,
+            input_missing,
             taken: Some(taken),
         };
         // No further request is taken from this connection until this one

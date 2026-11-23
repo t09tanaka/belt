@@ -804,3 +804,208 @@ async fn in_place_capacity_retries_keep_the_attempt_and_deduplicate_events() {
     }
     assert!(f.c.store().retire_tombstone(&attempt).unwrap().is_none());
 }
+
+/// A worker that refuses every submit with `INPUT_MISSING` and keeps a
+/// `ready` the test fills, as the delivery loop does.
+#[derive(Default)]
+struct Missing {
+    calls: AtomicUsize,
+    ready: std::sync::Mutex<Vec<super::input_gate::ReadyInput>>,
+}
+
+impl WorkerLink for Missing {
+    fn placement_inputs(&self) -> Option<super::input_gate::PlacementInputs> {
+        Some(super::input_gate::PlacementInputs {
+            generation: 1,
+            ready: self.ready.lock().unwrap().clone(),
+            identity: None,
+        })
+    }
+    fn withdraw_input(&self, source: &SourceId) {
+        self.ready
+            .lock()
+            .unwrap()
+            .retain(|i| &i.source_id != source);
+    }
+    fn call(&self, request: Request) -> LinkFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let source = match &request {
+            Request::SubmitAttempt(r) => r.payload.source_id.to_string(),
+            _ => String::new(),
+        };
+        Box::pin(async move {
+            Err(LinkError::Remote(crate::error::ApiError::input_missing(
+                source,
+                Vec::new(),
+                "not here",
+            )))
+        })
+    }
+}
+
+/// Spec 25.8 5b (b), (g)5: an attempt refused with `INPUT_MISSING` loses its
+/// input from the worker's `ready` and is not sent again, on either path,
+/// however many times it is looked at, until `ready` holds it again. Only
+/// the refusals after `ready` came back count; the third retires it with
+/// `input_missing`.
+#[tokio::test]
+async fn input_missing_withholds_the_attempt_until_its_input_is_ready_again() {
+    let f = fx();
+    let link = Arc::new(Missing::default());
+    let attached: Attached = link.clone();
+    f.c.attach(f.worker.clone(), attached.clone()).await;
+    let (task, attempt) = f.placed().await;
+    let live = |f: &Fx| {
+        f.c.store()
+            .live_attempt(&f.worker, &attempt)
+            .unwrap()
+            .unwrap()
+    };
+    let payload = live(&f).placement.unwrap().demand["payload"].clone();
+    let input = super::input_gate::ReadyInput {
+        run_id: RunId::parse(payload["run_id"].as_str().unwrap()).unwrap(),
+        source_id: SourceId::parse(payload["source_id"].as_str().unwrap()).unwrap(),
+        manifest_digest: Digest::of_bytes(b"manifest"),
+    };
+    macro_rules! send {
+        () => {{
+            let mut report = TickReport::default();
+            f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+                .await
+                .unwrap()
+        }};
+    }
+    // The resend of a placed attempt (the tick's `Step::Submit`).
+    macro_rules! resend {
+        () => {{
+            let mut report = TickReport::default();
+            let placed = live(&f);
+            f.c.submit(&*link, &placed, &mut report, &attached)
+                .await
+                .unwrap()
+        }};
+    }
+    let calls = || link.calls.load(Ordering::SeqCst);
+    let retired = |f: &Fx| live(f).retire_reason;
+    link.ready.lock().unwrap().push(input.clone());
+
+    // Refused the first time: `ready` loses the input; nothing counts.
+    assert_eq!(send!(), Sent::NotTaken);
+    assert_eq!(calls(), 1);
+    assert!(link.ready.lock().unwrap().is_empty());
+    for _ in 0..5 {
+        assert_eq!(send!(), Sent::Withheld);
+        assert_eq!(resend!(), Sent::Withheld);
+    }
+    assert_eq!(calls(), 1, "nothing is sent while ready is not back");
+    assert_eq!(retired(&f), None);
+
+    // Each time `ready` comes back the attempt is sent; the third refusal
+    // after that retires it.
+    for round in 1..=3 {
+        link.ready.lock().unwrap().push(input.clone());
+        let sent = if round % 2 == 0 { resend!() } else { send!() };
+        assert_eq!(sent, Sent::NotTaken);
+        assert_eq!(calls(), 1 + round);
+        if round < 3 {
+            assert_eq!(retired(&f), None, "round {round}");
+            assert_eq!(resend!(), Sent::Withheld);
+        }
+    }
+    assert_eq!(
+        retired(&f).as_deref(),
+        Some(scheduler::REASON_WORKER_CANNOT_RUN)
+    );
+    assert_excluded_for_input(&f, &attempt, &task, "refused_three_times").await;
+    // Each mark wrote why the attempt waits, on its run.
+    let waits = f.c.store().events_of(&attempt, EVENT_INPUT_WAIT).unwrap();
+    assert_eq!(waits.len(), 3, "{waits:?}");
+}
+
+/// The exclusion of an attempt taken off for its input: the worker event
+/// says why, and once the retire is confirmed the task's next placement
+/// leaves that worker out (review M2).
+async fn assert_excluded_for_input(f: &Fx, attempt: &AttemptId, task: &TaskId, why: &str) {
+    let ev =
+        f.c.store()
+            .events_of(attempt, scheduler::EVENT_WORKER_EXCLUDED)
+            .unwrap();
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    let text = format!("{ev:?}");
+    assert!(
+        text.contains(REASON_INPUT_MISSING) && text.contains(why),
+        "{text}"
+    );
+    f.c.store().confirm_retire(attempt, wall_ms()).unwrap();
+    let out = f.c.refused_by(task).await.unwrap();
+    assert!(out.contains(&f.worker), "{out:?}");
+}
+
+async fn missing_fx() -> (Fx, Arc<Missing>, Attached, TaskId, AttemptId) {
+    let f = fx();
+    let link = Arc::new(Missing::default());
+    let attached: Attached = link.clone();
+    f.c.attach(f.worker.clone(), attached.clone()).await;
+    let (task, attempt) = f.placed().await;
+    (f, link, attached, task, attempt)
+}
+
+/// Review M1: a marked attempt whose input never comes back to `ready` is
+/// taken off its worker after [`INPUT_WAIT`], not withheld forever.
+#[tokio::test]
+async fn input_missing_mark_expires_when_ready_never_returns() {
+    let (f, link, attached, task, attempt) = missing_fx().await;
+    let send = || async {
+        let mut report = TickReport::default();
+        f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+            .await
+            .unwrap()
+    };
+    assert_eq!(send().await, Sent::NotTaken);
+    assert_eq!(send().await, Sent::Withheld);
+    assert_eq!(
+        f.c.store()
+            .events_of(&attempt, EVENT_INPUT_WAIT)
+            .unwrap()
+            .len(),
+        1
+    );
+    {
+        let mut marks = f.c.input_missing.lock().unwrap();
+        let mark = marks.get_mut(&attempt).unwrap();
+        mark.marked = Instant::now()
+            .checked_sub(INPUT_WAIT + Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(send().await, Sent::NotTaken);
+    assert!(f.c.input_missing.lock().unwrap().is_empty());
+    assert_eq!(link.calls.load(Ordering::SeqCst), 1, "not sent again");
+    assert_excluded_for_input(&f, &attempt, &task, "not_delivered_again").await;
+}
+
+/// Review L3: a mark goes once its attempt is no longer live (here
+/// cancelled), at the next placement pass; on overflow the oldest goes.
+#[tokio::test]
+async fn input_missing_marks_are_pruned_and_the_oldest_evicted() {
+    let (f, link, attached, _task, attempt) = missing_fx().await;
+    let mut report = TickReport::default();
+    f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+        .await
+        .unwrap();
+    assert!(f.c.input_missing.lock().unwrap().contains_key(&attempt));
+    f.c.store().request_cancel(&attempt, wall_ms()).unwrap();
+    f.c.prune_missing().await.unwrap();
+    assert!(f.c.input_missing.lock().unwrap().is_empty());
+
+    let (run, source) = (RunId::generate(), SourceId::generate());
+    let ids: Vec<AttemptId> = (0..=INPUT_MISSING_MARKS)
+        .map(|_| AttemptId::generate())
+        .collect();
+    for id in &ids {
+        f.c.refused_for_input(id, run.clone(), source.clone());
+    }
+    let marks = f.c.input_missing.lock().unwrap();
+    assert_eq!(marks.len(), INPUT_MISSING_MARKS);
+    assert!(!marks.contains_key(&ids[0]), "the oldest goes");
+    assert!(ids[1..].iter().all(|id| marks.contains_key(id)));
+}

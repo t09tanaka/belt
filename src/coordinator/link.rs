@@ -264,6 +264,10 @@ pub trait WorkerLink: Send + Sync {
         Vec::new()
     }
     fn inputs_evaluated(&self, _generation: u64, _run: &crate::ids::RunId) {}
+    /// The worker refused an attempt with `INPUT_MISSING`: its `ready` rows
+    /// of `source` go (spec 25.8 5b (b)); the delivery loop delivers it
+    /// again and puts them back once verified.
+    fn withdraw_input(&self, _source: &crate::ids::SourceId) {}
     /// Inspection without observing source gates or changing placement state.
     fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
         self.call(request)
@@ -428,6 +432,11 @@ impl WorkerLink for ClientLink {
     fn placement_inputs(&self) -> Option<PlacementInputs> {
         self.gate.as_ref().map(|gate| gate.placement_inputs())
     }
+    fn withdraw_input(&self, source: &crate::ids::SourceId) {
+        if let Some(gate) = &self.gate {
+            gate.retain(|i| &i.source_id != source);
+        }
+    }
     fn input_refusals(&self) -> Vec<(crate::ids::RunId, String)> {
         self.gate
             .as_ref()
@@ -513,6 +522,9 @@ impl WorkerLink for Budgeted {
     }
     fn inputs_evaluated(&self, generation: u64, run: &crate::ids::RunId) {
         self.inner.inputs_evaluated(generation, run);
+    }
+    fn withdraw_input(&self, source: &crate::ids::SourceId) {
+        self.inner.withdraw_input(source);
     }
     fn placement_inputs(&self) -> Option<PlacementInputs> {
         self.inner.placement_inputs()

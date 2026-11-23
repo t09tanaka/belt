@@ -1072,6 +1072,11 @@ pub struct AttemptPayload {
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
 pub const WORKFLOW_ARTIFACTS_FEATURE: &str = "ci_workflow_artifacts_v1";
 pub const MATRIX_DISPATCH_FEATURE: &str = "ci_matrix_dispatch_v1";
+/// The `hello` feature of the typed refusal `INPUT_MISSING` (spec 25.8 5b
+/// (b)): a worker refuses a new attempt whose source is not in its store,
+/// and answers a publication whose input went away, with that code only on
+/// a connection that agreed this feature. Never required.
+pub const INPUT_MISSING_FEATURE: &str = "input_missing_v1";
 /// The worker can run dedicated listing attempts before the CI plan is partitioned.
 pub const CI_DISCOVERY_FEATURE: &str = "ci_discovery_v1";
 

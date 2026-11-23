@@ -91,6 +91,51 @@ pub const REASON_SUBMIT_REFUSED: &str = "submit_refused";
 /// for it and the task does not fail.
 pub const REASON_ATTEMPT_ID_IN_USE: &str = "attempt_id_in_use";
 
+/// The `reason` of the [`scheduler::EVENT_WORKER_EXCLUDED`] event on an
+/// attempt taken off its worker for its input (spec 25.8 5b (b)): refused
+/// with `INPUT_MISSING` three times in a row after its input was delivered
+/// there again, its input not delivered again within [`INPUT_WAIT`], or a
+/// payload that names no source or run. The tombstone's reason is
+/// [`scheduler::REASON_WORKER_CANNOT_RUN`], so the task is not placed on
+/// that worker again.
+pub const REASON_INPUT_MISSING: &str = "input_missing";
+
+/// The event on a run whose attempt its worker refused with
+/// `INPUT_MISSING`: the attempt waits for its input to be delivered there
+/// again. Payload: `{"worker", "source", "strikes"}`.
+pub const EVENT_INPUT_WAIT: &str = "input_wait";
+
+/// How long a marked attempt waits for its input to be back in its worker's
+/// `ready` before it is taken off that worker (spec 25.8 5b (b)).
+const INPUT_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// How many `INPUT_MISSING` marks the coordinator keeps (one per attempt).
+/// One more drops another: that attempt is then as after a restart of this
+/// process (its next refusal marks it again).
+const INPUT_MISSING_MARKS: usize = 4096;
+
+/// An attempt its worker refused with `INPUT_MISSING` (spec 25.8 5b (b)): it
+/// is not sent again until the worker's `ready` holds its run's source
+/// again. `strikes` counts the refusals that came after `ready` returned.
+#[derive(Debug, Clone)]
+struct MissingMark {
+    run: crate::ids::RunId,
+    source: crate::ids::SourceId,
+    strikes: u8,
+    /// When the last refusal marked it (this process's clock).
+    marked: Instant,
+    /// Insertion order: on overflow the oldest mark goes.
+    order: u64,
+}
+
+/// What [`Coordinator::input_wait`] found for an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputWait {
+    Send,
+    Waits,
+    Expired,
+}
+
 /// The event on an attempt whose id its worker could not take. Payload:
 /// `{"worker", "code", "reason", "retire"}` (`retire`: whether a retire was
 /// asked for); written with the tombstone, in one transaction.
@@ -560,6 +605,10 @@ pub struct Coordinator {
     /// them. Kept in this process only: after a restart the `inspect` of
     /// each worker decides anew.
     capacity_refused: Mutex<BTreeSet<WorkerId>>,
+    /// The attempts refused with `INPUT_MISSING`, in this process's memory
+    /// (spec 25.8 5b (b)). A mark goes when its attempt is taken, found
+    /// terminal or retired, and at most [`INPUT_MISSING_MARKS`] are kept.
+    input_missing: Mutex<std::collections::HashMap<AttemptId, MissingMark>>,
     sched: Scheduler,
 }
 
@@ -619,6 +668,7 @@ impl Coordinator {
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             capacity_refused: Mutex::default(),
+            input_missing: Mutex::default(),
             sched,
         })
     }
@@ -1521,7 +1571,20 @@ impl Coordinator {
             })
             .await?;
         if ended {
+            self.forget_missing(&a.attempt_id);
             return Ok(Sent::NotTaken);
+        }
+        // Refused for its input: not sent again, on either path, until the
+        // worker's `ready` holds the input again (spec 25.8 5b (b)).
+        match self.input_wait(link, &a.attempt_id) {
+            InputWait::Send => {}
+            InputWait::Waits => return Ok(Sent::Withheld),
+            InputWait::Expired => {
+                self.forget_missing(&a.attempt_id);
+                self.exclude_for_input(a, "not_delivered_again").await?;
+                self.observe(&a.attempt_id, Observation::Known).await?;
+                return Ok(Sent::NotTaken);
+            }
         }
         let payload: Option<AttemptPayload> = live
             .placement
@@ -1571,7 +1634,61 @@ impl Coordinator {
                 let id = a.attempt_id.clone();
                 self.db(move |s| s.record_seen(&id, true, seen, Observation::Known, wall_ms()))
                     .await?;
+                self.forget_missing(&a.attempt_id);
                 Ok(Sent::Taken)
+            }
+            Err(LinkError::Remote(e)) if e.code == ErrorCode::InputMissing => {
+                // Not taken, nothing stored: not a retry of the task. The
+                // input leaves the worker's `ready` and the attempt waits for
+                // it there. Only refusals after `ready` came back count; the
+                // third retires the attempt.
+                // The source the parent sent, not the one the worker named.
+                let field = |k: &str| {
+                    live.placement
+                        .as_ref()
+                        .and_then(|p| p.demand["payload"][k].as_str().map(str::to_string))
+                };
+                let source = field("source_id").and_then(|s| crate::ids::SourceId::parse(&s).ok());
+                let run = field("run_id").and_then(|s| crate::ids::RunId::parse(&s).ok());
+                let (Some(source), Some(run)) = (source, run) else {
+                    // Nothing to wait for: sending it again would be refused
+                    // the same way on every tick.
+                    self.exclude_for_input(a, "no_source_in_payload").await?;
+                    self.observe(&a.attempt_id, Observation::Known).await?;
+                    return Ok(Sent::NotTaken);
+                };
+                link.withdraw_input(&source);
+                match self.refused_for_input(&a.attempt_id, run.clone(), source.clone()) {
+                    None => {
+                        self.forget_missing(&a.attempt_id);
+                        self.note_refusal(&a.attempt_id, "submit_input_missing", &e)
+                            .await?;
+                        self.exclude_for_input(a, "refused_three_times").await?;
+                    }
+                    Some(strikes) => {
+                        let (aid, payload) = (
+                            a.attempt_id.clone(),
+                            json!({
+                                "worker": a.worker_id.to_string(),
+                                "source": source.to_string(),
+                                "strikes": strikes,
+                            }),
+                        );
+                        self.db(move |s| {
+                            s.append_event(
+                                Some(&run),
+                                Some(&aid),
+                                EVENT_INPUT_WAIT,
+                                &payload,
+                                wall_ms(),
+                            )
+                            .map(|_| ())
+                        })
+                        .await?;
+                    }
+                }
+                self.observe(&a.attempt_id, Observation::Known).await?;
+                Ok(Sent::NotTaken)
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
@@ -1672,6 +1789,135 @@ impl Coordinator {
                 Ok(Sent::NotTaken)
             }
         }
+    }
+
+    /// Whether `attempt` was refused for its input and the worker's
+    /// `ready` does not hold that input again yet ([`InputWait::Waits`]),
+    /// or has not for [`INPUT_WAIT`] since the mark ([`InputWait::Expired`]).
+    /// A link that keeps no `ready` never withholds.
+    fn input_wait(&self, link: &dyn WorkerLink, attempt: &AttemptId) -> InputWait {
+        let marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mark) = marks.get(attempt) else {
+            return InputWait::Send;
+        };
+        let waits = link.placement_inputs().is_some_and(|inputs| {
+            !inputs
+                .ready
+                .iter()
+                .any(|i| i.run_id == mark.run && i.source_id == mark.source)
+        });
+        if !waits {
+            InputWait::Send
+        } else if mark.marked.elapsed() >= INPUT_WAIT {
+            InputWait::Expired
+        } else {
+            InputWait::Waits
+        }
+    }
+
+    /// Mark `attempt` refused for its input. Returns the strikes counted
+    /// so far, or `None` for the third refusal in a row after its input was
+    /// ready again: then it is taken off its worker.
+    fn refused_for_input(
+        &self,
+        attempt: &AttemptId,
+        run: crate::ids::RunId,
+        source: crate::ids::SourceId,
+    ) -> Option<u8> {
+        let mut marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mark) = marks.get_mut(attempt) {
+            // (sent while marked: `ready` had come back)
+            mark.strikes = mark.strikes.saturating_add(1);
+            mark.marked = Instant::now();
+            return (mark.strikes < 3).then_some(mark.strikes);
+        }
+        if marks.len() >= INPUT_MISSING_MARKS {
+            let oldest = marks
+                .iter()
+                .min_by_key(|(_, m)| m.order)
+                .map(|(a, _)| a.clone());
+            if let Some(oldest) = oldest {
+                marks.remove(&oldest);
+            }
+        }
+        let order = marks.values().map(|m| m.order + 1).max().unwrap_or(0);
+        marks.insert(
+            attempt.clone(),
+            MissingMark {
+                run,
+                source,
+                strikes: 0,
+                marked: Instant::now(),
+                order,
+            },
+        );
+        Some(0)
+    }
+
+    /// Take `a` off its worker for its input, and leave that worker out for
+    /// its task, as for a worker that keeps refusing it.
+    async fn exclude_for_input(&self, a: &AttemptRecord, why: &str) -> Result<()> {
+        let excluded = json!({
+            "worker": a.worker_id.to_string(),
+            "code": ErrorCode::InputMissing.to_string(),
+            "reason": REASON_INPUT_MISSING,
+            "why": why,
+        });
+        let id = a.attempt_id.clone();
+        self.db(move |s| {
+            s.begin_retire_noting(
+                &id,
+                scheduler::REASON_WORKER_CANNOT_RUN,
+                Some((scheduler::EVENT_WORKER_EXCLUDED, &excluded)),
+                wall_ms(),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Drop the marks of attempts that are no longer live (gone, terminal,
+    /// retired or being retired, cancelled): they are never sent again.
+    async fn prune_missing(&self) -> Result<()> {
+        let marked: Vec<AttemptId> = {
+            let marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+            if marks.is_empty() {
+                return Ok(());
+            }
+            marks.keys().cloned().collect()
+        };
+        let gone = self
+            .db(move |s| {
+                let mut gone = Vec::new();
+                for id in marked {
+                    let live = match s.get_attempt(&id)? {
+                        Some(r) => {
+                            r.state != AttemptState::Terminal
+                                && !r.retired
+                                && r.cancel_requested_at_ms.is_none()
+                                && s.retire_tombstone(&id)?.is_none()
+                        }
+                        None => false,
+                    };
+                    if !live {
+                        gone.push(id);
+                    }
+                }
+                Ok(gone)
+            })
+            .await?;
+        let mut marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+        for id in gone {
+            marks.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn forget_missing(&self, attempt: &AttemptId) {
+        self.input_missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(attempt);
     }
 
     /// The worker stored nothing of an attempt and will not take it as it
@@ -1903,6 +2149,7 @@ impl Coordinator {
         if self.in_trial() {
             return Ok(());
         }
+        self.prune_missing().await?;
         // Tasks every attached worker is excluded for come last: however
         // many of them wait, they do not fill the scan in front of a task
         // that can be placed. A worker that is attached later is not

@@ -1006,8 +1006,9 @@ fn a_submodule_capture_that_has_not_arrived_blocks_publication() {
         .objects
         .receive_bundle(&bundle, &ci, &a.dirty_below(&ci).unwrap())
         .unwrap();
+    // (not a broken input: the child is gone, spec 25.8 5b (b))
     let err = b.publish_received(&ci, Some(&other.objects)).unwrap_err();
-    assert!(err.to_string().contains("submodule"), "{err}");
+    assert!(belt::source::store::input_gone(&err).is_some(), "{err}");
     assert!(b.manifest(&ci.source_id).unwrap().is_none());
 }
 
@@ -1543,6 +1544,30 @@ fn the_bundle_is_planned_by_the_objects_and_publication_needs_the_commit() {
     };
     let plan = a.plan_transfer(id, &other_objects).unwrap();
     assert!(plan.bundle && plan.manifests.is_empty() && plan.blobs.is_empty());
+}
+
+/// Spec 25.8 5b (h)8: the snapshot ref of a carried source that someone
+/// removed while its commit stays is not a broken input: the publication
+/// says the input is gone (`INPUT_MISSING`), never `corrupt`.
+#[test]
+fn a_removed_snapshot_ref_is_input_gone_not_corrupt() {
+    let f = fixture();
+    dirty(&f.dir);
+    let a = f.store();
+    let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
+    let id = got.manifest.ci_source_id.clone();
+    let ci = a.manifest(&id).unwrap().unwrap();
+    let r = recv(&f, "b");
+    send(&f, &a, &r, &id);
+    r.objects.check_reachable(&ci).unwrap();
+    git(
+        &r.dir.join("clone"),
+        &["update-ref", "-d", &format!("refs/local-ci/snapshots/{id}")],
+    );
+    let err = r.objects.check_reachable(&ci).unwrap_err();
+    let gone = belt::source::store::input_gone(&err).expect("typed as gone");
+    assert_eq!(gone.source, id);
+    assert!(gone.missing.is_empty());
 }
 
 #[test]
