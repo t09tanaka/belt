@@ -1967,10 +1967,10 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 ### (a) 入力の保持の終点
 
-**今の挙動。** 親の入力（source）とVaultの削除は、`input_retention_end_on`（`src/storage/coordinator/retention.rs`）が返す終点を待つ。この章の最初の版の時点で、この式は次の2つのrunで永久に終点を返さず、そのrunの入力は消えなかった。1つ目は、この章と並行して直してある。2つ目は残っている。
+**段階0より前の挙動。** 親の入力（source）とVaultの削除は、`input_retention_end_on`（`src/storage/coordinator/retention.rs`）が返す終点を待つ。この章の最初の版の時点で、この式は次の2つのrunで永久に終点を返さず、そのrunの入力は消えなかった。1つ目は、この章と並行して直してある。2つ目は、段階0の (a) で直してある。
 
 - retire済みのattemptを持つrun。retire（`attempt.retired = 1`）はterminalでないattemptにだけ付き（`free_attempt`）、付いた後もterminalにはならない。以前の式は、すべてのattemptに `state = 'terminal'` と閉じた回収を求めたので、満たさなかった。**直してある**: 今の式は `retired = 0` のattemptにだけそれを求め、終点に `retired_at_ms`・taskのcancelの時刻・runを閉じた時刻を入れる（下の規則の3・4と、終点の時刻の文のとおり）。
-- attemptを1つも持たないtaskを含むrun（配置前にcancelしたtask、適用済みのdiscoveryのprobe、joinの済んだmatrixの元）。式は「attemptの無いtaskがある」だけで終点なしとする。**残っている。** 段階0の (a) で実装するのは、この点（下の規則の2）である。
+- attemptを1つも持たないtaskを含むrun（配置前にcancelしたtask、適用済みのdiscoveryのprobe、joinの済んだmatrixの元）。以前の式は「attemptの無いtaskがある」だけで終点なしとした。**直してある**（段階0の (a)）: 今の式は、下の規則の2で判定する。閉じたrunのtaskも、配置されないので済んでいるとする（今のgenerationのattemptを持たないtaskに共通）。
 
 **規則。** runが**終わった**とは、次のすべてが成り立つことである。入力・Vaultの保持の終点と、刈り取りの条件（25.5）は、この同じ述語を使う。
 
@@ -1990,9 +1990,9 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 **規則。** 親DBの `run` に、刈り取り中の印（`pruning_at_ms`。NULLでなければ印あり）を足す。印は取り消さない。印を書くのは段階2の刈り取りだけで、段階0では誰も書かない。
 
 - **書き込みの断り。** 印のあるrunへの `retry`・enqueue・`create_task`・`create_attempt`・cancelは、`NOT_FOUND`（理由 `run_pruned`）で断る。印の確認は、それぞれが行やattemptを作るのと同じtransactionで行う。
-- **印の確認は、再送の受領より先。** cancelと `retry` は、同じ `request_id` の再送に、保存した答え（`control_request` の行）を返す。今の実装は、対象を解決する前にこの受領を引く（`src/storage/coordinator/control.rs` の `apply_cancel` の最初の文、`src/storage/coordinator/retry.rs` の3か所）。段階0で順序を入れ替え、対象のrunの印を先に確かめる。印があれば、受領の行が残っていても `NOT_FOUND`（`run_pruned`）と答える。受領の行は、刈り取りがrunと一緒に消す（25.5）ので、「刈り取りの途中は保存した答え、刈り取りの後は `NOT_FOUND`」と答えが変わる窓を作らない。
-- **読み手の断り。** 印のあるrunは、すべての読み手に `NOT_FOUND` と答える: `show`、`ls`（一覧に出さない）、`logs`、`outputs`、`top`、`ci status`（`--post` を含む）、GitHub statusの再投稿、residentの復旧と配置の走査。読み手は、印の確認と、答えに使うrunの行の読み取りを、**1つの読み取りtransaction**（同じsnapshot）で行う。複数の問い合わせで答えを組み立てる読み手（`show`、`ci status --post`）は、その全部を同じtransactionの中で行う。
-- **fileの読み手は、pinを取った後に確かめ直す。** `logs`・`outputs` は、共有pinを取った**後**に、1つの読み取りtransactionで、印が無いことと、対象がそのrunのものであることを確かめ直す。確かめ直しが通らなければ、pinを手放して `NOT_FOUND` と答え、fileを開かない。今の実装（`src/storage/coordinator.rs` の、pinを取る関数）は、pinの後に対象のrunだけを確かめ直している。ここに印を足す。pinを取る前の確認だけでは足りない: 確認とpinの間に印が書かれ、刈り取りが排他pinを取ってfileを消し、pinを手放した後に、読み手が共有pinを取れてしまう。
+- **印の確認は、再送の受領より先。** cancelと `retry` は、同じ `request_id` の再送に、保存した答え（`control_request` の行）を返す。段階0より前の実装は、対象を解決する前にこの受領を引いた（`src/storage/coordinator/control.rs` の `apply_cancel` の最初の文、`src/storage/coordinator/retry.rs` の3か所）。段階0で順序を入れ替えてあり、対象のrunの印を先に確かめる。印があれば、受領の行が残っていても `NOT_FOUND`（`run_pruned`）と答える。受領の行は、刈り取りがrunと一緒に消す（25.5）ので、「刈り取りの途中は保存した答え、刈り取りの後は `NOT_FOUND`」と答えが変わる窓を作らない。
+- **読み手の断り。** 印のあるrunは、すべての読み手に `NOT_FOUND` と答える: `show`、`ls`（一覧に出さない）、`logs`、`outputs`、`top`、`ci status`（`--post` を含む）、GitHub statusの再投稿、residentの復旧と配置の走査。読み手は、印の確認と、答えに使うrunの行の読み取りを、**1つの読み取りtransaction**（同じsnapshot）で行う。複数の問い合わせで答えを組み立てる読み手（`show`、`ci status --post`）は、その全部を同じtransactionの中で行う。**段階0の実装は、これを次の形で満たす**（wireを変えないため）: `show` は既存の2つの問い合わせ（`Run`、`Tasks`）のままで、それぞれが自分のsnapshotで印を確かめる。`ci status` は、最初の読み取りの前と最後の読み取りの後に印を確かめる。印は取り消されず、行は印の後にだけ消えるので、後の確認で印が無ければ、それより前の読み取りはすべて欠けの無いrunを見ている。印があれば `NOT_FOUND` と答え、途中の読み取りの結果は使わない。
+- **fileの読み手は、pinを取った後に確かめ直す。** `logs`・`outputs` は、共有pinを取った**後**に、1つの読み取りtransactionで、印が無いことと、対象がそのrunのものであることを確かめ直す。確かめ直しが通らなければ、pinを手放して `NOT_FOUND` と答え、fileを開かない。段階0より前の実装（`src/storage/coordinator.rs` の、pinを取る関数）は、pinの後に対象のrunだけを確かめ直していた。段階0で、同じsnapshotに印を足してある。pinを取る前の確認だけでは足りない: 確認とpinの間に印が書かれ、刈り取りが排他pinを取ってfileを消し、pinを手放した後に、読み手が共有pinを取れてしまう。
 
 **決定: 「印のあるrunは無い」とする。** 採らなかった案は「印から最後まで排他pinを持ち続ける」である。pinを持ち続ける案は、(1) passをまたいで、さらにresidentの再起動をまたいでdescriptorを持ち続けることはできず、再起動の直後に必ず窓が開く、(2) pinを取らない読み手（`show`・`ls`・`ci status`）には効かない、(3) fileの読み手が「無い」ではなく待ちか失敗になる。印はDBに永続し、読み手のsnapshotの中で確かめられるので、半分消えたrunを見る経路が無い。
 
@@ -2502,7 +2502,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 外したメンバー | `coordinator.db` の `removed_member` | 接続の拒否 | 戻したときに消す | 外した名前ごとに1行 | 既存 | 利用者の操作 |
 | 結果 | `results/<attempt>/`（result・log・artifact・`tmp/*.part`） | `logs`・`outputs`・CIの後のJobのdownload | attemptごとに、終了と回収を閉じた時点の遅い方から `retention_days` 日。workflow artifactは、runが終わってから `retention_days` 日。spoolは1 GiB/task、artifactは1 GiB/upload | 同じ。刈り取りの段3が残りを消す | 既存（残りは2） | 排他pinと、回収が閉じていること |
 | readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | 消さない。結果のGCが、行の無いrunのpinも作る | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
-| 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日。ただし、attemptの無いtaskを含むrunでは消えない（25.3） | 同じ（終点を直す） | 既存（修正は0） | 索引に参照が無いこと、排他lock |
+| 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日（終点は25.3の (a)） | 同じ | 既存 | 索引に参照が無いこと、排他lock |
 | 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | 行を消さない。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
 | runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 消さない | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
 | 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る（親では、片付ける処理が呼ばれていない） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
