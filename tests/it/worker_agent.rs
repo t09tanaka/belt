@@ -1153,6 +1153,23 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let worker = WorkerId::parse("snapshot-worker").unwrap();
     let store = WorkerStore::open(dir.path(), &worker).unwrap();
+    // An event of an attempt is written only while the attempt has a row.
+    let attempt = AttemptId::generate();
+    store
+        .for_member(&CoordinatorId::generate())
+        .submit(
+            belt::storage::NewAcceptance {
+                attempt_id: attempt.clone(),
+                run_id: RunId::generate(),
+                task_id: TaskId::generate(),
+                generation: Generation(1),
+                payload_hash: PayloadHash::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+                coordinator_epoch: CoordinatorEpoch(1),
+                spec: serde_json::json!({"cmd": "true"}),
+            },
+            1,
+        )
+        .unwrap();
     // Put the schema in the main DB first. The following single event commit
     // then stays below SQLite's automatic WAL checkpoint threshold.
     let checkpoint = rusqlite::Connection::open(dir.path().join("worker.db")).unwrap();
@@ -1160,7 +1177,6 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     drop(checkpoint);
-    let attempt = AttemptId::generate();
     let marker = "synthetic-snapshot-marker-123456789";
     store
         .append_event(
