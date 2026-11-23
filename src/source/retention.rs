@@ -1341,6 +1341,22 @@ mod tests {
             self.settle(&attempt, 3);
             (task, attempt)
         }
+        /// `run`, bound to its source, with one task that has no attempt.
+        fn unplaced_run(&self, run: &RunId, spec: &serde_json::Value) -> TaskId {
+            let id = self.store.source_of_run(run).unwrap().unwrap();
+            let source = super::super::classify::source_id_of_ci(&id).unwrap();
+            let manifest = self.store.manifest(&id).unwrap().unwrap();
+            let digest = Digest::parse(&manifest.manifest_digest)
+                .or_else(|_| Digest::parse(&format!("sha256:{}", manifest.manifest_digest)))
+                .unwrap();
+            self.owner.put_source_ref(&source, &digest, 1).unwrap();
+            self.owner
+                .create_run(run, Some(&source), None, &serde_json::json!({}), 1)
+                .unwrap();
+            let task = TaskId::generate();
+            self.owner.create_task(&task, run, spec, 1).unwrap();
+            task
+        }
         fn spare(&self, task: &TaskId, at: u64) -> AttemptId {
             let attempt = AttemptId::generate();
             self.owner
@@ -1692,6 +1708,72 @@ mod tests {
         assert_eq!(f.source_end(&run), Some(6));
         f.owner.close_run(&run, 7).unwrap();
         assert_eq!(f.source_end(&run), Some(7));
+    }
+    /// Spec 25.3 (a), rule 2. A run none of whose tasks was ever placed has
+    /// no attempt to end: it ends when the last of them is cancelled, or
+    /// when it is closed. Until then a task that waits to be placed, held or
+    /// not, still reads the inputs.
+    #[test]
+    fn a_run_whose_tasks_were_never_placed_ends_at_their_cancel_or_at_its_close() {
+        for held in [false, true] {
+            let f = Fixture::new();
+            let run = RunId::generate();
+            f.bind(&run);
+            let spec = serde_json::json!({"ci": {"hold": held}});
+            let first = f.unplaced_run(&run, &spec);
+            let second = TaskId::generate();
+            f.owner.create_task(&second, &run, &spec, 2).unwrap();
+            assert_eq!(f.source_end(&run), None, "both wait to be placed");
+            f.cancel_at(&first, 30);
+            assert_eq!(f.source_end(&run), None, "one still waits");
+            f.cancel_at(&second, 20);
+            assert_eq!(f.source_end(&run), Some(30), "the later cancel");
+
+            let f = Fixture::new();
+            let run = RunId::generate();
+            f.bind(&run);
+            f.unplaced_run(&run, &spec);
+            f.owner.close_run(&run, 40).unwrap();
+            assert_eq!(f.source_end(&run), Some(40), "a closed run places nothing");
+        }
+    }
+    /// Spec 25.3 (a), rule 2. A probe whose discovery was applied and the
+    /// origin of a matrix whose members were joined are never placed
+    /// themselves: they hold the inputs only until then, and the end is the
+    /// one of the tasks that ran.
+    #[test]
+    fn a_task_that_is_never_placed_itself_holds_the_inputs_only_until_it_is_settled() {
+        for (pending, settled) in [
+            (
+                serde_json::json!({"ci": {"task": {"inputs": {"belt_discovery": {"applied": false}}}}}),
+                serde_json::json!({"ci": {"task": {"inputs": {"belt_discovery": {"applied": true}}}}}),
+            ),
+            (
+                serde_json::json!({"ci": {"dynamic_origin": true}}),
+                serde_json::json!({"ci": {"dynamic_origin": true, "core_outcome": "success"}}),
+            ),
+        ] {
+            let f = Fixture::new();
+            let run = RunId::generate();
+            f.bind(&run);
+            f.terminal(&run);
+            assert_eq!(f.source_end(&run), Some(5));
+            let task = TaskId::generate();
+            f.owner.create_task(&task, &run, &pending, 6).unwrap();
+            assert_eq!(f.source_end(&run), None, "{pending}");
+            let (id, spec) = (task.to_string(), settled.to_string());
+            f.owner
+                .db
+                .call(move |c| {
+                    c.execute(
+                        "UPDATE task SET spec_json=?1 WHERE task_id=?2",
+                        rusqlite::params![spec, id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(f.source_end(&run), Some(5), "{settled}");
+        }
     }
     #[test]
     fn exclusive_preview_fences_enqueue_without_holding_coordinator_transaction() {

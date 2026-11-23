@@ -34,6 +34,7 @@ async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 
 fn worker_command(
     home: &std::path::Path,
+    tools: &std::path::Path,
     cluster: &ClusterId,
     key: &std::path::Path,
 ) -> tokio::process::Command {
@@ -43,6 +44,7 @@ fn worker_command(
         .args(["--name", "colab", "--key-file"])
         .arg(key)
         .env("HOME", home)
+        .env("PATH", tools)
         .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -61,17 +63,20 @@ async fn stop_with_live_attempt(pre: &str, tail: &str, bound: Duration) {
     belt::secrets::key::init(&key).unwrap();
     let cluster = ClusterId::generate();
     let state = home.join(".belt");
-    let mut worker = tokio::process::Command::new(BIN)
-        .args(["worker", "--ephemeral", "--cluster"])
-        .arg(cluster.to_string())
-        .args(["--name", "colab", "--key-file"])
-        .arg(&key)
-        .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
+    let tools = crate::common::tool_stubs(home);
+    // The attempt uses absolute shell/sleep paths and only needs mv on PATH;
+    // the worker needs git to start. Nothing else of the host is on PATH, so
+    // its native probes see only stubs that answer at once.
+    std::os::unix::fs::symlink("/bin/mv", tools.join("mv")).unwrap();
+    let git = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("git on the PATH of the test");
+    std::os::unix::fs::symlink(git, tools.join("git")).unwrap();
+    let mut worker = worker_command(home, &tools, &cluster, &key)
         .spawn()
         .unwrap();
     let worker_pid = worker.id().unwrap();
@@ -215,7 +220,9 @@ async fn stop_with_live_attempt(pre: &str, tail: &str, bound: Duration) {
     assert!(!state.exists(), "state was kept: {stderr}");
 
     // A new ephemeral worker starts on the same host and ends cleanly.
-    let mut again = worker_command(home, &cluster, &key).spawn().unwrap();
+    let mut again = worker_command(home, &tools, &cluster, &key)
+        .spawn()
+        .unwrap();
     let again_pid = again.id().unwrap();
     assert!(again_pid > 1);
     wait_for("the new worker to listen", || {

@@ -57,6 +57,9 @@ pub fn page(
                 ..Default::default()
             })
         }
+        // The run was pruned, or is being pruned, since the cursor named it:
+        // its position is dropped and the next page reads the next run.
+        Err(crate::storage::StorageError::NotFound { .. }) => return Ok(PageReport::default()),
         Err(e) => return Err(e.into()),
     };
     let claim = store.claim_result_page(
@@ -173,5 +176,42 @@ mod tests {
         })
         .await
         .expect("GC owner did not drain");
+    }
+
+    /// Spec 25.5. The cursor names a run that was marked for pruning, or
+    /// pruned, since the page before: the page makes no pin for it, drops
+    /// its position and leaves the next page to read the run after it.
+    #[test]
+    fn a_page_passes_over_a_run_that_is_being_pruned_or_is_gone_and_makes_no_pin() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let store = CoordinatorStore::open(root.path(), 1).unwrap();
+        let files = ResultStore::open(&root.path().join("results")).unwrap();
+        let marked = crate::ids::RunId::generate();
+        store
+            .create_run(&marked, None, None, &serde_json::json!({}), 1)
+            .unwrap();
+        store.mark_pruning_for_test(&marked);
+        let gone = crate::ids::RunId::generate();
+        for run in [marked, gone] {
+            let pin = root.path().join(format!("reader-pins/{run}.lock"));
+            let _ = std::fs::remove_file(&pin);
+            let mut cursor = Cursor {
+                run_after: None,
+                current: Some((run.clone(), "ref".into())),
+            };
+            let report = page(&store, &files, &mut cursor, 7).unwrap();
+            assert_eq!((report.examined, report.removed, report.deleted), (0, 0, 0));
+            assert!(!report.skipped, "not a run to come back to");
+            assert!(
+                cursor.current.is_none(),
+                "the position in the run is dropped"
+            );
+            assert_eq!(
+                cursor.run_after,
+                Some(run),
+                "the next page reads the run after it"
+            );
+            assert!(!pin.exists(), "no pin was made");
+        }
     }
 }

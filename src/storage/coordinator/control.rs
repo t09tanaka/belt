@@ -158,8 +158,13 @@ impl CoordinatorStore {
     pub fn completion(&self, target: Target) -> Result<Snapshot> {
         let (cancel, collections, retry) =
             (self.task_cancel, self.collections, self.retry_boundaries);
+        let pruning = self.pruning;
         self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
+            // The mark and the rows of the answer are one snapshot.
+            if pruning {
+                refuse_pruned_target(&tx, &target)?;
+            }
             completion_on(&tx, target, cancel, collections, retry)
         })
     }
@@ -172,6 +177,8 @@ fn apply_cancel(
     request_id: String,
     at_ms: u64,
 ) -> Result<Snapshot> {
+    check_request_id(&request_id)?;
+    refuse_pruned_target(c, &target)?;
     if let Some(snapshot) = control_receipt(c, &target, expected, &request_id, "cancel")? {
         return Ok(snapshot);
     }
@@ -212,6 +219,26 @@ fn apply_cancel(
     Ok(snapshot)
 }
 
+fn check_request_id(request_id: &str) -> Result<()> {
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(StorageError::Invalid("invalid control request ID".into()));
+    }
+    Ok(())
+}
+
+/// Refuse a control request whose run carries the mark of a pruned run
+/// (spec 25.3 (b)). Every caller reads this before [`control_receipt`]: the
+/// receipt of a request is deleted with its run, so a retransmission to a
+/// marked run is answered `run_pruned` while the receipt is still there,
+/// and not the stored answer first and "not found" later. A target without
+/// a row carries no mark and is answered as before.
+pub(super) fn refuse_pruned_target(c: &Connection, target: &Target) -> Result<()> {
+    match target {
+        Target::Run(run) => refuse_pruned(c, run.as_str()),
+        Target::Task(task) => refuse_pruned_task(c, task.as_str()),
+    }
+}
+
 pub(super) fn control_receipt<T: DeserializeOwned>(
     c: &Connection,
     target: &Target,
@@ -219,9 +246,7 @@ pub(super) fn control_receipt<T: DeserializeOwned>(
     request_id: &str,
     operation: &str,
 ) -> Result<Option<T>> {
-    if request_id.is_empty() || request_id.len() > 128 {
-        return Err(StorageError::Invalid("invalid control request ID".into()));
-    }
+    check_request_id(request_id)?;
     let previous: Option<(String, String, i64, String)> = c.query_row(
         "SELECT operation,target_json,expected_revision,reply_json FROM control_request WHERE request_id=?1",
         [request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
