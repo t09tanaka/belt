@@ -400,7 +400,7 @@ fn shared_page(
 
 /// Remove the membership `object` of `root`, and the object's rows when no
 /// root and no claim names it any more.
-fn forget_member(c: &mut Connection, root: &str, object: &str) -> Result<()> {
+pub(super) fn forget_member(c: &mut Connection, root: &str, object: &str) -> Result<()> {
     let tx = c.transaction()?;
     tx.execute(
         "DELETE FROM member WHERE root=?1 AND object=?2",

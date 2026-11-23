@@ -20,6 +20,7 @@ pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
+pub use deletion::{ReceivedPassInputs, ReceivedPassReport, SourceUse};
 pub use deletion::{RetentionCursor, RetentionPage};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::fs::{File, TryLockError};
@@ -247,7 +248,7 @@ impl Index {
     fn ensure_size_accounting(db: &mut Connection) -> Result<()> {
         const CHECK: &str = "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')
             AND EXISTS(SELECT 1 FROM pragma_table_info('root') WHERE name='used_ms')
-            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','root_used','graph_source','clone_ref_root'))=9
+            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','root_used','root_used_id','graph_source','clone_ref_root'))=10
             AND (SELECT count(*) FROM meta WHERE key IN ('store_bytes','bytes_fill','clone_ref_fill'))=3";
         let ready: bool = db.query_row(CHECK, [], |r| r.get(0))?;
         if ready {
@@ -265,6 +266,7 @@ impl Index {
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS object_bytes(id TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS root_used ON root(kind,used_ms);
+             CREATE INDEX IF NOT EXISTS root_used_id ON root(kind,used_ms,id);
              CREATE INDEX IF NOT EXISTS graph_source ON graph(source,root);
              CREATE TABLE IF NOT EXISTS clone_ref(clone TEXT NOT NULL,source TEXT NOT NULL,root TEXT NOT NULL,PRIMARY KEY(clone,source,root));
              CREATE INDEX IF NOT EXISTS clone_ref_root ON clone_ref(root);
@@ -2216,6 +2218,8 @@ impl SourceStore {
 
 #[cfg(test)]
 mod abandon_tests;
+#[cfg(test)]
+mod received_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

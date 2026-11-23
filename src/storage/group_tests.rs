@@ -1047,3 +1047,28 @@ fn an_accepted_attempt_records_its_source_and_the_migration_fills_live_rows_only
         1
     );
 }
+
+#[test]
+fn a_source_is_in_use_while_any_member_has_a_live_attempt_naming_it() {
+    // spec 25.8 5b (a) (1) and L6: the deleting pass asks across every
+    // member, and learns the newest terminal time of the ended ones.
+    let t = two();
+    let source = SourceId::parse("src_01JABCDEFGHJKMNPQRSTVWXYZ0").unwrap();
+    assert_eq!(t.a.source_use(&source).unwrap(), (false, None));
+    let x = AttemptId::generate();
+    let mut new = acceptance(&x, &TaskId::generate(), 'b', 1);
+    new.spec = json!({"cmd": "true", "source_id": source.as_str()});
+    t.b.submit(new, 5).unwrap();
+    assert_eq!(t.a.source_use(&source).unwrap(), (true, None));
+    t.own
+        .db
+        .write(|tx| {
+            tx.execute(
+                "UPDATE worker_attempt SET state='terminal', termination_json='{}', terminal_at_ms=77",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(t.a.source_use(&source).unwrap(), (false, Some(77)));
+}
