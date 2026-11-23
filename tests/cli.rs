@@ -11,6 +11,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 const FAKE_NPM: &str = r#"#!/bin/sh
@@ -6487,6 +6488,26 @@ fn spares_beyond_a_lowered_pool_size_are_discarded_by_the_next_command() {
     assert_eq!(w.spares().len(), 1);
 }
 
+/// As when no command ran for 8 days in the repository whose directory
+/// of the cache is `repo`.
+fn unused_for_8_days(repo: &Path) {
+    let then = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 8 * 86_400;
+    for p in [repo.join(".main"), repo.join("pool")] {
+        let ok = Command::new("perl")
+            .args(["-e", "utime($ARGV[0], $ARGV[0], $ARGV[1]) or exit 1"])
+            .arg(then.to_string())
+            .arg(&p)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "could not age {}", p.display());
+    }
+}
+
 #[test]
 fn the_spares_of_a_repository_that_is_gone_are_removed_by_a_command_elsewhere() {
     let w = World::new();
@@ -6504,13 +6525,54 @@ fn the_spares_of_a_repository_that_is_gone_are_removed_by_a_command_elsewhere() 
     w.fw(&second, &["add", "../second-a", "-b", "a"])
         .assert_ok();
     assert!(spare.is_dir(), "its repository is there");
-    // The first repository is deleted.
+    // The first repository is deleted. That alone changes nothing: it was
+    // in use a moment ago, and may be back.
     fs::remove_dir_all(&main).unwrap();
     w.forget_stamps();
     w.fw(&second, &["add", "../second-b", "-b", "b"])
         .assert_ok();
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert!(spare.is_dir(), "used this week");
+    // A week without a command of it, and it goes whole.
+    unused_for_8_days(&repo);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-c", "-b", "c"])
+        .assert_ok();
     wait_until("the gone repository's cache directory", || !repo.exists());
     assert!(!spare.exists());
+}
+
+#[test]
+fn the_spares_of_a_repository_that_is_not_used_are_discarded_and_unregistered() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(2);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let repo = w.pool_dir().parent().unwrap().to_path_buf();
+    assert_eq!((w.spares().len(), w.pool_registrations()), (2, 2));
+    // Another repository makes the walks; the first is there, unused.
+    w.git(&w.base, &["clone", "-q", "upstream", "second"]);
+    let second = w.base.join("second");
+    w.pool_size(0);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-a", "-b", "a"])
+        .assert_ok();
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!((w.spares().len(), w.pool_registrations()), (2, 2));
+    unused_for_8_days(&repo);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-b", "-b", "b"])
+        .assert_ok();
+    // Files and registrations, as any spare is discarded; the rest of the
+    // repository's directory of the cache stays.
+    wait_until("the unused repository's spares", || {
+        w.spares().is_empty() && w.pool_registrations() == 0
+    });
+    assert!(repo.join("pool/fill.lock").is_file());
+    assert!(!repo.join("pool/fill.log").exists());
+    assert!(repo.join(".main").is_file());
+    let list = w.git(&main, &["worktree", "list", "--porcelain"]);
+    assert_eq!(list.matches("worktree ").count(), 1, "{list}");
 }
 
 #[test]

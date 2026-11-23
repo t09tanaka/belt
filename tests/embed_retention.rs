@@ -3,7 +3,8 @@
 //! worktrees, and `sweep_trash` for the cache.
 
 use fast_worktree::{
-    sweep_trash, Checkout, CreateOptions, Output, RemoveMode, RemoveOptions, Repository, Start,
+    sweep_trash, Checkout, CreateOptions, KeptRefDeletion, Output, RemoveMode, RemoveOptions,
+    Repository, Start,
 };
 use std::fs;
 use std::path::Path;
@@ -23,14 +24,17 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn age(path: &Path, secs_ago: u64) {
-    let now = std::time::SystemTime::now()
+fn now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+}
+
+fn age(path: &Path, secs_ago: u64) {
     let ok = Command::new("perl")
         .args(["-e", "utime($ARGV[0], $ARGV[0], $ARGV[1]) or exit 1"])
-        .arg((now - secs_ago).to_string())
+        .arg((now() - secs_ago).to_string())
         .arg(path)
         .status()
         .unwrap()
@@ -103,14 +107,70 @@ fn library_calls_make_the_sweep() {
         .iter()
         .any(|l| l.text.contains(old) && l.text.contains(&head));
     assert!(said, "{:?}", made.log);
+    // And in the result, for a caller that does not read the log.
+    assert_eq!(made.deleted_kept_refs.len(), 1, "{:?}", made);
+    let d = &made.deleted_kept_refs[0];
+    assert_eq!((d.name.as_str(), d.commit.as_str()), (old, head.as_str()));
+    assert_eq!(d.reason, KeptRefDeletion::Expired);
 
     // So does removing one, an hour later.
     git(&main, &["update-ref", old, &head]);
     for e in fs::read_dir(&cache).unwrap().flatten() {
         let _ = fs::remove_file(e.path().join(".retention-stamp"));
     }
-    repo.remove_worktree(&made.path, &RemoveOptions::new(RemoveMode::Discard))
+    let quiet = repo.clone().with_output(Output::Discard);
+    let removed = quiet
+        .remove_worktree(&made.path, &RemoveOptions::new(RemoveMode::Discard))
         .unwrap();
+    assert!(refs(&main).is_empty(), "{}", refs(&main));
+    assert!(removed.log.is_empty());
+    assert_eq!(removed.deleted_kept_refs.len(), 1, "{removed:?}");
+    assert_eq!(removed.deleted_kept_refs[0].name, old);
+
+    // `prune_kept_refs` goes by age alone, as it always did: a ref that
+    // a branch has made needless stays until it is that old.
+    let stamp = |secs_ago: u64| {
+        let out = Command::new("perl")
+            .args([
+                "-MPOSIX",
+                "-e",
+                "print strftime('%Y%m%d-%H%M%S', gmtime($ARGV[0]))",
+            ])
+            .arg((now() - secs_ago).to_string())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let held = format!("refs/fast-worktree/kept/held-{}/head", stamp(2 * 86_400));
+    git(&main, &["update-ref", &held, &head]);
+    assert_eq!(repo.prune_kept_refs(30).unwrap(), 0);
+    assert_eq!(repo.prune_kept_refs(3).unwrap(), 0);
+    assert!(refs(&main).contains(&held));
+    // A fill deletes none either: it has nowhere to say so.
+    fs::create_dir_all(base.join("xdg/fast-worktree")).unwrap();
+    fs::write(
+        base.join("xdg/fast-worktree/config.toml"),
+        "[pool]\nsize = 1\n",
+    )
+    .unwrap();
+    for e in fs::read_dir(&cache).unwrap().flatten() {
+        let _ = fs::remove_file(e.path().join(".retention-stamp"));
+    }
+    let _ = repo.fill_pool();
+    fs::remove_file(base.join("xdg/fast-worktree/config.toml")).unwrap();
+    assert!(refs(&main).contains(&held));
+    // The automatic rule, asked for: it is held by the branch.
+    let swept = repo.sweep_kept_refs().unwrap();
+    assert_eq!(swept.len(), 1, "{swept:?}");
+    assert_eq!(swept[0].name, held);
+    assert!(
+        matches!(&swept[0].reason, KeptRefDeletion::HeldBy { holder, .. } if holder == "trunk"),
+        "{swept:?}"
+    );
+    assert!(refs(&main).is_empty(), "{}", refs(&main));
+    // And age alone still deletes what is that old, held or not.
+    git(&main, &["update-ref", &held, &head]);
+    assert_eq!(repo.prune_kept_refs(2).unwrap(), 1);
     assert!(refs(&main).is_empty(), "{}", refs(&main));
 
     // `sweep_trash` walks the cache of every repository.

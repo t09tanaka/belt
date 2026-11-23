@@ -165,6 +165,18 @@ pub fn helper_exe() -> std::io::Result<PathBuf> {
     }
 }
 
+/// The executable for background work that only this version knows how to
+/// do (`cache retire`): [`helper_exe`], except that a program that embeds
+/// the library and has no helper in place (as in [`crate::sweep_trash`])
+/// gets none, since the running binary is then not `fast-worktree`.
+pub fn background_exe() -> Option<PathBuf> {
+    let configured = CONTEXT.with(|c| c.borrow().is_some());
+    if !configured && is_embedded() {
+        return None;
+    }
+    helper_exe().ok()
+}
+
 /// `Command::status`, except that while the library captures output, what
 /// the command writes goes to the sink too and not to this process's own
 /// stdout and stderr.

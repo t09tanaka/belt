@@ -73,6 +73,12 @@ const KEEP_SECS: u64 = 7 * 86_400;
 /// this old: the pid may be another process's by now. Making a spare, or
 /// moving one to where it belongs, takes minutes at most.
 const LEFTOVER_MAX_SECS: u64 = 86_400;
+/// A leftover whose owner is gone by its pid still stays until its inode
+/// last changed this long ago, as a half-made cache entry does
+/// ([`cache::TMP_MIN_AGE`]): a pid says nothing about a process in another
+/// pid namespace (a container that shares the cache), where the fill that
+/// is making it may be alive.
+const LEFTOVER_MIN_SECS: u64 = cache::TMP_MIN_AGE.as_secs();
 /// How long `pool fill` lets the fetch of the default branch take.
 const FETCH_LIMIT: Duration = Duration::from_secs(60);
 
@@ -411,7 +417,9 @@ pub fn fill_for(main: &Path, after: Option<&Path>) -> Result<i32> {
         outln!("the pool is off: set [pool] size in {}", hooks::FILE);
         return Ok(0);
     }
-    crate::retention::run(Some(&main));
+    // Not the part that deletes kept refs: this mostly runs in the
+    // background, where nobody reads what it says.
+    crate::retention::run_in_fill(&main);
     let pool = dir(&main);
     let Some(_lock) = try_lock(&pool)? else {
         outln!("{} fill  another fill is running", stamp());
@@ -693,24 +701,32 @@ fn maker_of(id: &str) -> Option<u32> {
 /// is left alone.
 ///
 /// A `.new-<id>` or `.no-hooks-<id>` is what the fill with the pid in the
-/// id is making: a leftover when that process is gone (`alive`), when the
+/// id is making: a leftover when that process is gone (`alive`) or the
 /// caller holds the fill lock (`fill_idle`: only a fill makes them, and no
-/// fill is running), or, whatever the pid says, when the time in the id is
-/// more than [`LEFTOVER_MAX_SECS`] ago. So the sweep of a command needs no
-/// fill lock to tell, and a fill that starts meanwhile is not turned away.
+/// fill is running), and its inode last changed at least `min_age` seconds
+/// ago; or, whatever the pid says, when the time in the id is more than
+/// [`LEFTOVER_MAX_SECS`] ago. So the sweep of a command needs no fill lock
+/// to tell, and a fill that starts meanwhile is not turned away.
 ///
 /// A `.claimed-<pid>-<id>` is a spare that the `add` with that pid took: a
-/// leftover when that process is gone, or when it was taken (its inode
-/// last changed) more than [`LEFTOVER_MAX_SECS`] ago.
+/// leftover when that process is gone and it was taken (its inode last
+/// changed) at least `min_age` seconds ago, or when it was taken more than
+/// [`LEFTOVER_MAX_SECS`] ago.
+///
+/// `min_age` ([`LEFTOVER_MIN_SECS`]) is there because neither a pid nor,
+/// on some shared file systems, a lock is seen from another machine or
+/// container that uses the same cache.
 fn stale_leftovers(
     entries: &[(String, u64)],
     now: u64,
     fill_idle: bool,
+    min_age: u64,
     alive: &dyn Fn(u32) -> bool,
 ) -> Vec<String> {
     entries
         .iter()
         .filter(|(name, changed_ago)| {
+            let settled = *changed_ago >= min_age;
             if let Some(id) = name
                 .strip_prefix(NO_HOOKS_PREFIX)
                 .or_else(|| name.strip_prefix(BUILDING_PREFIX))
@@ -718,7 +734,8 @@ fn stale_leftovers(
                 let (Some(created), Some(pid)) = (created_of(id), maker_of(id)) else {
                     return false;
                 };
-                return fill_idle || !alive(pid) || created + LEFTOVER_MAX_SECS < now;
+                return ((fill_idle || !alive(pid)) && settled)
+                    || created + LEFTOVER_MAX_SECS < now;
             }
             if let Some((pid, id)) = name
                 .strip_prefix(CLAIMED_PREFIX)
@@ -727,7 +744,7 @@ fn stale_leftovers(
                 return maker_of(id).is_some()
                     && pid
                         .parse::<u32>()
-                        .is_ok_and(|p| !alive(p) || *changed_ago > LEFTOVER_MAX_SECS);
+                        .is_ok_and(|p| (!alive(p) && settled) || *changed_ago > LEFTOVER_MAX_SECS);
             }
             false
         })
@@ -778,6 +795,11 @@ pub fn sweep_in(main: &Path, pool: &Path) {
 /// Discard the leftovers of killed runs in `pool` ([`stale_leftovers`]).
 /// `fill_idle`: the caller holds the fill lock.
 fn sweep_leftovers(main: &Path, pool: &Path, fill_idle: bool) {
+    sweep_leftovers_aged(main, pool, fill_idle, LEFTOVER_MIN_SECS);
+}
+
+/// [`sweep_leftovers`] with the least age of a leftover given.
+fn sweep_leftovers_aged(main: &Path, pool: &Path, fill_idle: bool, min_age: u64) {
     let wall = SystemTime::now();
     let entries: Vec<(String, u64)> = fs::read_dir(pool)
         .into_iter()
@@ -794,7 +816,7 @@ fn sweep_leftovers(main: &Path, pool: &Path, fill_idle: bool) {
             Some((name, changed))
         })
         .collect();
-    for name in stale_leftovers(&entries, now_secs(), fill_idle, &cache::pid_alive) {
+    for name in stale_leftovers(&entries, now_secs(), fill_idle, min_age, &cache::pid_alive) {
         let path = pool.join(&name);
         if name.starts_with(NO_HOOKS_PREFIX) {
             // Empty, unless something put a file there.
@@ -803,6 +825,162 @@ fn sweep_leftovers(main: &Path, pool: &Path, fill_idle: bool) {
             discard(main, &path);
         }
     }
+}
+
+/// Whether `name` in a pool directory is a spare in any state: ready
+/// (`wt-<id>`), being made (`.new-<id>`, `.no-hooks-<id>`) or taken
+/// (`.claimed-<pid>-<id>`). Its id, when it is.
+fn spare_id(name: &str) -> Option<&str> {
+    let id = if let Some(rest) = name.strip_prefix(CLAIMED_PREFIX) {
+        let (pid, id) = rest.split_once('-')?;
+        pid.parse::<u32>().ok()?;
+        id
+    } else {
+        name.strip_prefix(BUILDING_PREFIX)
+            .or_else(|| name.strip_prefix(NO_HOOKS_PREFIX))
+            .unwrap_or(name)
+    };
+    maker_of(id).map(|_| id)
+}
+
+/// Empty the pool directory `pool` of a repository that ran no command for
+/// [`crate::retention::IDLE`]: a spare is there for the next `add` of its
+/// repository, and nothing shows that one is coming. The spares in every
+/// state go, and `fill.log` and `misses` (which only say something about
+/// the last 7 days). `fill.lock` and the directory stay
+/// ([`crate::retention`]); so does every name that is not one of these.
+///
+/// With the main checkout `main` (it is there), each spare is discarded as
+/// everywhere else: unregistered, then deleted. Without it (the checkout
+/// cannot be reached: a volume that is not mounted, a checkout that was
+/// moved) the directories are only moved into the trash, added to `moved`
+/// for the caller's deleter, and their registrations stay in the
+/// repository until its next command ([`drop_dangling`]).
+///
+/// Only the detached process of the walk calls this. The fill lock is
+/// taken without waiting. Returns false when a fill holds it: nothing was
+/// done, and the next walk tries again.
+pub fn retire(pool: &Path, main: Option<&Path>, moved: &mut Vec<PathBuf>) -> bool {
+    let names: Vec<String> = fs::read_dir(pool)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n == FILL_LOG || n == MISSES || spare_id(n).is_some())
+        .collect();
+    if names.is_empty() {
+        return true;
+    }
+    let _lock = match util::lock_path(&pool.join(FILL_LOCK), false, false) {
+        Ok(Some(f)) => Some(f),
+        Ok(None) => return false,
+        // A file system without locks: no fill holds it either.
+        Err(_) => None,
+    };
+    let now = now_secs();
+    for name in names {
+        let path = pool.join(&name);
+        if name == FILL_LOG {
+            let _ = fs::remove_file(&path);
+        } else if name == MISSES {
+            let _ = edit_misses(&path, false, |text| kept_misses(text, now));
+        } else if name.starts_with(NO_HOOKS_PREFIX) {
+            let _ = fs::remove_dir(&path);
+        } else if let Some(main) = main {
+            // Under a name of our own first, as `add` takes one: an `add`
+            // of an older version (which does not say that the repository
+            // is in use) then finds no spare, rather than half of one.
+            let claimed = match name.starts_with(SPARE_PREFIX) {
+                true => pool.join(format!("{CLAIMED_PREFIX}{}-{name}", std::process::id())),
+                false => path.clone(),
+            };
+            if claimed == path || fs::rename(&path, &claimed).is_ok() {
+                discard(main, &claimed);
+            }
+        } else if let Ok(dest) = trash::move_aside(&path) {
+            moved.push(dest);
+        }
+    }
+    true
+}
+
+/// The pool directory and the id of the spare that a registration in
+/// `.git/worktrees` is for: `locked` is what its `locked` file holds, and
+/// `worktree` the path its `gitdir` file gives. `None` unless it is locked
+/// with exactly the reason every version locks its spares with
+/// ([`LOCK_REASON`]; a worktree that the user or another tool locked is
+/// never ours to touch), and unless the path is
+/// `<cache>/<repository>/pool/<a spare's name>` in this cache (`roots`:
+/// the cache root as it is written and as it resolves). A spare that
+/// another machine made in a cache of its own, for a repository on a
+/// shared disk, is then left alone unless that cache is at the same path.
+fn registered_spare<'a>(
+    locked: Option<&str>,
+    worktree: &'a Path,
+    roots: &[PathBuf],
+) -> Option<(&'a Path, &'a str)> {
+    let reason = locked?;
+    if reason.strip_suffix('\n').unwrap_or(reason) != LOCK_REASON {
+        return None;
+    }
+    let id = spare_id(worktree.file_name()?.to_str()?)?;
+    let pool = worktree.parent()?;
+    let repo = pool.parent()?;
+    let ours = pool.file_name()? == "pool"
+        && cache::is_repo_name(repo.file_name()?.to_str()?)
+        && roots.iter().any(|r| repo.parent() == Some(r.as_path()));
+    ours.then_some((pool, id))
+}
+
+/// Unregister the spares of the repository at `main` whose directories
+/// are no longer there: the registrations (`.git/worktrees/wt-*`, each
+/// with an index) that are left when the cache directory of the repository
+/// went without git being told. That happens when the repository was not
+/// in use and could not be reached ([`retire`]), and when its checkout was
+/// moved: the spares stay behind under the old path's name and go with it
+/// ([`crate::retention`]), while the registrations moved with `.git`.
+/// They are locked, so `git worktree prune` keeps them for ever.
+///
+/// Only a registration that [`registered_spare`] says is a spare's, whose
+/// directory does not exist ("no such file", looked for inside the cache
+/// only), and whose id no entry of its pool directory has (a spare is
+/// renamed while it is made and while it is taken, and git is told just
+/// after). All of it is looked at again holding the registration lock,
+/// which every `git worktree` command of fast-worktree holds; the lock is
+/// not waited for. Returns how many were unregistered.
+pub fn drop_dangling(main: &Path) -> usize {
+    let root = paths::cache_root();
+    let mut roots = vec![root.clone()];
+    if let Ok(real) = root.canonicalize() {
+        if real != root {
+            roots.push(real);
+        }
+    }
+    let dangling = |admin: &Path| -> bool {
+        let locked = fs::read_to_string(admin.join("locked")).ok();
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            return false;
+        };
+        // `<worktree>/.git`, absolute or relative to the entry.
+        let dot_git = admin.join(gitdir.trim_end_matches('\n'));
+        let Some(worktree) = dot_git.parent() else {
+            return false;
+        };
+        let Some((pool, id)) = registered_spare(locked.as_deref(), worktree, &roots) else {
+            return false;
+        };
+        let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+        if !fs::symlink_metadata(worktree).is_err_and(|e| missing(&e)) {
+            return false;
+        }
+        match fs::read_dir(pool) {
+            Ok(entries) => !entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(id)),
+            Err(e) => missing(&e),
+        }
+    };
+    git::unregister_where(&main.join(".git"), &dangling)
 }
 
 /// [`size`] when the settings can be read, without reporting when they
@@ -941,17 +1119,22 @@ mod tests {
             ".claimed-77-wt-999900-1-0",
         ]);
         assert_eq!(
-            stale_leftovers(&all, now, false, &dead),
+            stale_leftovers(&all, now, false, 10, &dead),
             ours,
             "a ready spare and unknown names stay"
         );
         // Their owners are alive: the fill that makes one, the `add` that
         // took one. Nothing is a leftover, and no fill lock was needed to
         // tell.
-        assert!(stale_leftovers(&all, now, false, &alive).is_empty());
+        assert!(stale_leftovers(&all, now, false, 10, &alive).is_empty());
         // The caller holds the fill lock: no fill is running, whatever the
         // pids say.
-        assert_eq!(stale_leftovers(&all, now, true, &alive), ours[..2]);
+        assert_eq!(stale_leftovers(&all, now, true, 10, &alive), ours[..2]);
+        // A second short of the least age, nothing is a leftover yet:
+        // neither a pid nor a lock is seen from another container.
+        assert!(stale_leftovers(&all, now, false, 11, &dead).is_empty());
+        assert!(stale_leftovers(&all, now, true, 11, &dead).is_empty());
+        assert_eq!(LEFTOVER_MIN_SECS, 600);
     }
 
     #[test]
@@ -963,7 +1146,7 @@ mod tests {
                 (format!(".new-wt-{created}-1-0"), changed_ago),
                 (format!(".claimed-77-wt-{created}-1-0"), changed_ago),
             ];
-            stale_leftovers(&e, now, false, &alive)
+            stale_leftovers(&e, now, false, LEFTOVER_MIN_SECS, &alive)
         };
         let limit = LEFTOVER_MAX_SECS;
         // Exactly at the limit both stay; a second past it they go. What
@@ -975,6 +1158,96 @@ mod tests {
         assert!(at(now - 30 * 86_400, 0)
             .iter()
             .all(|n| n.starts_with(".new-")));
+    }
+
+    #[test]
+    fn a_leftover_made_just_now_stays_and_an_old_one_is_discarded() {
+        let t = tempfile::tempdir().unwrap();
+        std::env::set_var("FAST_WORKTREE_CACHE", t.path().join("cache"));
+        let pool = t.path().join("cache/repo-0123abcd/pool");
+        let made = now_secs() - 7_200;
+        let building = pool.join(format!(".new-wt-{made}-2000000000-0"));
+        let claimed = pool.join(format!(".claimed-2000000000-wt-{made}-1-1"));
+        for d in [&building, &claimed] {
+            fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        // Their makers are gone, but they were put there this second: a
+        // fill in another container may be making them.
+        sweep_leftovers(t.path(), &pool, false);
+        sweep_leftovers(t.path(), &pool, true);
+        assert!(building.is_dir() && claimed.is_dir());
+        // With no least age (the inode change time cannot be set back).
+        sweep_leftovers_aged(t.path(), &pool, false, 0);
+        assert!(!building.exists() && !claimed.exists());
+    }
+
+    #[test]
+    fn a_spare_is_known_by_its_name_in_every_state() {
+        assert_eq!(spare_id("wt-1700000000-12-0"), Some("wt-1700000000-12-0"));
+        assert_eq!(
+            spare_id(".new-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        assert_eq!(
+            spare_id(".no-hooks-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        assert_eq!(
+            spare_id(".claimed-7-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        for other in [
+            "fill.lock",
+            "misses",
+            "wt-x",
+            ".claimed-x-wt-1-1-0",
+            ".something-else",
+            "wt-1-1",
+        ] {
+            assert_eq!(spare_id(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn only_a_registration_locked_with_our_reason_in_this_cache_is_a_spare_s() {
+        let roots = vec![PathBuf::from("/c/fast-worktree")];
+        let spare = Path::new("/c/fast-worktree/app-0123abcd/pool/wt-1700000000-12-0");
+        let ours = Some((spare.parent().unwrap(), "wt-1700000000-12-0"));
+        let reason = format!("{LOCK_REASON}\n");
+        assert_eq!(registered_spare(Some(&reason), spare, &roots), ours);
+        assert_eq!(registered_spare(Some(LOCK_REASON), spare, &roots), ours);
+        // While it is made or taken, the same spare.
+        let taken = spare.with_file_name(".claimed-9-wt-1700000000-12-0");
+        assert_eq!(
+            registered_spare(Some(&reason), &taken, &roots).map(|s| s.1),
+            Some("wt-1700000000-12-0")
+        );
+        // Not locked, or locked by the user or another tool: never ours.
+        for other in [
+            None,
+            Some(""),
+            Some("fast-worktree pool 2\n"),
+            Some("mine\n"),
+            Some("fast-worktree pool\n\n"),
+            Some(" fast-worktree pool\n"),
+        ] {
+            assert_eq!(registered_spare(other, spare, &roots), None, "{other:?}");
+        }
+        // Locked with our reason, but not at a spare's place in this cache.
+        for path in [
+            "/c/other-cache/app-0123abcd/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/app-0123abcd/wt-1700000000-12-0",
+            "/c/fast-worktree/app/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/x/app-0123abcd/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/app-0123abcd/pool/feature",
+            "/work/app-wt",
+        ] {
+            assert_eq!(
+                registered_spare(Some(&reason), Path::new(path), &roots),
+                None,
+                "{path}"
+            );
+        }
     }
 
     #[test]

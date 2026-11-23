@@ -250,6 +250,13 @@ pub fn unregister(admin: &Path) -> Result<()> {
         .and_then(Path::parent)
         .ok_or_else(|| Error::msg("not a worktree administrative directory"))?;
     let _registration = lock_common(common)?;
+    if admin
+        .symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Unregistered meanwhile ([`unregister_where`]).
+        return Ok(());
+    }
     let is_entry = admin
         .parent()
         .is_some_and(|p| p.file_name().is_some_and(|n| n == "worktrees"))
@@ -258,6 +265,40 @@ pub fn unregister(admin: &Path) -> Result<()> {
         bail!("{}: not a worktree entry; left alone", admin.display());
     }
     fs::remove_dir_all(admin).map_err(|e| Error::msg(format!("{}: {e}", admin.display())))
+}
+
+/// Unregister the worktrees whose administrative directory under
+/// `<common>/worktrees` `pick` chooses, holding the registration lock.
+/// `pick` is asked twice: before the lock is taken (nothing chosen: no lock
+/// is taken at all), and again once it is held, when no `git worktree`
+/// command of fast-worktree can be in the middle of changing an entry. The
+/// lock is not waited for: when it is held, nothing is done this time.
+/// Returns how many entries were deleted.
+pub fn unregister_where(common: &Path, pick: &dyn Fn(&Path) -> bool) -> usize {
+    let picked = |common: &Path| -> Vec<PathBuf> {
+        fs::read_dir(common.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|admin| pick(admin))
+            .collect()
+    };
+    if picked(common).is_empty() {
+        return 0;
+    }
+    let Ok(key) = common.canonicalize() else {
+        return 0;
+    };
+    let Ok(Some(_registration)) =
+        crate::util::lock_path(&key.join(REGISTRATION_LOCK), false, false)
+    else {
+        return 0;
+    };
+    picked(&key)
+        .iter()
+        .filter(|admin| fs::remove_dir_all(admin).is_ok())
+        .count()
 }
 
 /// Tracked files under `root` matching the pathspecs, relative to `root`.

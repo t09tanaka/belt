@@ -11,7 +11,8 @@ use super::cache::table;
 use crate::error::Result;
 use crate::git;
 use crate::util::{errln, out, outln};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -266,42 +267,90 @@ pub fn ls() -> Result<i32> {
 }
 
 /// `kept prune [--older-than <days>]`: delete the kept refs whose name says
-/// they are older than that, and those whose commit a branch holds
-/// ([`prune_refs`]). Refs whose name has no time are left alone.
+/// they are older than that, and those whose commit a branch or a tag
+/// holds ([`prune_refs`]). Refs whose name has no time are left alone.
 pub fn prune(older_than_days: Option<u64>) -> Result<i32> {
     let days = older_than_days.unwrap_or(PRUNE_DAYS);
     let done = prune_refs(Path::new("."), days)?;
-    for (r, _) in &done.held {
-        outln!("pruned {r} (a branch or tag has its commit)");
-    }
-    for (r, _) in &done.expired {
-        outln!("pruned {r}");
+    let mut held = 0;
+    for d in &done.deleted {
+        match &d.reason {
+            Reason::HeldBy(holder) => {
+                held += 1;
+                outln!("pruned {} (its commit is held by {holder})", d.name);
+            }
+            Reason::Expired => outln!("pruned {}", d.name),
+        }
     }
     outln!(
         "pruned {} kept for {days} days or more, and {} whose commit a branch or tag has",
-        count(done.expired.len()),
-        count(done.held.len())
+        count(done.deleted.len() - held),
+        count(held)
     );
+    if done.failed > 0 {
+        errln!(
+            "fast-worktree: {} could not be deleted (one of them changed meanwhile); run it again",
+            count(done.failed)
+        );
+    }
     Ok(i32::from(done.failed > 0))
 }
 
-/// [`prune`] for the repository at `dir`, without printing. Returns how
-/// many refs were pruned and how many could not be.
-pub fn prune_in(dir: &Path, days: u64) -> Result<(usize, usize)> {
-    let done = prune_refs(dir, days)?;
-    Ok((done.held.len() + done.expired.len(), done.failed))
+/// Delete the kept refs of the repository at `dir` that are `days` days
+/// old or older, whatever holds their commits, and nothing else: what
+/// [`crate::Repository::prune_kept_refs`] has done since it was released.
+/// One git for each ref, each deleted only if it still has the commit that
+/// was read. Returns how many were deleted and how many could not be.
+pub fn prune_by_age(dir: &Path, days: u64) -> Result<(usize, usize)> {
+    let now = now_secs();
+    let mut pruned = 0;
+    let mut failed = 0;
+    for (r, o) in kept_refs(dir)? {
+        let Some(t) = kept_time(&r) else {
+            continue;
+        };
+        if now.saturating_sub(t) < days.saturating_mul(86_400) {
+            continue;
+        }
+        match git::output(dir, &["update-ref", "-d", &r, &o]) {
+            Ok(_) => {
+                outln!("pruned {r}");
+                pruned += 1;
+            }
+            Err(e) => {
+                errln!("fast-worktree: {e}");
+                failed += 1;
+            }
+        }
+    }
+    Ok((pruned, failed))
 }
 
-/// What [`prune_refs`] deleted: refs with their commits.
+/// Why a kept ref was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reason {
+    /// A local branch or a tag holds its commit: the ref protected
+    /// nothing. The name is the branch (`main`) or the tag (`tags/v1`).
+    HeldBy(String),
+    /// It was kept for the number of days asked for ([`PRUNE_DAYS`] when
+    /// nobody asked). Unless something else holds its commit, `git gc` may
+    /// drop it now.
+    Expired,
+}
+
+/// A kept ref that was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deleted {
+    pub name: String,
+    pub commit: String,
+    pub reason: Reason,
+}
+
+/// What [`prune_refs`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pruned {
-    /// Refs whose commit a branch, a remote-tracking branch or a tag holds:
-    /// they protected nothing.
-    pub held: Vec<(String, String)>,
-    /// Refs that were the only thing holding their commit, deleted for
-    /// their age: that work can now be dropped by `git gc`.
-    pub expired: Vec<(String, String)>,
-    /// How many refs could not be deleted.
+    pub deleted: Vec<Deleted>,
+    /// How many refs should have been deleted and were not.
     pub failed: usize,
 }
 
@@ -328,32 +377,44 @@ fn plan(refs: &[(String, String)], now: u64, days: u64) -> (Vec<usize>, Vec<usiz
     (expired, ask)
 }
 
-/// Which of `commits` a branch, a remote-tracking branch or a tag of the
-/// repository at `dir` holds, with one git process for all of them. `git
-/// rev-list <commits> --not --branches --tags --remotes` prints what those
-/// do not hold: a commit that is held is one that is not printed. When git
-/// fails (an object that is gone, say), none counts as held.
+/// What `git name-rev` printed, as commit to holder: each line is a commit
+/// and how to reach it from a ref (`main~3`, `tags/v1^0`), or `undefined`
+/// when none of the refs asked about has it. The holder is the ref's part
+/// of that. A commit git said nothing about is not in the result.
+fn holders(name_rev: &str) -> HashMap<String, String> {
+    name_rev
+        .lines()
+        .filter_map(|l| l.trim().split_once(' '))
+        .filter(|(_, name)| *name != "undefined")
+        .filter_map(|(commit, name)| {
+            let holder = name.split(['~', '^']).next().filter(|h| !h.is_empty())?;
+            Some((commit.to_string(), holder.to_string()))
+        })
+        .collect()
+}
+
+/// Which of `commits` a local branch or a tag of the repository at `dir`
+/// holds, and which one, with one git process for all of them (`git
+/// name-rev --refs=refs/heads/* --refs=refs/tags/*`). When git fails, or
+/// says nothing about a commit (an object that is gone), it does not count
+/// as held.
 ///
-/// A worktree's `HEAD` holds nothing here: a worktree goes with one `git
-/// worktree remove`, and one that a removal moved into the trash is still
-/// registered until the trash entry is deleted.
-fn held_by_a_branch(dir: &Path, commits: &[&str]) -> HashSet<String> {
-    let mut held = HashSet::new();
+/// Only what the user alone deletes counts. A remote-tracking branch does
+/// not: it goes when somebody else deletes or rewrites the branch and the
+/// next fetch prunes it, and a commit that only it held is then held by
+/// nothing, with its kept ref long deleted. A worktree's `HEAD` holds
+/// nothing either: a worktree goes with one `git worktree remove`, and one
+/// that a removal moved into the trash is still registered until the trash
+/// entry is deleted.
+fn held_by(dir: &Path, commits: &[&str]) -> HashMap<String, String> {
+    let mut held = HashMap::new();
     // Far below what a command line may hold, whatever the hash length.
     for group in commits.chunks(500) {
-        let mut args = vec!["rev-list"];
+        let mut args = vec!["name-rev", "--refs=refs/heads/*", "--refs=refs/tags/*"];
         args.extend_from_slice(group);
-        args.extend_from_slice(&["--not", "--branches", "--tags", "--remotes"]);
-        let Ok(out) = git::output(dir, &args) else {
-            continue;
-        };
-        let loose: HashSet<&str> = out.lines().map(str::trim).collect();
-        held.extend(
-            group
-                .iter()
-                .filter(|c| !loose.contains(**c))
-                .map(|c| c.to_string()),
-        );
+        if let Ok(out) = git::output(dir, &args) {
+            held.extend(holders(&out));
+        }
     }
     held
 }
@@ -361,77 +422,99 @@ fn held_by_a_branch(dir: &Path, commits: &[&str]) -> HashSet<String> {
 /// Delete the kept refs of the repository at `dir` that are no longer
 /// needed, in this order:
 ///
-/// 1. A worktree's `HEAD` whose commit a branch, a remote-tracking branch
-///    or a tag holds protects nothing, and is deleted without waiting for
-///    its age, once it is [`GRACE_SECS`] old.
-/// 2. Any other is the only thing that holds its commit, and is deleted
-///    once it is `days` days old.
+/// 1. A worktree's `HEAD` whose commit a local branch or a tag holds
+///    protects nothing, and is deleted without waiting for its age, once
+///    it is [`GRACE_SECS`] old.
+/// 2. Any other may be the only thing that holds its commit, and is
+///    deleted once it is `days` days old.
 ///
 /// The automatic sweep and `kept prune` both call this. All refs are
 /// deleted by one `git update-ref --stdin`, each only if it still has the
-/// commit that was read; when that fails as a whole (one ref changed
-/// meanwhile), they are deleted one by one.
+/// commit that was read. When that fails (one ref changed meanwhile), none
+/// is deleted and all are counted as failed: they are still there for the
+/// next time, which reads them afresh.
 pub fn prune_refs(dir: &Path, days: u64) -> Result<Pruned> {
     let refs = kept_refs(dir)?;
     let (expired, ask) = plan(&refs, now_secs(), days);
     let commits: Vec<&str> = ask.iter().map(|&i| refs[i].1.as_str()).collect();
     let held = if commits.is_empty() {
-        HashSet::new()
+        HashMap::new()
     } else {
-        held_by_a_branch(dir, &commits)
+        held_by(dir, &commits)
     };
-    let held: Vec<usize> = ask
+    let of = |i: usize, reason: Reason| Deleted {
+        name: refs[i].0.clone(),
+        commit: refs[i].1.clone(),
+        reason,
+    };
+    let mut deleted: Vec<Deleted> = ask
         .into_iter()
-        .filter(|&i| held.contains(&refs[i].1))
+        .filter_map(|i| Some(of(i, Reason::HeldBy(held.get(&refs[i].1)?.clone()))))
         .collect();
-    let mut done = Pruned::default();
-    if held.is_empty() && expired.is_empty() {
-        return Ok(done);
+    deleted.extend(expired.into_iter().map(|i| of(i, Reason::Expired)));
+    if deleted.is_empty() {
+        return Ok(Pruned::default());
     }
-    let input: String = held
+    let input: String = deleted
         .iter()
-        .chain(&expired)
-        .map(|&i| format!("delete {} {}\n", refs[i].0, refs[i].1))
+        .map(|d| format!("delete {} {}\n", d.name, d.commit))
         .collect();
-    let all_at_once = git::output_with_stdin(dir, &["update-ref", "--stdin"], &input).is_ok();
-    let delete = |i: usize| {
-        let (r, o) = &refs[i];
-        all_at_once || git::output(dir, &["update-ref", "-d", r, o]).is_ok()
-    };
-    for i in held {
-        match delete(i) {
-            true => done.held.push(refs[i].clone()),
-            false => done.failed += 1,
-        }
+    if git::output_with_stdin(dir, &["update-ref", "--stdin"], &input).is_err() {
+        return Ok(Pruned {
+            deleted: Vec::new(),
+            failed: deleted.len(),
+        });
     }
-    for i in expired {
-        match delete(i) {
-            true => done.expired.push(refs[i].clone()),
-            false => done.failed += 1,
-        }
-    }
-    Ok(done)
+    Ok(Pruned { deleted, failed: 0 })
 }
 
-/// [`prune_refs`] for the sweep that every `add`, `remove` and library call
-/// makes. A ref that held its commit alone is not deleted in silence: one
-/// line for each goes to stderr (and to the log of a library call).
-pub fn prune_auto(dir: &Path) {
+thread_local! {
+    /// What [`prune_auto`] deleted in this thread since [`take_deleted`].
+    static DELETED: RefCell<Vec<Deleted>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The kept refs that the automatic sweeps of this thread deleted since
+/// the last call: for the result of the library call that made them.
+pub fn take_deleted() -> Vec<Deleted> {
+    DELETED.with(|d| d.take())
+}
+
+/// The line that says why the kept ref `d` was deleted by itself.
+fn why(d: &Deleted) -> String {
+    match &d.reason {
+        Reason::HeldBy(holder) => format!(
+            "fast-worktree: deleted {}: its commit {} is held by {holder}",
+            d.name, d.commit
+        ),
+        Reason::Expired => format!(
+            "fast-worktree: deleted {}: {PRUNE_DAYS} days passed since it was kept; unless a \
+             branch or a tag has its commit {}, `git gc` may drop it now",
+            d.name, d.commit
+        ),
+    }
+}
+
+/// [`prune_refs`] for the sweep that every `add`, `remove` and library
+/// call makes for its repository (never `pool fill`, which mostly runs in
+/// the background). No ref is deleted in silence: one line for each goes
+/// to stderr, with why, and the list is kept for [`take_deleted`]. Returns
+/// what was deleted.
+pub fn prune_auto(dir: &Path) -> Vec<Deleted> {
     let Ok(done) = prune_refs(dir, PRUNE_DAYS) else {
-        return;
+        return Vec::new();
     };
-    for (r, commit) in &done.expired {
-        errln!(
-            "fast-worktree: deleted {r}, kept for {PRUNE_DAYS} days: nothing else holds its \
-             commit {commit}, which `git gc` may drop now"
-        );
+    for d in &done.deleted {
+        errln!("{}", why(d));
     }
     if done.failed > 0 {
         errln!(
-            "fast-worktree: {} old kept ref(s) could not be deleted",
-            done.failed
+            "fast-worktree: {} that are no longer needed could not be deleted; a later command \
+             tries again",
+            count(done.failed)
         );
     }
+    DELETED.with(|d| d.borrow_mut().extend(done.deleted.iter().cloned()));
+    done.deleted
 }
 
 #[cfg(test)]
@@ -480,6 +563,38 @@ mod tests {
         assert_eq!(plan(&refs, now, 30), (vec![0, 5], vec![1, 2]));
         // `--older-than 0`: everything with a time, nothing to ask.
         assert_eq!(plan(&refs, now, 0), (vec![0, 1, 2, 3, 4, 5], vec![]));
+    }
+
+    #[test]
+    fn the_holder_is_read_from_what_name_rev_prints() {
+        let out = "aaaa main~3\nbbbb tags/v1^0\ncccc undefined\ndddd feature/nested/x\n\neeee\n";
+        let h = holders(out);
+        assert_eq!(h.get("aaaa").map(String::as_str), Some("main"));
+        assert_eq!(h.get("bbbb").map(String::as_str), Some("tags/v1"));
+        assert_eq!(h.get("dddd").map(String::as_str), Some("feature/nested/x"));
+        // Held by nothing, and a line that is no answer.
+        assert_eq!(h.len(), 3, "{h:?}");
+    }
+
+    #[test]
+    fn every_deletion_says_why() {
+        let d = |reason| Deleted {
+            name: format!("{KEPT_REFS}a-20261026-120000/head"),
+            commit: "c".repeat(40),
+            reason,
+        };
+        let held = why(&d(Reason::HeldBy("main".into())));
+        assert!(
+            held.contains("is held by main") && held.contains(&"c".repeat(40)),
+            "{held}"
+        );
+        assert!(!held.contains("git gc"), "{held}");
+        let expired = why(&d(Reason::Expired));
+        assert!(
+            expired.contains("30 days passed") && expired.contains("git gc"),
+            "{expired}"
+        );
+        assert!(expired.contains(&format!("{KEPT_REFS}a-20261026-120000/head")));
     }
 
     #[test]

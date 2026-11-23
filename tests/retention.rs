@@ -262,12 +262,20 @@ fn a_kept_ref_goes_at_once_when_a_branch_has_its_commit_and_after_30_days_when_n
     let w = World::new();
     let m = w.main();
     let head = w.git(&m, &["rev-parse", "HEAD"]).trim().to_string();
-    let (alone, old, twice, detached) = (
+    let (alone, old, twice, detached, remote, tagged, nested) = (
         w.loose_commit("alone"),
         w.loose_commit("old"),
         w.loose_commit("twice"),
         w.loose_commit("detached"),
+        w.loose_commit("remote"),
+        w.loose_commit("tagged"),
+        w.loose_commit("nested"),
     );
+    // What somebody else can take away with a push and a `fetch --prune`
+    // holds nothing; a tag and a branch (whatever its name) do.
+    w.git(&m, &["update-ref", "refs/remotes/origin/theirs", &remote]);
+    w.git(&m, &["tag", "-a", "-m", "v1", "v1", &tagged]);
+    w.git(&m, &["branch", "feature/nested/x", &nested]);
     // A worktree with a detached HEAD holds no commit for this purpose: it
     // goes with one `git worktree remove`.
     let dw = w.base.join("dw");
@@ -307,6 +315,10 @@ fn a_kept_ref_goes_at_once_when_a_branch_has_its_commit_and_after_30_days_when_n
         (name("detached", 26 * hour, "head"), &detached, true),
         // A submodule's commit is another repository's: never asked about.
         (name("sub", 26 * hour, "sub/lib"), &head, true),
+        // Only a remote-tracking branch has it: held by nobody, 30 days.
+        (name("remote", 26 * hour, "head"), &remote, true),
+        (name("tagged", 26 * hour, "head"), &tagged, false),
+        (name("nested", 26 * hour, "head"), &nested, false),
     ];
     for (r, commit, _) in &refs {
         w.git(&m, &["update-ref", r, commit]);
@@ -316,20 +328,43 @@ fn a_kept_ref_goes_at_once_when_a_branch_has_its_commit_and_after_30_days_when_n
     for (r, _, stays) in &refs {
         assert_eq!(left.contains(r.as_str()), *stays, "{r}\n{left}");
     }
-    // The one deletion that loses work is said, with the ref and the
-    // commit; the one that loses nothing is not.
-    let line = err
-        .lines()
-        .find(|l| l.contains(&refs[4].0))
-        .unwrap_or_else(|| panic!("no line for the expired ref in:\n{err}"));
-    assert!(line.contains(&old) && line.contains("30 days"), "{line}");
-    assert!(!err.contains(&refs[0].0), "{err}");
+    // Every deletion is said, one line each, with the ref, the commit and
+    // why: what holds the commit, or that the 30 days passed.
+    let line = |i: usize| {
+        let mut lines = err.lines().filter(|l| l.contains(&refs[i].0));
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("no line for {} in:\n{err}", refs[i].0));
+        assert_eq!(lines.next(), None, "one line for {}", refs[i].0);
+        assert!(line.contains(refs[i].1.as_str()), "{line}");
+        line.to_string()
+    };
+    assert!(line(4).contains("30 days passed"), "{}", line(4));
+    assert!(line(4).contains("git gc"), "{}", line(4));
+    // (`trunk` has it, and so has the tag, whose commit was made on top
+    // of it: git names one of them.)
+    assert!(
+        line(0).contains("is held by trunk") || line(0).contains("is held by tags/v1"),
+        "{}",
+        line(0)
+    );
+    assert!(!line(0).contains("git gc"), "{}", line(0));
+    assert!(line(10).contains("is held by tags/v1"), "{}", line(10));
+    assert!(
+        line(11).contains("is held by feature/nested/x"),
+        "{}",
+        line(11)
+    );
+    let deletions = err.lines().filter(|l| l.contains(": deleted ")).count();
+    assert_eq!(deletions, 4, "{err}");
     // The manual command applies the same rules, and names both.
     w.git(&m, &["update-ref", &refs[0].0, &head]);
     let out = w.fw(&["kept", "prune"]);
     assert!(out.contains(&refs[0].0), "{out}");
+    assert!(out.contains("its commit is held by "), "{out}");
     assert!(!w.kept_refs().contains(&refs[0].0));
     assert!(w.kept_refs().contains(&refs[2].0));
+    assert!(w.kept_refs().contains(&refs[9].0), "remote-tracking only");
 }
 
 #[test]
@@ -341,8 +376,8 @@ fn a_kept_ref_whose_objects_are_gone_is_kept_rather_than_guessed_at() {
         "refs/fast-worktree/kept/x-{}/head",
         compact(now() - 2 * DAY)
     );
-    // Git cannot answer for all of them at once when one names an object
-    // that is not there: none is then taken to be on a branch.
+    // One names an object that is not there: git says nothing about it,
+    // so it is not taken to be on a branch; the other is answered for.
     w.git(&m, &["update-ref", &r, &head]);
     let broken = format!(
         "refs/fast-worktree/kept/y-{}/head",
@@ -351,8 +386,83 @@ fn a_kept_ref_whose_objects_are_gone_is_kept_rather_than_guessed_at() {
     let file = m.join(".git").join(&broken);
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(&file, format!("{}\n", "1".repeat(40))).unwrap();
-    w.add("wt1");
-    assert!(w.kept_refs().contains(&r), "{}", w.kept_refs());
+    let err = w.add("wt1");
+    assert!(w.kept_refs().contains(&broken), "{}", w.kept_refs());
+    assert!(!w.kept_refs().contains(&r), "{}", w.kept_refs());
+    assert!(!err.contains(&broken), "{err}");
+}
+
+#[test]
+fn kept_refs_that_cannot_be_deleted_are_left_for_the_next_time_and_said_once() {
+    let w = World::new();
+    let m = w.main();
+    let head = w.git(&m, &["rev-parse", "HEAD"]).trim().to_string();
+    let refs: Vec<String> = (0..3)
+        .map(|i| format!("refs/fast-worktree/kept/old{i}-20200101-12000{i}/head"))
+        .collect();
+    for r in &refs {
+        w.git(&m, &["update-ref", r, &head]);
+    }
+    // As when another git is writing one of them: the deletion of all of
+    // them is one transaction, which then fails.
+    let busy = m.join(".git").join(format!("{}.lock", refs[1]));
+    fs::write(&busy, "").unwrap();
+    let err = w.add("wt1");
+    for r in &refs {
+        assert!(w.kept_refs().contains(r.as_str()), "{r} is left");
+        assert!(!err.contains(r.as_str()), "nothing was deleted: {err}");
+    }
+    let said: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("could not be deleted"))
+        .collect();
+    assert_eq!(said.len(), 1, "{err}");
+    assert!(said[0].contains("3 refs"), "{err}");
+    // The next time (an hour later) they go.
+    fs::remove_file(&busy).unwrap();
+    w.forget_stamps();
+    let err = w.add("wt2");
+    assert!(w.kept_refs().trim().is_empty(), "{}", w.kept_refs());
+    assert_eq!(err.lines().filter(|l| l.contains(": deleted ")).count(), 3);
+}
+
+#[test]
+fn a_fill_deletes_no_kept_ref_and_leaves_that_to_the_next_command() {
+    let w = World::new();
+    let m = w.main();
+    let head = w.git(&m, &["rev-parse", "HEAD"]).trim().to_string();
+    let old = "refs/fast-worktree/kept/a-20200101-120000/head";
+    w.git(&m, &["update-ref", old, &head]);
+    let config = w.base.join("config/fast-worktree");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "[pool]\nsize = 1\n").unwrap();
+    // The fill itself cannot do much here (there is no origin to fetch):
+    // its sweep is what is looked at. Its output would be in a log file
+    // that nobody reads.
+    let mut c = Command::new(BIN);
+    w.env(&mut c);
+    let out = c.args(["pool", "fill"]).current_dir(&m).output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(w.kept_refs().contains(old), "{said}");
+    assert!(!said.contains(old), "{said}");
+    // It did sweep (the repository's directory of the cache is there),
+    // and did not use up the hour of the part it left out.
+    let repo = fs::read_dir(w.cache())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join(".main").is_file())
+        .expect("the fill made its sweep");
+    assert!(!repo.join(".retention-stamp").exists());
+    // The next command that somebody waits for deletes it, and says so.
+    fs::remove_file(config.join("config.toml")).unwrap();
+    let err = w.add("wt1");
+    assert!(w.kept_refs().trim().is_empty(), "{}", w.kept_refs());
+    assert!(err.contains(old) && err.contains("30 days passed"), "{err}");
 }
 
 #[test]
@@ -506,10 +616,21 @@ fn pool_leftovers_of_killed_runs_and_old_misses_are_removed() {
     w.add("wt2");
     drop(fill);
 
-    wait_gone(&building);
-    wait_gone(&claimed);
-    assert!(!building.exists() && !claimed.exists() && !hooks.exists());
+    // What a run that is gone left goes too, but not within ten minutes
+    // of when it was last touched: its pid says nothing about a fill in
+    // another container that shares this cache. (The inode change time
+    // cannot be set back from here: that an older one goes is in the unit
+    // test of `sweep_leftovers_aged`.)
+    assert!(building.is_dir() && claimed.is_dir() && hooks.is_dir());
     assert!(in_work.is_dir() && live.is_dir() && other.is_dir());
+    // Whatever the pid says, one made more than a day ago goes.
+    let ancient = pool.join(format!(".new-wt-{}-{me}-7", now() - 2 * DAY));
+    fs::create_dir_all(ancient.join("sub")).unwrap();
+    w.forget_stamps();
+    w.add("wt3");
+    wait_gone(&ancient);
+    assert!(!ancient.exists());
+    assert!(building.is_dir() && claimed.is_dir());
     assert_eq!(
         fs::read_to_string(pool.join("misses")).unwrap(),
         format!("{fresh}\n")
@@ -656,58 +777,371 @@ fn recorded_repo(w: &World, main: &Path) -> PathBuf {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .find(|p| fs::read(p.join(".main")).is_ok_and(|b| b == main.as_os_str().as_encoded_bytes()))
+        .find(|p| p.join(".main").is_file() && record(p).0 == main)
         .expect("a repository directory that records its main checkout");
     entry(&repo.join("app"), KEY, 60);
     fs::create_dir_all(repo.join("pool/wt-1-1-0/node_modules")).unwrap();
+    fs::create_dir_all(repo.join("pool/.new-wt-1-1-1/sub")).unwrap();
+    fs::create_dir_all(repo.join("pool/.something-else")).unwrap();
+    fs::write(repo.join("pool/fill.log"), "a fill").unwrap();
     for l in ["lifecycle.lock", "pool/fill.lock", "app/.store.lock"] {
         fs::write(repo.join(l), "").unwrap();
     }
     repo
 }
 
+/// What `<repo>/.main` records: the main checkout, and the three device
+/// numbers when it has them.
+fn record(repo: &Path) -> (PathBuf, Option<Vec<u64>>) {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = fs::read(repo.join(".main")).unwrap();
+    let mut parts = bytes.splitn(2, |b| *b == 0);
+    let main = PathBuf::from(std::ffi::OsStr::from_bytes(parts.next().unwrap()));
+    let devices = parts.next().map(|d| {
+        String::from_utf8_lossy(d)
+            .split(' ')
+            .map(|n| n.parse().unwrap())
+            .collect()
+    });
+    (main, devices)
+}
+
+fn set_record(repo: &Path, main: &Path, devices: Option<&[u64]>) {
+    let mut bytes = main.as_os_str().as_encoded_bytes().to_vec();
+    if let Some(d) = devices {
+        let d: Vec<String> = d.iter().map(u64::to_string).collect();
+        bytes.push(0);
+        bytes.extend(d.join(" ").bytes());
+    }
+    fs::write(repo.join(".main"), bytes).unwrap();
+}
+
+/// As when no command ran in the repository of `repo` for `secs`.
+fn unused_for(repo: &Path, secs: u64) {
+    age(&repo.join(".main"), secs);
+    age(&repo.join("pool"), secs);
+}
+
+/// `fast-worktree cache retire <repos>`: what the walk starts detached,
+/// run here to its end.
+fn retire(w: &World, repos: &[&PathBuf]) {
+    let mut c = Command::new(BIN);
+    w.env(&mut c);
+    let out = c
+        .args(["cache", "retire"])
+        .args(repos)
+        .current_dir(&w.base)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+const WEEK: u64 = 7 * DAY;
+
 #[test]
-fn the_directory_of_a_repository_that_is_gone_goes_whole_and_no_other() {
+fn the_directory_of_a_repository_goes_only_when_it_is_unused_and_surely_gone() {
     let w = World::new();
-    let gone = recorded_repo(&w, &w.base.join("repos/gone"));
-    let busy = recorded_repo(&w, &w.base.join("repos/busy"));
-    let there = recorded_repo(&w, &w.base.join("repos/there"));
-    let unmounted = recorded_repo(&w, &w.base.join("volume/away"));
+    let repo = |name: &str| recorded_repo(&w, &w.base.join(name));
+    // Deleted, and no command for 7 days: gone.
+    let gone = repo("repos/gone");
+    // Deleted an hour ago, used 6 days ago: it may be back tomorrow.
+    let recent = repo("repos/recent");
+    // Deleted and unused, but something holds one of its locks.
+    let busy = repo("repos/busy");
+    // Unused, but there.
+    let there = repo("repos/there");
+    // Unused, and the directory it was in is missing too: as when the
+    // volume `/Volumes/X` is not mounted.
+    let unmounted = repo("volume/away");
+    // Unused and missing, and the directory it was in is on another
+    // device than when a command last ran there: as when the disk that
+    // was mounted at that directory is not mounted, a network or FUSE
+    // mount is down, or the path is another machine's.
+    let other_device = repo("repos/other-device");
+    // It was itself the root of a mount (another device than the
+    // directory it was in).
+    let mount_root = repo("repos/mount-root");
+    // A record of before the devices were written.
+    let old_record = repo("repos/old-record");
     // One that only older versions wrote to: no record of its checkout.
     let unknown = w.cache().join("old-0123abcd");
-    fs::create_dir_all(unknown.join("pool")).unwrap();
+    fs::create_dir_all(unknown.join("pool/wt-1-1-0")).unwrap();
     fs::write(unknown.join("pool/fill.lock"), "").unwrap();
     fs::write(unknown.join("lifecycle.lock"), "").unwrap();
 
-    fs::remove_dir_all(w.base.join("repos/gone")).unwrap();
-    fs::remove_dir_all(w.base.join("repos/busy")).unwrap();
-    // As when its volume is not mounted: the directory it was in is
-    // missing too.
-    fs::remove_dir_all(w.base.join("volume")).unwrap();
+    for name in [
+        "repos/gone",
+        "repos/recent",
+        "repos/busy",
+        "volume",
+        "repos/other-device",
+        "repos/mount-root",
+        "repos/old-record",
+    ] {
+        fs::remove_dir_all(w.base.join(name)).unwrap();
+    }
+    let (main, devices) = record(&other_device);
+    let d = devices.expect("the devices are recorded");
+    assert_eq!(d.len(), 3);
+    assert_eq!(d[0], d[1], "the checkout is on its directory's device");
+    set_record(&other_device, &main, Some(&[d[0] + 1, d[0] + 1, d[2]]));
+    let (main, _) = record(&mount_root);
+    set_record(&mount_root, &main, Some(&[d[0], d[0] + 1, d[2]]));
+    let (main, _) = record(&old_record);
+    set_record(&old_record, &main, None);
+    let all = [
+        &gone,
+        &recent,
+        &busy,
+        &there,
+        &unmounted,
+        &other_device,
+        &mount_root,
+        &old_record,
+        &unknown,
+    ];
+    for r in all {
+        if r.join(".main").is_file() {
+            unused_for(r, WEEK + 60);
+        }
+    }
+    unused_for(&recent, WEEK - 3_600);
     let held = hold(&busy.join("lifecycle.lock"));
     w.forget_stamps();
-    let start = std::time::Instant::now();
-    w.add("wt1");
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(20),
-        "the walk waited for another repository's lock"
-    );
+    retire(&w, &all);
     wait_gone(&gone);
     assert!(!gone.exists(), "entries, spares and locks: all of it");
-    assert!(busy.join("pool/wt-1-1-0").is_dir(), "its lock is held");
-    for kept in [&there, &unmounted] {
+
+    // Not gone, or not surely: the directory, its entries and its lock
+    // files stay.
+    for kept in [&recent, &busy, &there, &unmounted, &other_device] {
         assert!(kept.join("app").join(KEY).is_dir(), "{}", kept.display());
-        assert!(kept.join("pool/wt-1-1-0").is_dir());
         assert!(kept.join("lifecycle.lock").is_file());
+        assert!(kept.join("pool/fill.lock").is_file());
+        assert!(kept.join(".main").is_file());
     }
-    assert!(unknown.join("pool/fill.lock").is_file());
+    for kept in [&mount_root, &old_record] {
+        assert!(kept.join("app").join(KEY).is_dir(), "{}", kept.display());
+    }
+    assert!(
+        unknown.join("pool/wt-1-1-0").is_dir(),
+        "no record: as it was"
+    );
     assert!(unknown.join("lifecycle.lock").is_file());
-    // Once the lock is free, the next walk takes it.
+    // In use, or busy: its spares too.
+    for kept in [&recent, &busy] {
+        assert!(kept.join("pool/wt-1-1-0").is_dir(), "{}", kept.display());
+        assert!(kept.join("pool/fill.log").is_file());
+        assert!(!kept.join(".retention-stamp").exists(), "asked again");
+    }
+    // Unused: the spares, what a fill left half made and its log go,
+    // whether or not the checkout can be reached. Nothing else does.
+    for emptied in [&there, &unmounted, &other_device, &mount_root, &old_record] {
+        let pool = emptied.join("pool");
+        wait_gone(&pool.join("wt-1-1-0"));
+        let mut left: Vec<String> = fs::read_dir(&pool)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [".something-else", "fill.lock"],
+            "{}",
+            emptied.display()
+        );
+        // Looked at: not again for a day.
+        assert!(emptied.join(".retention-stamp").is_file());
+    }
+    // Once the lock is free, it goes.
     drop(held);
-    w.forget_stamps();
-    w.add("wt2");
+    retire(&w, &[&busy]);
     wait_gone(&busy);
     assert!(!busy.exists());
+    // A command in the repository says that it is in use again.
+    let (main, _) = record(&there);
+    let mut c = Command::new(BIN);
+    w.env(&mut c);
+    let wt = main.with_extension("wt2");
+    let out = c
+        .args(["add", "-b", "y", wt.to_str().unwrap(), "HEAD"])
+        .current_dir(&main)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    fs::create_dir_all(there.join("pool/wt-1-1-0")).unwrap();
+    age(&there.join("pool"), WEEK + 60);
+    let _ = fs::remove_file(there.join(".retention-stamp"));
+    retire(&w, &[&there]);
+    assert!(there.join("pool/wt-1-1-0").is_dir());
+}
+
+#[test]
+fn a_walk_hands_the_unused_repositories_to_a_detached_process_and_does_not_wait() {
+    let w = World::new();
+    let gone = recorded_repo(&w, &w.base.join("repos/gone"));
+    let there = recorded_repo(&w, &w.base.join("repos/there"));
+    let recent = recorded_repo(&w, &w.base.join("repos/recent"));
+    fs::remove_dir_all(w.base.join("repos/gone")).unwrap();
+    fs::remove_dir_all(w.base.join("repos/recent")).unwrap();
+    unused_for(&gone, WEEK + 60);
+    unused_for(&there, WEEK + 60);
+    w.forget_stamps();
+    w.add("wt1");
+    wait_gone(&gone);
+    assert!(!gone.exists());
+    wait_gone(&there.join("pool/wt-1-1-0"));
+    assert!(!there.join("pool/wt-1-1-0").exists());
+    assert!(there.join("lifecycle.lock").is_file());
+    assert!(recent.join("pool/wt-1-1-0").is_dir(), "used this week");
+    // The one that stays is not handed over again for a day, however
+    // often the cache is walked: its stamp is not renewed.
+    let stamp = there.join(".retention-stamp");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !stamp.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    age(&stamp, 3_600);
+    let before = fs::metadata(&stamp).unwrap().modified().unwrap();
+    fs::create_dir_all(there.join("pool/wt-1-1-0")).unwrap();
+    age(&there.join("pool"), WEEK + 60);
+    let _ = fs::remove_file(w.cache().join(".retention-stamp"));
+    w.add("wt2");
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert_eq!(fs::metadata(&stamp).unwrap().modified().unwrap(), before);
+    assert!(there.join("pool/wt-1-1-0").is_dir());
+    // A day after it was looked at, it is.
+    age(&stamp, DAY + 60);
+    let _ = fs::remove_file(w.cache().join(".retention-stamp"));
+    w.add("wt3");
+    wait_gone(&there.join("pool/wt-1-1-0"));
+    assert!(!there.join("pool/wt-1-1-0").exists());
+}
+
+/// The worktrees that git lists as locked, with the reason of each.
+fn locked(w: &World, main: &Path) -> Vec<String> {
+    let mut v: Vec<String> = w
+        .git(main, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|l| l.strip_prefix("locked"))
+        .map(|l| l.trim().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A spare as a fill leaves it: a locked worktree in the pool of `repo`.
+fn spare(w: &World, main: &Path, repo: &Path, id: &str) -> PathBuf {
+    let path = repo.join("pool").join(id);
+    let p = path.to_str().unwrap();
+    w.git(main, &["worktree", "add", "-q", "--detach", p, "HEAD"]);
+    w.git(
+        main,
+        &["worktree", "lock", "--reason", "fast-worktree pool", p],
+    );
+    path
+}
+
+#[test]
+fn the_registrations_of_spares_that_went_with_a_moved_checkout_are_dropped() {
+    let w = World::new();
+    let first = w.base.join("repos/app");
+    let old_key = recorded_repo(&w, &first);
+    let ours = "fast-worktree pool".to_string();
+    let a = spare(&w, &first, &old_key, "wt-1700000000-2000000000-0");
+    // A worktree that the user locked, on a disk that is not plugged in.
+    let users = w.base.join("users-wt");
+    let u = users.to_str().unwrap();
+    w.git(&first, &["worktree", "add", "-q", "--detach", u, "HEAD"]);
+    w.git(
+        &first,
+        &["worktree", "lock", "--reason", "on my usb disk", u],
+    );
+    fs::remove_dir_all(&users).unwrap();
+    // And one locked with a reason that only looks like ours.
+    let near = w.base.join("near-wt");
+    let n = near.to_str().unwrap();
+    w.git(&first, &["worktree", "add", "-q", "--detach", n, "HEAD"]);
+    w.git(
+        &first,
+        &["worktree", "lock", "--reason", "fast-worktree pool 2", n],
+    );
+    fs::remove_dir_all(&near).unwrap();
+    let all = vec![
+        ours.clone(),
+        "fast-worktree pool 2".to_string(),
+        "on my usb disk".to_string(),
+    ];
+    assert_eq!(locked(&w, &first), all);
+
+    // The checkout is moved. Its commands now use another directory of
+    // the cache; the spare is still where it was, registered.
+    let second = w.base.join("repos/moved");
+    fs::rename(&first, &second).unwrap();
+    let add = |main: &Path, name: &str| {
+        let mut c = Command::new(BIN);
+        w.env(&mut c);
+        let wt = w.base.join(name);
+        let out = c
+            .args(["add", "-b", name, wt.to_str().unwrap(), "HEAD"])
+            .current_dir(main)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    w.forget_stamps();
+    add(&second, "m1");
+    assert_eq!(locked(&w, &second), all, "its directory is there");
+    // A week later the old path's directory of the cache goes, with the
+    // spare: nothing is at the old path, and git cannot be told.
+    unused_for(&old_key, WEEK + 60);
+    retire(&w, &[&old_key]);
+    wait_gone(&old_key);
+    assert!(!old_key.exists() && !a.exists());
+    assert_eq!(locked(&w, &second), all, "still registered, and locked");
+    // The next command of the repository, where it is now, drops that
+    // registration, and no other.
+    w.forget_stamps();
+    add(&second, "m2");
+    assert_eq!(locked(&w, &second), all[1..]);
+    assert!(!second
+        .join(".git/worktrees/wt-1700000000-2000000000-0")
+        .exists());
+
+    // Moved back: the same for what is left under the old name.
+    fs::rename(&second, &first).unwrap();
+    w.forget_stamps();
+    add(&first, "m3");
+    assert!(old_key.is_dir(), "the old name is in use again");
+    let b = spare(&w, &first, &old_key, "wt-1700000001-2000000000-0");
+    // (Not a ready one: the pool is off here, and the spares of a pool
+    // that is off are discarded by every command.)
+    let making = format!(".new-wt-{}-{}-0", now(), std::process::id());
+    let c = spare(&w, &first, &old_key, &making);
+    let d = spare(&w, &first, &old_key, "wt-1700000003-2000000000-0");
+    // One went without git being told (as when the repository was unused
+    // and could not be reached); one is there, being made by a fill that
+    // is alive; one is being taken by an `add` right now, renamed and not
+    // yet repaired.
+    fs::remove_dir_all(&b).unwrap();
+    fs::rename(
+        &d,
+        old_key.join("pool/.claimed-2000000000-wt-1700000003-2000000000-0"),
+    )
+    .unwrap();
+    w.forget_stamps();
+    add(&first, "m4");
+    let mut expected = vec![ours.clone(), ours.clone()];
+    expected.extend(all[1..].iter().cloned());
+    assert_eq!(locked(&w, &first), expected);
+    assert!(c.is_dir());
+    assert!(!first
+        .join(".git/worktrees/wt-1700000001-2000000000-0")
+        .exists());
+    assert!(first
+        .join(".git/worktrees/wt-1700000003-2000000000-0")
+        .is_dir());
 }
 
 #[test]

@@ -320,8 +320,9 @@ pub fn sweep() {
 }
 
 /// What [`sweep`] deletes, for the trash directory `dir` at time `now`. A
-/// note whose sibling is gone is removed on the way, once the name says
-/// stale (before that the sibling may be about to be put there).
+/// note goes with its sibling, right after it, once the sibling's name
+/// says stale (before that the sibling may be about to be put there),
+/// whether or not the sibling is still there.
 fn stale(dir: &Path, now: u64) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -350,11 +351,11 @@ fn stale(dir: &Path, now: u64) -> Vec<PathBuf> {
         if !is_stale(theirs, now) {
             continue;
         }
-        if target.symlink_metadata().is_err() {
-            let _ = fs::remove_file(e.path());
-        } else {
-            out.push(target);
-        }
+        // The sibling is on another volume, which may be a network mount
+        // that is down: it is not looked at here, in a command that
+        // somebody waits for. The deleter takes it, and then its note.
+        out.push(target);
+        out.push(e.path());
     }
     out
 }
@@ -403,14 +404,17 @@ mod tests {
         assert!(note.is_file());
         // Not stale yet: neither the sibling nor the note goes.
         assert!(stale(&dir, 100 + SWEEP_AFTER_SECS).is_empty());
-        assert_eq!(stale(&dir, 100 + SWEEP_AFTER_SECS + 1), vec![d.clone()]);
-        // Once the sibling is gone, so is the note; not before its name
-        // says stale, when the sibling may be about to be put there.
+        // Stale: the sibling for the deleter, and its note right after it.
+        let both = vec![d.clone(), note.clone()];
+        assert_eq!(stale(&dir, 100 + SWEEP_AFTER_SECS + 1), both);
+        // The sibling is not looked at here (it may be on a mount that is
+        // down): gone or not, the deleter is given both, and the note
+        // goes with it; not before the name says stale, when the sibling
+        // may be about to be put there.
         fs::remove_dir_all(&d).unwrap();
         assert!(stale(&dir, 100 + SWEEP_AFTER_SECS).is_empty());
-        assert!(note.exists());
-        assert!(stale(&dir, 100 + SWEEP_AFTER_SECS + 1).is_empty());
-        assert!(!note.exists());
+        assert_eq!(stale(&dir, 100 + SWEEP_AFTER_SECS + 1), both);
+        assert!(note.exists(), "left to the deleter");
     }
 
     #[test]
@@ -425,7 +429,7 @@ mod tests {
         let note = dir.join("beside-keep-200-100-1-1-wt");
         assert_eq!(fs::read(&note).unwrap(), d.as_os_str().as_bytes());
         assert!(stale(&dir, 200).is_empty(), "kept until its time is up");
-        assert_eq!(stale(&dir, 201), vec![d.clone()]);
+        assert_eq!(stale(&dir, 201), vec![d.clone(), note.clone()]);
         // A rename that fails leaves no note behind.
         assert!(beside(&base.join("vol/none"), "100-1-2-none", &dir).is_err());
         assert!(!dir.join("beside-100-1-2-none").exists());

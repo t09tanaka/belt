@@ -189,12 +189,17 @@ enum CacheCmd {
         #[arg(long, conflicts_with = "older_than")]
         legacy: bool,
     },
+    /// Run as the background helper of the hourly walk: look at the
+    /// repositories that these directories of the cache belong to, which
+    /// ran no command for 7 days
+    #[command(hide = true)]
+    Retire { repos: Vec<PathBuf> },
 }
 
 /// Parse the command line, run the command and return its exit code.
 ///
-/// The background helpers (`pool fill`, `install --changed --deferred`)
-/// re-exec the running binary. This is [`run_with_helper`] with the
+/// The background helpers (`pool fill`, `install --changed --deferred`,
+/// `cache retire`) re-exec the running binary. This is [`run_with_helper`] with the
 /// process's arguments and no helper.
 pub fn run() -> i32 {
     run_with_helper(std::env::args_os(), None)
@@ -208,8 +213,9 @@ pub fn run() -> i32 {
 /// prints them and return their exit code (2, 0, 0) instead of exiting.
 ///
 /// `helper` is the executable that every background helper this call starts
-/// re-execs: `pool fill` after `add` and `hook create`, and `install
-/// --changed --deferred`. It must behave as the `fast-worktree` command:
+/// re-execs: `pool fill` after `add` and `hook create`, `install
+/// --changed --deferred`, and `cache retire` (the hourly walk's look at
+/// the repositories that ran no command for 7 days). It must behave as the `fast-worktree` command:
 /// for example a link named `fast-worktree` to the embedding binary, whose
 /// `main` sees that name and calls this function again with the same
 /// helper. `None` re-execs [`std::env::current_exe`], as [`run`] does. On
@@ -290,6 +296,10 @@ fn dispatch(cli: Cli) -> i32 {
             CacheCmd::Ls => cmd::cache::ls(),
             CacheCmd::Prune { legacy: true, .. } => cmd::cache::prune_legacy(),
             CacheCmd::Prune { older_than, .. } => cmd::cache::prune(older_than),
+            CacheCmd::Retire { repos } => {
+                crate::retention::retire(&repos);
+                0
+            }
         }),
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Status => pool::status(),
