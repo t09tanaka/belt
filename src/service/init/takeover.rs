@@ -161,7 +161,7 @@ fn stages(dirs: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
                 if entry
                     .file_name()
                     .to_str()
-                    .is_some_and(crate::platform::owned_temp::is_own_file_name)
+                    .is_some_and(|s| s.starts_with(crate::platform::owned_temp::STAGE_PREFIX))
                 {
                     paths.insert(entry.path());
                 }

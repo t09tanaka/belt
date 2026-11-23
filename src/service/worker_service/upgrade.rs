@@ -177,6 +177,7 @@ pub fn upgrade<L: Launcher>(
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
+    sweep_written_directories(&paths);
     let mut journal = require_journal(&paths)?;
     check_request(&journal, request)?;
     let digest = sha256_file(current_exe)?;

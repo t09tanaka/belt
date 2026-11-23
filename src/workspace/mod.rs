@@ -733,9 +733,10 @@ impl Workspaces {
 
     /// Clear what workers that died left under the state directory: scratch
     /// directories (`workspaces/.staging.*`, `clones/.clone.*`) and attempt
-    /// workspaces `has_record` does not know. Meant for the worker's startup
-    /// (S10), before any create runs: a create's own scratch directory would
-    /// look like a leftover. A leftover worktree is removed like any other
+    /// workspaces `has_record` does not know. Only for the worker's startup
+    /// (S10), under `agent.lock` and before any create runs: a scratch
+    /// directory without a marker is removed on that ground alone, and a
+    /// create's own would look like a leftover. A leftover worktree is removed like any other
     /// (its clone is read from its `.git` file); anything that cannot be
     /// cleared is reported in `failed` and the sweep goes on.
     pub fn sweep_orphans(
@@ -758,6 +759,17 @@ impl Workspaces {
                     plan::Entry::Attempt(_) if scratch_only => continue,
                     plan::Entry::Attempt(a) if has_record(&a) => continue,
                     plan::Entry::Attempt(a) => self.sweep_attempt(&clones, &a),
+                    // Without a marker (an older version made it, or its
+                    // maker could not say who it was) nothing can be proven
+                    // by the directory itself: it goes because this runs at
+                    // the worker's start under `agent.lock`, before any
+                    // create, where no writer can exist.
+                    plan::Entry::Scratch
+                        if crate::platform::owned_temp::is_without_marker(&path) =>
+                    {
+                        remove_any(&path)
+                            .map_err(|e| io_err("cannot remove a scratch directory", e))
+                    }
                     // A marker proves the owner gone (spec 25.4 (a)); one
                     // that cannot be proven is kept.
                     plan::Entry::Scratch => {

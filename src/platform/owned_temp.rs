@@ -354,34 +354,52 @@ fn parse_marker(text: &str) -> Option<Owner> {
 // ---------------------------------------------------------------------------
 // Single temporary files: the NAME proves the owner (spec 25.4 (a)).
 //
-// `.belt-tmp.<place hash>.<pid>.<start identity>.<random>`: the same three
-// facts as a marker, with the place folded into 16 hex digits so that the
-// name stays at most 71 bytes, far below `NAME_MAX`.
+// `.belt-tmp.<place hash>.<boot hash>.<pid>.<start identity>.<random>`: the
+// same facts as a marker. The host and the PID namespace are folded into 16
+// hex digits and the boot into 8 of its own, so that the name stays at most
+// 80 bytes, far below `NAME_MAX`, and a file left by an earlier boot of this
+// place can still be told from a file of another place.
 // ---------------------------------------------------------------------------
 
 /// Every temporary file belt names itself starts with this. Directories that
 /// other products share (LaunchAgents, systemd units) are only looked at
 /// through it.
 pub const FILE_PREFIX: &str = ".belt-tmp.";
+/// A stage: a file whose name `init` writes into its journal, so that a later
+/// process finishes the publication. It is not a temporary file: no sweep of
+/// temporary files looks at it, and only the recovery of that journal decides
+/// about it ([`sweep_stages`]). The rest of the name is that of a temporary
+/// file, so an abandoned stage can still be told from one in use.
+pub const STAGE_PREFIX: &str = ".init-";
 const RANDOM_LEN: usize = 12;
 const MAX_PID_DIGITS: usize = 10;
 const MAX_START_DIGITS: usize = 20;
+const PLACE_HASH_LEN: usize = 16;
+const BOOT_HASH_LEN: usize = 8;
 const NO_PLACE_HASH: &str = "0000000000000000";
+const NO_BOOT_HASH: &str = "00000000";
 
-/// The first 16 hex digits of SHA-256 over host, PID namespace and boot,
-/// separated by NUL (which none of them can contain).
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The first 16 hex digits of SHA-256 over host and PID namespace, separated
+/// by NUL (which neither can contain). The boot is not part of it: see
+/// [`boot_hash`].
 fn place_hash(place: &Place) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(place.host.as_bytes());
     h.update([0]);
     h.update(place.pid_ns.as_bytes());
-    h.update([0]);
-    h.update(place.boot.as_bytes());
-    h.finalize()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex_of(&h.finalize()[..PLACE_HASH_LEN / 2])
+}
+
+/// The first 8 hex digits of SHA-256 over the boot ID. A name of the same
+/// place with another boot hash is of an owner that went with that boot.
+fn boot_hash(place: &Place) -> String {
+    use sha2::{Digest, Sha256};
+    hex_of(&Sha256::digest(place.boot.as_bytes())[..BOOT_HASH_LEN / 2])
 }
 
 /// A start identity as the decimal that goes into a name: Linux clock ticks,
@@ -411,29 +429,49 @@ fn start_from_digits(digits_text: &str) -> Option<String> {
     }
 }
 
-/// `.belt-tmp.<hash>.<pid>.<start>.` for this process. When the place or the
-/// start cannot be read, the hash is all zeros: such a name is never
-/// recognised as anybody's, so it is only ever removed by its creator.
-pub fn file_prefix() -> String {
+/// `<place hash>.<boot hash>.<pid>.<start>.` for the process `pid` that is
+/// in `place` and started at `start`. When the place (the boot is a part of
+/// it) or the start is not known, or the start has no decimal form, the
+/// hashes are all zeros and the start is `0`: such a name does not parse, so
+/// it is never recognised as anybody's and only its creator removes it. A
+/// real place is never paired with a made-up start, which a reader would
+/// take for an owner that is gone.
+fn owner_part(place: Option<&Place>, start: &StartIdentity, pid: u32) -> String {
+    let known = match (place, start) {
+        (Some(place), StartIdentity::Identity(start)) => {
+            start_digits(start).map(|start| (place_hash(place), boot_hash(place), start))
+        }
+        _ => None,
+    };
+    let (place, boot, start) = known.unwrap_or_else(|| {
+        (
+            NO_PLACE_HASH.to_string(),
+            NO_BOOT_HASH.to_string(),
+            "0".to_string(),
+        )
+    });
+    format!("{place}.{boot}.{pid}.{start}.")
+}
+
+/// [`owner_part`] of this process.
+fn own_part() -> String {
     use std::sync::Mutex;
     static CACHE: Mutex<Option<(u32, String)>> = Mutex::new(None);
     let pid = std::process::id();
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached, prefix)) = cache.as_ref() {
+    if let Some((cached, part)) = cache.as_ref() {
         if *cached == pid {
-            return prefix.clone();
+            return part.clone();
         }
     }
-    let (hash, start) = match (Place::here(), process_start_identity(pid)) {
-        (Some(place), StartIdentity::Identity(start)) => (
-            place_hash(&place),
-            start_digits(&start).unwrap_or_else(|| "0".to_string()),
-        ),
-        _ => (NO_PLACE_HASH.to_string(), "0".to_string()),
-    };
-    let prefix = format!("{FILE_PREFIX}{hash}.{pid}.{start}.");
-    *cache = Some((pid, prefix.clone()));
-    prefix
+    let part = owner_part(Place::here().as_ref(), &process_start_identity(pid), pid);
+    *cache = Some((pid, part.clone()));
+    part
+}
+
+/// `.belt-tmp.<place hash>.<boot hash>.<pid>.<start>.` for this process.
+pub fn file_prefix() -> String {
+    format!("{FILE_PREFIX}{}", own_part())
 }
 
 /// A new temporary file (mode 0600) in `dir`, named by the rule above.
@@ -444,10 +482,27 @@ pub fn file_in(dir: impl AsRef<Path>) -> io::Result<tempfile::NamedTempFile> {
         .tempfile_in(dir)
 }
 
+/// A new stage (mode 0600) in `dir`: see [`STAGE_PREFIX`].
+pub fn stage_in(dir: impl AsRef<Path>) -> io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(&format!("{STAGE_PREFIX}{}", own_part()))
+        .rand_bytes(RANDOM_LEN)
+        .tempfile_in(dir)
+}
+
 /// A name for a temporary file that the caller creates itself (with
 /// `O_EXCL`, or by `openat`): the prefix of this process and 12 random
 /// alphanumerics.
 pub fn new_file_name() -> String {
+    new_name(FILE_PREFIX)
+}
+
+/// A name for a stage that the caller creates itself: see [`STAGE_PREFIX`].
+pub fn new_stage_name() -> String {
+    new_name(STAGE_PREFIX)
+}
+
+fn new_name(kind: &str) -> String {
     const ALPHABET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut random = [0u8; RANDOM_LEN];
     // Without randomness the exclusive create below the caller does is what
@@ -458,7 +513,7 @@ pub fn new_file_name() -> String {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         random.copy_from_slice(&[n.to_le_bytes(), n.to_be_bytes()].concat()[..RANDOM_LEN]);
     }
-    let mut name = file_prefix();
+    let mut name = format!("{kind}{}", own_part());
     name.extend(
         random
             .iter()
@@ -467,23 +522,40 @@ pub fn new_file_name() -> String {
     name
 }
 
-/// What a temporary file name says: the place hash and the owner.
+/// What a temporary file name says: the place, the boot and the owner.
 #[derive(Debug, PartialEq, Eq)]
 struct FileName {
     hash: String,
+    boot: String,
     pid: u32,
     start_digits: String,
 }
 
-fn parse_file_name(name: &str) -> Option<FileName> {
-    let rest = name.strip_prefix(FILE_PREFIX)?;
-    let mut parts = rest.split('.');
-    let (hash, pid, start, random) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some()
-        || hash.len() != 16
-        || !hash
-            .bytes()
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(test)]
+fn parse_file_name(name: &str) -> Option<FileName> {
+    parse_name(name, FILE_PREFIX)
+}
+
+/// `name` as `<kind><place hash>.<boot hash>.<pid>.<start>.<random>`.
+fn parse_name(name: &str, kind: &str) -> Option<FileName> {
+    let rest = name.strip_prefix(kind)?;
+    let mut parts = rest.split('.');
+    let (hash, boot, pid, start, random) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    if parts.next().is_some()
+        || !is_hex(hash, PLACE_HASH_LEN)
+        || !is_hex(boot, BOOT_HASH_LEN)
         || pid.len() > MAX_PID_DIGITS
         || start.len() > MAX_START_DIGITS
         || random.len() != RANDOM_LEN
@@ -493,9 +565,11 @@ fn parse_file_name(name: &str) -> Option<FileName> {
     }
     let pid: u32 = digits(pid)?.try_into().ok().filter(|pid| *pid > 1)?;
     i32::try_from(pid).ok()?;
-    digits(start)?;
+    // No process starts at 0: it is what a name without a known owner says.
+    digits(start).filter(|start| *start > 0)?;
     Some(FileName {
         hash: hash.to_string(),
+        boot: boot.to_string(),
         pid,
         start_digits: start.to_string(),
     })
@@ -511,9 +585,16 @@ pub fn count_files(dir: &Path) -> usize {
     })
 }
 
-/// Whether `name` is a temporary file name of this very process.
+/// Whether `name` is a temporary file name of this very process: its place,
+/// boot, PID and start, not the PID alone (another process may have had it).
 pub fn is_own_file_name(name: &str) -> bool {
-    parse_file_name(name).is_some_and(|n| n.pid == std::process::id())
+    is_own_name(name, &file_prefix())
+}
+
+fn is_own_name(name: &str, own_prefix: &str) -> bool {
+    name.strip_prefix(own_prefix).is_some_and(|random| {
+        random.len() == RANDOM_LEN && random.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
 }
 
 /// How a sweep of one directory went.
@@ -531,6 +612,20 @@ pub struct FileSweep {
 /// link, never followed), are removed; entries that do not start with
 /// [`FILE_PREFIX`] are not looked at.
 pub fn sweep_files(dir: &Path) -> FileSweep {
+    sweep_named(dir, FILE_PREFIX)
+}
+
+/// The same for the stages ([`STAGE_PREFIX`]) in `dir`. Only for the owner
+/// of the journal that can name a stage there, after its recovery found no
+/// stage pending and while it holds the lock that keeps another recovery
+/// out: a stage of a gone owner that the journal does not name is nobody's.
+/// A stage in the older form (`.init-<ulid>`) does not say who made it and
+/// is kept.
+pub fn sweep_stages(dir: &Path) -> FileSweep {
+    sweep_named(dir, STAGE_PREFIX)
+}
+
+fn sweep_named(dir: &Path, kind: &str) -> FileSweep {
     let mut out = FileSweep::default();
     let Ok(entries) = fs::read_dir(dir) else {
         return out;
@@ -538,11 +633,11 @@ pub fn sweep_files(dir: &Path) -> FileSweep {
     let here = Place::here();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str().filter(|n| n.starts_with(FILE_PREFIX)) else {
+        let Some(name) = name.to_str().filter(|n| n.starts_with(kind)) else {
             continue;
         };
         let path = entry.path();
-        if file_owner_is_gone(&path, name, here.as_ref()) && fs::remove_file(&path).is_ok() {
+        if file_owner_is_gone(&path, name, kind, here.as_ref()) && fs::remove_file(&path).is_ok() {
             out.removed += 1;
         } else {
             out.kept += 1;
@@ -553,7 +648,7 @@ pub fn sweep_files(dir: &Path) -> FileSweep {
 
 /// True only with proof: a regular file of this user with one link, and a
 /// name that [`name_owner_is_gone`].
-fn file_owner_is_gone(path: &Path, name: &str, here: Option<&Place>) -> bool {
+fn file_owner_is_gone(path: &Path, name: &str, kind: &str, here: Option<&Place>) -> bool {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -562,22 +657,29 @@ fn file_owner_is_gone(path: &Path, name: &str, here: Option<&Place>) -> bool {
     if !plain || meta.uid() != unsafe { libc::geteuid() } {
         return false;
     }
-    name_is_of_gone_owner(name, here)
+    name_is_of_gone_owner(name, kind, here)
 }
 
 /// Whether `name` is a temporary file name (see [`FILE_PREFIX`]) that parses,
 /// was made in this place, and whose process is proven gone. The caller
 /// still has to look at the file itself (type, owner, links).
 pub fn name_owner_is_gone(name: &str) -> bool {
-    name_is_of_gone_owner(name, Place::here().as_ref())
+    name_is_of_gone_owner(name, FILE_PREFIX, Place::here().as_ref())
 }
 
-fn name_is_of_gone_owner(name: &str, here: Option<&Place>) -> bool {
-    let (Some(parsed), Some(here)) = (parse_file_name(name), here) else {
+/// The rule of [`proven_gone`], read from a name: another host or PID
+/// namespace (another place hash) proves nothing; the same place with
+/// another boot hash is an owner that went with that boot; in the same boot
+/// the process is looked at.
+fn name_is_of_gone_owner(name: &str, kind: &str, here: Option<&Place>) -> bool {
+    let (Some(parsed), Some(here)) = (parse_name(name, kind), here) else {
         return false;
     };
     if parsed.hash != place_hash(here) {
         return false;
+    }
+    if parsed.boot != boot_hash(here) {
+        return true;
     }
     let Some(start) = start_from_digits(&parsed.start_digits) else {
         return false;
@@ -588,6 +690,15 @@ fn name_is_of_gone_owner(name: &str, here: Option<&Place>) -> bool {
         start,
     };
     proven_gone(&owner, here, &process_start_identity(parsed.pid))
+}
+
+/// Whether `dir` certainly has no marker file of an [`OwnedTemp`]: one that
+/// is there but unreadable, or a directory that cannot be looked into, is
+/// not "without". A directory without one says nothing of its owner: only a
+/// caller that knows no writer can exist (a lock held since before any
+/// create) may remove it.
+pub fn is_without_marker(dir: &Path) -> bool {
+    matches!(fs::symlink_metadata(dir.join(MARKER)), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
 /// What tests of the places that sweep need: owners that are gone or alive,
@@ -632,23 +743,57 @@ pub(crate) mod testing {
 
     /// A temporary file name of the rule, as made by `pid` with `start`.
     pub(crate) fn name_of(pid: u32, start: &str, random: &str) -> String {
-        let hash = place_hash(&Place::here().expect("a readable place"));
+        let here = Place::here().expect("a readable place");
         format!(
-            "{FILE_PREFIX}{hash}.{pid}.{}.{random}",
+            "{FILE_PREFIX}{}.{}.{pid}.{}.{random}",
+            place_hash(&here),
+            boot_hash(&here),
             start_digits(start).unwrap()
         )
     }
 
+    fn other_hex(here: &str) -> String {
+        let fill = if here.starts_with('f') { "e" } else { "f" };
+        fill.repeat(here.len())
+    }
+
     /// The same, with a place hash that is not this one's.
     pub(crate) fn name_in_another_place(pid: u32, start: &str, random: &str) -> String {
-        let name = name_of(pid, start, random);
-        let here = &name[FILE_PREFIX.len()..FILE_PREFIX.len() + 16];
-        let other = if here == "ffffffffffffffff" {
-            "0123456789abcdef"
-        } else {
-            "ffffffffffffffff"
-        };
-        name.replacen(here, other, 1)
+        let here = place_hash(&Place::here().unwrap());
+        name_of(pid, start, random).replacen(&here, &other_hex(&here), 1)
+    }
+
+    /// The same in this place, with a boot hash that is not this boot's.
+    pub(crate) fn name_in_another_boot(pid: u32, start: &str, random: &str) -> String {
+        let here = Place::here().unwrap();
+        let (place, boot) = (place_hash(&here), boot_hash(&here));
+        name_of(pid, start, random).replacen(
+            &format!("{place}.{boot}."),
+            &format!("{place}.{}.", other_hex(&boot)),
+            1,
+        )
+    }
+
+    /// `name` (of this process, as production code made it) as a process
+    /// that is gone would have made it: only the PID and the start differ.
+    pub(crate) fn with_ended_owner(name: &str) -> String {
+        let (pid, start) = ended_process();
+        let own = format!(
+            ".{}.{}.",
+            std::process::id(),
+            start_digits(&this_start()).unwrap()
+        );
+        assert!(name.contains(&own), "{name} is not of this process");
+        name.replacen(
+            &own,
+            &format!(".{pid}.{}.", start_digits(&start).unwrap()),
+            1,
+        )
+    }
+
+    /// A stage name ([`STAGE_PREFIX`]) with the owner of the temporary file name `name`.
+    pub(crate) fn as_stage(name: &str) -> String {
+        format!("{STAGE_PREFIX}{}", name.strip_prefix(FILE_PREFIX).unwrap())
     }
 
     /// A name of a process that is gone.
@@ -1069,10 +1214,11 @@ mod tests {
     #[test]
     fn new_names_fit_the_limit_and_parse_back() {
         let name = new_file_name();
-        assert!(name.len() <= 71, "{name}");
+        assert!(name.len() <= 80, "{name}");
         let parsed = parse_file_name(&name).expect("own name parses");
         assert_eq!(parsed.pid, std::process::id());
         assert_eq!(parsed.hash, place_hash(&Place::here().unwrap()));
+        assert_eq!(parsed.boot, boot_hash(&Place::here().unwrap()));
         let dir = parent();
         let file = file_in(dir.path()).unwrap();
         let made = file
@@ -1083,18 +1229,177 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            made.len() <= 71 && parse_file_name(&made).is_some(),
+            made.len() <= 80 && parse_file_name(&made).is_some(),
             "{made}"
         );
         assert!(!made.ends_with(".plist") && !made.ends_with(".service"));
-        // the longest legal form is exactly 71 bytes
+        // the longest legal form is exactly 80 bytes
         let longest = format!(
-            "{FILE_PREFIX}{}.4294967295.{}.{}",
+            "{FILE_PREFIX}{}.{}.2147483647.{}.{}",
             "a".repeat(16),
-            "9".repeat(20),
+            "b".repeat(8),
+            "1".repeat(20),
             "x".repeat(12)
         );
-        assert_eq!(longest.len(), 71);
+        assert_eq!(longest.len(), 80);
+        assert!(parse_file_name(&longest).is_some());
+    }
+
+    /// The place hash is of the host and the PID namespace only; the boot
+    /// has its own field, so the same place in another boot is recognised.
+    #[test]
+    fn the_boot_is_carried_apart_from_the_place() {
+        let a = place("host", "ns", "boot-1");
+        let b = place("host", "ns", "boot-2");
+        assert_eq!(place_hash(&a), place_hash(&b));
+        assert_ne!(boot_hash(&a), boot_hash(&b));
+        assert_ne!(place_hash(&a), place_hash(&place("other", "ns", "boot-1")));
+        assert_ne!(
+            place_hash(&a),
+            place_hash(&place("host", "other", "boot-1"))
+        );
+        // the separator keeps "ho"+"stns" apart from "host"+"ns"
+        assert_ne!(place_hash(&a), place_hash(&place("ho", "stns", "boot-1")));
+        assert_eq!(place_hash(&a).len(), 16);
+        assert_eq!(boot_hash(&a).len(), 8);
+    }
+
+    /// A file of this place that an earlier boot left (power loss) is gone
+    /// with that boot, whatever has its PID now; the same name with another
+    /// place hash proves nothing.
+    #[test]
+    fn a_file_of_an_earlier_boot_of_this_place_is_swept() {
+        let dir = parent();
+        let me = std::process::id();
+        // the PID and start of this live process: only the boot differs
+        let earlier = testing::name_in_another_boot(me, &testing::this_start(), "cccccccccccc");
+        let elsewhere = {
+            let here = place_hash(&Place::here().unwrap());
+            let other = if here.starts_with('f') { "e" } else { "f" }.repeat(16);
+            earlier.replacen(&here, &other, 1)
+        };
+        assert_ne!(earlier, elsewhere);
+        for name in [&earlier, &elsewhere] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert!(name_owner_is_gone(&earlier));
+        assert!(!name_owner_is_gone(&elsewhere));
+        assert_eq!(
+            sweep_files(dir.path()),
+            FileSweep {
+                removed: 1,
+                kept: 1
+            }
+        );
+        assert!(!dir.path().join(&earlier).exists() && dir.path().join(&elsewhere).exists());
+    }
+
+    /// Without a known place, boot or start the name carries no owner: zeros,
+    /// which do not parse, never a real place with a made-up start.
+    #[test]
+    fn a_process_that_cannot_say_who_it_is_makes_names_of_nobody() {
+        let here = place("host", "ns", "boot");
+        let known = owner_part(
+            Some(&here),
+            &StartIdentity::Identity("linux:42".to_string()),
+            77,
+        );
+        assert_eq!(
+            known,
+            format!("{}.{}.77.42.", place_hash(&here), boot_hash(&here))
+        );
+        assert!(parse_file_name(&format!("{FILE_PREFIX}{known}abcDEF123456")).is_some());
+        let nobody = format!("{NO_PLACE_HASH}.{NO_BOOT_HASH}.77.0.");
+        for (place, start) in [
+            // a start that has no decimal form
+            (Some(&here), StartIdentity::Identity("other:42".to_string())),
+            (Some(&here), StartIdentity::Unknown),
+            (Some(&here), StartIdentity::NoProcess),
+            (Some(&here), StartIdentity::Zombie("linux:42".to_string())),
+            // no place: the host, the namespace or the boot is not readable
+            (None, StartIdentity::Identity("linux:42".to_string())),
+        ] {
+            assert_eq!(owner_part(place, &start, 77), nobody, "{start:?}");
+        }
+        let name = format!("{FILE_PREFIX}{nobody}abcDEF123456");
+        assert_eq!(parse_file_name(&name), None);
+        assert!(!name_is_of_gone_owner(&name, FILE_PREFIX, Some(&here)));
+        // the creator still knows its own
+        assert!(is_own_name(&name, &format!("{FILE_PREFIX}{nobody}")));
+    }
+
+    /// A start of 0 is what "not known" is written as: with the place and
+    /// boot of this process and a PID that is gone it still proves nothing.
+    #[test]
+    fn a_start_of_zero_is_nobody() {
+        let (pid, start) = testing::ended_process();
+        let real = testing::name_of(pid, &start, "abcDEF123456");
+        assert!(name_owner_is_gone(&real));
+        let digits = start_digits(&start).unwrap();
+        let zero = real.replacen(&format!(".{pid}.{digits}."), &format!(".{pid}.0."), 1);
+        assert_ne!(real, zero);
+        assert_eq!(parse_file_name(&zero), None);
+        assert!(!name_owner_is_gone(&zero));
+    }
+
+    /// Own means the whole prefix: place, boot, PID and start.
+    #[test]
+    fn only_a_name_with_the_whole_own_prefix_is_own() {
+        let me = std::process::id();
+        assert!(is_own_file_name(&new_file_name()));
+        assert!(is_own_file_name(&testing::live_name("abcDEF123456")));
+        for other in [
+            // this PID in another place, in another boot, with another start
+            testing::name_in_another_place(me, &testing::this_start(), "abcDEF123456"),
+            testing::name_in_another_boot(me, &testing::this_start(), "abcDEF123456"),
+            testing::name_of(me, &testing::my_start_shifted(-30), "abcDEF123456"),
+            format!("{}x", testing::live_name("abcDEF123456")),
+            format!("{}.more", testing::live_name("abcDEF12345")),
+            testing::as_stage(&testing::live_name("abcDEF123456")),
+        ] {
+            assert!(!is_own_file_name(&other), "{other}");
+        }
+    }
+
+    /// Stages are not temporary files: the file sweep does not look at them,
+    /// and the stage sweep removes only those that name a gone owner.
+    #[test]
+    fn stages_are_swept_only_by_the_stage_sweep() {
+        let dir = parent();
+        let made = stage_in(dir.path()).unwrap().keep().unwrap().1;
+        let made_name = made.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(made_name.starts_with(STAGE_PREFIX) && !made_name.starts_with(FILE_PREFIX));
+        assert_eq!(
+            made_name,
+            testing::as_stage(&testing::live_name(&made_name[made_name.len() - 12..]))
+        );
+        assert!(new_stage_name().starts_with(&made_name[..made_name.len() - 12]));
+        assert!(parse_name(&made_name, STAGE_PREFIX).is_some());
+        let dead = dir
+            .path()
+            .join(testing::as_stage(&testing::dead_name("aaaaaaaaaaa1")));
+        let old_form = dir.path().join(".init-01JD0000000000000000000000");
+        let temporary = dir.path().join(testing::dead_name("aaaaaaaaaaa2"));
+        for f in [&dead, &old_form, &temporary] {
+            fs::write(f, b"x").unwrap();
+        }
+        assert_eq!(count_files(dir.path()), 1);
+        assert_eq!(
+            sweep_files(dir.path()),
+            FileSweep {
+                removed: 1,
+                kept: 0
+            }
+        );
+        assert!(dead.exists() && made.exists() && old_form.exists() && !temporary.exists());
+        assert_eq!(
+            sweep_stages(dir.path()),
+            FileSweep {
+                removed: 1,
+                kept: 2
+            }
+        );
+        assert!(!dead.exists() && made.exists() && old_form.exists());
     }
 
     #[test]
@@ -1110,12 +1415,36 @@ mod tests {
             ok.replacen(&format!(".{}.", std::process::id()), ".0.", 1),
             ok.replacen(&format!(".{}.", std::process::id()), ".-5.", 1),
             ok.replacen(&format!(".{}.", std::process::id()), ".99999999999.", 1),
-            format!("{FILE_PREFIX}XYZ.1.1.abcDEF123456"),
+            format!("{FILE_PREFIX}XYZ.{}.5.1.abcDEF123456", "b".repeat(8)),
             format!("{FILE_PREFIX}{}.5.1.abcDEF12345!", "a".repeat(16)),
             format!(
-                "{FILE_PREFIX}{}.5.{}.abcDEF123456",
+                "{FILE_PREFIX}{}.{}.5.1.abcDEF12345!",
                 "a".repeat(16),
+                "b".repeat(8)
+            ),
+            // the form without a boot field, a boot of the wrong length or alphabet
+            format!("{FILE_PREFIX}{}.5.1.abcDEF123456", "a".repeat(16)),
+            format!(
+                "{FILE_PREFIX}{}.{}.5.1.abcDEF123456",
+                "a".repeat(16),
+                "b".repeat(7)
+            ),
+            format!(
+                "{FILE_PREFIX}{}.{}.5.1.abcDEF123456",
+                "a".repeat(16),
+                "B".repeat(8)
+            ),
+            format!(
+                "{FILE_PREFIX}{}.{}.5.{}.abcDEF123456",
+                "a".repeat(16),
+                "b".repeat(8),
                 "1".repeat(21)
+            ),
+            // a start of 0
+            format!(
+                "{FILE_PREFIX}{}.{}.5.0.abcDEF123456",
+                "a".repeat(16),
+                "b".repeat(8)
             ),
             ".tmpAbCd12".to_string(),
         ];
@@ -1221,6 +1550,187 @@ mod tests {
         assert_eq!(sweep(dir.path(), "ci-plan-"), 1);
         assert!(!dead.exists() && live.exists() && unmarked.exists());
         assert!(!remove_if_owner_gone(&unmarked) && unmarked.exists());
+        // "without a marker" is only what is certainly so
+        assert!(is_without_marker(&unmarked) && !is_without_marker(&live));
+        write_marker(&unmarked, "garbage");
+        assert!(!is_without_marker(&unmarked));
+        let file = dir.path().join("a-file");
+        fs::write(&file, b"x").unwrap();
+        assert!(!is_without_marker(&file), "ENOTDIR is not NotFound");
+    }
+
+    /// The lines (1-based) of the Rust source `text` that use the `tempfile`
+    /// crate outside the rule, test-only items left out.
+    ///
+    /// - A use is `tempfile` as a path segment (`tempfile::…`, also after a
+    ///   leading `::`) or as what a `use`/`extern crate` names (`use tempfile
+    ///   as t`). The one form that is allowed is a call of
+    ///   `tempfile::tempfile(` or `tempfile::tempfile_in(`.
+    /// - A test-only item is what follows a `#[cfg(test)]`: up to the `;`
+    ///   that ends it (`mod x;`, a `use`: nothing more is left out, the file
+    ///   of the module is looked at as a file) or to the brace that closes
+    ///   its block, counted from the first `{`, wherever the item is indented
+    ///   and whether or not it is on one line.
+    /// - `//` comments are dropped. Strings and block comments are NOT
+    ///   understood: a brace or a `;` in one counts like any other (so a
+    ///   test-only item may end early or late), and `tempfile::` in a string
+    ///   is reported.
+    fn tempfile_uses(text: &str) -> Vec<usize> {
+        const ATTR: &str = "#[cfg(test)]";
+        enum At {
+            Code,
+            /// After the attribute, before the item's `;` or first `{`.
+            TestItem,
+            /// Inside the block of a test-only item.
+            TestBlock(usize),
+        }
+        fn is_ident(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        /// Whether `code` (outside test-only items) uses the crate.
+        fn uses(code: &str) -> bool {
+            let bytes = code.as_bytes();
+            let mut from = 0;
+            while let Some(found) = code[from..].find("tempfile") {
+                let (start, end) = (from + found, from + found + "tempfile".len());
+                from = end;
+                let whole = (start == 0 || !is_ident(bytes[start - 1]))
+                    && bytes.get(end).is_none_or(|b| !is_ident(*b));
+                if !whole {
+                    continue;
+                }
+                let before = code[..start].trim_end();
+                let after = code[end..].trim_start();
+                // `a::tempfile` is a member of something else; `::tempfile` is the crate
+                let member = before.strip_suffix("::").is_some_and(|path| {
+                    path.as_bytes()
+                        .last()
+                        .is_some_and(|b| is_ident(*b) || *b == b'>')
+                });
+                let before = before.strip_suffix("::").unwrap_or(before).trim_end();
+                let named = before.ends_with("use") || before.ends_with("extern crate");
+                let path = after.strip_prefix("::").map(str::trim_start);
+                let allowed = path
+                    .is_some_and(|p| p.starts_with("tempfile(") || p.starts_with("tempfile_in("));
+                if !member && !allowed && (path.is_some() || named) {
+                    return true;
+                }
+            }
+            false
+        }
+        let mut at = At::Code;
+        let mut found = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let line = line.split("//").next().unwrap_or("");
+            // the parts of the line that are outside test-only items
+            let mut code = String::new();
+            let mut rest = line;
+            while !rest.is_empty() {
+                match at {
+                    At::Code => match rest.find(ATTR) {
+                        Some(attr) => {
+                            code.push_str(&rest[..attr]);
+                            code.push(' ');
+                            rest = &rest[attr + ATTR.len()..];
+                            at = At::TestItem;
+                        }
+                        None => {
+                            code.push_str(rest);
+                            rest = "";
+                        }
+                    },
+                    At::TestItem => match rest.find(['{', ';']) {
+                        Some(end) => {
+                            at = if rest.as_bytes()[end] == b'{' {
+                                At::TestBlock(1)
+                            } else {
+                                At::Code
+                            };
+                            rest = &rest[end + 1..];
+                        }
+                        None => rest = "",
+                    },
+                    At::TestBlock(depth) => match rest.find(['{', '}']) {
+                        Some(brace) => {
+                            at = match (rest.as_bytes()[brace] == b'{', depth) {
+                                (true, depth) => At::TestBlock(depth + 1),
+                                (false, 1) => At::Code,
+                                (false, depth) => At::TestBlock(depth - 1),
+                            };
+                            rest = &rest[brace + 1..];
+                        }
+                        None => rest = "",
+                    },
+                }
+            }
+            if uses(&code) {
+                found.push(i + 1);
+            }
+        }
+        found
+    }
+
+    /// The scanner itself: what it must report and what it must leave out.
+    #[test]
+    fn the_tempfile_scanner_sees_through_test_only_items() {
+        // a `#[cfg(test)] mod x;` does not hide the rest of the file
+        let declared = "\
+#[cfg(test)]
+mod tests;
+fn f() { tempfile::tempdir(); }
+";
+        assert_eq!(tempfile_uses(declared), [3]);
+        // an indented or one-line test-only item ends at its own brace
+        let indented = "\
+impl S {
+    #[cfg(test)]
+    fn only_in_tests() {
+        if true { tempfile::tempdir(); }
+    }
+    fn real() { tempfile::NamedTempFile::new(); }
+}
+#[cfg(test)] fn one_line() { tempfile::tempdir(); }
+fn after() { tempfile::Builder::new(); }
+    #[cfg(test)]
+    use tempfile::TempDir;
+fn last() -> tempfile::TempDir { todo!() }
+";
+        assert_eq!(tempfile_uses(indented), [6, 9, 12]);
+        // the crate under another name, or named without a path after it
+        let renamed = "\
+use tempfile as t;
+use ::tempfile;
+extern crate tempfile;
+use tempfile::{self as u, tempdir};
+fn f() { ::tempfile::tempdir(); }
+";
+        assert_eq!(tempfile_uses(renamed), [1, 2, 3, 4, 5]);
+        // the block of a test module is left out whole; what follows is not
+        let module = "\
+fn before() {}
+#[cfg(test)]
+#[allow(dead_code)]
+mod tests {
+    use super::*;
+    fn f() { let _ = tempfile::tempdir(); }
+    mod deeper { fn g() { tempfile::tempdir(); } }
+}
+fn after() { tempfile::tempdir(); }
+";
+        assert_eq!(tempfile_uses(module), [9]);
+        // the allowed form, comments, and names that only contain the word
+        let allowed = "\
+fn f() {
+    let a = tempfile::tempfile();
+    let b = tempfile::tempfile_in(dir);
+    let c = ::tempfile::tempfile();
+    // tempfile::tempdir() in a comment
+    let tempfile = 1; let d = my_tempfile::new(); let e = x.tempfile;
+    let f = store::tempfile::make(); let g = tempfile_in(dir);
+    let h = tempfile::tempfile_into(dir);
+}
+";
+        assert_eq!(tempfile_uses(allowed), [8]);
     }
 
     /// Spec 25.4 (a) acceptance (vi): outside tests, `src/` creates temporary
@@ -1251,30 +1761,12 @@ mod tests {
                 }
                 let text = fs::read_to_string(&path).unwrap();
                 let lines: Vec<&str> = text.lines().collect();
-                let mut in_test_item = false;
-                for (i, line) in lines.iter().enumerate() {
-                    if line.trim() == "#[cfg(test)]" {
-                        let next = lines.get(i + 1).map_or("", |next| next.trim_start());
-                        if next.starts_with("mod ") || next.contains(" mod ") {
-                            // the rest of the file is the test module
-                            break;
-                        }
-                        // a test-only item: up to its closing brace in column 0
-                        in_test_item = true;
-                    }
-                    if in_test_item {
-                        in_test_item = *line != "}";
-                        continue;
-                    }
-                    let code = line.split("//").next().unwrap_or("");
-                    let mut rest = code;
-                    while let Some(at) = rest.find("tempfile::") {
-                        let after = &rest[at + "tempfile::".len()..];
-                        if !(after.starts_with("tempfile(") || after.starts_with("tempfile_in(")) {
-                            found.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
-                        }
-                        rest = after;
-                    }
+                for line in tempfile_uses(&text) {
+                    found.push(format!(
+                        "{}:{line}: {}",
+                        path.display(),
+                        lines[line - 1].trim()
+                    ));
                 }
             }
         }

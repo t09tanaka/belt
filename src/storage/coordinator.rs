@@ -415,7 +415,9 @@ impl CoordinatorStore {
             );
             return Ok(());
         }
-        let stage = crate::platform::owned_temp::file_in(state_dir)?;
+        // A stage, not a temporary file: `publish` writes its name into the
+        // journal of `init`, and a later `init` finishes the publication.
+        let stage = crate::platform::owned_temp::stage_in(state_dir)?;
         let db = Db::open(stage.path(), DbKind::Coordinator, Access::ReadWrite)?;
         let cl = cluster.clone();
         let co = coordinator.clone();

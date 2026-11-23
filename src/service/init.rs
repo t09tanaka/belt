@@ -77,6 +77,17 @@ fn services_dir(backend: Backend, home: &Path, config: &Path) -> anyhow::Result<
         }
     })
 }
+/// The directories of the parent in which a killed command can leave a
+/// temporary file, beyond those of the worker on the same host: the parent's
+/// state directory (`traffic-hold.json` and the like) and the directory of
+/// the upgrade record. `None` when the paths cannot be resolved.
+pub(super) fn temporary_dirs(
+    env: &BTreeMap<String, String>,
+    backend: Backend,
+) -> Option<[PathBuf; 2]> {
+    let paths = Paths::resolve_for(env, backend).ok()?;
+    Some([paths.state, paths.config.join("upgrade")])
+}
 impl Paths {
     #[cfg(test)]
     fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
@@ -406,7 +417,7 @@ fn recover(
                     .path
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with(crate::platform::owned_temp::FILE_PREFIX)),
+                    .is_some_and(is_stage_name),
             "invalid pending stage"
         );
         if p.target.try_exists()? {
@@ -458,11 +469,41 @@ fn owned(j: &Journal, path: &Path) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
+/// Where the file that becomes `target` is prepared. The journal names this
+/// path (`pending`) and a later `init` finishes the publication, so it is a
+/// stage and not a temporary file (spec 25.4 (a)): no sweep of temporary
+/// files may touch it.
 fn stage_path(target: &Path) -> PathBuf {
     target
         .parent()
         .expect("absolute target")
-        .join(crate::platform::owned_temp::new_file_name())
+        .join(crate::platform::owned_temp::new_stage_name())
+}
+/// A stage a journal may name: `.init-…`, both the form that says who made
+/// it and the `.init-<ulid>` of earlier versions, whose journal a later
+/// binary must still recover.
+fn is_stage_name(name: &str) -> bool {
+    name.starts_with(crate::platform::owned_temp::STAGE_PREFIX)
+}
+/// Remove the stages that an `init` which was killed before it journaled
+/// them left in the directories that only this journal governs: the
+/// configuration directory, the directory of the binary and the parent's
+/// state directory. Only after [`recover`] returned with no stage pending
+/// and under `init.lock`: then no journal names a stage whose owner is gone.
+/// The directory of the service definitions is shared with other
+/// installations of this user (another configuration directory, another
+/// journal), so a stage there is left alone.
+fn sweep_abandoned_stages(j: &Journal, paths: &Paths) {
+    if j.pending.is_some() {
+        return;
+    }
+    let binary_dir = j.spec.executable.parent();
+    for dir in [Some(paths.config.as_path()), binary_dir, Some(&paths.state)]
+        .into_iter()
+        .flatten()
+    {
+        crate::platform::owned_temp::sweep_stages(dir);
+    }
 }
 fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     resident::validate_components(path)?;
@@ -754,6 +795,7 @@ async fn initialize_prepared<L: Launcher>(
         p.verify()?;
     }
     recover(&mut j, &mut jf, &paths, &plan)?;
+    sweep_abandoned_stages(&j, &paths);
     private_dir_with(&paths.state, durability)?;
     private_dir_with(&paths.worker, durability)?;
     if !owned(&j, &paths.key)? {
@@ -854,7 +896,7 @@ async fn initialize_prepared<L: Launcher>(
     let _service_lease = files.lifecycle_lock()?;
     if j.plist.is_none() {
         let receipt = files
-            .install_journaled(&plan, |receipt, stage| {
+            .install_staged(&plan, |receipt, stage| {
                 durability.sync_directory(stage.parent().context("plist stage parent")?)?;
                 j.plist = Some(receipt.clone());
                 j.pending = Some(Pending {

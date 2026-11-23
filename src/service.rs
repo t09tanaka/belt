@@ -39,7 +39,9 @@ pub mod planning;
 pub(crate) mod top;
 
 /// The directories that [`sweep_start_temporaries`] looks at.
-fn temporary_dirs(env: &std::collections::BTreeMap<String, String>) -> Vec<std::path::PathBuf> {
+pub(crate) fn temporary_dirs(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Vec<std::path::PathBuf> {
     use worker_service::Paths;
     let mut dirs = Vec::new();
     for backend in [
@@ -49,13 +51,18 @@ fn temporary_dirs(env: &std::collections::BTreeMap<String, String>) -> Vec<std::
         let Ok(paths) = Paths::resolve_for(env, backend) else {
             continue;
         };
+        // The worker's state directory is not the parent's: `init` keeps
+        // the parent's below the user's state home.
+        let parent = init::temporary_dirs(env, backend);
         for dir in [
             paths.config.clone(),
             paths.config.join("bin"),
             paths.state.clone(),
-            paths.state.join("upgrade"),
             paths.services.clone(),
-        ] {
+        ]
+        .into_iter()
+        .chain(parent.into_iter().flatten())
+        {
             if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -67,8 +74,8 @@ fn temporary_dirs(env: &std::collections::BTreeMap<String, String>) -> Vec<std::
 /// Spec 25.4 (a): at the start of `init`, `upgrade`, `group`, `workers`, the
 /// resident and the worker, clear the temporary files that a process killed
 /// earlier left in the places those commands write: the configuration
-/// directory and its `bin/`, the state directory and its `upgrade/`, and the
-/// directory of the service definitions (LaunchAgents or the user's systemd
+/// directory with its `bin/` and `upgrade/`, the state directories of the
+/// worker and of the parent, and the directory of the service definitions (LaunchAgents or the user's systemd
 /// units, shared with other products: only names that start with
 /// [`crate::platform::owned_temp::FILE_PREFIX`] are looked at there). One
 /// `readdir` of each; a path that cannot be resolved is skipped.
@@ -95,21 +102,30 @@ mod start_sweep_tests {
     use std::collections::BTreeMap;
 
     /// Spec 25.4 (a) acceptance (i), (ii) and (v) for the places the start of
-    /// a command sweeps: the configuration directory and `bin/`, the state
-    /// directory and `upgrade/`, and the service definitions.
+    /// a command sweeps: the configuration directory with `bin/` and
+    /// `upgrade/`, the state directories of the worker and of the parent
+    /// (which is not the worker's), and the service definitions. The
+    /// configuration directory is the one the environment names, not a fixed
+    /// one.
     #[test]
     fn start_sweep_clears_dead_temporaries_and_leaves_other_products_alone() {
         let home = crate::test_tmp::tempdir().unwrap();
-        let env = BTreeMap::from([(
-            "HOME".to_string(),
-            home.path().to_string_lossy().into_owned(),
-        )]);
+        let at = |leaf: &str| home.path().join(leaf).to_string_lossy().into_owned();
+        let env = BTreeMap::from([
+            ("HOME".to_string(), at("")),
+            ("XDG_CONFIG_HOME".to_string(), at("elsewhere/config")),
+            ("XDG_STATE_HOME".to_string(), at("elsewhere/state")),
+        ]);
         let paths = worker_service::Paths::resolve(&env).unwrap();
+        let parent_state = home.path().join("elsewhere/state/belt/coordinator");
+        assert_eq!(paths.config, home.path().join("elsewhere/config/belt"));
+        assert_ne!(paths.state, parent_state);
         let dirs = [
             paths.config.clone(),
             paths.config.join("bin"),
+            paths.config.join("upgrade"),
             paths.state.clone(),
-            paths.state.join("upgrade"),
+            parent_state,
             paths.services.clone(),
         ];
         let mut gone = Vec::new();

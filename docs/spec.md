@@ -2006,30 +2006,32 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 ### (a) 一時fileと一時directory
 
-**今の挙動（段階1の (a) の実装後）。** 規則と、表の各場所の走査は入った（名前は `owned_temp::file_in`・`new_file_name`、走査は `sweep_files`、directoryは `OwnedTemp` と `sweep`。`doctor` は残った件数を `leftover_temporaries` で示す）。規則の外に残るのは2つで、どちらも所有を証明する名前にしていない: 再開できる受け渡しの `incoming-*.part`（`worker/ci_task.rs`。名前が決まっていて、持ち主の `sweep_plans` が消す）と、`setup/store.rs` の `.tmp-<ulid>`（workerの起動時の `sweep` が、`agent.lock` の下で消す）。他のuidのfileに触れないことは、試験では確かめていない（別のuidのfileを作れないため）。
+**今の挙動（段階1の (a) の実装後）。** 規則と、表の各場所の走査は入った（名前は `owned_temp::file_in`・`new_file_name`、走査は `sweep_files`、directoryは `OwnedTemp` と `sweep`。journalが名指すstageは `stage_in`・`new_stage_name` と、`init` だけが呼ぶ `sweep_stages`。`doctor` は残った件数を `leftover_temporaries` で示す）。規則の外に残るのは2つで、どちらも所有を証明する名前にしていない: 再開できる受け渡しの `incoming-*.part`（`worker/ci_task.rs`。名前が決まっていて、持ち主の `sweep_plans` が消す）と、`setup/store.rs` の `.tmp-<ulid>`（workerの起動時の `sweep` が、`agent.lock` の下で消す）。他のuidのfileに触れないことは、試験では確かめていない（別のuidのfileを作れないため）。
 
 **規則。** beltが作る一時のfile・directoryは、例外なく次のどちらかにする。
 
 - **directory**は、所有marker（`platform::owned_temp`。場所・pid・processの開始identity）を持つ。
-- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所のhash>.<pid>.<開始identity>.<乱数>` とし、markerと同じ3つの事実を運ぶ。場所・pid・開始identityの定義は `owned_temp` と同じものを使う。
-- **場所は固定長のhashで運ぶ。** `owned_temp` の場所は、hostname・OSのboot・PID namespaceの3つで、hostnameだけで255 bytesになり得る。そのまま名前に入れると、file名の上限（`NAME_MAX`。255 bytes）を超える。名前に入れるのは、3つを区切りつきで並べたもののSHA-256の先頭16桁（hex）とする。pidは10進（10桁まで）、開始identityは10進（20桁まで）、乱数は英数字12字とする。名前は最長で `.belt-tmp.`（10）+ 16 + 1 + 10 + 1 + 20 + 1 + 12 = 71 bytesで、どのfilesystemの上限にも収まる。走査は、今の場所から同じhashを計算して比べる。hashが違えば「場所が違う」として触れない。directoryのmarkerは、fileの中身なので、今までどおり3つをそのまま持つ。
+- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所のhash>.<bootのhash>.<pid>.<開始identity>.<乱数>` とし、markerと同じ事実（場所・boot・pid・開始identity）を運ぶ。それぞれの定義は `owned_temp` と同じものを使う。
+- **場所とbootは、別々の固定長のhashで運ぶ。** `owned_temp` の場所は、hostname・PID namespace・OSのbootの3つで、hostnameだけで255 bytesになり得る。そのまま名前に入れると、file名の上限（`NAME_MAX`。255 bytes）を超える。名前に入れるのは、hostnameとPID namespaceを区切りつきで並べたもののSHA-256の先頭16桁（hex。場所のhash）と、bootのIDのSHA-256の先頭8桁（hex。bootのhash）である。bootを場所のhashに混ぜない: 混ぜると、再起動の後は「別の場所」と区別できず、電源断で残った単独のfile（鍵の平文の写しを含む）を、どのprocessも二度と消せない。pidは10進（10桁まで）、開始identityは10進（20桁まで。0は使わない）、乱数は英数字12字とする。名前は最長で `.belt-tmp.`（10）+ 16 + 1 + 8 + 1 + 10 + 1 + 20 + 1 + 12 = 80 bytesで、どのfilesystemの上限にも収まる。走査は、今の場所から同じ2つのhashを計算して比べる。場所のhashが違えば「場所が違う」として触れない。場所のhashが同じでbootのhashが違えば、持ち主はそのbootと一緒に居なくなっている（markerの規則と同じ）。bootのhashも同じときだけ、pidと開始identityを見る。directoryのmarkerは、fileの中身なので、今までどおり3つをそのまま持つ。
+- **持ち主を言えないprocessの名前は、誰のものでもない。** 場所（hostname・PID namespace・boot）か、自分の開始identityを読めないprocessは、2つのhashを全部0、開始identityを0にした名前を使う。開始identityが0の名前は解釈できない名前として扱い、走査は触れない（作ったprocessだけが消す）。本物の場所に、作り物の開始identityを組み合わせない: 読み手には「持ち主が居ない」と見えてしまう。
+- **journalに書いた名前のfileは、一時fileではない。** `init` は、公開の直前のfile（鍵・binary・DB・入力・serviceの定義）の名前を `init.json` の `pending` に書いてから公開し、途中で終わると、後の `init` がそのfileを使って公開を済ませる。後のprocessへ引き渡すfileなので、「読むのは作ったprocessだけ」という一時fileの前提が成り立たない。このfile（stage）は `.init-` で始まる名前にし、一時fileの走査は見ない。持ち主はjournalの回復である: 回復が公開を済ませる（renameで名前が消える）か、取り消しがjournalと一緒に消す。名前の残りは一時fileと同じ形（`.init-<場所のhash>.<bootのhash>.<pid>.<開始identity>.<乱数>`）にして、作ったprocessが分かるようにする。`init` は、`init.lock` の下で回復が済み、`pending` が空になった後に、そのjournalだけが扱うdirectory（config directory、binaryのdirectory、親のstate）にある、持ち主の居ないstageを消す（journalに書く前に終わった `init` の残り。journalが名指していないことは、`pending` が空であることで分かる）。serviceの定義のdirectoryは、同じ利用者の別の導入（別のconfig directoryとjournal）と共有なので、そこのstageは消さない。古い版が書いた `.init-<ulid>` は、誰が作ったか分からないので消さないが、`pending` が名指すstageとしては、どちらの形も受け付ける（古いbinaryの書いたjournalを回復できる）。
 - 作った時点でunlinkできるもの（匿名で足りるもの）は、名前を持たせない。
 
-走査は、その場所で同じ種類の処理を始めるとき（下の表）に、そのdirectoryの `readdir` 1回で行う。消すのは、名前かmarkerが解釈でき、場所が今と同じで、そのpidのprocessが居ないか開始identityが違うものだけである。自分のuidの所有で、link数が1（fileのとき）で、symlinkをたどらない。解釈できないもの、場所が違うものには触れず、`doctor` が件数を示す。processにsignalは送らない。
+走査は、その場所で同じ種類の処理を始めるとき（下の表）に、そのdirectoryの `readdir` 1回で行う。消すのは、名前かmarkerが解釈でき、場所が今と同じで、bootが今と違うか、そのpidのprocessが居ないか開始identityが違うものだけである。自分のuidの所有で、link数が1（fileのとき）で、symlinkをたどらない。解釈できないもの、場所が違うものには触れず、`doctor` が件数を示す。processにsignalは送らない。
 
 | 場所 | 作るもの | 走査の契機 |
 | - | - | - |
-| 親のstate直下 | `ci-plan-*/`（計画の下書き）、`.init-*`（DBの準備）、`traffic-hold.json` などの固定fileの一時file | 計画の開始、`init`、residentの起動 |
+| 親のstate直下（`<state home>/belt/coordinator/`。workerのstateとは別のdirectory） | `ci-plan-*/`（計画の下書き）、`traffic-hold.json` などの固定fileの一時file。DBの準備の `.init-*` はstageで、一時fileではない（上の規則） | 計画の開始、`init`・`upgrade`・`group`・`workers` の各commandの開始、residentの起動 |
 | 親・workerの `sources/tmp/` | `.recv.*`、`.manifest.*`、`commit-<sha>-*/` | そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動時） |
 | 親の `results/<attempt>/tmp/` | `*.part` | 回収の続き（既存）。attemptの結果を消すときに一緒に消える |
 | 親の `secrets/` | `.<名前>.<ulid>.tmp` | Vaultの排他lockの下の保持driver（既存の `sweep_orphan_tmp`。所有を証明できる名前に変える） |
 | 親の `sources/secrets/` | `.secrets.tmp-*`（local-ciが書く、平文のsecretの束の一時file。名前はlocal-ciが決めるので、この規則の名前にできない） | 保持driverが `sources/secrets.lock` を待たずに排他で取れたpass。この一時fileを書く取り込みは、必ずこのlockを持つ（`src/secrets/capture.rs`）ので、lockを取れた時点の残りは、書き手の居ない残骸である。workerの側は、起動時の既存の片付け（`sweep_store_copies`）が同じ規則で消す |
 | workerのstate直下 | `.s*/`（socketの準備）、`worker-socket.json` などの一時file、`removed-members.json` の一時file | workerの起動（`agent.lock` の下） |
-| workerの `clones/`・`workspaces/` | 展開と作成の作業用directory | workerの起動（既存の孤児の走査） |
+| workerの `clones/`・`workspaces/` | 展開と作成の作業用directory（`.clone.*`・`.staging.*`） | workerの起動（既存の孤児の走査）。`agent.lock` の下で、どの作成よりも前に走るので、書き手は居ない。markerのあるものは持ち主の規則に従い、markerの無いもの（古い版が作ったもの、作ったprocessが自分の場所か開始identityを読めなかったもの）は、書き手が居ないことを根拠に消す。markerがあって読めないものは残す |
 | workerの `setup/builders/<id>/`、`attempts/<attempt>/`、親の `results/<attempt>/` | builderの一時file、準備の観測の一時file、CIのartifactの受け渡しの作業用 | 持ち主のdirectoryと一緒に消える（既存）。持ち主のdirectoryの外（state直下）に書くものは、workerの起動 |
-| system userのworkerの入力のdirectory | 入力の一時file | そのworkerのserviceを書くcommandの開始 |
+| system userのworkerの入力のdirectory（管理者が決めたconfig directory） | 入力・journalの一時file、`bin/` の切替の途中のlink | そのworkerの入力を書くcommand（`worker-service` の `install`・`upgrade`）の開始と、そのworkerの起動。どちらも、自分が書く先として解決したdirectoryを走査する |
 | config directory | `init.json`・`membership-undo.json`・`worker-service.json`・鍵・設定の一時file | `init`・`group`・`workers` の各commandの開始、residentとworkerの起動 |
-| `<state>/upgrade/` | `record.json` の一時file | `upgrade` の開始、serviceの入口 |
+| `<config>/upgrade/` | `record.json` と退避した設定の一時file | `upgrade` の開始、serviceの入口 |
 | `<config>/bin/` | `.resident.<pid>`、`.current.<pid>`（切替の途中のlink） | `upgrade`・`init` の開始、residentとworkerの起動 |
 | LaunchAgentsのdirectory（macOS）、systemdのunitのdirectory | service定義の一時file | serviceの定義を書くcommandの開始 |
 | `$TMPDIR` | `belt-log-reader-*/`、profileの検査用directory | `logs` の開始、検査の開始 |
@@ -2038,7 +2040,7 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 **安全の証明。** 一時fileを読むのは作ったprocessだけである（公開はrename）。そのprocessが居ないことを、場所・pid・開始identityの一致で確かめる。pidが使い回されていても、開始identityが違えば別のprocessである。場所が違うfile（別のhost、またはhostを特定できない）は消さない。
 
-**受け入れ試験。** 表の各場所について: (i) 一時fileを作ったprocessをSIGKILLし、次の契機でそのfileが消える。(ii) 生きているprocessの一時fileは消えない。(iii) pidが同じで開始identityが違うものは消える。(iv) 名前が合わないfile、他のuidのfile、link数が2のfileには触れない。(v) LaunchAgentsのdirectoryにある他の製品のfileに触れない。(vi) `src/` に、この規則を通らない `tempfile` の呼び出しが無いこと（testを除く）を、固定の検査で確かめる。
+**受け入れ試験。** 表の各場所について: (i) 一時fileを作ったprocessをSIGKILLし、次の契機でそのfileが消える。(ii) 生きているprocessの一時fileは消えない。(iii) pidが同じで開始identityが違うものは消える。(iv) 名前が合わないfile、他のuidのfile、link数が2のfileには触れない。(v) LaunchAgentsのdirectoryにある他の製品のfileに触れない。(vi) `src/` に、この規則を通らない `tempfile` の呼び出しが無いこと（testを除く）を、固定の検査で確かめる。検査は、`#[cfg(test)]` の付いた項目だけを、その項目の終わり（`;` か、対応する閉じ括弧）まで除き、`tempfile` をpathの一部として使う行と、`use tempfile as …` のような別名を見つける。文字列と `/* */` の中は解釈しない。 (vii) journalが名指すstageは、作った `init` が居なくなった後の各commandの開始の走査で消えず、次の `init` が公開を済ませる。 (viii) 場所が同じでbootが違う名前のfileは消え、場所が違う名前のfileは消えない。
 
 ### (b) 提出されなかった取り込み
 
@@ -2517,7 +2519,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときだけ消す | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
 | 実測 | `stats/costs-v1.sqlite`（`costs`・`preparation_namespaces`・`preparation_receipts`・`cost_eviction`） | 配置の見積 | `costs` 4,096行、`preparation_namespaces` 4,096 | 同じ | 既存 | 順位 |
 | 更新の試用 | `upgrade/`（`record.json`、退避したDBと設定） | rollback | 試用の間。同時に1つ | 同じ | 既存 | commitの記録 |
-| DBの準備の途中 | `.init-*` | `init` の続き | `init` とrollbackが片付ける。名前が所有を証明し、`init` などの開始が持ち主の居ないものを消す | 加えて25.4の (a) | 1 | `init.json` に無いことと、持ち主 |
+| 公開の直前のstage（鍵・binary・DB・入力・serviceの定義） | `.init-*` | `init` の続き | journalが名指すものは、`init` の回復が公開を済ませ、取り消しが消す。一時fileの走査は見ない。journalに書く前に終わった `init` の残りは、次の `init` が、回復の後に持ち主の居ないものを消す（config directory、binaryのdirectory、親のstate）。serviceの定義のdirectoryの残りと、古い形の `.init-<ulid>` は残る（1回のkillにつき高々1個。serviceの定義は数KB） | 同じ | 1 | `init.json` に無いことと、持ち主 |
 | 固定のfile | `coordinator.json`、`init.json`、`control.json`、`group-rotation.json`、`membership-undo.json`、`membership-restart`、`traffic-hold.json`、`upgrade-hold.json`、`request.sock`、`owner.token` | それぞれの操作と起動 | 各1個。上書きする | 同じ | 既存 | 各操作の規則 |
 | 固定のlock | 25.1の表の最後の行のうち、親のもの | すべてのcommand | 各1個 | unlinkしない | 既存 | 該当なし |
 

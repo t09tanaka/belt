@@ -386,7 +386,7 @@ async fn binary_stage_directory_barrier_precedes_pending_and_os_actions() {
                     e.unwrap()
                         .file_name()
                         .to_string_lossy()
-                        .starts_with(crate::platform::owned_temp::FILE_PREFIX)
+                        .starts_with(crate::platform::owned_temp::STAGE_PREFIX)
                 })
             {
                 let j: Journal = serde_json::from_slice(&fs::read(&self.journal)?).unwrap();
@@ -554,7 +554,8 @@ async fn uncertain_journal_commit_retains_exact_native_stage_for_reinit() {
     };
     jf.save(&j).unwrap();
     let error = native
-        .install_journaled(&plan, |receipt, stage| {
+        .install_staged(&plan, |receipt, stage| {
+            assert!(is_stage_name(stage.file_name().unwrap().to_str().unwrap()));
             j.plist = Some(receipt.clone());
             j.pending = Some(Pending {
                 staged: Proof::read(stage)?,
@@ -1428,4 +1429,169 @@ async fn a_start_without_a_leftover_changes_nothing() {
     let before = fs::read(&paths.journal).unwrap();
     settle_key_change(&spec).unwrap();
     assert_eq!(fs::read(&paths.journal).unwrap(), before);
+}
+
+/// The path `stage_path` gives for `target`, as an `init` that has since been
+/// killed would have named it.
+fn stage_of_a_killed_init(target: &Path) -> PathBuf {
+    let stage = stage_path(target);
+    let name = stage.file_name().unwrap().to_str().unwrap();
+    stage.with_file_name(crate::platform::owned_temp::testing::with_ended_owner(name))
+}
+
+/// A stage that the journal names is handed to a later process: it is not a
+/// temporary file, and the sweep that every later command runs at its start
+/// must leave it for the recovery, although the `init` that made it is gone.
+#[tokio::test]
+async fn a_journaled_stage_of_a_killed_init_survives_the_start_sweep_and_recovers() {
+    for database in [false, true] {
+        let (_t, c) = fixture();
+        let p = Paths::resolve(&c.env).unwrap();
+        assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+        let mut j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+        let mut jf = JournalFile {
+            path: p.journal.clone(),
+            proof: Some(Proof::read(&p.journal).unwrap()),
+        };
+        let target = if database {
+            p.state.join("coordinator.db")
+        } else {
+            p.input.clone()
+        };
+        let stage = stage_of_a_killed_init(&target);
+        fs::rename(&target, &stage).unwrap();
+        j.files.retain(|f| f.path != target);
+        if database {
+            j.database = None;
+        }
+        j.pending = Some(Pending {
+            staged: Proof::read(&stage).unwrap(),
+            target: target.clone(),
+        });
+        jf.save(&j).unwrap();
+        // what `init`, `upgrade`, `group`, `workers`, the resident and the
+        // worker all do first; the stage is in a directory it looks at
+        assert!(
+            crate::service::temporary_dirs(&c.env).contains(&stage.parent().unwrap().to_owned())
+        );
+        crate::service::sweep_start_temporaries(&c.env);
+        assert!(stage.exists(), "the start sweep took a journaled stage");
+        assert!(initialize(c, &mut Unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+        let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+        assert!(j.pending.is_none() && target.exists() && !stage.exists());
+        assert!(
+            j.files.iter().any(|f| f.path == target)
+                || j.database.as_ref().is_some_and(|f| f.path == target)
+        );
+    }
+}
+
+/// A journal that an earlier version wrote names its stage `.init-<ulid>`:
+/// it still recovers. A temporary file is never a stage a journal may name.
+#[tokio::test]
+async fn a_pending_stage_in_the_form_of_an_earlier_version_recovers() {
+    for (name, accepted) in [
+        (format!(".init-{}", ulid::Ulid::new()), true),
+        (crate::platform::owned_temp::new_stage_name(), true),
+        (crate::platform::owned_temp::new_file_name(), false),
+        ("coordinator.json.new".to_string(), false),
+    ] {
+        let (_t, c) = fixture();
+        let p = Paths::resolve(&c.env).unwrap();
+        assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+        let mut j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+        let mut jf = JournalFile {
+            path: p.journal.clone(),
+            proof: Some(Proof::read(&p.journal).unwrap()),
+        };
+        let stage = p.config.join(&name);
+        fs::rename(&p.input, &stage).unwrap();
+        j.files.retain(|f| f.path != p.input);
+        j.pending = Some(Pending {
+            staged: Proof::read(&stage).unwrap(),
+            target: p.input.clone(),
+        });
+        jf.save(&j).unwrap();
+        let error = initialize(c, &mut Unknown).await.unwrap_err().to_string();
+        let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+        if accepted {
+            assert!(error.contains("unknown"), "{name}: {error}");
+            assert!(j.pending.is_none() && p.input.exists() && !stage.exists());
+        } else {
+            assert!(error.contains("invalid pending stage"), "{name}: {error}");
+            assert!(j.pending.is_some() && stage.exists(), "{name}");
+        }
+    }
+}
+
+/// A stage that an `init` made and was killed before it journaled it is
+/// nobody's: the next `init` removes it once its recovery found nothing
+/// pending, in the directories that only its journal governs. A stage of a
+/// live process, one in the form that does not say who made it, and one in
+/// the directory of the service definitions (shared with other
+/// installations) are left.
+#[tokio::test]
+async fn init_removes_the_unjournaled_stages_of_a_killed_init() {
+    let (_t, c) = fixture();
+    let p = Paths::resolve(&c.env).unwrap();
+    assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+    let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+    let put = |path: PathBuf| {
+        fs::write(&path, b"left").unwrap();
+        path
+    };
+    let abandoned = [
+        put(stage_of_a_killed_init(&p.input)),
+        put(stage_of_a_killed_init(&j.spec.executable)),
+        put(stage_of_a_killed_init(&p.state.join("coordinator.db"))),
+    ];
+    let kept = [
+        put(stage_path(&p.input)),
+        put(p.config.join(format!(".init-{}", ulid::Ulid::new()))),
+        put(stage_of_a_killed_init(&p.services.join("any.plist"))),
+    ];
+    assert!(initialize(c, &mut Unknown).await.is_err());
+    for path in &abandoned {
+        assert!(!path.exists(), "{path:?}");
+    }
+    for path in &kept {
+        assert!(path.exists(), "{path:?}");
+    }
+    // with a stage pending nothing is swept: the journal may name any of them
+    let mut pending = j;
+    pending.pending = Some(Pending {
+        staged: Proof::read(&p.input).unwrap(),
+        target: p.input.clone(),
+    });
+    let again = put(stage_of_a_killed_init(&p.input));
+    sweep_abandoned_stages(&pending, &p);
+    assert!(again.exists());
+    pending.pending = None;
+    sweep_abandoned_stages(&pending, &p);
+    assert!(!again.exists());
+}
+
+/// The database is prepared in a stage too: `init` journals its path.
+#[test]
+fn the_database_is_prepared_in_a_stage() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let seen = std::cell::RefCell::new(None);
+    let result = crate::storage::CoordinatorStore::initialize_identity(
+        dir.path(),
+        &ClusterId::generate(),
+        &CoordinatorId::generate(),
+        |stage| {
+            *seen.borrow_mut() = Some(stage.to_owned());
+            anyhow::bail!("not published")
+        },
+    );
+    assert!(result.is_err());
+    let stage = seen.into_inner().unwrap();
+    assert!(is_stage_name(stage.file_name().unwrap().to_str().unwrap()));
+    assert_eq!(stage.parent(), Some(dir.path()));
+    assert_eq!(crate::platform::owned_temp::count_files(dir.path()), 0);
 }

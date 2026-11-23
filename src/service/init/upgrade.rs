@@ -185,7 +185,10 @@ fn replace_journal(paths: &Paths, j: &Journal) -> anyhow::Result<()> {
 }
 
 fn put_input(paths: &Paths, spec: &Spec) -> anyhow::Result<()> {
-    let stage = stage_path(&paths.input);
+    // No journal names this file: a temporary file, not a stage.
+    let stage = paths
+        .config
+        .join(crate::platform::owned_temp::new_file_name());
     bootstrap::write_input(&stage, spec)?;
     fs::rename(&stage, &paths.input)?;
     File::open(&paths.config)?.sync_all()?;

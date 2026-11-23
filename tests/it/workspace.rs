@@ -1277,8 +1277,16 @@ fn the_sweeper_clears_what_no_record_names() {
     };
     let live_scratch = f.state.join("workspaces/.staging.live");
     marked(&live_scratch, me, &my_start);
+    // without a marker (an older version, or a maker that could not say who
+    // it was): removed, because the sweep runs where no writer can exist
     let unmarked_scratch = f.state.join("clones/.clone.unmarked");
-    std::fs::create_dir_all(&unmarked_scratch).unwrap();
+    std::fs::create_dir_all(unmarked_scratch.join("c/.git")).unwrap();
+    let unmarked_staging = f.state.join("workspaces/.staging.unmarked");
+    std::fs::create_dir_all(&unmarked_staging).unwrap();
+    // a marker that is there but says nothing readable: kept
+    let garbled_scratch = f.state.join("clones/.clone.garbled");
+    std::fs::create_dir_all(&garbled_scratch).unwrap();
+    std::fs::write(garbled_scratch.join("owner"), "not a marker").unwrap();
     let foreign = f.state.join("workspaces/notes.txt");
     std::fs::write(&foreign, "mine").unwrap();
     // a leftover that holds a directory it cannot read
@@ -1293,10 +1301,17 @@ fn the_sweeper_clears_what_no_record_names() {
         .sweep_orphans(&|a| kept_root.ends_with(a.as_str()))
         .unwrap();
     assert!(report.failed.is_empty(), "{:?}", report.failed);
-    assert_eq!(report.removed.len(), 4, "{:?}", report.removed);
+    assert_eq!(report.removed.len(), 6, "{:?}", report.removed);
     assert!(kept.root.exists());
-    assert!(foreign.exists() && live_scratch.exists() && unmarked_scratch.exists());
-    for gone in [&lost.root, &plain, &scratch, &half_clone] {
+    assert!(foreign.exists() && live_scratch.exists() && garbled_scratch.exists());
+    for gone in [
+        &lost.root,
+        &plain,
+        &scratch,
+        &half_clone,
+        &unmarked_scratch,
+        &unmarked_staging,
+    ] {
         assert!(!gone.exists(), "{gone:?}");
     }
     // the dead attempt's branch went with its worktree

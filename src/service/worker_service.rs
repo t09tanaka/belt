@@ -319,6 +319,18 @@ pub(crate) fn switch_lock(
 }
 
 /// The exclusive switch lock, or the reason nothing was done.
+/// Spec 25.4 (a): a command that writes this worker's input, journal and
+/// version link clears, when it starts, the temporary files that a killed
+/// one left in the very directories it writes. These are the paths the
+/// command itself resolved, so the worker of a system user, whose
+/// configuration directory the administrator chose, is covered like any
+/// other.
+fn sweep_written_directories(paths: &Paths) {
+    for dir in [&paths.config, &paths.config.join("bin"), &paths.state] {
+        crate::platform::owned_temp::sweep_files(dir);
+    }
+}
+
 fn exclusive_lock(paths: &Paths) -> anyhow::Result<SwitchLock> {
     // A host without an install has no lock to take, and says so as before.
     require_journal(paths)?;
@@ -863,6 +875,7 @@ pub fn install<L: Launcher>(
 ) -> anyhow::Result<Status> {
     ensure!(request.schema == 1, "unsupported install request schema");
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    sweep_written_directories(&paths);
     // The worker will share the scope of the user's CLI: refuse here, at
     // install, an environment it would refuse at start. Only here: stop,
     // drain and status do not depend on the caller's scope.

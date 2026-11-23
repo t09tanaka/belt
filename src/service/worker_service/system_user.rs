@@ -296,6 +296,9 @@ pub(crate) fn start(input: &Path) -> anyhow::Result<()> {
     ]);
     let paths = Paths::resolve_for(&env, HostLauncher::native().backend())?;
     ensure!(paths.input == input, "unexpected system worker input path");
+    // The start of this worker: its directories are those of the input it
+    // was given, which the environment of a system service does not name.
+    sweep_written_directories(&paths);
     let pinned = check_boot(&paths, &name, &std::env::current_exe()?)?;
     // macOS current_exe preserves the invocation symlink. Enter the pinned
     // version directly, so the foreground worker and its supervisor retain
