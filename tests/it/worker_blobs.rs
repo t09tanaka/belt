@@ -389,6 +389,13 @@ impl Host for RealButCore {
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         Ok(())
     }
+    fn received_pass(
+        &self,
+        attempts: &belt::worker::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
+        self.0.received_pass(attempts, stop)
+    }
     fn sweep_store_copies(&self) -> Result<(), ApiError> {
         self.0.sweep_store_copies()
     }
@@ -3544,6 +3551,18 @@ fn a_source_nobody_added_to_goes_at_the_next_pass_with_its_token() {
     std::fs::write(f.incoming(&fresh.source).join("touch"), "now").unwrap();
     agent.supervise();
     assert!(!f.incoming(&p.source).exists());
+    // (the files only the token held go in step 0 of the received pass,
+    // which the agent runs on its own thread: the tick takes no exclusive
+    // lock, spec 25.8 5b). A round the tick scheduled may be running: this
+    // one starts after it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while agent.received_passes() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no received pass ran within 30 s (a scheduled round never ended, or the host has no store)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // the token's rows went, and with them what that failed receipt put
     // into the store
     assert_eq!(index_rows(&f, "").0, 0);
