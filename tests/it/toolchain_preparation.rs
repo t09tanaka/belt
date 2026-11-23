@@ -536,10 +536,10 @@ fn a_failed_or_stopped_install_does_not_block_the_same_version_afterwards() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
     let a = f.consumer();
     assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
-    wait_until(|| f.calls() == 1);
+    wait_until(&f, "manager called exactly once", || f.calls() == 1);
     let root = f.plan().root().to_path_buf();
     f.setups.release(&a);
-    wait_until(|| builders_settled(&f));
+    wait_until(&f, "builder directories settled", || builders_settled(&f));
     assert!(
         root.join("home").exists(),
         "the stopped install left a root"
@@ -561,7 +561,9 @@ fn a_restart_in_the_middle_of_an_install_ends_with_the_version_installed() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
     let a = f.consumer();
     assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
-    wait_until(|| f.calls() == 1);
+    wait_until_within(&f, "manager called exactly once", PRODUCT_BOUND, || {
+        f.calls() == 1
+    });
     let reopened = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
     let b = AttemptId::generate();
     // The old writer still works in the root: no second one beside it.
@@ -570,16 +572,24 @@ fn a_restart_in_the_middle_of_an_install_ends_with_the_version_installed() {
         ToolPreparationPoll::Pending
     );
     assert_eq!(reopened.builds_started(), 0);
-    wait_until(|| reopened.unsettled().is_empty());
+    wait_until_within(&f, "reopened builders settled", PRODUCT_BOUND, || {
+        reopened.unsettled().is_empty()
+    });
     assert!(!f.plan().root().join("receipt.json").exists());
     std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(90);
     let done = loop {
         let poll = reopened.poll_tool(&b, &f.request).unwrap();
         if poll != ToolPreparationPoll::Pending {
             break poll;
         }
-        assert!(Instant::now() < deadline, "tool builder timed out");
+        assert!(
+            Instant::now() < deadline,
+            "tool builder timed out: restarted install completed; waited {:?} (deadline 90s)\n{}",
+            started.elapsed(),
+            fixture_diagnostics(&f),
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
@@ -645,16 +655,163 @@ fn direct_hidden_helper_never_executes_manager_without_admission() {
     assert_eq!(f.calls(), 1);
 }
 
-fn wait_until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+// Best-effort snapshots only: never recover, open a writable store, or acquire
+// admission locks while reporting a timeout. Cleanup may race these reads.
+fn diagnostic_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let offset = len.saturating_sub(32 * 1024);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.take(32 * 1024).read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<_> = text.lines().collect();
+        Ok(format!(
+            "{}{}",
+            if offset > 0 || lines.len() > 50 {
+                "[truncated]\n"
+            } else {
+                ""
+            },
+            lines[lines.len().saturating_sub(50)..].join("\n")
+        ))
+    };
+    read().unwrap_or_else(|e| format!("[unavailable: {e}]"))
+}
+
+fn diagnostic_query(db: &rusqlite::Connection, sql: &str, attempt: &str) -> String {
+    let read = || -> rusqlite::Result<Vec<String>> {
+        let mut stmt = db.prepare(sql)?;
+        let columns = stmt.column_count();
+        let rows = stmt.query_map([attempt], |row| {
+            (0..columns)
+                .map(|i| {
+                    row.get::<_, rusqlite::types::Value>(i)
+                        .map(|v| format!("{v:?}"))
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map(|values| values.join(" | "))
+        })?;
+        rows.collect()
+    };
+    match read() {
+        Ok(rows) if rows.is_empty() => "[no records]".into(),
+        Ok(rows) => rows.join("\n"),
+        Err(e) => format!("[unavailable: {e}]"),
+    }
+}
+
+fn fixture_diagnostics(f: &Fx) -> String {
+    let mut out = format!(
+        "fixture: {}\nhost/calls (last 50 lines, at most 32 KiB):\n{}\n",
+        f.dir.path().display(),
+        diagnostic_tail(&f.dir.path().join("host/calls")),
+    );
+    let entries = match std::fs::read_dir(f.cfg.state_dir.join("setup/builders")) {
+        Ok(entries) => entries,
+        Err(e) => return format!("{out}builders unavailable: {e}"),
+    };
+    let mut found = false;
+    for entry in entries {
+        let dir = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                out.push_str(&format!("builder entry unavailable: {e}\n"));
+                continue;
+            }
+        };
+        found = true;
+        out.push_str(&format!(
+            "builder: {}\nmeta.json: {}\n",
+            dir.display(),
+            diagnostic_tail(&dir.join("meta.json"))
+        ));
+        let spec = std::fs::read(dir.join("spec.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<belt::supervisor::spec::SuperviseSpec>(&bytes)
+                    .map_err(|e| e.to_string())
+            });
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(e) => {
+                out.push_str(&format!("spec unavailable: {e}\n"));
+                continue;
+            }
+        };
+        let attempt = spec.attempt_id.as_str();
+        out.push_str(&format!("attempt: {attempt}\n"));
+        match rusqlite::Connection::open_with_flags(
+            dir.join("worker.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(db) => {
+                // Do not let lock contention obscure the original timeout.
+                if let Err(e) = db.busy_timeout(Duration::ZERO) {
+                    out.push_str(&format!("diagnostic busy timeout unavailable: {e}\n"));
+                }
+                for (label, sql) in [
+                    ("events (last 50, newest first)", "SELECT seq, at_ms, kind, payload_json FROM event WHERE attempt_id = ?1 ORDER BY seq DESC LIMIT 50"),
+                    ("supervisor_unresolved reasons (last 50, newest first)", "SELECT seq, at_ms, payload_json FROM event WHERE attempt_id = ?1 AND kind = 'supervisor_unresolved' ORDER BY seq DESC LIMIT 50"),
+                    ("admission worker attempt", "SELECT state, termination_json, cancel_requested_at_ms FROM worker_attempt WHERE attempt_id = ?1 LIMIT 50"),
+                    ("admission command launches", "SELECT node_id, intent_at_ms, boot_id, pid, start_identity, identity_at_ms FROM command_launch WHERE attempt_id = ?1 LIMIT 50"),
+                ] {
+                    out.push_str(&format!("{label}:\n{}\n", diagnostic_query(&db, sql, attempt)));
+                }
+            }
+            Err(e) => out.push_str(&format!("worker.db unavailable: {e}\n")),
+        }
+        // Use only this fixture's configured paths; never resolve host defaults.
+        let paths = task_traffic_controller::paths::Paths::new(
+            &spec.traffic_state_dir,
+            spec.traffic_config_path(),
+        );
+        let command = belt::supervisor::spec::command_id(&spec.attempt_id, 0);
+        out.push_str(&format!(
+            "admission {command} sidecar:\n{}\nadmission fixture ledger:\n{}\n",
+            diagnostic_tail(&paths.managed_file(&command)),
+            diagnostic_tail(&paths.ledger_file()),
+        ));
+    }
+    if !found {
+        out.push_str("[no builder directories]\n");
+    }
+    out
+}
+
+#[track_caller]
+fn wait_until(f: &Fx, label: &str, ready: impl FnMut() -> bool) {
+    wait_until_within(f, label, Duration::from_secs(30), ready)
+}
+
+/// The product's own bounds for the two waits of a restart, plus room for
+/// the poll: a helper waits up to 60 s for its admission records
+/// (`ADMISSION_WAIT`, src/toolchain/preparation.rs), and a builder that could
+/// not be settled is looked at again 60 times at least 1 s apart
+/// (`REAP_TRIES`, `REAP_PAUSE_MS`, src/setup/builder.rs). A shorter wait here
+/// failed the test while the product was still within what it allows.
+const PRODUCT_BOUND: Duration = Duration::from_secs(65);
+
+#[track_caller]
+fn wait_until_within(f: &Fx, label: &str, bound: Duration, mut ready: impl FnMut() -> bool) {
+    let started = Instant::now();
+    let deadline = started + bound;
     while !ready() {
-        assert!(Instant::now() < deadline, "fixture condition timed out");
+        assert!(
+            Instant::now() < deadline,
+            "fixture condition timed out: {label}; waited {:?} (deadline {bound:?}) at {}\n{}",
+            started.elapsed(),
+            std::panic::Location::caller(),
+            fixture_diagnostics(f),
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 fn fixture_child(f: &Fx) -> (u32, u64) {
     let path = f.dir.path().join("host/child");
-    wait_until(|| path.exists());
+    wait_until(f, "fixture child PID file exists", || path.exists());
     let pid = std::fs::read_to_string(path)
         .unwrap()
         .trim()
@@ -678,7 +835,7 @@ fn releasing_one_consumer_preserves_install_and_final_release_drains_owned_child
         let b = f.consumer();
         f.poll(&a);
         f.poll(&b);
-        wait_until(|| f.calls() == 1);
+        wait_until(&f, "manager called exactly once", || f.calls() == 1);
         f.setups.release(&a);
         std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
         assert!(matches!(f.done(&b), ToolPreparationPoll::Installed(_)));
@@ -692,8 +849,10 @@ fn releasing_one_consumer_preserves_install_and_final_release_drains_owned_child
     let b = f.consumer();
     assert_eq!(f.poll(&b), ToolPreparationPoll::Pending);
     assert_eq!(f.setups.builds_started(), 1);
-    wait_until(|| !same_live(pid, start));
-    wait_until(|| builders_settled(&f));
+    wait_until(&f, "recorded child no longer live", || {
+        !same_live(pid, start)
+    });
+    wait_until(&f, "builder directories settled", || builders_settled(&f));
     assert_eq!(f.calls(), 1);
     assert_eq!(f.setups.builds_started(), 1);
     assert!(
@@ -718,7 +877,9 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again()
         ToolPreparationPoll::Pending
     );
     assert_eq!(reopened.builds_started(), 0);
-    wait_until(|| reopened.unsettled().is_empty());
+    wait_until_within(&f, "reopened builders settled", PRODUCT_BOUND, || {
+        reopened.unsettled().is_empty()
+    });
     // The barrier goes only after the old writer is seen gone: at the moment
     // nothing is unsettled any more, its child is not alive.
     assert!(
@@ -735,7 +896,7 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again()
     );
     assert_eq!(reopened.builds_started(), 1);
     reopened.release(&b);
-    wait_until(|| builders_settled(&f));
+    wait_until(&f, "builder directories settled", || builders_settled(&f));
     assert!(f.setups.preparation_observations(64).is_empty());
     assert!(reopened.preparation_observations(64).is_empty());
 }
@@ -756,7 +917,9 @@ fn supervisor_deadline_drains_installer_descendants_without_publishing_receipt()
     f.poll(&a);
     let (pid, start) = fixture_child(&f);
     assert!(matches!(f.done(&a), ToolPreparationPoll::Failed(_)));
-    wait_until(|| !same_live(pid, start));
+    wait_until(&f, "recorded child no longer live", || {
+        !same_live(pid, start)
+    });
     assert!(!f.plan().root().join("receipt.json").exists());
 }
 
@@ -776,10 +939,10 @@ fn source_contracts_share_artifact_but_attempt_bindings_and_concrete_versions_st
         f.setups.poll_tool(&b, &other_source).unwrap(),
         ToolPreparationPoll::Pending
     );
-    wait_until(|| f.calls() == 1);
+    wait_until(&f, "manager called exactly once", || f.calls() == 1);
     std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
     assert!(matches!(f.done(&a), ToolPreparationPoll::Installed(_)));
-    wait_until(|| {
+    wait_until(&f, "other source installed", || {
         matches!(
             f.setups.poll_tool(&b, &other_source).unwrap(),
             ToolPreparationPoll::Installed(_)
@@ -793,13 +956,13 @@ fn source_contracts_share_artifact_but_attempt_bindings_and_concrete_versions_st
     let d = f.consumer();
     f.setups.poll_tool(&c, &node20).unwrap();
     f.setups.poll_tool(&d, &node22).unwrap();
-    wait_until(|| {
+    wait_until(&f, "node 20 installed", || {
         matches!(
             f.setups.poll_tool(&c, &node20).unwrap(),
             ToolPreparationPoll::Installed(_)
         )
     });
-    wait_until(|| {
+    wait_until(&f, "node 22 installed", || {
         matches!(
             f.setups.poll_tool(&d, &node22).unwrap(),
             ToolPreparationPoll::Installed(_)
@@ -846,7 +1009,9 @@ fn helper_death_still_drains_recorded_owned_manager_children() {
     let identity = crate::common::identity_of(helper.pid).unwrap();
     crate::common::kill_recorded(helper.pid, &identity);
     assert!(matches!(f.done(&a), ToolPreparationPoll::Failed(_)));
-    wait_until(|| !same_live(pid, start));
+    wait_until(&f, "recorded child no longer live", || {
+        !same_live(pid, start)
+    });
     assert_eq!(f.calls(), 1);
     assert!(!f.plan().root().join("receipt.json").exists());
     // A later consumer is not failed by the root the dead helper left: a
@@ -868,7 +1033,7 @@ fn helper_death_still_drains_recorded_owned_manager_children() {
     assert_eq!(f.setups.builds_started(), 2);
     assert_eq!(f.calls(), 2);
     f.setups.release(&b);
-    wait_until(|| builders_settled(&f));
+    wait_until(&f, "builder directories settled", || builders_settled(&f));
 }
 
 #[test]
@@ -1043,7 +1208,7 @@ fn preparation_observation_excludes_actual_ttc_admission_wait() {
     let a = f.consumer();
     let start = Instant::now();
     assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
-    wait_until(|| {
+    wait_until(&f, "installer queued alongside admission blocker", || {
         task_traffic_controller::ledger::Ledger::load(&ctx.paths.ledger_file())
             .unwrap()
             .entries
@@ -1071,7 +1236,7 @@ fn preparation_telemetry_publish_failure_preserves_successful_installation() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
     let a = f.consumer();
     assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
-    wait_until(|| f.calls() == 1);
+    wait_until(&f, "manager called exactly once", || f.calls() == 1);
     let dir = std::fs::read_dir(f.cfg.state_dir.join("setup/builders"))
         .unwrap()
         .next()
