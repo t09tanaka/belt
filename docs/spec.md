@@ -2561,7 +2561,7 @@ task-traffic-controllerの台帳と履歴の置き場は、製品では単独CLI
 | ライブラリ | beltが渡すもの | 保持 |
 | - | - | - |
 | local-ci | attemptごとの `attempts/<attempt>/ci/{run,tools,lock,trash}` とworkspace。sourceのstoreの中の `manifests`・`objects`・`git` | attemptの分は、beltがattemptと一緒に消す。storeの中は、この章の規則でbeltが消す。Git領域のrefを消す関数は未決（25.16） |
-| task-traffic-controller | 台帳と履歴の置き場（第16章） | そのライブラリの契約。beltが呼ぶ関数は、自動保持を持つ版を採用するときに確かめる |
+| task-traffic-controller | 台帳と履歴の置き場（第16章） | そのライブラリの契約。0.11.0 から、保持の掃除（履歴・job・sidecar・一時file・lease）は、`exec::run_gated`（`belt exec`）と `managed::finish`（supervisorの各node。終了コード0のときだけ）の終わりに、6時間に1回、最大200 msで走る。`managed::register` は掃除しない。掃除は `Paths::config_file()` を読み、保持の数値は呼び出し側の設定とその大きい方を取る。beltのContextはcommandと同じ `(state, config)` の組で作るので、belt・単独CLI・掃除は同じ設定ファイルを見る。失敗は stderr の `task-traffic-controller: cleanup: ...` に出る（beltは抑えず、stderrの有無を成否に使わない）。beltは中を自分で消さない |
 | fast-worktree | workerの `HOME` の下の、単独CLIと同じcache・pool・trash・kept ref（22.5） | そのライブラリの契約。beltはattemptごとに削除を呼ぶ。それ以外は、自動保持を持つ版を採用するときに確かめる |
 | portool | workerの `HOME` の下の、単独CLIと同じ割当表（22.5） | そのライブラリの契約。beltはworkspaceの削除後に `portool::release_removed_in` を呼ぶ。それ以外は同上 |
 
