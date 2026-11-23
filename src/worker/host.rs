@@ -116,8 +116,14 @@ pub trait Host: Send + Sync {
     /// The paths (relative to the workspace root) of the secret files of the
     /// source the payload names: the declared ones and what
     /// `.worktreeinclude` matched. `None` while that source is not in this
-    /// worker's store.
-    fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError>;
+    /// worker's store. `wait`: whether the read waits for a deleting pass's
+    /// step (the accepted attempt's `prepare`) or not (acceptance, which
+    /// never waits, spec 25.8 5b (a)).
+    fn secret_paths(
+        &self,
+        payload: &AttemptPayload,
+        wait: bool,
+    ) -> Result<Option<Vec<String>>, ApiError>;
     /// Place the files of a `secret_bundle_put` in the attempt's workspace.
     /// Returns how many are in place.
     fn place_secrets(

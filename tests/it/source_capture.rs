@@ -1648,7 +1648,7 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     let root = crate::test_tmp::tempdir().unwrap();
     let store = SourceStore::open(root.path()).unwrap();
     let bytes = vec![37; 3 * 64 * 1024 + 3];
-    let (hash, size) = store.object_store().unwrap().put_bytes(&bytes).unwrap();
+    let (hash, size) = ingest(&store, &bytes);
     let mut upload = store.open_blob_verified(&hash).unwrap();
     assert_eq!(upload.size, size);
     assert_eq!(upload.digest, belt::ids::Digest::of_bytes(&bytes));
@@ -1680,6 +1680,19 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     std::fs::remove_file(&bundle).unwrap();
     std::os::unix::fs::symlink(&path, &bundle).unwrap();
     assert!(store.open_bundle_verified(&bundle).is_err());
-    let (empty, _) = store.object_store().unwrap().put_bytes(b"").unwrap();
+    let (empty, _) = ingest(&store, b"");
     assert_eq!(store.open_blob_verified(&empty).unwrap().size, 0);
+}
+
+/// Writes `bytes` through the receiver's blob intake (the only blob writer
+/// after `GuardedObjectStore::put_bytes` was removed).
+fn ingest(store: &SourceStore, bytes: &[u8]) -> (String, u64) {
+    use sha2::Digest;
+    let hash = format!("{:x}", sha2::Sha256::digest(bytes));
+    let want = BlobWant {
+        hash: hash.clone(),
+        size: bytes.len() as u64,
+    };
+    store.ingest_blob(&want, &mut &bytes[..]).unwrap();
+    (hash, want.size)
 }

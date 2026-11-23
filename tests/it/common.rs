@@ -346,3 +346,13 @@ pub fn profile_env() -> Option<(String, String)> {
         .ok()
         .map(|v| ("LLVM_PROFILE_FILE".to_string(), v))
 }
+
+/// Publish a source captured straight into a worker's store the way a
+/// delivery publishes it: a worker's store holds only what it received
+/// (`receive:<S>`, spec 25.8 5b (b)), never a capture's own roots.
+pub fn publish_as_received(store: &belt::source::SourceStore, ci_source_id: &str) {
+    // (its commit, if any, was made in this store by the capture: the
+    // publication's reachability check of a delivered bundle is not asked)
+    let m = store.manifest(ci_source_id).unwrap().unwrap();
+    store.publish_received_one(&m, false, None).unwrap();
+}

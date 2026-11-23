@@ -100,6 +100,13 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         &CaptureParams::default(),
     )
     .unwrap();
+    // (as a delivery publishes it: a worker's store holds only what it
+    // received, spec 25.8 5b (b))
+    let ci = store
+        .manifest(&captured.manifest.ci_source_id)
+        .unwrap()
+        .unwrap();
+    store.publish_received(&ci, None).unwrap();
     let resident = Resident::start(&config(), input).await.unwrap();
     let client = resident.client();
     let runner = tokio::spawn(resident.run());

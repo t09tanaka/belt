@@ -2142,6 +2142,8 @@ fn what_released_import_tokens_still_hold_is_counted() {
         roots: 0,
         members: 0,
         bytes: 0,
+        bytes_truncated: false,
+        unreadable_tokens: 0,
     });
     assert!(evaluate("mini-a", &facts)
         .iter()
@@ -2150,6 +2152,8 @@ fn what_released_import_tokens_still_hold_is_counted() {
         roots: 2,
         members: 5,
         bytes: 900,
+        bytes_truncated: false,
+        unreadable_tokens: 0,
     });
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "abandoned_imports"), Level::Notice);
@@ -2157,4 +2161,17 @@ fn what_released_import_tokens_still_hold_is_counted() {
     assert!(
         text.contains("2 released") && text.contains("5 membership") && text.contains("900 byte")
     );
+    assert!(!text.contains("at least") && !text.contains("cannot be read"));
+    // a truncated total says it is a lower bound; unreadable token records
+    // are counted, and alone they raise the notice
+    facts.abandoned_imports = Some(AbandonedImports {
+        roots: 0,
+        members: 0,
+        bytes: 0,
+        bytes_truncated: true,
+        unreadable_tokens: 3,
+    });
+    let checks = evaluate("mini-a", &facts);
+    let text = detail(&checks, "abandoned_imports");
+    assert!(text.contains("at least 0 byte") && text.contains("3 incoming source(s)"));
 }

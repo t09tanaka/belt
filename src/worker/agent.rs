@@ -1538,7 +1538,7 @@ impl Agent {
             // (The result of a CI task leaves as an artifact.)
             None
         } else {
-            let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
+            let secrets = self.host.secret_paths(&payload, true)?.ok_or_else(|| {
                 ApiError::new(
                     ErrorCode::NotFound,
                     format!(
@@ -3148,7 +3148,7 @@ impl Agent {
                 // later check. One that is here with another manifest than
                 // the payload names, or a store that cannot be read, is the
                 // answer: nothing is accepted.
-                if let Some(secrets) = self.host.secret_paths(&r.payload)? {
+                if let Some(secrets) = self.host.secret_paths(&r.payload, false)? {
                     check_artifacts_not_secret(&r.payload, &secrets)?;
                 }
             }
