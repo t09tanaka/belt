@@ -502,3 +502,44 @@ fn a_file_from_before_the_mark_is_read_as_it_is() {
         .is_ok());
     drop(reader.result_read_pin(&run, None).unwrap());
 }
+
+/// The step that adds the mark keeps the runs of an older file, and none of
+/// them carries it.
+#[test]
+fn the_migration_that_adds_the_mark_leaves_every_run_without_it() {
+    use super::policy::Access;
+    let root = crate::test_tmp::tempdir().unwrap();
+    let path = root.path().join("coordinator.db");
+    let steps = schema::steps(DbKind::Coordinator);
+    assert_eq!(
+        steps.last().unwrap(),
+        "ALTER TABLE run ADD COLUMN pruning_at_ms INTEGER;"
+    );
+    assert_eq!(steps.len(), 23);
+    let previous = steps.len() - 1;
+    let run = RunId::generate();
+    let old = db::open_with(
+        &path,
+        DbKind::Coordinator.as_str(),
+        &steps[..previous],
+        schema::compat(previous),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    let id = run.to_string();
+    old.write(move |tx| {
+        tx.execute(
+            "INSERT INTO run (run_id, spec_json, created_at_ms) VALUES (?1,'{}',1)",
+            [id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    drop(old);
+    let store = CoordinatorStore::open(root.path(), 50).unwrap();
+    assert!(!store.run_is_pruned(&run).unwrap());
+    assert!(store.query_run(run.clone()).unwrap().is_some());
+    mark(&store, &run);
+    assert!(store.run_is_pruned(&run).unwrap());
+    assert!(store.query_run(run).unwrap().is_none());
+}

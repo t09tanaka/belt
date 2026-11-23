@@ -6388,12 +6388,9 @@ fn removed_member_ssh_migration_preserves_legacy_records() {
     let root = crate::test_tmp::tempdir().unwrap();
     let path = root.path().join("coordinator.db");
     let steps = schema::steps(DbKind::Coordinator);
-    assert_eq!(
-        steps.last().unwrap(),
-        "ALTER TABLE removed_member ADD COLUMN ssh TEXT;"
-    );
-    assert_eq!(steps.len(), 22);
-    let previous = steps.len() - 1;
+    // The step is the 22nd; the steps after it run on the same file below.
+    assert_eq!(steps[21], "ALTER TABLE removed_member ADD COLUMN ssh TEXT;");
+    let previous = 21;
     let old = db::open_with(
         &path,
         DbKind::Coordinator.as_str(),
