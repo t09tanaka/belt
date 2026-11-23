@@ -231,7 +231,7 @@ pub fn execute(opts: Opts) -> Result<Done> {
     if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
-    trash::sweep();
+    crate::retention::run(Some(&main));
     let dest = match trash::move_aside(&path) {
         Ok(d) => d,
         Err(e) => bail!(

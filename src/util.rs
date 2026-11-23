@@ -6,6 +6,66 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// Open the lock file `path` (making its directory first when `make_dir`
+/// and it is gone) and take an exclusive `flock` on it: waiting for it, or
+/// with `wait` false giving `Ok(None)` when another process holds it. The
+/// lock file of a directory that is removed when it is empty is unlinked
+/// with it, so once the lock is held it is checked that `path` still names
+/// the file that was locked, and otherwise the lock is taken again on the
+/// file there now. That check is what makes it safe to unlink a lock file.
+pub fn lock_path(
+    path: &Path,
+    wait: bool,
+    make_dir: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    for _ in 0..100 {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+        };
+        let f = match open() {
+            Err(e) if make_dir && e.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                open()?
+            }
+            other => other?,
+        };
+        loop {
+            let op = if wait {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_EX | libc::LOCK_NB
+            };
+            // SAFETY: a valid open descriptor; the lock goes when it is closed.
+            if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                ErrorKind::Interrupted => {}
+                ErrorKind::WouldBlock if !wait => return Ok(None),
+                _ => return Err(e),
+            }
+        }
+        let same = match (f.metadata(), std::fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        };
+        if same {
+            return Ok(Some(f));
+        }
+    }
+    Err(std::io::Error::other("the lock file keeps being replaced"))
+}
+
 pub fn home() -> PathBuf {
     env::var_os("HOME")
         .filter(|v| !v.is_empty())
@@ -103,6 +163,18 @@ pub fn helper_exe() -> std::io::Result<PathBuf> {
             "no `fast-worktree` executable is configured for background work",
         )),
     }
+}
+
+/// The executable for background work that only this version knows how to
+/// do (`cache retire`): [`helper_exe`], except that a program that embeds
+/// the library and has no helper in place (as in [`crate::sweep_trash`])
+/// gets none, since the running binary is then not `fast-worktree`.
+pub fn background_exe() -> Option<PathBuf> {
+    let configured = CONTEXT.with(|c| c.borrow().is_some());
+    if !configured && is_embedded() {
+        return None;
+    }
+    helper_exe().ok()
 }
 
 /// `Command::status`, except that while the library captures output, what

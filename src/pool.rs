@@ -44,7 +44,6 @@ use crate::util::{errln, out, outln};
 use crate::{cache, clone, git, paths, pending, trash, util};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,13 +60,25 @@ const NO_HOOKS_PREFIX: &str = ".no-hooks-";
 /// after.
 const AFTER_LIMIT: Duration = Duration::from_secs(30 * 60);
 const MISSES: &str = "misses";
-const FILL_LOCK: &str = "fill.lock";
+pub(crate) const FILL_LOCK: &str = "fill.lock";
 pub const FILL_LOG: &str = "fill.log";
 /// `fill.log` is started afresh once it grows past this.
 const LOG_LIMIT: u64 = 1 << 20;
-/// Hidden entries left by a run that was killed are cleared by `pool
-/// clear` once they are this old.
-const LEFTOVER_SECS: u64 = 3_600;
+/// `misses` keeps the `add`s that found no spare for this long (it is
+/// trimmed whenever one is added to), and `fill.log` stays this long after
+/// the last fill wrote to it (and at most [`LOG_LIMIT`] long): a pool size
+/// is judged by the last week, and the log is read to see why a fill failed.
+const KEEP_SECS: u64 = 7 * 86_400;
+/// A leftover whose owner is alive by its pid is still removed once it is
+/// this old: the pid may be another process's by now. Making a spare, or
+/// moving one to where it belongs, takes minutes at most.
+const LEFTOVER_MAX_SECS: u64 = 86_400;
+/// A leftover whose owner is gone by its pid still stays until its inode
+/// last changed this long ago, as a half-made cache entry does
+/// ([`cache::TMP_MIN_AGE`]): a pid says nothing about a process in another
+/// pid namespace (a container that shares the cache), where the fill that
+/// is making it may be alive.
+const LEFTOVER_MIN_SECS: u64 = cache::TMP_MIN_AGE.as_secs();
 /// How long `pool fill` lets the fetch of the default branch take.
 const FETCH_LIMIT: Duration = Duration::from_secs(60);
 
@@ -207,6 +218,9 @@ pub fn take(main: &Path, target: &Path) -> Taken {
         if fs::rename(&s.path, &claimed).is_err() {
             continue; // another `add` took it first
         }
+        // When it was taken, for the sweep (the rename itself already says
+        // so in the inode change time, where the file system keeps one).
+        cache::touch(&claimed);
         return match settle(main, &claimed, target) {
             Ok(()) => Taken::Spare {
                 made_at: building_paths(&pool, &s.id),
@@ -268,17 +282,50 @@ fn building_paths(pool: &Path, id: &str) -> Vec<PathBuf> {
     v
 }
 
-/// Note that an `add` found no spare.
+/// Note that an `add` found no spare, and drop the notes older than
+/// [`KEEP_SECS`] while at it. The file is read and written holding a lock
+/// on the file itself, so that `add`s at the same time each leave their
+/// line.
 pub fn record_miss(main: &Path) {
-    let pool = dir(main);
-    let _ = fs::create_dir_all(&pool);
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(pool.join(MISSES))
-    {
-        let _ = writeln!(f, "{}", now_secs());
+    let path = dir(main).join(MISSES);
+    let now = now_secs();
+    let _ = edit_misses(&path, true, |text| {
+        let mut kept = kept_misses(text, now).unwrap_or_else(|| text.to_string());
+        kept.push_str(&format!("{now}\n"));
+        Some(kept)
+    });
+}
+
+/// Rewrite the `misses` file at `path` under an exclusive lock on it:
+/// `edit` gets its text and returns the new one (`None`: leave it). A file
+/// that would be empty is removed, which is safe because whoever waited for
+/// the lock looks at the path again ([`util::lock_path`]; no version locks
+/// this path without doing so). With `make` false a file that is not there
+/// is not made.
+fn edit_misses(path: &Path, make: bool, edit: impl Fn(&str) -> Option<String>) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !make && !path.exists() {
+        return Ok(());
     }
+    let Some(mut f) = util::lock_path(path, true, make)? else {
+        return Ok(());
+    };
+    let mut text = String::new();
+    // Opened for writing only: read through a second handle.
+    File::open(path)?.read_to_string(&mut text)?;
+    let Some(new) = edit(&text) else {
+        return if text.is_empty() {
+            fs::remove_file(path)
+        } else {
+            Ok(())
+        };
+    };
+    if new.is_empty() {
+        return fs::remove_file(path);
+    }
+    f.set_len(0)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(new.as_bytes())
 }
 
 /// How many times an `add` found no spare.
@@ -330,24 +377,9 @@ pub struct FillLock(#[allow(dead_code)] File);
 
 /// Take the fill lock without waiting. `None` when another process has it.
 pub fn try_lock(pool: &Path) -> Result<Option<FillLock>> {
-    fs::create_dir_all(pool)?;
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(pool.join(FILL_LOCK))?;
-    // SAFETY: a valid open descriptor; the lock goes with it when the file
-    // is closed.
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(Some(FillLock(f)))
-    } else {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(None)
-        } else {
-            Err(Error::msg(format!("{FILL_LOCK}: {e}")))
-        }
+    match util::lock_path(&pool.join(FILL_LOCK), false, true) {
+        Ok(f) => Ok(f.map(FillLock)),
+        Err(e) => Err(Error::msg(format!("{FILL_LOCK}: {e}"))),
     }
 }
 
@@ -385,6 +417,9 @@ pub fn fill_for(main: &Path, after: Option<&Path>) -> Result<i32> {
         outln!("the pool is off: set [pool] size in {}", hooks::FILE);
         return Ok(0);
     }
+    // Not the part that deletes kept refs: this mostly runs in the
+    // background, where nobody reads what it says.
+    crate::retention::run_in_fill(&main);
     let pool = dir(&main);
     let Some(_lock) = try_lock(&pool)? else {
         outln!("{} fill  another fill is running", stamp());
@@ -394,6 +429,9 @@ pub fn fill_for(main: &Path, after: Option<&Path>) -> Result<i32> {
         wait_for_install(a);
     }
     outln!("{} fill  started", stamp());
+    // No other fill is running: what an earlier one left half made is not
+    // in use, and is removed before this one adds to the pool.
+    sweep_leftovers(&main, &pool, true);
     let base = fetched_base(&main)?;
     fill_locked(&main, &pool, size, &base)
 }
@@ -424,11 +462,15 @@ fn wait_for_install(root: &Path) {
 }
 
 fn fill_locked(main: &Path, pool: &Path, size: u32, base: &str) -> Result<i32> {
+    let mut size = size;
     while spares(pool).len() < size as usize {
         if let Err(e) = make_spare(main, pool, base) {
             outln!("{} fill  failed: {e}", stamp());
             return Ok(1);
         }
+        // A size that was lowered meanwhile holds from now on: the spares
+        // beyond it would be discarded by the next command ([`trim`]).
+        size = size_if_readable(main).unwrap_or(size);
     }
     outln!(
         "{} fill  done: {} of {size} ready",
@@ -643,6 +685,373 @@ pub fn refresh() -> Result<i32> {
     fill_locked(&main, &pool, size, &base)
 }
 
+/// The pid in a spare's id, `wt-<unix seconds>-<pid>-<n>`: the process
+/// that made it.
+fn maker_of(id: &str) -> Option<u32> {
+    let mut parts = id.strip_prefix(SPARE_PREFIX)?.split('-');
+    parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some(pid)
+}
+
+/// Which of the hidden entries in a pool directory a killed run left.
+/// `entries` are their names with how many seconds ago each one's inode
+/// last changed; `now` is in unix seconds. A name that is not one of these
+/// is left alone.
+///
+/// A `.new-<id>` or `.no-hooks-<id>` is what the fill with the pid in the
+/// id is making: a leftover when that process is gone (`alive`) or the
+/// caller holds the fill lock (`fill_idle`: only a fill makes them, and no
+/// fill is running), and its inode last changed at least `min_age` seconds
+/// ago; or, whatever the pid says, when the time in the id is more than
+/// [`LEFTOVER_MAX_SECS`] ago. So the sweep of a command needs no fill lock
+/// to tell, and a fill that starts meanwhile is not turned away.
+///
+/// A `.claimed-<pid>-<id>` is a spare that the `add` with that pid took: a
+/// leftover when that process is gone and it was taken (its inode last
+/// changed) at least `min_age` seconds ago, or when it was taken more than
+/// [`LEFTOVER_MAX_SECS`] ago.
+///
+/// `min_age` ([`LEFTOVER_MIN_SECS`]) is there because neither a pid nor,
+/// on some shared file systems, a lock is seen from another machine or
+/// container that uses the same cache.
+fn stale_leftovers(
+    entries: &[(String, u64)],
+    now: u64,
+    fill_idle: bool,
+    min_age: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(name, changed_ago)| {
+            let settled = *changed_ago >= min_age;
+            if let Some(id) = name
+                .strip_prefix(NO_HOOKS_PREFIX)
+                .or_else(|| name.strip_prefix(BUILDING_PREFIX))
+            {
+                let (Some(created), Some(pid)) = (created_of(id), maker_of(id)) else {
+                    return false;
+                };
+                return ((fill_idle || !alive(pid)) && settled)
+                    || created + LEFTOVER_MAX_SECS < now;
+            }
+            if let Some((pid, id)) = name
+                .strip_prefix(CLAIMED_PREFIX)
+                .and_then(|r| r.split_once('-'))
+            {
+                return maker_of(id).is_some()
+                    && pid
+                        .parse::<u32>()
+                        .is_ok_and(|p| (!alive(p) && settled) || *changed_ago > LEFTOVER_MAX_SECS);
+            }
+            false
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The lines of `misses` that stay at time `now`: those from the last
+/// [`KEEP_SECS`]. `None` when there is nothing to drop.
+fn kept_misses(text: &str, now: u64) -> Option<String> {
+    let keep = |l: &str| l.trim().parse::<u64>().is_ok_and(|t| t + KEEP_SECS >= now);
+    if text.lines().all(keep) {
+        return None;
+    }
+    let mut out = String::new();
+    for l in text.lines().filter(|l| keep(l)) {
+        out.push_str(l.trim());
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Remove, from the pool `pool` of the repository at `main`: the `misses`
+/// older than [`KEEP_SECS`] (the file when none is left), `fill.log` when
+/// it has not been written for that long, and the leftovers of killed runs
+/// ([`stale_leftovers`]). Nothing a live process may use is touched, and
+/// nothing is reported.
+///
+/// The fill lock is not taken: a fill that starts while this runs must not
+/// find it held and give up. The pool directory and its `fill.lock` stay
+/// while the repository is there: every version takes that lock on
+/// whatever file it opened, so the path is never unlinked.
+pub fn sweep_in(main: &Path, pool: &Path) {
+    let now = now_secs();
+    let _ = edit_misses(&pool.join(MISSES), false, |text| kept_misses(text, now));
+    let log = pool.join(FILL_LOG);
+    let idle = fs::metadata(&log)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .is_some_and(|age| age.as_secs() > KEEP_SECS);
+    if idle {
+        let _ = fs::remove_file(&log);
+    }
+    sweep_leftovers(main, pool, false);
+}
+
+/// Discard the leftovers of killed runs in `pool` ([`stale_leftovers`]).
+/// `fill_idle`: the caller holds the fill lock.
+fn sweep_leftovers(main: &Path, pool: &Path, fill_idle: bool) {
+    sweep_leftovers_aged(main, pool, fill_idle, LEFTOVER_MIN_SECS);
+}
+
+/// [`sweep_leftovers`] with the least age of a leftover given.
+fn sweep_leftovers_aged(main: &Path, pool: &Path, fill_idle: bool, min_age: u64) {
+    let wall = SystemTime::now();
+    let entries: Vec<(String, u64)> = fs::read_dir(pool)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') {
+                return None;
+            }
+            let changed = e
+                .metadata()
+                .map_or(0, |m| cache::changed_ago(&m, wall).as_secs());
+            Some((name, changed))
+        })
+        .collect();
+    for name in stale_leftovers(&entries, now_secs(), fill_idle, min_age, &cache::pid_alive) {
+        let path = pool.join(&name);
+        if name.starts_with(NO_HOOKS_PREFIX) {
+            // Empty, unless something put a file there.
+            let _ = fs::remove_dir(&path);
+        } else {
+            discard(main, &path);
+        }
+    }
+}
+
+/// Whether `name` in a pool directory is a spare in any state: ready
+/// (`wt-<id>`), being made (`.new-<id>`, `.no-hooks-<id>`) or taken
+/// (`.claimed-<pid>-<id>`). Its id, when it is.
+fn spare_id(name: &str) -> Option<&str> {
+    let id = if let Some(rest) = name.strip_prefix(CLAIMED_PREFIX) {
+        let (pid, id) = rest.split_once('-')?;
+        pid.parse::<u32>().ok()?;
+        id
+    } else {
+        name.strip_prefix(BUILDING_PREFIX)
+            .or_else(|| name.strip_prefix(NO_HOOKS_PREFIX))
+            .unwrap_or(name)
+    };
+    maker_of(id).map(|_| id)
+}
+
+/// Empty the pool directory `pool` of a repository that ran no command for
+/// [`crate::retention::IDLE`]: a spare is there for the next `add` of its
+/// repository, and nothing shows that one is coming. The spares in every
+/// state go, and `fill.log` and `misses` (which only say something about
+/// the last 7 days). `fill.lock` and the directory stay
+/// ([`crate::retention`]); so does every name that is not one of these.
+///
+/// With the main checkout `main` (it is there), each spare is discarded as
+/// everywhere else: unregistered, then deleted. Without it (the checkout
+/// cannot be reached: a volume that is not mounted, a checkout that was
+/// moved) the directories are only moved into the trash, added to `moved`
+/// for the caller's deleter, and their registrations stay in the
+/// repository until its next command ([`drop_dangling`]).
+///
+/// Only the detached process of the walk calls this. The fill lock is
+/// taken without waiting. Returns false when a fill holds it: nothing was
+/// done, and the next walk tries again.
+pub fn retire(pool: &Path, main: Option<&Path>, moved: &mut Vec<PathBuf>) -> bool {
+    let wall = SystemTime::now();
+    let entries: Vec<(String, u64)> = fs::read_dir(pool)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let age = e
+                .metadata()
+                .ok()
+                .map(|m| cache::changed_ago(&m, wall).as_secs());
+            // Unknown age cannot prove a leftover safe to discard.
+            if age.is_none() && name.starts_with('.') {
+                return None;
+            }
+            Some((name, age.unwrap_or(0)))
+        })
+        .collect();
+    let names = retirement_names(&entries, now_secs(), &cache::pid_alive);
+    if names.is_empty() {
+        return true;
+    }
+    let _lock = match util::lock_path(&pool.join(FILL_LOCK), false, false) {
+        Ok(Some(f)) => Some(f),
+        Ok(None) => return false,
+        // A file system without locks: no fill holds it either.
+        Err(_) => None,
+    };
+    let now = now_secs();
+    for name in names {
+        let path = pool.join(&name);
+        if name == FILL_LOG {
+            let _ = fs::remove_file(&path);
+        } else if name == MISSES {
+            let _ = edit_misses(&path, false, |text| kept_misses(text, now));
+        } else if name.starts_with(NO_HOOKS_PREFIX) {
+            let _ = fs::remove_dir(&path);
+        } else if let Some(main) = main {
+            // Under a name of our own first, as `add` takes one: an `add`
+            // of an older version (which does not say that the repository
+            // is in use) then finds no spare, rather than half of one.
+            let claimed = match name.starts_with(SPARE_PREFIX) {
+                true => pool.join(format!("{CLAIMED_PREFIX}{}-{name}", std::process::id())),
+                false => path.clone(),
+            };
+            if claimed == path || fs::rename(&path, &claimed).is_ok() {
+                discard(main, &claimed);
+            }
+        } else if let Ok(dest) = trash::move_aside(&path) {
+            moved.push(dest);
+        }
+    }
+    true
+}
+
+fn retirement_names(
+    entries: &[(String, u64)],
+    now: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    // Keep live owners even with the fill lock: another host may share this pool.
+    let stale = stale_leftovers(entries, now, false, LEFTOVER_MIN_SECS, alive);
+    entries
+        .iter()
+        .filter(|(name, _)| {
+            name == FILL_LOG
+                || name == MISSES
+                || (name.starts_with(SPARE_PREFIX) && spare_id(name).is_some())
+                || stale.contains(name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The pool directory and the id of the spare that a registration in
+/// `.git/worktrees` is for: `locked` is what its `locked` file holds, and
+/// `worktree` the path its `gitdir` file gives. `None` unless it is locked
+/// with exactly the reason every version locks its spares with
+/// ([`LOCK_REASON`]; a worktree that the user or another tool locked is
+/// never ours to touch), and unless the path is
+/// `<cache>/<repository>/pool/<a spare's name>` in this cache (`roots`:
+/// the cache root as it is written and as it resolves). A spare that
+/// another machine made in a cache of its own, for a repository on a
+/// shared disk, is then left alone unless that cache is at the same path.
+fn registered_spare<'a>(
+    locked: Option<&str>,
+    worktree: &'a Path,
+    roots: &[PathBuf],
+) -> Option<(&'a Path, &'a str)> {
+    let reason = locked?;
+    if reason.strip_suffix('\n').unwrap_or(reason) != LOCK_REASON {
+        return None;
+    }
+    let id = spare_id(worktree.file_name()?.to_str()?)?;
+    let pool = worktree.parent()?;
+    let repo = pool.parent()?;
+    let ours = pool.file_name()? == "pool"
+        && cache::is_repo_name(repo.file_name()?.to_str()?)
+        && roots.iter().any(|r| repo.parent() == Some(r.as_path()));
+    ours.then_some((pool, id))
+}
+
+/// Unregister the spares of the repository at `main` whose directories
+/// are no longer there: the registrations (`.git/worktrees/wt-*`, each
+/// with an index) that are left when the cache directory of the repository
+/// went without git being told. That happens when the repository was not
+/// in use and could not be reached ([`retire`]), and when its checkout was
+/// moved: the spares stay behind under the old path's name and go with it
+/// ([`crate::retention`]), while the registrations moved with `.git`.
+/// They are locked, so `git worktree prune` keeps them for ever.
+///
+/// Only a registration that [`registered_spare`] says is a spare's, whose
+/// directory does not exist ("no such file", looked for inside the cache
+/// only), and whose id no entry of its pool directory has (a spare is
+/// renamed while it is made and while it is taken, and git is told just
+/// after). All of it is looked at again holding the registration lock,
+/// which every `git worktree` command of fast-worktree holds; the lock is
+/// not waited for. Returns how many were unregistered.
+pub fn drop_dangling(main: &Path) -> usize {
+    let root = paths::cache_root();
+    let mut roots = vec![root.clone()];
+    if let Ok(real) = root.canonicalize() {
+        if real != root {
+            roots.push(real);
+        }
+    }
+    let dangling = |admin: &Path| -> bool {
+        let locked = fs::read_to_string(admin.join("locked")).ok();
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            return false;
+        };
+        // `<worktree>/.git`, absolute or relative to the entry.
+        let dot_git = admin.join(gitdir.trim_end_matches('\n'));
+        let Some(worktree) = dot_git.parent() else {
+            return false;
+        };
+        let Some((pool, id)) = registered_spare(locked.as_deref(), worktree, &roots) else {
+            return false;
+        };
+        let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+        if !fs::symlink_metadata(worktree).is_err_and(|e| missing(&e)) {
+            return false;
+        }
+        match fs::read_dir(pool) {
+            Ok(entries) => !entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(id)),
+            Err(e) => missing(&e),
+        }
+    };
+    git::unregister_where(&main.join(".git"), &dangling)
+}
+
+/// [`size`] when the settings can be read, without reporting when they
+/// cannot: for the sweeps, which must not take a broken settings file for
+/// "the pool is off".
+fn size_if_readable(main: &Path) -> Option<u32> {
+    let repo = Config::load(main).ok()?.pool.and_then(|p| p.size);
+    match repo {
+        Some(n) => Some(n),
+        None => Some(hooks::user_pool_size().ok()?.unwrap_or(0)),
+    }
+}
+
+/// Which of `ready` (the ready spares, newest first) are beyond the pool
+/// size `size`: all of them when the pool is off, else the oldest.
+fn surplus(ready: &[Spare], size: u32) -> &[Spare] {
+    &ready[ready.len().min(size as usize)..]
+}
+
+/// Discard the spares of the repository at `main` that are beyond its
+/// configured pool size: all of them when the pool was turned off. A spare
+/// is there only while its repository is in use ([`retire`]), the pool is
+/// on, and it is within the size; every command in the repository checks (one directory
+/// listing, and nothing more while the pool is empty). Returns how many
+/// were discarded.
+pub fn trim(main: &Path) -> usize {
+    let pool = dir(main);
+    let ready = spares(&pool);
+    if ready.is_empty() {
+        return 0;
+    }
+    let Some(size) = size_if_readable(main) else {
+        return 0;
+    };
+    surplus(&ready, size)
+        .iter()
+        .filter(|s| claim_and_discard(main, &pool, s))
+        .count()
+}
+
 /// `pool clear`: remove every spare, and what killed runs left behind.
 pub fn clear() -> Result<i32> {
     let main = main_here()?;
@@ -653,28 +1062,7 @@ pub fn clear() -> Result<i32> {
             n += 1;
         }
     }
-    let now = now_secs();
-    for e in fs::read_dir(&pool).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(created) = name.strip_prefix(NO_HOOKS_PREFIX).and_then(created_of) {
-            // Empty, unless something put a file there.
-            if created + LEFTOVER_SECS < now {
-                let _ = fs::remove_dir(e.path());
-            }
-            continue;
-        }
-        let rest = name.strip_prefix(BUILDING_PREFIX).or_else(|| {
-            // `.claimed-<pid>-wt-...`
-            name.strip_prefix(CLAIMED_PREFIX)
-                .and_then(|r| r.split_once('-'))
-                .map(|(_, id)| id)
-        });
-        if let Some(created) = rest.and_then(created_of) {
-            if created + LEFTOVER_SECS < now {
-                discard(&main, &e.path());
-            }
-        }
-    }
+    sweep_in(&main, &pool);
     outln!("removed {n} spare(s) (deleting in background)");
     if matches!(try_lock(&pool), Ok(None)) {
         outln!("note   a fill is running and may add spares again");
@@ -732,5 +1120,266 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "still locked");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn leftovers_are_those_nothing_alive_can_own() {
+        let dead = |_: u32| false;
+        let alive = |_: u32| true;
+        let now = 1_000_000;
+        let all: Vec<(String, u64)> = names(&[
+            ".new-wt-999900-1-0",
+            ".no-hooks-wt-999900-1-0",
+            ".claimed-77-wt-999900-1-0",
+            "wt-999900-1-0",
+            ".new-wt-x",
+            ".new-wt-999900-x-0",
+            ".claimed-x-wt-5-1-0",
+            "fill.lock",
+        ])
+        .into_iter()
+        .map(|n| (n, 10))
+        .collect();
+        let ours = names(&[
+            ".new-wt-999900-1-0",
+            ".no-hooks-wt-999900-1-0",
+            ".claimed-77-wt-999900-1-0",
+        ]);
+        assert_eq!(
+            stale_leftovers(&all, now, false, 10, &dead),
+            ours,
+            "a ready spare and unknown names stay"
+        );
+        // Their owners are alive: the fill that makes one, the `add` that
+        // took one. Nothing is a leftover, and no fill lock was needed to
+        // tell.
+        assert!(stale_leftovers(&all, now, false, 10, &alive).is_empty());
+        // The caller holds the fill lock: no fill is running, whatever the
+        // pids say.
+        assert_eq!(stale_leftovers(&all, now, true, 10, &alive), ours[..2]);
+        // A second short of the least age, nothing is a leftover yet:
+        // neither a pid nor a lock is seen from another container.
+        assert!(stale_leftovers(&all, now, false, 11, &dead).is_empty());
+        assert!(stale_leftovers(&all, now, true, 11, &dead).is_empty());
+        assert_eq!(LEFTOVER_MIN_SECS, 600);
+    }
+
+    #[test]
+    fn retirement_keeps_live_and_young_leftovers() {
+        let now = 1_000_000;
+        let leftovers = names(&[
+            ".new-wt-999900-1-0",
+            ".no-hooks-wt-999900-1-0",
+            ".claimed-77-wt-999900-1-0",
+        ]);
+        let entries = |age| {
+            leftovers
+                .iter()
+                .cloned()
+                .chain(names(&["wt-999900-1-0", "fill.lock", ".new-wt-x"]))
+                .map(|name| (name, age))
+                .collect::<Vec<_>>()
+        };
+        let plain = names(&["wt-999900-1-0"]);
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS), now, &|_| true),
+            plain
+        );
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS - 1), now, &|_| false),
+            plain
+        );
+        let mut discarded = leftovers.clone();
+        discarded.extend(plain);
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS), now, &|_| false),
+            discarded
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_cannot_keep_a_leftover_for_ever() {
+        let alive = |_: u32| true;
+        let now = 1_800_000_000;
+        let at = |created: u64, changed_ago: u64| {
+            let e = vec![
+                (format!(".new-wt-{created}-1-0"), changed_ago),
+                (format!(".claimed-77-wt-{created}-1-0"), changed_ago),
+            ];
+            stale_leftovers(&e, now, false, LEFTOVER_MIN_SECS, &alive)
+        };
+        let limit = LEFTOVER_MAX_SECS;
+        // Exactly at the limit both stay; a second past it they go. What
+        // is being made is judged by the time in its id, what was taken by
+        // when it was taken (a spare may be days old when it is taken).
+        assert!(at(now - limit, limit).is_empty());
+        assert_eq!(at(now - limit - 1, 0), vec![".new-wt-1799913599-1-0"]);
+        assert_eq!(at(now, limit + 1), vec![".claimed-77-wt-1800000000-1-0"]);
+        assert!(at(now - 30 * 86_400, 0)
+            .iter()
+            .all(|n| n.starts_with(".new-")));
+    }
+
+    #[test]
+    fn a_leftover_made_just_now_stays_and_an_old_one_is_discarded() {
+        let t = tempfile::tempdir().unwrap();
+        std::env::set_var("FAST_WORKTREE_CACHE", t.path().join("cache"));
+        let pool = t.path().join("cache/repo-0123abcd/pool");
+        let made = now_secs() - 7_200;
+        let building = pool.join(format!(".new-wt-{made}-2000000000-0"));
+        let claimed = pool.join(format!(".claimed-2000000000-wt-{made}-1-1"));
+        for d in [&building, &claimed] {
+            fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        // Their makers are gone, but they were put there this second: a
+        // fill in another container may be making them.
+        sweep_leftovers(t.path(), &pool, false);
+        sweep_leftovers(t.path(), &pool, true);
+        assert!(building.is_dir() && claimed.is_dir());
+        // With no least age (the inode change time cannot be set back).
+        sweep_leftovers_aged(t.path(), &pool, false, 0);
+        assert!(!building.exists() && !claimed.exists());
+    }
+
+    #[test]
+    fn a_spare_is_known_by_its_name_in_every_state() {
+        assert_eq!(spare_id("wt-1700000000-12-0"), Some("wt-1700000000-12-0"));
+        assert_eq!(
+            spare_id(".new-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        assert_eq!(
+            spare_id(".no-hooks-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        assert_eq!(
+            spare_id(".claimed-7-wt-1700000000-12-0"),
+            Some("wt-1700000000-12-0")
+        );
+        for other in [
+            "fill.lock",
+            "misses",
+            "wt-x",
+            ".claimed-x-wt-1-1-0",
+            ".something-else",
+            "wt-1-1",
+        ] {
+            assert_eq!(spare_id(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn only_a_registration_locked_with_our_reason_in_this_cache_is_a_spare_s() {
+        let roots = vec![PathBuf::from("/c/fast-worktree")];
+        let spare = Path::new("/c/fast-worktree/app-0123abcd/pool/wt-1700000000-12-0");
+        let ours = Some((spare.parent().unwrap(), "wt-1700000000-12-0"));
+        let reason = format!("{LOCK_REASON}\n");
+        assert_eq!(registered_spare(Some(&reason), spare, &roots), ours);
+        assert_eq!(registered_spare(Some(LOCK_REASON), spare, &roots), ours);
+        // While it is made or taken, the same spare.
+        let taken = spare.with_file_name(".claimed-9-wt-1700000000-12-0");
+        assert_eq!(
+            registered_spare(Some(&reason), &taken, &roots).map(|s| s.1),
+            Some("wt-1700000000-12-0")
+        );
+        // Not locked, or locked by the user or another tool: never ours.
+        for other in [
+            None,
+            Some(""),
+            Some("fast-worktree pool 2\n"),
+            Some("mine\n"),
+            Some("fast-worktree pool\n\n"),
+            Some(" fast-worktree pool\n"),
+        ] {
+            assert_eq!(registered_spare(other, spare, &roots), None, "{other:?}");
+        }
+        // Locked with our reason, but not at a spare's place in this cache.
+        for path in [
+            "/c/other-cache/app-0123abcd/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/app-0123abcd/wt-1700000000-12-0",
+            "/c/fast-worktree/app/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/x/app-0123abcd/pool/wt-1700000000-12-0",
+            "/c/fast-worktree/app-0123abcd/pool/feature",
+            "/work/app-wt",
+        ] {
+            assert_eq!(
+                registered_spare(Some(&reason), Path::new(path), &roots),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn taking_a_spare_shows_in_its_inode_change_time() {
+        // What the age of a `.claimed-*` is read from: a rename (and the
+        // touch after it) sets the time, however old the directory.
+        let t = tempfile::tempdir().unwrap();
+        let spare = t.path().join("wt-1-1-0");
+        fs::create_dir(&spare).unwrap();
+        std::thread::sleep(Duration::from_millis(2_100));
+        let age = |p: &Path| cache::changed_ago(&fs::metadata(p).unwrap(), SystemTime::now());
+        assert!(age(&spare) >= Duration::from_secs(2));
+        let claimed = t.path().join(".claimed-1-wt-1-1-0");
+        fs::rename(&spare, &claimed).unwrap();
+        cache::touch(&claimed);
+        assert!(age(&claimed) < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn spares_beyond_the_size_are_surplus_oldest_first() {
+        let spare = |created: u64| Spare {
+            path: PathBuf::from(format!("/p/wt-{created}-1-0")),
+            id: format!("wt-{created}-1-0"),
+            created,
+        };
+        let ready = [spare(300), spare(200), spare(100)];
+        assert!(surplus(&ready, 3).is_empty() && surplus(&ready, 9).is_empty());
+        assert_eq!(surplus(&ready, 2), &ready[2..]);
+        assert_eq!(surplus(&ready, 0), &ready[..], "the pool is off");
+    }
+
+    #[test]
+    fn misses_written_at_the_same_time_are_all_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("pool/misses");
+        let now = now_secs();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..25 {
+                        edit_misses(&path, true, |text| Some(format!("{text}{now}\n"))).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(misses(t.path().join("pool").as_path()), 200);
+        // Trimmed to nothing, the file goes; one that is not there is not
+        // made by a sweep.
+        edit_misses(&path, false, |_| Some(String::new())).unwrap();
+        assert!(!path.exists());
+        edit_misses(&path, false, |text| kept_misses(text, now)).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn misses_older_than_the_limit_are_dropped() {
+        let now = 10_000_000;
+        let edge = now - KEEP_SECS;
+        assert_eq!(kept_misses(&format!("{edge}\n{now}\n"), now), None);
+        assert_eq!(
+            kept_misses(&format!("{}\n{edge}\n", edge - 1), now),
+            Some(format!("{edge}\n"))
+        );
+        assert_eq!(
+            kept_misses(&format!("{}\n", edge - 1), now),
+            Some(String::new())
+        );
+        assert_eq!(kept_misses("junk\n", now), Some(String::new()));
+        assert_eq!(kept_misses("", now), None);
     }
 }

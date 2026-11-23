@@ -1,8 +1,7 @@
 //! Thin wrappers around the `git` CLI.
 
 use crate::error::{bail, Error, Kind, Result};
-use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -37,6 +36,39 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
         .envs(env.iter().copied())
         .output()
         .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {}: {}", args.join(" "), err.trim()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`output`] for a command that reads `input` on its standard input and
+/// takes no part in worktree registration (`update-ref --stdin`).
+pub fn output_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    use std::io::Write;
+    let fail = |e: std::io::Error| Error::of(Kind::Git, format!("cannot run git: {e}"));
+    let mut child = command(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    // Written from another thread: git may fill its output pipes before it
+    // has read everything.
+    let mut stdin = child.stdin.take();
+    let text = input.to_string();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut pipe) = stdin.take() {
+            let _ = pipe.write_all(text.as_bytes());
+        }
+    });
+    let out = child.wait_with_output().map_err(fail)?;
+    let _ = writer.join();
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(Error::of(
@@ -93,28 +125,28 @@ fn registration_lock(dir: &Path) -> Result<RegistrationLock> {
     ))
 }
 
+/// The lock file, in the repository's common git directory. It is never
+/// unlinked: the versions from 0.4.0 on take the lock on whatever file
+/// they opened, without looking at the path again, so one that waited on a
+/// file that was unlinked meanwhile would hold "the lock" together with
+/// the next operation, and two registrations would run side by side. It is
+/// one empty file for a repository, and goes with the repository.
+const REGISTRATION_LOCK: &str = "fast-worktree-registration.lock";
+
 fn lock_common(common: &Path) -> Result<RegistrationLock> {
     let key = common.canonicalize()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(key.join("fast-worktree-registration.lock"))?;
-    // SAFETY: a valid descriptor; closing it releases the process-shared lock.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(error.into());
+    let path = key.join(REGISTRATION_LOCK);
+    let file = match crate::util::lock_path(&path, false, false)? {
+        Some(f) => f,
+        None => {
+            if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
+                bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
+            }
+            // A separate operation waits; only inherited same-repository reentry
+            // fails. The marker is never permission to access incomplete metadata.
+            crate::util::lock_path(&path, true, false)?.ok_or_else(|| Error::msg("lock"))?
         }
-        if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
-            bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
-        }
-        // A separate operation waits; only inherited same-repository reentry
-        // fails. The marker is never permission to access incomplete metadata.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
+    };
     Ok(RegistrationLock { _file: file, key })
 }
 
@@ -218,6 +250,13 @@ pub fn unregister(admin: &Path) -> Result<()> {
         .and_then(Path::parent)
         .ok_or_else(|| Error::msg("not a worktree administrative directory"))?;
     let _registration = lock_common(common)?;
+    if admin
+        .symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Unregistered meanwhile ([`unregister_where`]).
+        return Ok(());
+    }
     let is_entry = admin
         .parent()
         .is_some_and(|p| p.file_name().is_some_and(|n| n == "worktrees"))
@@ -226,6 +265,40 @@ pub fn unregister(admin: &Path) -> Result<()> {
         bail!("{}: not a worktree entry; left alone", admin.display());
     }
     fs::remove_dir_all(admin).map_err(|e| Error::msg(format!("{}: {e}", admin.display())))
+}
+
+/// Unregister the worktrees whose administrative directory under
+/// `<common>/worktrees` `pick` chooses, holding the registration lock.
+/// `pick` is asked twice: before the lock is taken (nothing chosen: no lock
+/// is taken at all), and again once it is held, when no `git worktree`
+/// command of fast-worktree can be in the middle of changing an entry. The
+/// lock is not waited for: when it is held, nothing is done this time.
+/// Returns how many entries were deleted.
+pub fn unregister_where(common: &Path, pick: &dyn Fn(&Path) -> bool) -> usize {
+    let picked = |common: &Path| -> Vec<PathBuf> {
+        fs::read_dir(common.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|admin| pick(admin))
+            .collect()
+    };
+    if picked(common).is_empty() {
+        return 0;
+    }
+    let Ok(key) = common.canonicalize() else {
+        return 0;
+    };
+    let Ok(Some(_registration)) =
+        crate::util::lock_path(&key.join(REGISTRATION_LOCK), false, false)
+    else {
+        return 0;
+    };
+    picked(&key)
+        .iter()
+        .filter(|admin| fs::remove_dir_all(admin).is_ok())
+        .count()
 }
 
 /// Tracked files under `root` matching the pathspecs, relative to `root`.

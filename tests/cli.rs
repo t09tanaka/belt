@@ -11,6 +11,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 const FAKE_NPM: &str = r#"#!/bin/sh
@@ -525,7 +526,7 @@ fn a_lockfile_at_the_repository_root_is_a_project() {
         let from_cache = fs::read_dir(&w.cache)
             .unwrap()
             .flatten()
-            .find(|e| e.file_name() != "trash")
+            .find(|e| e.file_name() != "trash" && e.path().is_dir())
             .unwrap()
             .path();
         assert!(
@@ -1012,7 +1013,7 @@ impl World {
             .into_iter()
             .flatten()
             .flatten()
-            .find(|e| e.file_name() != "trash")
+            .find(|e| e.file_name() != "trash" && e.path().is_dir())
         else {
             return Vec::new();
         };
@@ -1346,6 +1347,12 @@ fn cache_ls_and_prune() {
         .join("app-1234abcd/packages__web/bbbbbbbbbbbbbbbb-v20.0.0");
     fs::create_dir_all(&old).unwrap();
     fs::create_dir_all(&new).unwrap();
+    fs::write(
+        w.cache
+            .join("app-1234abcd/packages__web/bbbbbbbbbbbbbbbb-v20.0.0.ok"),
+        "",
+    )
+    .unwrap();
     fs::create_dir_all(w.cache.join("trash/1-1-1-x")).unwrap();
     let old_marker = w
         .cache
@@ -3579,6 +3586,11 @@ fn cache_ls_shows_an_older_layout_apart_and_prune_legacy_removes_it() {
     let key = "0123456789abcdef-v20.0.0";
     let current = w.cache.join("app-1234abcd/_root").join(key);
     fs::create_dir_all(&current).unwrap();
+    fs::write(
+        w.cache.join("app-1234abcd/_root").join(format!("{key}.ok")),
+        "",
+    )
+    .unwrap();
     // The older layout: no hash after the repository's name, and the root
     // project's entries right in it, holding packages.
     let old_root = w.cache.join("app").join(key);
@@ -4164,7 +4176,7 @@ impl World {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_name() != "trash")
+            .filter(|e| e.file_name() != "trash" && e.path().is_dir())
             .flat_map(|repo| {
                 fs::read_dir(repo.path().join(slug))
                     .into_iter()
@@ -6419,4 +6431,238 @@ exec /usr/bin/git "$@"
     assert!(fs::read_to_string(nested_output)
         .unwrap()
         .contains("recursive Git metadata operation"));
+}
+
+// ---- what is deleted without a command: spares and kept refs ----
+
+impl World {
+    /// Make the walks that are spaced out by an hour due again.
+    fn forget_stamps(&self) {
+        let _ = fs::remove_file(self.cache.join(".retention-stamp"));
+        for e in fs::read_dir(&self.cache).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(e.path().join(".retention-stamp"));
+        }
+    }
+
+    fn pool_registrations(&self) -> usize {
+        self.git(&self.main(), &["worktree", "list", "--porcelain"])
+            .matches("locked fast-worktree pool")
+            .count()
+    }
+}
+
+#[test]
+fn spares_beyond_a_lowered_pool_size_are_discarded_by_the_next_command() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(3);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let mut before = w.spares();
+    before.sort();
+    assert_eq!((before.len(), w.pool_registrations()), (3, 3));
+    // Lowered: the next command (a fill, which then has nothing to make)
+    // discards the oldest, files and registration.
+    w.pool_size(1);
+    let r = w.fw(&main, &["pool", "fill"]);
+    r.assert_ok();
+    assert!(r.out().contains("fill  done: 1 of 1 ready"), "{}", r.all());
+    assert_eq!(w.spares(), vec![before[2].clone()], "the newest stays");
+    assert_eq!(w.pool_registrations(), 1);
+    // Turned off: none is left, whatever the command.
+    w.pool_size(0);
+    let _held = hold_fill_lock(&w.pool_dir());
+    w.fw(&main, &["add", "../wt", "-b", "feat"]).assert_ok();
+    assert_eq!(w.spares(), Vec::<PathBuf>::new());
+    assert_eq!(w.pool_registrations(), 0);
+    // A settings file that cannot be read is not "off".
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    fs::write(
+        w.home().join(".config/fast-worktree/config.toml"),
+        "[pool\n",
+    )
+    .unwrap();
+    let _ = w.fw(&main, &["add", "../wt", "-b", "feat"]);
+    assert_eq!(w.spares().len(), 1);
+}
+
+/// As when no command ran for 8 days in the repository whose directory
+/// of the cache is `repo`.
+fn unused_for_8_days(repo: &Path) {
+    let then = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 8 * 86_400;
+    for p in [repo.join(".main"), repo.join("pool")] {
+        let ok = Command::new("perl")
+            .args(["-e", "utime($ARGV[0], $ARGV[0], $ARGV[1]) or exit 1"])
+            .arg(then.to_string())
+            .arg(&p)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "could not age {}", p.display());
+    }
+}
+
+#[test]
+fn the_spares_of_a_repository_that_is_gone_are_removed_by_a_command_elsewhere() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(1);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let spare = w.spares().pop().unwrap();
+    let repo = w.pool_dir().parent().unwrap().to_path_buf();
+    assert!(spare.join("app/node_modules").is_dir());
+    // Another repository, whose commands make the walks from now on.
+    w.git(&w.base, &["clone", "-q", "upstream", "second"]);
+    let second = w.base.join("second");
+    w.pool_size(0);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-a", "-b", "a"])
+        .assert_ok();
+    assert!(spare.is_dir(), "its repository is there");
+    // The first repository is deleted. That alone changes nothing: it was
+    // in use a moment ago, and may be back.
+    fs::remove_dir_all(&main).unwrap();
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-b", "-b", "b"])
+        .assert_ok();
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert!(spare.is_dir(), "used this week");
+    // A week without a command of it, and it goes whole.
+    unused_for_8_days(&repo);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-c", "-b", "c"])
+        .assert_ok();
+    wait_until("the gone repository's cache directory", || !repo.exists());
+    assert!(!spare.exists());
+}
+
+#[test]
+fn the_spares_of_a_repository_that_is_not_used_are_discarded_and_unregistered() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(2);
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    let repo = w.pool_dir().parent().unwrap().to_path_buf();
+    assert_eq!((w.spares().len(), w.pool_registrations()), (2, 2));
+    // Another repository makes the walks; the first is there, unused.
+    w.git(&w.base, &["clone", "-q", "upstream", "second"]);
+    let second = w.base.join("second");
+    w.pool_size(0);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-a", "-b", "a"])
+        .assert_ok();
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!((w.spares().len(), w.pool_registrations()), (2, 2));
+    unused_for_8_days(&repo);
+    w.forget_stamps();
+    w.fw(&second, &["add", "../second-b", "-b", "b"])
+        .assert_ok();
+    // Files and registrations, as any spare is discarded; the rest of the
+    // repository's directory of the cache stays.
+    wait_until("the unused repository's spares", || {
+        w.spares().is_empty() && w.pool_registrations() == 0
+    });
+    assert!(repo.join("pool/fill.lock").is_file());
+    assert!(!repo.join("pool/fill.log").exists());
+    assert!(repo.join(".main").is_file());
+    let list = w.git(&main, &["worktree", "list", "--porcelain"]);
+    assert_eq!(list.matches("worktree ").count(), 1, "{list}");
+}
+
+#[test]
+fn a_fill_is_not_turned_away_by_the_sweeps_of_other_commands() {
+    let w = World::new();
+    let main = w.main();
+    w.pool_size(2);
+    // Worktrees whose removal makes a sweep of this repository's pool
+    // each, with a leftover in it to look at.
+    let wts: Vec<PathBuf> = (0..6).map(|i| w.base.join(format!("plain{i}"))).collect();
+    for (i, wt) in wts.iter().enumerate() {
+        let name = format!("plain{i}");
+        w.git(
+            &main,
+            &["worktree", "add", "-q", "-b", &name, wt.to_str().unwrap()],
+        );
+    }
+    w.fw(&main, &["pool", "fill"]).assert_ok();
+    w.fw(&main, &["pool", "clear"]).assert_ok();
+    let pool = w.pool_dir();
+    fs::create_dir_all(pool.join(".new-wt-1700000000-2000000000-0/sub")).unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+    w.env(&mut c);
+    let fill = c
+        .args(["pool", "fill"])
+        .current_dir(&main)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for wt in &wts {
+        w.forget_stamps();
+        w.fw(&main, &["remove", wt.to_str().unwrap()]).assert_ok();
+        let status = w.fw(&main, &["pool", "status"]);
+        assert!(!status.out().contains("misses 1"), "{}", status.out());
+    }
+    let out = fill.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!text.contains("another fill is running"), "{text}");
+    assert!(text.contains("fill  done: 2 of 2 ready"), "{text}");
+    assert_eq!(w.spares().len(), 2);
+}
+
+#[test]
+fn the_ref_a_removal_keeps_survives_the_sweeps_and_says_when_it_goes() {
+    let w = World::new();
+    let main = w.main();
+    // Uncommitted changes on the worktree's own branch (which the removal
+    // deletes: the ref it makes is then on the default branch's commit),
+    // and a commit on no branch.
+    let own = w.hook_worktree("own");
+    fs::write(own.join("notes.txt"), "wip\n").unwrap();
+    let det = w.hook_worktree("det");
+    w.git(&det, &["checkout", "-q", "--detach"]);
+    w.commit(&det, &[("lonely.txt", "x")], "lonely");
+    let mut kept = Vec::new();
+    for wt in [&own, &det] {
+        let sha = w.git(wt, &["rev-parse", "HEAD"]).trim().to_string();
+        // The removal's own sweep is due.
+        w.forget_stamps();
+        let r = w.hook_remove(wt);
+        r.assert_ok();
+        let name = kept_ref(&r.err());
+        assert_eq!(
+            w.git(&main, &["rev-parse", &name]).trim(),
+            sha,
+            "{}",
+            r.err()
+        );
+        // The line that says the ref was made says the day it goes.
+        let err = r.err();
+        let at = "is deleted by itself on ";
+        let i = err.find(at).unwrap_or_else(|| panic!("no date in:\n{err}"));
+        let day = &err[i + at.len()..][..10];
+        assert!(
+            day.len() == 10 && day.as_bytes()[4] == b'-' && day.as_bytes()[7] == b'-',
+            "{}",
+            r.err()
+        );
+        assert!(r.err().contains("30 days from now"), "{}", r.err());
+        kept.push((name, sha));
+    }
+    // Every later command sweeps; the refs stay.
+    for i in 0..3 {
+        w.forget_stamps();
+        let name = format!("later{i}");
+        w.fw(&main, &["add", &format!("../{name}"), "-b", &name])
+            .assert_ok();
+    }
+    for (name, sha) in &kept {
+        assert_eq!(w.git(&main, &["rev-parse", name]).trim(), *sha);
+    }
 }

@@ -5,6 +5,107 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [Unreleased]
+
+### Changed
+
+- Nothing fast-worktree keeps is kept without bound, and no command has to
+  be run to clean up: `add`, `remove`, `hook remove`, `install`, `pool fill`
+  and the library calls that do the same delete what is old, from the
+  places they write to (see "What is deleted by itself" in the README).
+  - Kept refs under `refs/fast-worktree/kept/` are deleted by the next of
+    those commands in the repository, at most once an hour, but never by
+    `pool fill` (it mostly runs in the background, with its output in a
+    log file). A worktree's `HEAD` whose commit a local branch or a tag has
+    protects nothing and goes after 25 hours; a remote-tracking branch
+    does not count as a holder, since somebody else can delete it. Any
+    other ref goes after 30 days (what `kept prune` already dropped). Every
+    such deletion is one line on stderr with the ref, the commit and why
+    (held by which branch or tag, or the 30 days passed); the line printed
+    when a ref is made now says the day. When the refs cannot be deleted
+    (one changed meanwhile), none is, that is said once, and a later
+    command tries again.
+  - `kept prune` applies both rules (it used to go by age alone), and
+    names the holder of each ref it deletes for that.
+  - Cache entries unused for 7 days are deleted in every project of every
+    repository, not only in the project that is installed again; a
+    half-made entry (`<key>.tmp-<pid>-<n>`) of a run that is gone is
+    deleted. Only names that fast-worktree makes are touched (a key with
+    its `.ok` marker), so a cache directory shared with other things is
+    safe.
+  - A pool's `.new-*`, `.claimed-*` and `.no-hooks-*` leftovers of killed
+    runs are deleted by the next command in the repository (no more waiting
+    for `pool clear`), without taking the fill lock, once they were last
+    touched 10 minutes ago (a pid says nothing about a fill in a container
+    that shares the cache); `pool/misses` keeps the last 7 days; `fill.log`
+    goes 7 days after the last fill wrote to it.
+  - Spares beyond `[pool] size` are discarded by the next command in the
+    repository when the size was lowered or the pool turned off.
+  - A repository that ran no command for 7 days is not in use
+    (`<cache>/<repo>/.main` records where its main checkout is and on which
+    devices, and its modification time is the last command): its spares,
+    what a fill left half made, `fill.log` and `misses` are discarded.
+  - The whole cache directory of a repository goes when, on top of that,
+    its main checkout was deleted: the directory the checkout was in is
+    there, on the same device and inode as when a command last ran, the
+    recorded host identity matches, and the path is missing (the parent is
+    checked again afterwards). A disk that is not mounted at its mount
+    point, a network or FUSE mount that is down, a cache shared with another
+    machine and a record without devices, host identity or parent inode
+    are not that, and keep it.
+  - The registrations of spares whose directories are gone (a checkout
+    that was moved leaves them: they are locked, so `git worktree prune`
+    keeps them) are dropped by the next command in the repository: only
+    those locked with the reason fast-worktree locks its spares with, at a
+    spare's place in this cache.
+  - `add`, `install` and `pool fill` also finish deleting the trash, as
+    `remove` did.
+  - The walk over the whole cache never waits for another repository's
+    lock, runs no git, moves at most 200 things at a time with one
+    background deleter for all of them, and touches no path outside the
+    cache (a network mount that is down cannot hold a command up). What
+    has to look at another repository's checkout is done by one detached,
+    low-priority `fast-worktree cache retire` process (a hidden
+    subcommand), which starts a deleter of its own for what it moves. A
+    sweep no longer looks at a trash entry's sibling on another volume
+    either: the deleter is given its note and then it.
+- Lock files (`.store.lock`, `lifecycle.lock`, `fill.lock`, the
+  registration lock in `.git`, the trash's `.lock`) and the directories
+  that hold them are not deleted while their repository is there: versions
+  0.4.0 to 0.6.0 lock the same paths without looking at the path again
+  after locking, so unlinking one would let two processes hold the lock.
+  They are a few empty files for a repository. (This version does look
+  again when it takes one, except the trash's deleters, which queue with
+  `lockf -k`.)
+- `pool clear` removes the leftovers of killed runs that are 10 minutes
+  old, not only those an hour old, but not those of a fill or an `add`
+  that is alive.
+- `pool/misses` is written under a lock on the file itself, so that `add`s
+  at the same time each leave their line.
+
+### Library
+
+- `create_worktree` and `remove_worktree` make the sweeps themselves: no
+  new call is needed. At most once an hour they delete the kept refs of
+  their repository that are no longer needed (they deleted none before).
+  Each deletion is a line in the call's log, and the new field
+  `deleted_kept_refs` of `Created` and `Removed` lists them (`DeletedKeptRef`:
+  ref, commit, and `KeptRefDeletion::HeldBy { holder }` or
+  `KeptRefDeletion::Expired`), for a caller that discards the log.
+- `fill_pool` makes the sweeps too, except that it deletes no kept refs.
+- New `Repository::sweep_kept_refs()` applies the automatic rule at once
+  and returns what it deleted.
+- `Repository::prune_kept_refs(days)` is unchanged: age alone, as in 0.6.0.
+- `sweep_trash` also walks the cache (at most once an hour). It starts no
+  process: the repositories that are not in use are only looked at when a
+  `Repository` call with a helper executable of this version, or the
+  command, makes the walk.
+- The helper executable (`with_helper`, `cli::run_with_helper`) is now also
+  run as `fast-worktree cache retire <directories>`. One older than this
+  version rejects that and nothing happens.
+- A worktree entry that is already gone is no longer an error when a spare
+  is unregistered.
+
 ## [0.6.0] - 2026-11-21
 
 ### Added

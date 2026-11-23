@@ -33,6 +33,14 @@ pub fn repo_key(main_checkout: &Path) -> String {
     let real = main_checkout
         .canonicalize()
         .unwrap_or_else(|_| main_checkout.to_path_buf());
+    key_of_real(&real)
+}
+
+/// [`repo_key`] of a path that is real already. It only reads the path's
+/// bytes, never the file system: a walk over the cache uses it to check
+/// what another repository recorded without touching where that
+/// repository is.
+pub fn key_of_real(real: &Path) -> String {
     let name = real
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

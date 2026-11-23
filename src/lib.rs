@@ -63,6 +63,11 @@
 //! refilled automatically; [`Repository::fill_pool`] fills them in the
 //! calling thread.
 //!
+//! The same executable is run, at most once an hour, as `fast-worktree
+//! cache retire` to look at the repositories that ran no command for 7
+//! days (see [`sweep_trash`]). A helper older than this version does not
+//! know that command, and then nothing is done for them.
+//!
 //! A program that embeds the whole command (for example, one binary that
 //! acts as `fast-worktree` when started through a link of that name) runs
 //! it with `cli::run_with_helper(args, Some(path))`, so that the
@@ -103,6 +108,7 @@ mod include;
 mod paths;
 mod pending;
 mod pool;
+mod retention;
 mod submodules;
 mod trash;
 mod util;
@@ -307,6 +313,9 @@ pub struct Created {
     pub setup_ok: bool,
     /// The output of the call, with [`Output::Capture`].
     pub log: Vec<LogEntry>,
+    /// The kept refs that the call's sweep deleted (see
+    /// [`DeletedKeptRef`]); mostly empty.
+    pub deleted_kept_refs: Vec<DeletedKeptRef>,
 }
 
 /// How a worktree is removed.
@@ -365,6 +374,9 @@ pub struct Removed {
     pub complete: bool,
     /// The output of the call, with [`Output::Capture`].
     pub log: Vec<LogEntry>,
+    /// The kept refs that the call's sweep deleted (see
+    /// [`DeletedKeptRef`]); mostly empty.
+    pub deleted_kept_refs: Vec<DeletedKeptRef>,
 }
 
 /// The settings that apply to a repository.
@@ -404,6 +416,53 @@ pub struct KeptRef {
     /// When it was kept, read from the ref's name; `None` for a ref whose
     /// name has no time (those are never pruned).
     pub kept_at: Option<SystemTime>,
+}
+
+/// Why a kept ref was deleted by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeptRefDeletion {
+    /// A local branch or a tag holds its commit, so the ref protected
+    /// nothing (and it was at least 25 hours old).
+    #[non_exhaustive]
+    HeldBy {
+        /// The branch (`main`) or the tag (`tags/v1`).
+        holder: String,
+    },
+    /// 30 days passed since it was kept. Unless a branch or a tag has its
+    /// commit, `git gc` may drop it now.
+    Expired,
+}
+
+/// A kept ref that fast-worktree deleted without being asked: the sweep
+/// that [`Repository::create_worktree`] and [`Repository::remove_worktree`]
+/// make for their repository at most once an hour deleted it, or
+/// [`Repository::sweep_kept_refs`] did. The same is written to the call's
+/// log, one line each; this is for a program that does not read the log
+/// ([`Output::Discard`]) and still has to tell its user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeletedKeptRef {
+    /// The full ref name.
+    pub name: String,
+    /// The commit it pointed to.
+    pub commit: String,
+    /// Why it was deleted.
+    pub reason: KeptRefDeletion,
+}
+
+fn deleted_kept_refs(deleted: Vec<cmd::kept::Deleted>) -> Vec<DeletedKeptRef> {
+    deleted
+        .into_iter()
+        .map(|d| DeletedKeptRef {
+            name: d.name,
+            commit: d.commit,
+            reason: match d.reason {
+                cmd::kept::Reason::HeldBy(holder) => KeptRefDeletion::HeldBy { holder },
+                cmd::kept::Reason::Expired => KeptRefDeletion::Expired,
+            },
+        })
+        .collect()
 }
 
 impl Repository {
@@ -446,6 +505,8 @@ impl Repository {
     /// Run `f` with this repository's output and helper in place; returns
     /// its value and the captured log.
     fn call<T>(&self, f: impl FnOnce() -> T) -> (T, Vec<LogEntry>) {
+        // What an earlier call of this thread did not hand out.
+        cmd::kept::take_deleted();
         let log = Rc::new(RefCell::new(Vec::new()));
         let sink: Option<util::Sink> = match self.output {
             Output::Inherit => None,
@@ -496,6 +557,7 @@ impl Repository {
             from_pool: made.from_pool,
             setup_ok: made.ok,
             log,
+            deleted_kept_refs: deleted_kept_refs(cmd::kept::take_deleted()),
         })
     }
 
@@ -546,6 +608,7 @@ impl Repository {
                         branch_deleted: d.branch_deleted,
                         complete: d.code == 0,
                         log: Vec::new(),
+                        deleted_kept_refs: Vec::new(),
                     }
                 }
                 RemoveMode::Discard => {
@@ -556,12 +619,14 @@ impl Repository {
                         branch_deleted: false,
                         complete: d.complete,
                         log: Vec::new(),
+                        deleted_kept_refs: Vec::new(),
                     }
                 }
             })
         });
         let mut removed = done?;
         removed.log = log;
+        removed.deleted_kept_refs = deleted_kept_refs(cmd::kept::take_deleted());
         Ok(removed)
     }
 
@@ -616,7 +681,8 @@ impl Repository {
 
     /// Make spares until the pool has its configured size, as `fast-worktree
     /// pool fill` does, in the calling thread; returns at once when another
-    /// fill is running or the pool is off. Spares take a while to make:
+    /// fill is running or the pool is off. It deletes no kept refs (it has
+    /// no result to name them in): see [`Self::sweep_kept_refs`]. Spares take a while to make:
     /// call this from a background thread or a maintenance job. This runs
     /// synchronously. With [`Output::Capture`] or [`Output::Discard`], child
     /// output is buffered.
@@ -644,10 +710,13 @@ impl Repository {
             .collect())
     }
 
-    /// Delete the kept refs that are `older_than_days` days old or older
-    /// (the command's default is 30). Returns how many were deleted.
+    /// Delete the kept refs that are `older_than_days` days old or older,
+    /// whatever holds their commits, and no others: age alone decides, as
+    /// since 0.6.0 (the command's default is 30 days). Returns how many
+    /// were deleted. For the rule that the calls which create and remove
+    /// worktrees apply by themselves, see [`Self::sweep_kept_refs`].
     pub fn prune_kept_refs(&self, older_than_days: u64) -> Result<usize> {
-        let (done, _log) = self.call(|| cmd::kept::prune_in(&self.main, older_than_days));
+        let (done, _log) = self.call(|| cmd::kept::prune_by_age(&self.main, older_than_days));
         let (pruned, failed) = done?;
         if failed > 0 {
             return Err(Error::Git {
@@ -656,13 +725,61 @@ impl Repository {
         }
         Ok(pruned)
     }
+
+    /// Delete the kept refs that are no longer needed, now, by the rule
+    /// that [`Self::create_worktree`] and [`Self::remove_worktree`] apply
+    /// by themselves at most once an hour: one that is 30 days old; and a
+    /// worktree's `HEAD` that is 25 hours old and whose commit a local
+    /// branch or a tag holds (a remote-tracking branch does not count).
+    /// Returns what was deleted, each with why. When they cannot be
+    /// deleted (one changed meanwhile), none is, and the next call tries
+    /// again.
+    ///
+    /// A program that only ever calls [`Self::fill_pool`] for a repository
+    /// calls this from time to time; one that creates or removes worktrees
+    /// there need not.
+    pub fn sweep_kept_refs(&self) -> Result<Vec<DeletedKeptRef>> {
+        let (done, _log) = self.call(|| cmd::kept::prune_refs(&self.main, cmd::kept::PRUNE_DAYS));
+        let done = done?;
+        if done.failed > 0 {
+            return Err(Error::Git {
+                message: format!("{} kept ref(s) could not be deleted", done.failed),
+            });
+        }
+        Ok(deleted_kept_refs(done.deleted))
+    }
 }
 
 /// Finish deleting what earlier removals left in the trash, and expire what
 /// was kept for a day and is due, as every removal does before it moves its
-/// own worktree. Cheap when the trash is empty.
-/// Sets a process-global embedded flag that is never reset.
+/// own worktree; and, at most once an hour, remove from the dependency
+/// cache what is unused for 7 days or half made by a killed run, in every
+/// project of every repository. Cheap when there is nothing to do; it
+/// never waits for a repository's lock, runs no git, and touches no path
+/// outside the cache. Sets a process-global embedded flag that is never
+/// reset.
+///
+/// [`Repository::create_worktree`], [`Repository::remove_worktree`] and
+/// [`Repository::fill_pool`] make this sweep themselves, and, for their
+/// repository, also discard the spares beyond the pool size. The first two
+/// also, at most once an hour, delete its kept refs that are no longer
+/// needed (each is named in the call's log and in the result's
+/// `deleted_kept_refs`), the leftovers in its pool and the registrations
+/// of spares that are gone. So a program that calls them need call nothing
+/// else; call this from a maintenance job only when it may go long without
+/// any of them. A repository's own kept refs are only ever deleted by the
+/// calls made for that repository.
+///
+/// The repositories that ran no command for 7 days (their spares are
+/// discarded, and the cache directory of one whose main checkout was
+/// deleted goes whole) are looked at by a detached `fast-worktree cache
+/// retire` process, because that has to touch where those repositories
+/// are. The calls of a [`Repository`] start it with the helper executable
+/// ([`Repository::with_helper`]); this function starts none, and neither
+/// does a repository with `with_helper(None)` or a helper older than this
+/// version, so then those stay until a `fast-worktree` command of this
+/// version runs on the machine.
 pub fn sweep_trash() {
     util::set_embedded();
-    trash::sweep();
+    retention::run(None);
 }
