@@ -62,7 +62,9 @@ impl Index {
         )?;
         if ours {
             c.execute(
-                "UPDATE root SET kind='abandoned' WHERE id=?1 AND kind='receipt'",
+                // ('pending': what `begin_import` made before receipts had
+                // a kind of their own)
+                "UPDATE root SET kind='abandoned' WHERE id=?1 AND kind IN ('receipt','pending')",
                 [format!("import:{id}")],
             )?;
             // a session whose root is gone already goes with it
@@ -129,14 +131,12 @@ impl SourceStore {
         self.release_abandoned_imports()
     }
 
-    /// One bounded pass over the abandoned tokens, under the exclusive
-    /// mutation lock. A store that is busy is left for the next pass.
+    /// One bounded pass over the abandoned tokens: the shared part under the
+    /// shared mutation lock, then the exclusive part only when every gate is
+    /// open. A store that is busy is left for the next pass.
     pub fn release_abandoned_imports(&self) -> Result<ImportReleaseReport> {
-        if !self.retention.import_release_due()? {
-            return Ok(ImportReleaseReport::default());
-        }
-        let _guard = match self.retention.guard(true) {
-            Ok(g) => g,
+        let mut report = match self.mutation_guard() {
+            Ok(_guard) => self.retention.release_shared_imports()?,
             Err(e) if would_block(&e) => {
                 return Ok(ImportReleaseReport {
                     stopped: true,
@@ -145,7 +145,29 @@ impl SourceStore {
             }
             Err(e) => return Err(e),
         };
-        self.retention.release_abandoned_imports()
+        if !self.retention.import_release_due()? {
+            return Ok(report);
+        }
+        let _guard = match self.retention.guard(true) {
+            Ok(g) => g,
+            Err(e) if would_block(&e) => {
+                report.stopped = true;
+                return Ok(report);
+            }
+            Err(e) => return Err(e),
+        };
+        let pass = self.retention.release_abandoned_imports()?;
+        report.released += pass.released;
+        report.unlinked += pass.unlinked;
+        report.kept += pass.kept;
+        report.stopped |= pass.stopped;
+        Ok(report)
+    }
+
+    /// For `doctor`: abandoned token roots, their memberships, and the bytes
+    /// of the files only they hold.
+    pub fn abandoned_imports(&self) -> Result<(u64, u64, u64)> {
+        self.retention.abandoned_imports()
     }
 
     /// At the worker's start, under `agent.lock` and before anything is
@@ -171,28 +193,37 @@ impl SourceStore {
                     break;
                 };
                 after = last.clone();
+                let mut abandoned = Vec::new();
                 for token in tokens.iter().filter(|t| !owned.contains(*t)) {
                     if self.retention.abandon_import(&tx, token)? {
                         report.abandoned += 1;
+                        abandoned.push(token);
                     } else {
                         report.kept += 1;
                     }
                 }
                 tx.commit()?;
+                // members whose file never came go now (as `release_import`
+                // does), not when the gates open
+                for token in abandoned {
+                    self.retention
+                        .forget_absent_members(&format!("import:{token}"))?;
+                }
             }
         }
-        // (until a pass makes no progress: the old intake left a token for
-        // every blob it took)
-        loop {
+        // (until a pass makes no progress, and at most one pass per token
+        // abandoned plus one: the old intake left a token for every blob)
+        for _ in 0..=report.abandoned {
             let pass = self.release_abandoned_imports()?;
             report.release.released += pass.released;
             report.release.unlinked += pass.unlinked;
-            report.release.kept = pass.kept;
+            report.release.kept += pass.kept;
             report.release.stopped = pass.stopped;
             if pass.released == 0 && pass.unlinked == 0 {
-                return Ok(report);
+                break;
             }
         }
+        Ok(report)
     }
 }
 
@@ -416,6 +447,16 @@ mod tests {
         for _ in 0..3 {
             store.ingest_blob(&want(&b), &mut &b[..]).unwrap();
         }
+        // (whose roots were `pending`)
+        store
+            .retention
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE root SET kind='pending' WHERE id LIKE 'import:%' AND id<>'import:'||?1",
+                [SourceStore::import_token_id(&kept)],
+            )
+            .unwrap();
         // a row of another shape (a parent's publication)
         let other = store.begin_import().unwrap();
         let other_id = SourceStore::import_token_id(&other).to_string();
@@ -437,6 +478,121 @@ mod tests {
             .resume_import(SourceStore::import_token_id(&kept))
             .unwrap()
             .is_some());
+        assert!(store.has_blob(&want(&b).hash));
+    }
+
+    /// Abandoned roots whose files wait for the gates: `n` roots of
+    /// `members` unshared members each, named before every other token.
+    fn stuck_roots(store: &SourceStore, n: usize, members: usize) {
+        let mut c = store.retention.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        for i in 0..n {
+            let root = format!("import:0{i:025}");
+            tx.execute("INSERT INTO root(id,kind) VALUES(?1,'abandoned')", [&root])
+                .unwrap();
+            for j in 0..members {
+                let hash = format!("{:x}", sha2::Sha256::digest(format!("{i}/{j}")));
+                let key = format!("b:{hash}");
+                tx.execute(
+                    "INSERT INTO object VALUES(?1,?2)",
+                    params![key, format!("objects/{}/{hash}", &hash[..2])],
+                )
+                .unwrap();
+                tx.execute("INSERT INTO member VALUES(?1,?2)", params![root, key])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn roots_that_wait_for_the_gates_never_stop_the_others_nor_take_the_exclusive_lock() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        // a worker's store: the legacy registration never ends, the gates
+        // stay closed
+        let store = SourceStore::open(dir.path()).unwrap();
+        stuck_roots(&store, 1, 1000);
+        stuck_roots_more(&store);
+        let token = store.begin_import().unwrap();
+        let shared = [21u8; 9];
+        ingest(&store, &token, &shared);
+        publish(&store, &shared);
+        let id = SourceStore::import_token_id(&token).to_string();
+        // another receipt holds the shared lock all along
+        let held = store.mutation_guard().unwrap();
+        let r = store.release_import(&id).unwrap();
+        assert_eq!((r.released, r.unlinked), (1, 0));
+        assert!(!r.stopped);
+        assert!(store.resume_import(&id).unwrap().is_none());
+        // and so does every later token
+        let next = store.begin_import().unwrap();
+        ingest(&store, &next, &shared);
+        let r = store
+            .release_import(SourceStore::import_token_id(&next))
+            .unwrap();
+        assert_eq!(r.released, 1);
+        drop(held);
+        // the waiting roots and their files stay, counted for `doctor`
+        assert_eq!(store.abandoned_imports().unwrap(), (34, 1000 + 33, 0));
+        assert_eq!(claims(&store), 0);
+        assert!(store.has_blob(&want(&shared).hash));
+    }
+
+    /// 33 more waiting roots of one member each.
+    fn stuck_roots_more(store: &SourceStore) {
+        let mut c = store.retention.connect().unwrap();
+        let tx = c.transaction().unwrap();
+        for i in 0..33 {
+            let root = format!("import:1{i:025}");
+            let hash = format!("{:x}", sha2::Sha256::digest(format!("more/{i}")));
+            let key = format!("b:{hash}");
+            tx.execute("INSERT INTO root(id,kind) VALUES(?1,'abandoned')", [&root])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO object VALUES(?1,?2)",
+                params![key, format!("objects/{}/{hash}", &hash[..2])],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO member VALUES(?1,?2)", params![root, key])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn rows_the_old_intake_left_go_at_the_start_on_a_worker_store() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let b = [22u8; 5];
+        let kept = store.begin_import().unwrap();
+        ingest(&store, &kept, &b);
+        publish(&store, &b);
+        // what `begin_import` wrote before receipts had a kind of their own
+        let c = store.retention.connect().unwrap();
+        for i in 0..3 {
+            let token = format!("01J00000000000000000000{i:03}");
+            c.execute(
+                "INSERT INTO import_session(token,state) VALUES(?1,'pending')",
+                [&token],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO root(id,kind) VALUES('import:'||?1,'pending')",
+                [&token],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO member VALUES('import:'||?1,?2)",
+                params![token, format!("b:{}", want(&b).hash)],
+            )
+            .unwrap();
+        }
+        let owned = BTreeSet::from([SourceStore::import_token_id(&kept).to_string()]);
+        let held = store.mutation_guard().unwrap();
+        let report = store.forget_unowned_imports(&owned).unwrap();
+        drop(held);
+        assert_eq!((report.abandoned, report.release.released), (3, 3));
+        assert_eq!(rows(&store), (1, 1, 1));
         assert!(store.has_blob(&want(&b).hash));
     }
 

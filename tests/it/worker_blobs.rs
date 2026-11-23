@@ -3470,6 +3470,14 @@ fn the_start_removes_tokens_no_staging_directory_records() {
         };
         store.ingest_blob(&want, &mut &b[..]).unwrap();
     }
+    // (rows the old intake made: their roots were `pending`)
+    rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .execute(
+            "UPDATE root SET kind='pending' WHERE id LIKE 'import:%'",
+            [],
+        )
+        .unwrap();
     assert_eq!(index_rows(&f, "").0, p.blobs.len() as i64);
     // A record that cannot be read: nothing goes (it may name a token in use).
     let other = f.directory("other", 42);
@@ -3578,4 +3586,37 @@ fn files_cut_part_way_into_the_store_go_on_with_the_recorded_token() {
     assert!(verify(sink, &l, &p.source, p.refs()).ready);
     assert_eq!(index_rows(&f, "").0, 0);
     assert_eq!(index_rows(&f, "").1, 0);
+}
+
+#[test]
+fn a_record_left_after_the_publication_keeps_the_index_ref_of_the_source() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    let refs = git(&clones[0], &["for-each-ref"]);
+    let index = format!("refs/local-ci/index/{}", p.root.source_id);
+    assert!(refs.contains(&index), "{refs}");
+    // What a crash between the publication and the removal of the record
+    // leaves: the directory with the refs the bundle made.
+    let dir = f.incoming(&p.source);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("made-refs"),
+        format!(
+            "{}\n{index} - -\n",
+            p.root.repository_id.as_deref().unwrap()
+        ),
+    )
+    .unwrap();
+    // the next request finds the source published and throws the
+    // directory away: the ref of the published source stays
+    let b = p.blobs.values().next().unwrap();
+    assert!(put_all(sink, &l, &p.source, Content, b).unwrap().complete);
+    assert!(!dir.exists());
+    assert_eq!(git(&clones[0], &["for-each-ref"]), refs);
 }

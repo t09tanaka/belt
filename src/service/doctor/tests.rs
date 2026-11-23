@@ -384,6 +384,7 @@ fn healthy() -> HostFacts {
         cli_jobs: Some(CliJobs::default()),
         cli_jobs_error: None,
         linger: None,
+        abandoned_imports: None,
     }
 }
 fn level(checks: &[Check], id: &str) -> Level {
@@ -2131,5 +2132,29 @@ fn wrong_content_files_kept_because_another_root_holds_them_are_shown() {
         })
         .0,
         Level::Notice
+    );
+}
+
+#[test]
+fn what_released_import_tokens_still_hold_is_counted() {
+    let mut facts = healthy();
+    facts.abandoned_imports = Some(AbandonedImports {
+        roots: 0,
+        members: 0,
+        bytes: 0,
+    });
+    assert!(evaluate("mini-a", &facts)
+        .iter()
+        .all(|c| c.id != "abandoned_imports"));
+    facts.abandoned_imports = Some(AbandonedImports {
+        roots: 2,
+        members: 5,
+        bytes: 900,
+    });
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "abandoned_imports"), Level::Notice);
+    let text = detail(&checks, "abandoned_imports");
+    assert!(
+        text.contains("2 released") && text.contains("5 membership") && text.contains("900 byte")
     );
 }

@@ -3,11 +3,12 @@
 //! through [`Index::release_member`], so a file only that token held is
 //! claimed and unlinked, and one another root holds keeps that root.
 //!
-//! The caller holds the source mutation lock exclusively. A claim is made
-//! only when it can drain in the same section: while a root of unknown
-//! membership or an unfinished graph exists (another receipt in flight, a
-//! registration), objects no other root holds keep their membership and
-//! wait for a later pass; shared ones are detached all the same.
+//! A pass has two parts. Under the shared mutation lock, memberships another
+//! root holds are detached and empty token roots go. Under the exclusive
+//! lock, and only while every gate is open (no legacy registration left, no
+//! root of unknown membership, no unfinished graph), files no other root
+//! holds are claimed and unlinked; until then they keep their membership
+//! (counted by `doctor`).
 use super::*;
 
 /// What one pass did.
@@ -24,20 +25,25 @@ pub struct ImportReleaseReport {
     pub stopped: bool,
 }
 
-/// Memberships one pass looks at.
+/// Memberships one pass changes.
 const MEMBERS: usize = 1000;
 
+/// Where the exclusive pass resumes (a root id), so a root whose members
+/// cannot be proven does not stop the others.
+const CURSOR: &str = "import_release_after";
+
 impl Index {
-    /// Is there anything a pass under the exclusive lock would do? The
-    /// exclusive lock makes every other writer of the store fail at once,
-    /// so it is taken only then: an empty abandoned token root, a member
-    /// another root holds, or anything at all once the gates are open.
+    /// Is there anything the pass under the exclusive lock would do? Only
+    /// once the gates are open: while one is closed no claim can be made, and
+    /// the exclusive lock would only make every other writer fail.
     pub(in crate::source::retention) fn import_release_due(&self) -> Result<bool> {
         let c = self.connect()?;
-        let open = Gate::closed(&c)?.is_none();
+        if Gate::closed(&c)?.is_some() {
+            return Ok(false);
+        }
         Ok(c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM root r WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND (?1 OR NOT EXISTS(SELECT 1 FROM member m WHERE m.root=r.id) OR EXISTS(SELECT 1 FROM member m JOIN member o ON o.object=m.object AND o.root<>m.root WHERE m.root=r.id)))",
-            [open],
+            "SELECT EXISTS(SELECT 1 FROM root WHERE kind='abandoned' AND id LIKE 'import:%')",
+            [],
             |r| r.get(0),
         )?)
     }
@@ -66,42 +72,112 @@ impl Index {
         }
     }
 
-    /// One bounded pass over the abandoned token roots.
+    /// The part of a pass that needs only the shared lock (the caller holds
+    /// it): memberships another root holds are detached, and abandoned token
+    /// roots left without members go with their rows. Only roots with such
+    /// work are visited, so roots that wait for the gates cost nothing and
+    /// never stop the pass; at most [`MEMBERS`] rows change.
+    pub(in crate::source::retention) fn release_shared_imports(
+        &self,
+    ) -> Result<ImportReleaseReport> {
+        let mut report = ImportReleaseReport::default();
+        let mut c = self.connect_for_import()?;
+        let mut changed = 0usize;
+        let mut after = String::new();
+        loop {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let roots: Vec<String> = {
+                let mut s = tx.prepare("SELECT r.id FROM root r WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND r.id>?1 AND (NOT EXISTS(SELECT 1 FROM member m WHERE m.root=r.id) OR EXISTS(SELECT 1 FROM member m JOIN member o ON o.object=m.object AND o.root<>m.root WHERE m.root=r.id)) ORDER BY r.id LIMIT 32")?;
+                let rows = s.query_map([&after], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let Some(last) = roots.last() else {
+                tx.commit()?;
+                return Ok(report);
+            };
+            let last = last.clone();
+            let mut full = false;
+            for root in &roots {
+                let left = MEMBERS - changed;
+                let detached = tx.execute(
+                    "DELETE FROM member WHERE rowid IN (SELECT m.rowid FROM member m WHERE m.root=?1 AND EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>m.root) LIMIT ?2)",
+                    params![root, left as i64],
+                )?;
+                changed += detached;
+                if changed == MEMBERS {
+                    full = true;
+                    break;
+                }
+                if tx.execute(
+                    "DELETE FROM root WHERE id=?1 AND kind='abandoned' AND NOT EXISTS(SELECT 1 FROM member WHERE root=?1)",
+                    [root],
+                )? == 1
+                {
+                    tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
+                    tx.execute(
+                        "DELETE FROM import_session WHERE token=?1 AND state='pending' AND source IS NULL AND run_id IS NULL",
+                        [root.trim_start_matches("import:")],
+                    )?;
+                    report.released += 1;
+                }
+            }
+            tx.commit()?;
+            if full {
+                report.stopped = true;
+                return Ok(report);
+            }
+            after = last;
+        }
+    }
+
+    /// The part of a pass that claims files no other root holds, under the
+    /// exclusive lock and only while every gate is open. It resumes after
+    /// the root the last pass ended at; at most [`MEMBERS`] memberships are
+    /// looked at.
     pub(in crate::source::retention) fn release_abandoned_imports(
         &self,
     ) -> Result<ImportReleaseReport> {
         let mut report = ImportReleaseReport::default();
         let mut c = self.connect()?;
         let mut budget = BYTE_BUDGET;
+        if Gate::closed(&c)?.is_some() {
+            report.stopped = true;
+            return Ok(report);
+        }
         // A claim a crash left is finished first.
         let replay: Vec<String> = {
             let mut s = c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
             let rows = s.query_map([], |r| r.get(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        // the gates of every other deletion (legacy registration, a root
-        // of unknown membership, an unfinished graph)
-        let quiet = |c: &Connection| -> Result<bool> { Ok(Gate::closed(c)?.is_none()) };
-        if !replay.is_empty() {
-            if !quiet(&c)? {
+        for raw in replay {
+            let claim: Claim = serde_json::from_str(&raw)?;
+            if self.drain_claim(&mut c, &claim, &mut budget).is_err() {
                 report.stopped = true;
                 return Ok(report);
             }
-            for raw in replay {
-                let claim: Claim = serde_json::from_str(&raw)?;
-                if self.drain_claim(&mut c, &claim, &mut budget).is_err() {
-                    report.stopped = true;
-                    return Ok(report);
-                }
-            }
         }
-        let roots: Vec<String> = {
+        let start: String = c
+            .query_row("SELECT value FROM meta WHERE key=?1", [CURSOR], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or_default();
+        let mut roots: Vec<String> = {
+            let mut s = c.prepare(
+                "SELECT id FROM root WHERE kind='abandoned' AND id LIKE 'import:%' AND id>?1 ORDER BY id LIMIT 32",
+            )?;
+            let rows = s.query_map([&start], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if roots.is_empty() && !start.is_empty() {
+            // wrap around
             let mut s = c.prepare(
                 "SELECT id FROM root WHERE kind='abandoned' AND id LIKE 'import:%' ORDER BY id LIMIT 32",
             )?;
             let rows = s.query_map([], |r| r.get(0))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
+            roots = rows.collect::<std::result::Result<_, _>>()?;
+        }
         let mut looked = 0usize;
         for root in roots {
             let mut after = String::new();
@@ -123,16 +199,13 @@ impl Index {
                         params![object, root],
                         |r| r.get(0),
                     )?;
-                    if !shared && !quiet(&c)? {
-                        report.kept += 1;
-                        continue;
-                    }
                     if !shared && self.destination_absent(object, path) {
                         // Named before its file was written, and never
                         // written: nothing to prove or unlink.
                         forget_member(&mut c, &root, object)?;
                         continue;
                     }
+                    // (a shared member is only detached: nothing to examine)
                     match self.release_member(
                         &mut c,
                         &root,
@@ -140,7 +213,7 @@ impl Index {
                         path,
                         &mut budget,
                         true,
-                        true,
+                        !shared,
                     )? {
                         Released::Shared(_) => {}
                         Released::Unproven(_) => report.kept += 1,
@@ -169,9 +242,35 @@ impl Index {
                 )?;
                 report.released += 1;
             }
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![CURSOR, root],
+            )?;
             tx.commit()?;
         }
         Ok(report)
+    }
+
+    /// For `doctor`: the abandoned token roots, their memberships, and the
+    /// bytes of the files only they hold (no paths).
+    pub(in crate::source::retention) fn abandoned_imports(&self) -> Result<(u64, u64, u64)> {
+        let c = self.connect()?;
+        let (roots, members): (i64, i64) = c.query_row(
+            "SELECT (SELECT count(*) FROM root WHERE kind='abandoned' AND id LIKE 'import:%'), (SELECT count(*) FROM member m JOIN root r ON r.id=m.root WHERE r.kind='abandoned' AND r.id LIKE 'import:%')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut bytes = 0u64;
+        let mut s = c.prepare("SELECT o.path FROM member m JOIN root r ON r.id=m.root JOIN object o ON o.id=m.object WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND NOT EXISTS(SELECT 1 FROM member b WHERE b.object=m.object AND b.root<>m.root)")?;
+        let paths = s.query_map([], |r| r.get::<_, String>(0))?;
+        for path in paths {
+            if let Ok(m) = std::fs::symlink_metadata(self.path.join(path?)) {
+                if m.is_file() {
+                    bytes += m.len();
+                }
+            }
+        }
+        Ok((roots as u64, members as u64, bytes))
     }
 }
 

@@ -644,26 +644,44 @@ impl Incoming {
     }
 
     /// Remove what we staged for a source, and its directory when nothing
-    /// else is in it. Call under the source's lock.
-    fn discard(&self, source: &str) {
+    /// else is in it. Call under the source's lock, holding no source
+    /// mutation lock. Should the token not be released or the clone be busy,
+    /// everything stays for a later discard (the directory goes stale and
+    /// the next tick tries again).
+    fn discard(&self, source: &str, limits: &BlobLimits) {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(source);
         let dir = self.root.join(source);
         // The owner of the token ends: its rows go first (spec 25.8, 3).
-        // Should that fail, the rows stay until the next start removes
-        // them as unrecorded (25.8, 4); the directory goes all the same.
-        if let Ok(Some(id)) = recorded_token(&dir) {
-            let _ = self.store.release_import(&id);
+        match recorded_token(&dir) {
+            Ok(Some(id)) => {
+                if self.store.release_import(&id).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return,
         }
-        // Not published: the refs its bundle made go, but for the snapshots
-        // of captures that are published by now (as a refusal does).
+        // Not published: the refs its bundle made go, but for those of
+        // sources that are published by now (as a refusal does): a
+        // snapshot, or the index ref of a published source.
         if let Some((repository_id, made)) = read_made_refs(&dir) {
             if let Some(repo) = self.objects(&repository_id) {
-                Self::drop_refs(&repo, &made, |r| match &r.snapshot_of {
+                // Under the clone's import lock: another import may have
+                // found a ref of ours there and counted on it.
+                let busy = format!("the clone of {repository_id} is busy");
+                let Ok(_importing) = self
+                    .workspaces
+                    .import_lock(&repository_id)
+                    .and_then(|f| Self::wait_lock(f, limits, &busy))
+                else {
+                    return;
+                };
+                Self::drop_refs(&repo, &made, |r| match r.source() {
                     Some(id) => self.published(id).unwrap_or(true),
-                    None => false,
+                    None => true,
                 });
             }
         }
@@ -693,9 +711,9 @@ impl Incoming {
     }
 
     /// Nothing of a source that has no staged file stays.
-    fn discard_if_empty(&self, source: &SourceId) {
+    fn discard_if_empty(&self, source: &SourceId, limits: &BlobLimits) {
         if Self::holds_nothing(&self.dir(source)) {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits);
         }
     }
 
@@ -811,12 +829,12 @@ impl Incoming {
                 continue;
             }
             if held.is_some_and(|s| lock_shard(&other) == lock_shard(s.as_str())) {
-                self.discard(&other);
+                self.discard(&other, limits);
                 continue;
             }
             let f = self.lock_file(&lock_shard(&other).to_string())?;
             if f.try_lock().is_ok() {
-                self.discard(&other);
+                self.discard(&other, limits);
             }
         }
         Ok(())
@@ -1517,7 +1535,7 @@ impl Incoming {
             }
         }
         if let Some(why) = refused {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits);
             *st = Staged::default();
             return Err(invalid(format!("the source is refused: {why}")));
         }
@@ -1556,7 +1574,7 @@ impl Incoming {
                     .is_some_and(|m| m.execution_commit.is_some())
             });
         if homeless {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits);
             *st = Staged::default();
             return Err(invalid(
                 "the source is refused: it names a commit and no repository to hold it",
@@ -1628,7 +1646,7 @@ impl Incoming {
         }
         // published: the refs are the source's now
         remove_staged(&dir.join(MADE_REFS));
-        self.discard(source.as_str());
+        self.discard(source.as_str(), limits);
         Ok(true)
     }
 
@@ -1666,7 +1684,7 @@ impl Incoming {
                         Ok(None) => {}
                         Err(e) => {
                             // Nothing of a source that has nothing staged stays.
-                            self.discard_if_empty(&r.source_id);
+                            self.discard_if_empty(&r.source_id, limits);
                             return Err(e);
                         }
                     }
@@ -1804,7 +1822,7 @@ impl BlobSink for Incoming {
         };
         if self.published(&root_id)? {
             // The source is whole: nothing more is taken for it.
-            self.discard(r.source_id.as_str());
+            self.discard(r.source_id.as_str(), limits);
             if r.kind == SourceBlobKind::Content && !self.store.has_blob(hex_of(&r.digest)) {
                 return Err(invalid("no manifest of the source names this blob"));
             }
