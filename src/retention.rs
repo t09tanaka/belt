@@ -118,7 +118,9 @@ impl Keep {
         Keep {
             history_keep: cfg.history_keep as u64,
             history_keep_days: cfg.history_keep_days,
-            jobs_keep_days: cfg.jobs_keep_days,
+            // 0 is read as 1: a finished job nobody has waited on is kept at
+            // least a day.
+            jobs_keep_days: cfg.jobs_keep_days.max(1),
             jobs_log_max_mib: cfg.jobs_log_max_mib,
             managed_keep_days: cfg.managed_keep_days,
         }
@@ -148,6 +150,18 @@ impl Keep {
     /// `jobs_log_max_mib` in bytes.
     pub fn jobs_log_max_bytes(&self) -> u64 {
         self.jobs_log_max_mib.saturating_mul(1024 * 1024)
+    }
+}
+
+/// Says, once in a process, that `jobs_keep_days = 0` is read as 1 (the
+/// once-only path of the cleanup lines).
+pub fn note_zero_jobs_days(cfg: &Config, say: &dyn Fn(&str)) {
+    if cfg.jobs_keep_days == 0 {
+        let line = "task-traffic-controller: jobs_keep_days = 0 is read as 1: a finished \
+                    job is kept at least one day";
+        if first_time(line) {
+            say(line);
+        }
     }
 }
 
@@ -736,6 +750,10 @@ pub struct SidecarView {
     pub in_ledger: bool,
     /// Its owner holds the lease.
     pub lease_held: bool,
+    /// The child (or its process group's leader) it records is running, or
+    /// cannot be told apart from a running one ([`pid_alive`]). Only asked
+    /// for [`SidecarKind::Other`].
+    pub child_alive: bool,
     pub modified: DateTime<Utc>,
 }
 
@@ -748,13 +766,19 @@ pub struct SidecarView {
 /// last written `managed_keep_days` ago: with an entry it is held for
 /// `resolve`, but without one (the ledger was lost, or the release could
 /// not be written down) nothing charges for it or settles it any more, and
-/// the same time a finished one is remembered is given to it.
+/// the same time a finished one is remembered is given to it. Even then it
+/// stays while the child it records is still running.
 ///
 /// The caller asks for the lease last, and only for a sidecar that would
 /// go with `lease_held` false: looking at a lease locks it for an instant,
 /// which a released version that is taking it does not forgive.
 pub fn sidecar_due(v: &SidecarView, now: DateTime<Utc>, keep_days: u64) -> bool {
     if v.in_ledger || v.lease_held {
+        return false;
+    }
+    // The command may still run with its ledger lost: removing the sidecar
+    // would let the same id be registered and run twice.
+    if v.kind == SidecarKind::Other && v.child_alive {
         return false;
     }
     let kept_days = |t: DateTime<Utc>| days_before(now, keep_days).is_some_and(|cutoff| t < cutoff);
@@ -1288,6 +1312,7 @@ mod tests {
             kind: ended.map_or(SidecarKind::NeverLaunched, |s| SidecarKind::Ended(t(s))),
             in_ledger,
             lease_held,
+            child_alive: false,
             modified: t(-age),
         }
     }

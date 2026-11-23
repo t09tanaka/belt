@@ -1775,12 +1775,45 @@ fn sidecar_view(ctx: &Context, id: &str, in_ledger: bool) -> Option<crate::reten
         }
         _ => SidecarKind::Other,
     };
+    let child_alive = kind == SidecarKind::Other && recorded_child_alive(&p);
     Some(crate::retention::SidecarView {
         kind,
         in_ledger,
         lease_held: false,
+        child_alive,
         modified: modified.into(),
     })
+}
+
+/// Whether the child a sidecar file records (`child.pid`, and
+/// `child.pgid` when there is one) is running, asked with signal 0 only
+/// ([`crate::retention::pid_alive`]). Read from the JSON as it is, so another
+/// version's file is understood too. No child recorded: not alive. A pid
+/// that cannot be read or must never be signalled counts as alive.
+fn recorded_child_alive(path: &Path) -> bool {
+    use crate::retention::pid_alive;
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(child) = v.get("child").filter(|c| !c.is_null()) else {
+        return false;
+    };
+    let Some(pid) = child.get("pid").and_then(|p| p.as_u64()) else {
+        return true;
+    };
+    if u32::try_from(pid).map_or(true, pid_alive) {
+        return true;
+    }
+    match child.get("pgid").filter(|g| !g.is_null()) {
+        None => false,
+        Some(g) => g
+            .as_i64()
+            .and_then(|g| u32::try_from(g).ok())
+            .is_none_or(pid_alive),
+    }
 }
 
 /// The ids of the sidecars that [`crate::retention::sidecar_due`] would let

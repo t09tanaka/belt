@@ -277,18 +277,79 @@ fn gc_removes_old_finished_jobs_only() {
     assert_eq!(left[0]["id"], fresh.as_str());
 }
 
-/// With 0 a job's own runner, sweeping right after the job, would remove
-/// the result before `wait` reads it (`submit A; submit B; wait A B`).
+/// 0 was valid until 0.10.6, so it still loads (a program that embeds the
+/// library reads the same file); the sweep reads it as 1, and the command
+/// says so once on stderr.
 #[test]
-fn jobs_keep_days_zero_is_refused() {
+fn jobs_keep_days_zero_loads_and_is_said_once() {
     let env = TestEnv::new("budget = 4\njobs_keep_days = 0\n");
     let out = env.run(&["jobs"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("jobs_keep_days must be between 1 and 3650"),
+    assert_eq!(
+        err.matches("jobs_keep_days = 0 is read as 1").count(),
+        1,
         "{err}"
     );
+}
+
+/// A job with no entry whose lease is held has a live runner (mis-seen as
+/// lost, or still registering): `cancel` writes nothing for it, says it did
+/// not cancel, and fails; with the lease free it marks the job as before.
+#[test]
+fn cancel_does_not_write_an_exit_for_a_job_whose_lease_is_held() {
+    use chrono::{Duration as Span, Utc};
+    use task_traffic_controller::jobs::{self, Job};
+    use task_traffic_controller::{lock, Context, Paths};
+    let env = TestEnv::new("budget = 4\n");
+    let ctx = Context::new(Paths::new(
+        env.state(),
+        env.dir
+            .path()
+            .join("config/task-traffic-controller/config.toml"),
+    ));
+    let save = |id: &str, age: Span| {
+        jobs::save(
+            &ctx,
+            &Job {
+                id: id.into(),
+                argv: vec!["true".into()],
+                cwd: "/".into(),
+                weight: None,
+                front: false,
+                key: None,
+                label: None,
+                submitted_at: Utc::now() - age,
+                submitter_pid: 1,
+                detach: false,
+                orphaned: false,
+                finished_at: None,
+                extra: Default::default(),
+            },
+        )
+        .unwrap();
+    };
+    // Lost (old) and still starting (young) alike.
+    for (id, age) in [("lostjob", Span::hours(2)), ("younger", Span::seconds(1))] {
+        save(id, age);
+        let lease = lock::take_lease(&ctx, id).unwrap();
+        let out = env.run(&["cancel", id]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{id}: {text}");
+        assert!(text.contains("not cancelled"), "{id}: {text}");
+        assert!(!text.contains("marked lost"), "{id}: {text}");
+        assert_eq!(jobs::read_exit(&ctx, id), None, "{id}");
+        drop(lease);
+    }
+    // No runner and no lease: as before.
+    let out = env.run(&["cancel", "lostjob"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("marked lost"));
+    assert_eq!(jobs::read_exit(&ctx, "lostjob"), Some(2));
+    let out = env.run(&["cancel", "younger"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("cancelled before it started"));
+    assert_eq!(jobs::read_exit(&ctx, "younger"), Some(143));
 }
 
 /// The runner writes the exit code while its entry is still in the queue

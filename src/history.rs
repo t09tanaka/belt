@@ -182,11 +182,25 @@ fn appended_since(path: &Path, from: u64) -> Result<Vec<u8>> {
 /// of this version through the history lock; a released version appends
 /// without it, so what was appended while the new file was being written is
 /// carried over before the replacement. Only an append that lands between
-/// that last look and the rename (two system calls apart) is lost.
+/// that last look and the rename (two system calls apart) is lost, and a
+/// line still half written at the last look is cut off (its writer holds
+/// the old file, so nothing could finish it).
 pub fn trim_collect(
     path: &Path,
     keep: usize,
     cutoff: Option<DateTime<Utc>>,
+) -> Result<(usize, Vec<String>)> {
+    trim_collect_with(path, keep, cutoff, &mut || {})
+}
+
+/// [`trim_collect`], calling `before_last_look` after the kept lines are
+/// written and before what was appended meanwhile is carried over (a seam
+/// for tests).
+fn trim_collect_with(
+    path: &Path,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+    before_last_look: &mut dyn FnMut(),
 ) -> Result<(usize, Vec<String>)> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -195,7 +209,8 @@ pub fn trim_collect(
     };
     // Only whole lines are records. What follows the last newline is a
     // line somebody is still writing (a released version appends without
-    // the lock): it is carried over as it is, with whatever comes after.
+    // the lock): it is carried over with whatever comes after, as far as it
+    // is whole at the last look.
     let whole = whole_lines(&bytes);
     let all = parse(&bytes[..whole]);
     let (kept, gone_ids) = trim_plan(&all, keep, cutoff);
@@ -205,11 +220,16 @@ pub fn trim_collect(
     }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = crate::paths::temp_file_in(dir)?;
+    // How much of `tmp` is written, and how much of it ends at a newline.
+    let mut written = 0u64;
     for &i in &kept {
         let mut line = serde_json::to_string(&all[i])?;
         line.push('\n');
         tmp.write_all(line.as_bytes())?;
+        written += line.len() as u64;
     }
+    let mut cut = written;
+    before_last_look();
     let mut at = whole as u64;
     loop {
         let more = appended_since(path, at)?;
@@ -217,9 +237,19 @@ pub fn trim_collect(
             break;
         }
         tmp.write_all(&more)?;
+        if let Some(i) = more.iter().rposition(|&b| b == b'\n') {
+            cut = written + i as u64 + 1;
+        }
+        written += more.len() as u64;
         at += more.len() as u64;
     }
-    if kept.is_empty() && at == whole as u64 {
+    // Nothing can complete a line that is still half written here: its
+    // writer holds the old file. Left in, it would merge with the next
+    // append into one malformed line and lose that record too.
+    if cut < written {
+        tmp.as_file_mut().set_len(cut)?;
+    }
+    if cut == 0 {
         std::fs::remove_file(path)?;
     } else {
         tmp.persist(path).map_err(|e| e.error)?;
@@ -365,9 +395,8 @@ mod tests {
         assert_eq!(whole_lines(b"\n"), 1);
     }
 
-    /// A released version appends without the lock, so a trim can read the
-    /// file while a line is half written. The half is carried over where it
-    /// is and the rest lands behind it.
+    /// The tail of a line that was half written when the trim looked, and
+    /// arrives before the trim's last look, is carried over whole.
     #[test]
     fn a_line_caught_half_written_is_carried_over_whole() {
         let dir = tempfile::tempdir().unwrap();
@@ -383,28 +412,51 @@ mod tests {
             f.write_all(text.as_bytes()).unwrap();
         };
         add(head);
-        assert_eq!(trim(&p, 1).unwrap(), 2);
-        add(tail);
+        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || add(tail)).unwrap();
+        assert_eq!(dropped, 2);
         let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
         assert_eq!(walls, vec![3.0, 4.0]);
         let text = std::fs::read_to_string(&p).unwrap();
         assert_eq!(text.lines().count(), 2, "{text}");
 
-        // With nothing kept, the half line still keeps the file.
-        let q = dir.path().join("q.jsonl");
-        append(&q, &rec("k", 1.0)).unwrap();
-        std::fs::write(
-            &q,
-            [std::fs::read(&q).unwrap(), head.as_bytes().to_vec()].concat(),
-        )
-        .unwrap();
-        assert_eq!(trim(&q, 0).unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(&q).unwrap(), head);
-        // And a file of whole lines that are all dropped is removed.
+        // A file of whole lines that are all dropped is removed.
         let r = dir.path().join("r.jsonl");
         append(&r, &rec("k", 1.0)).unwrap();
         assert_eq!(trim(&r, 0).unwrap(), 1);
         assert!(!r.exists());
+    }
+
+    /// A half line nobody finishes (a writer that died, or one whose tail
+    /// lands in the old file after the trim's last look) must not be
+    /// persisted: the next append would merge with it and be lost.
+    #[test]
+    fn a_half_line_nobody_finishes_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        for w in [1.0, 2.0, 3.0] {
+            append(&p, &rec("k", w)).unwrap();
+        }
+        let mut line = serde_json::to_string(&rec("k", 4.0)).unwrap();
+        line.push('\n');
+        let head = &line[..line.len() / 2];
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(head.as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(trim(&p, 1).unwrap(), 2);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.ends_with('\n'), "{text:?}");
+        append(&p, &rec("k", 5.0)).unwrap();
+        let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
+        assert_eq!(walls, vec![3.0, 5.0]);
+
+        // With nothing kept, the half line alone does not keep the file.
+        let q = dir.path().join("q.jsonl");
+        append(&q, &rec("k", 1.0)).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&q).unwrap();
+        f.write_all(head.as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(trim(&q, 0).unwrap(), 1);
+        assert!(!q.exists());
     }
 
     #[test]

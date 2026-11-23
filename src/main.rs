@@ -163,6 +163,7 @@ fn main() {
 fn run(cli: Cli) -> error::Result<i32> {
     let ctx = env::context();
     let cfg = Config::load(ctx.paths.config_file())?;
+    task_traffic_controller::retention::note_zero_jobs_days(&cfg, &|l| eprintln!("{l}"));
     match cli.cmd {
         Cmd::Exec {
             weight,

@@ -533,6 +533,80 @@ fn a_stamp_that_cannot_be_created_does_not_mean_never() {
 }
 
 #[test]
+fn a_zero_jobs_keep_days_is_read_as_one_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, clock) = ctx(dir.path());
+    let cfg = config(&ctx, "jobs_keep_days = 0\n");
+    assert_eq!(cfg.jobs_keep_days, 0);
+    let now = clock.now();
+    finished_job(&ctx, "fresh", now - Span::hours(25), now - Span::hours(23));
+    finished_job(&ctx, "edge", now - Span::hours(30), now - Span::days(1));
+    finished_job(
+        &ctx,
+        "old",
+        now - Span::hours(30),
+        now - Span::seconds(86_401),
+    );
+    let report = retention::sweep(&ctx, &cfg);
+    assert_eq!(report.jobs_removed, 1, "{:?}", report.errors);
+    assert!(jobs::load(&ctx, "fresh").is_ok());
+    // Exactly one day old is kept, as with `jobs_keep_days = 1`.
+    assert!(jobs::load(&ctx, "edge").is_ok());
+    assert!(jobs::load(&ctx, "old").is_err());
+}
+
+/// A sidecar of a launch that was begun, with no entry and no lease, goes
+/// `managed_keep_days` after its last write: not while the child it records
+/// is still running (the ledger may have been lost while the command runs,
+/// and removing it would let the id be registered and run twice).
+#[test]
+fn an_old_launch_sidecar_is_kept_while_its_recorded_child_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _clock) = ctx(dir.path());
+    let cfg = Config::default();
+    std::fs::create_dir_all(ctx.paths.managed_dir()).unwrap();
+    let old = (cfg.managed_keep_days as i64 + 1) * 86_400;
+    let write = |id: &str, child: serde_json::Value| {
+        let sc = serde_json::json!({
+            "version": 1, "command_id": id, "spec_digest": "d", "phase": "launch_intent",
+            "registered_at": "2020-01-01T00:00:00Z", "owner_pid": 2,
+            "child": child,
+        });
+        let p = ctx.paths.managed_file(id);
+        std::fs::write(&p, serde_json::to_vec(&sc).unwrap()).unwrap();
+        age(&p, old);
+    };
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    write("alive", serde_json::json!({ "pid": pid }));
+    // The child is gone but its process group's leader is not.
+    write(
+        "group",
+        serde_json::json!({ "pid": 2_147_483_000u32, "pgid": pid }),
+    );
+    write("init", serde_json::json!({ "pid": 1 }));
+    write("junk", serde_json::json!({ "pid": "x" }));
+    let report = retention::sweep(&ctx, &cfg);
+    assert_eq!(report.receipts_removed, 0, "{:?}", report.errors);
+    for id in ["alive", "group", "init", "junk"] {
+        assert!(ctx.paths.managed_file(id).exists(), "{id}");
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Reaped: the two that depended on it go; pid 1 and an unreadable pid
+    // are never taken for a dead process.
+    let report = retention::sweep(&ctx, &cfg);
+    assert_eq!(report.receipts_removed, 2, "{:?}", report.errors);
+    assert!(!ctx.paths.managed_file("alive").exists());
+    assert!(!ctx.paths.managed_file("group").exists());
+    assert!(ctx.paths.managed_file("init").exists());
+    assert!(ctx.paths.managed_file("junk").exists());
+}
+
+#[test]
 fn no_configured_number_can_make_a_sweep_panic() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, clock) = ctx(dir.path());

@@ -159,9 +159,11 @@ impl Config {
                 "history_keep_days must be between 1 and 3650".into(),
             ));
         }
-        // Not 0: a job's own runner sweeps seconds after the job ends, and
-        // would remove the result before `wait` has read it.
-        if !(1..=3650).contains(&self.jobs_keep_days) {
+        // 0 is valid (it was until 0.10.6) and is read as 1 where the
+        // numbers are built (`retention::Keep::of`): a job's own runner
+        // sweeps seconds after the job ends, and would otherwise remove the
+        // result before `wait` has read it.
+        if self.jobs_keep_days > 3650 {
             return Err(Error::Config(
                 "jobs_keep_days must be between 1 and 3650".into(),
             ));
@@ -273,7 +275,8 @@ mod tests {
         assert!(Config::parse("history_keep_days = 3650").is_ok());
         assert!(Config::parse("history_keep_days = 0").is_err());
         assert!(Config::parse("history_keep_days = 3651").is_err());
-        assert!(Config::parse("jobs_keep_days = 0").is_err());
+        // 0 loads (it was valid until 0.10.6); the sweep reads it as 1.
+        assert!(Config::parse("jobs_keep_days = 0").is_ok());
         assert!(Config::parse("jobs_keep_days = 1").is_ok());
         assert!(Config::parse("jobs_keep_days = 3650").is_ok());
         assert!(Config::parse("jobs_keep_days = 3651").is_err());

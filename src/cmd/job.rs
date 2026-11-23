@@ -427,6 +427,20 @@ pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// Whether `cancel` may write the exit record itself. Only when the job has
+/// no ledger entry and nobody holds its lease: a held lease is a live
+/// runner (mis-seen, or still registering), and it writes its own record
+/// under its cutting order ([`jobs::end`]); one written here could land
+/// while its watcher is cutting the log, and `wait` would print a log
+/// mid-cut and remove it.
+pub fn may_write_exit(entry_present: bool, lease_held: bool) -> bool {
+    !entry_present && !lease_held
+}
+
+fn runner_alive_not_cancelled(id: &str) {
+    println!("{id}: its runner is alive but not in the queue yet; not cancelled, try again");
+}
+
 pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
     if ids.is_empty() {
         return Err(Error::Spawn(
@@ -434,13 +448,19 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
         ));
     }
     let ledger = lock::load_reaped(ctx)?;
+    let mut code = 0;
     for id in ids {
         jobs::load(ctx, id)?;
         match state_of(ctx, id, &ledger) {
             JobState::Done(c) => println!("{id}: already finished (exit {c})"),
             JobState::Lost => {
-                jobs::write_exit(ctx, id, 2);
-                println!("{id}: runner already gone, marked lost");
+                if may_write_exit(ledger.find(id).is_some(), lock::lease_is_held(ctx, id)) {
+                    jobs::write_exit(ctx, id, 2);
+                    println!("{id}: runner already gone, marked lost");
+                } else {
+                    runner_alive_not_cancelled(id);
+                    code = 1;
+                }
             }
             JobState::Queued | JobState::Running => {
                 match ledger.find(id).map(|e| e.pid) {
@@ -453,15 +473,32 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
                         }
                         println!("{id}: sent SIGTERM to runner {pid}");
                     }
-                    _ => {
+                    _ if may_write_exit(false, lock::lease_is_held(ctx, id)) => {
                         // Runner not registered yet: the exit file doubles
                         // as the cancellation request it will see on start.
                         jobs::write_exit(ctx, id, 128 + libc::SIGTERM);
                         println!("{id}: cancelled before it started");
                     }
+                    _ => {
+                        runner_alive_not_cancelled(id);
+                        code = 1;
+                    }
                 }
             }
         }
     }
-    Ok(0)
+    Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_write_exit;
+
+    #[test]
+    fn cancel_writes_the_exit_only_without_an_entry_and_a_lease() {
+        assert!(may_write_exit(false, false));
+        assert!(!may_write_exit(false, true));
+        assert!(!may_write_exit(true, false));
+        assert!(!may_write_exit(true, true));
+    }
 }

@@ -339,7 +339,8 @@ pair keeps it alive and a caller that dies takes its jobs down with it.
 `--detach` keeps a job running regardless. `jobs` lists every job with
 its state (`queued` / `running` / `done N` / `orphaned N` / `lost`) and
 ETA; `cancel` sends SIGTERM to the runner, or marks a not-yet-started job
-cancelled.
+cancelled (a job whose runner is alive but not in the queue yet is left
+alone: `cancel` says it did not cancel it and exits 1; try again).
 
 The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
@@ -607,7 +608,7 @@ backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has
 nested_guard_max_wait_secs = 60 # the first nested exec of a command is held by the memory/CPU guards for at most this long
 nested_sibling_max_wait_secs = 600 # a nested exec that does not fit starts anyway after this, one per period (0: never)
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
-jobs_keep_days = 1          # an uncollected job's files are removed this long after it finished or was found dead (1..3650)
+jobs_keep_days = 1          # an uncollected job's files are removed this long after it finished or was found dead (1..3650; 0 is read as 1)
 jobs_log_max_mib = 16       # a job log is cut to its last part beyond this, while it runs too (1..1048576)
 managed_keep_days = 7       # receipts of managed commands are removed this long after they ended (1..3650)
 
@@ -934,7 +935,7 @@ its start into it before it does anything.
 | `history.jsonl` | the weight learner (the newest 5 usable records of a key), `estimate`, `inspect`, `history` | each record beyond `history_keep` (50) per key, and every key not run for `history_keep_days` (30, the age at which the forecast already calls a sample stale), by the sweep; the file itself when nothing is left | 50 records for each key run in 30 days |
 | `measurements/<id>.applied` | `record_measurement`, to refuse a replay while a record with that id exists | at the moment the history drops the last record with that id | one per kept record |
 | `measurements/<id>.pending` | nobody (a dead attempt's) | at once when the append fails; the sweep for a crash. It becomes `.applied` if its record exists | none |
-| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it has an entry or its owner holds the lease; one that was never launched or is not JSON, and has neither, an hour after it was written (a crash between writing it and saving the ledger). One whose launch was begun, or that another version wrote, and that has neither, `managed_keep_days` after it was last written: with an entry it is held for `resolve`, without one nothing charges for it or settles it any more | per command in 7 days |
+| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it has an entry or its owner holds the lease; one that was never launched or is not JSON, and has neither, an hour after it was written (a crash between writing it and saving the ledger). One whose launch was begun, or that another version wrote, and that has neither, `managed_keep_days` after it was last written: with an entry it is held for `resolve`, without one nothing charges for it or settles it any more, unless the child it records (or its process group's leader) still runs | per command in 7 days |
 | temporary files (`.ttc-tmp.<pid>.*`) | nobody but the process that is writing one | by the sweep, when an hour old **and** process `<pid>` is gone (a writer stopped for longer keeps its file). The `.tmpXXXXXX` files of earlier versions name no process and go by age alone | none |
 | job files with no readable descriptor | nobody | by the sweep, when every file of that id is an hour old and the job has no entry, no held lease and no `wait` | none |
 | empty `measurements/` | nobody | when the last file in it goes | none |
