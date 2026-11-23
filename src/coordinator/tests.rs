@@ -854,7 +854,7 @@ async fn input_missing_withholds_the_attempt_until_its_input_is_ready_again() {
     let link = Arc::new(Missing::default());
     let attached: Attached = link.clone();
     f.c.attach(f.worker.clone(), attached.clone()).await;
-    let (_task, attempt) = f.placed().await;
+    let (task, attempt) = f.placed().await;
     let live = |f: &Fx| {
         f.c.store()
             .live_attempt(&f.worker, &attempt)
@@ -912,5 +912,100 @@ async fn input_missing_withholds_the_attempt_until_its_input_is_ready_again() {
             assert_eq!(resend!(), Sent::Withheld);
         }
     }
-    assert_eq!(retired(&f).as_deref(), Some(REASON_INPUT_MISSING));
+    assert_eq!(
+        retired(&f).as_deref(),
+        Some(scheduler::REASON_WORKER_CANNOT_RUN)
+    );
+    assert_excluded_for_input(&f, &attempt, &task, "refused_three_times").await;
+    // Each mark wrote why the attempt waits, on its run.
+    let waits = f.c.store().events_of(&attempt, EVENT_INPUT_WAIT).unwrap();
+    assert_eq!(waits.len(), 3, "{waits:?}");
+}
+
+/// The exclusion of an attempt taken off for its input: the worker event
+/// says why, and once the retire is confirmed the task's next placement
+/// leaves that worker out (review M2).
+async fn assert_excluded_for_input(f: &Fx, attempt: &AttemptId, task: &TaskId, why: &str) {
+    let ev =
+        f.c.store()
+            .events_of(attempt, scheduler::EVENT_WORKER_EXCLUDED)
+            .unwrap();
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    let text = format!("{ev:?}");
+    assert!(
+        text.contains(REASON_INPUT_MISSING) && text.contains(why),
+        "{text}"
+    );
+    f.c.store().confirm_retire(attempt, wall_ms()).unwrap();
+    let out = f.c.refused_by(task).await.unwrap();
+    assert!(out.contains(&f.worker), "{out:?}");
+}
+
+async fn missing_fx() -> (Fx, Arc<Missing>, Attached, TaskId, AttemptId) {
+    let f = fx();
+    let link = Arc::new(Missing::default());
+    let attached: Attached = link.clone();
+    f.c.attach(f.worker.clone(), attached.clone()).await;
+    let (task, attempt) = f.placed().await;
+    (f, link, attached, task, attempt)
+}
+
+/// Review M1: a marked attempt whose input never comes back to `ready` is
+/// taken off its worker after [`INPUT_WAIT`], not withheld forever.
+#[tokio::test]
+async fn input_missing_mark_expires_when_ready_never_returns() {
+    let (f, link, attached, task, attempt) = missing_fx().await;
+    let send = || async {
+        let mut report = TickReport::default();
+        f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+            .await
+            .unwrap()
+    };
+    assert_eq!(send().await, Sent::NotTaken);
+    assert_eq!(send().await, Sent::Withheld);
+    assert_eq!(
+        f.c.store()
+            .events_of(&attempt, EVENT_INPUT_WAIT)
+            .unwrap()
+            .len(),
+        1
+    );
+    {
+        let mut marks = f.c.input_missing.lock().unwrap();
+        let mark = marks.get_mut(&attempt).unwrap();
+        mark.marked = Instant::now()
+            .checked_sub(INPUT_WAIT + Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(send().await, Sent::NotTaken);
+    assert!(f.c.input_missing.lock().unwrap().is_empty());
+    assert_eq!(link.calls.load(Ordering::SeqCst), 1, "not sent again");
+    assert_excluded_for_input(&f, &attempt, &task, "not_delivered_again").await;
+}
+
+/// Review L3: a mark goes once its attempt is no longer live (here
+/// cancelled), at the next placement pass; on overflow the oldest goes.
+#[tokio::test]
+async fn input_missing_marks_are_pruned_and_the_oldest_evicted() {
+    let (f, link, attached, _task, attempt) = missing_fx().await;
+    let mut report = TickReport::default();
+    f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+        .await
+        .unwrap();
+    assert!(f.c.input_missing.lock().unwrap().contains_key(&attempt));
+    f.c.store().request_cancel(&attempt, wall_ms()).unwrap();
+    f.c.prune_missing().await.unwrap();
+    assert!(f.c.input_missing.lock().unwrap().is_empty());
+
+    let (run, source) = (RunId::generate(), SourceId::generate());
+    let ids: Vec<AttemptId> = (0..=INPUT_MISSING_MARKS)
+        .map(|_| AttemptId::generate())
+        .collect();
+    for id in &ids {
+        f.c.refused_for_input(id, run.clone(), source.clone());
+    }
+    let marks = f.c.input_missing.lock().unwrap();
+    assert_eq!(marks.len(), INPUT_MISSING_MARKS);
+    assert!(!marks.contains_key(&ids[0]), "the oldest goes");
+    assert!(ids[1..].iter().all(|id| marks.contains_key(id)));
 }
