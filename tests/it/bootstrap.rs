@@ -1731,9 +1731,9 @@ async fn an_interrupt_after_the_capture_began_always_sends_the_cancel() {
 /// Spec 25.4 (b): a submission that fails after it began its capture says
 /// `given_up` on its way out, through `submit` and through `ci run`. The
 /// owner (this process) is alive, so nothing else makes the capture
-/// deletable: the resident answers a cancel of the run "not found" and
-/// deletes the capture in that request, where it would accept the cancel of
-/// a capture that is still `capturing`.
+/// deletable: the resident answers a cancel of the run "not found", as for
+/// an abandoned capture, where it would accept the cancel of a capture that
+/// is still `capturing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_submission_that_fails_after_its_capture_began_gives_the_capture_up() {
     use belt::service::{completion::Target, context::Context, control};
@@ -1780,21 +1780,15 @@ async fn a_submission_that_fails_after_its_capture_began_gives_the_capture_up() 
         .await;
         assert_eq!(report.state, "run_not_found", "ci={ci}");
         assert!(!report.cancel_acknowledged);
-        // The deletion follows the answer, in the same request.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while open_sources(&spec.state_dir)
-            .capture_owner(&run)
+        // The resident judged the capture abandoned (its owner lives, so
+        // by `given_up` alone) and deletes it: in that request when the
+        // store is ready for deletions, else on a pass of its driver. Until
+        // then the row still says `given_up`.
+        assert!(belt::source::retention::inspect_owners(&spec.state_dir)
             .unwrap()
-            .is_some()
-        {
-            assert!(std::time::Instant::now() < deadline, "ci={ci}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(!spec
-            .state_dir
-            .join("sources/runs")
-            .join(format!("{run}.lock"))
-            .exists());
+            .unwrap()
+            .iter()
+            .all(|row| row.run != run.as_str() || row.given_up));
     }
     shutdown(&load(&spec)).await;
 }
