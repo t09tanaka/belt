@@ -90,12 +90,12 @@ impl CoordinatorStore {
         record: String,
     ) -> Result<bool> {
         let run = run.to_string();
-        self.db.write(move |tx| Ok(tx.execute(
+        self.db.write(move |tx| { super::refuse_pruned(tx, &run)?; Ok(tx.execute(
             "INSERT INTO ci_driver_transition(run_id,authorization,revision,record)
              SELECT ?1,?2,?3,?4 WHERE ?3=(SELECT coalesce(max(revision),0)+1 FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2)
              AND ?2=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)
              AND EXISTS (SELECT 1 FROM run WHERE run_id=?1 AND closed_at_ms IS NULL)",
-            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1))
+            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1) })
     }
 
     /// Add the complete derived membership before releasing any variant. The
@@ -152,6 +152,7 @@ impl CoordinatorStore {
     ) -> Result<bool> {
         let (run, origin, status) = (run.to_string(), origin.to_string(), status.to_string());
         self.db.write(move|tx|{
+            super::refuse_pruned(tx, &run)?;
             let changed=tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.core_outcome',?3) WHERE run_id=?1 AND task_id=?2
                 AND json_extract(spec_json,'$.ci.dynamic_origin')=1 AND json_extract(spec_json,'$.ci.core_outcome') IS NULL
                 AND ?4=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)",

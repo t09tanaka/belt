@@ -217,6 +217,22 @@ impl CoordinatorStore {
         at_ms: u64,
         source: crate::source::retention::Guard,
     ) -> Result<()> {
+        self.enqueue_guarded_after(run_id, source_id, run_spec, tasks, at_ms, source, || ())
+    }
+    /// [`Self::enqueue_guarded`]; `between` runs after the check that comes
+    /// before the pin file and before the transaction that makes the rows
+    /// (a test marks the run there).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_guarded_after(
+        &self,
+        run_id: &RunId,
+        source_id: Option<&SourceId>,
+        run_spec: &Value,
+        tasks: &[(TaskId, Value)],
+        at_ms: u64,
+        source: crate::source::retention::Guard,
+        between: impl FnOnce(),
+    ) -> Result<()> {
         if source.root != self.state_dir.join("sources") {
             return Err(StorageError::Invalid("foreign source guard".into()));
         }
@@ -249,6 +265,7 @@ impl CoordinatorStore {
         // that is being pruned is not made again.
         let known = run_id.to_string();
         self.db.call(move |c| super::refuse_pruned(c, &known))?;
+        between();
         crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);

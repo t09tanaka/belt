@@ -52,6 +52,7 @@ impl CoordinatorStore {
         let fingerprint = upload.fingerprint()?;
         let receipt = upload.receipt;
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, producer.as_str())?;
             let inserted=tx.execute(
                 "INSERT INTO workflow_upload_inflight(producer,action_key,workflow,name,fingerprint)
                  VALUES(?1,?2,?3,?4,?5) ON CONFLICT(producer,action_key) DO NOTHING",
@@ -100,6 +101,8 @@ impl CoordinatorStore {
             key.to_string(),
         );
         self.db.write(move|tx| {
+            super::refuse_pruned(tx, &run)?;
+            super::refuse_pruned_attempt(tx, &consumer)?;
             let fp=serde_json::to_string(&(&run,&workflow,&name,&pattern)).map_err(|e|StorageError::Invalid(e.to_string()))?;
             if let Some((prior,selection))=tx.query_row(
                 "SELECT fingerprint,selection_json FROM workflow_download WHERE consumer=?1 AND action_key=?2",
@@ -193,6 +196,11 @@ impl CoordinatorStore {
             overwrite,
             mut receipt,
         } = upload;
+        // Before the files are verified and sealed: nothing under the
+        // results of a run that is being pruned is touched. The transaction
+        // below checks again.
+        let known = run.to_string();
+        self.db.call(move |c| super::refuse_pruned(c, &known))?;
         let files = ResultStore::open(&self.state_dir.join("results"))
             .map_err(|e| StorageError::Corrupt(e.to_string()))?;
         let mut paths = std::collections::BTreeSet::new();
@@ -232,6 +240,8 @@ impl CoordinatorStore {
         );
         local_ci::artifact::validate_name(&receipt.name).map_err(StorageError::Invalid)?;
         self.db.write(move |tx| {
+            super::refuse_pruned(tx, &run)?;
+            super::refuse_pruned_attempt(tx, producer.as_str())?;
             let active: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempt a JOIN task t USING(task_id)
                  WHERE a.attempt_id=?1 AND t.run_id=?2 AND a.retired=0 AND a.state<>'terminal'

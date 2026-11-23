@@ -108,6 +108,27 @@ impl CoordinatorStore {
     }
 }
 
+impl CoordinatorStore {
+    /// What the pruning does last: the attempts, the tasks and the row of
+    /// the run are gone, and no mark is left to see.
+    pub(crate) fn delete_run_for_test(&self, run: &RunId) {
+        let run = run.to_string();
+        let gone = self
+            .db
+            .write(move |tx| {
+                tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+                tx.execute(
+                    "DELETE FROM attempt WHERE task_id IN (SELECT task_id FROM task WHERE run_id=?1)",
+                    [&run],
+                )?;
+                tx.execute("DELETE FROM task WHERE run_id=?1", [&run])?;
+                Ok(tx.execute("DELETE FROM run WHERE run_id=?1", [&run])?)
+            })
+            .unwrap();
+        assert_eq!(gone, 1);
+    }
+}
+
 fn mark(store: &CoordinatorStore, run: &RunId) {
     store.mark_pruning_for_test(run);
 }
@@ -240,6 +261,17 @@ fn assert_not_found_by_any_reader(f: &Fx, reader: &CoordinatorStore) {
 #[test]
 fn no_reader_finds_a_run_that_is_being_pruned_whatever_is_left_of_its_rows() {
     let f = fx();
+    // A task of a CI run that waits for the jobs it needs: without the mark
+    // the scan of the resident finds its run.
+    f.store
+        .create_task(
+            &TaskId::generate(),
+            &f.run,
+            &json!({"ci": {"hold": true}}),
+            6,
+        )
+        .unwrap();
+    assert_eq!(f.store.ci_waiting_runs(10).unwrap(), vec![f.run.clone()]);
     mark(&f.store, &f.run);
     let reader = CoordinatorStore::open_read_only(f.dir.path()).unwrap();
     for store in [&f.store, &reader] {
@@ -564,4 +596,408 @@ fn a_run_is_whole_only_with_its_row_and_without_the_mark() {
     assert!(!f.store.task_is_whole(&TaskId::generate()).unwrap());
     assert!(f.store.run_is_whole(&other).unwrap());
     assert!(f.store.task_is_whole(&other_task).unwrap());
+}
+
+/// Spec 25.5, the after-pin check of the writer of results. The writer
+/// passed its first check. Before it makes the pin file, the pruning writes
+/// the mark, takes the pin exclusively, deletes what it deletes, unlinks the
+/// pin file and lets go. The writer makes the file again and takes it, and
+/// is refused by the check it makes with the pin held: it is handed no pin
+/// (so it writes no result), and the file it made is gone again.
+#[test]
+fn a_writer_of_results_overtaken_by_the_pruning_is_refused_and_leaves_no_pin() {
+    for rows_gone in [false, true] {
+        let f = fx();
+        drop(f.store.result_writer_pin(&f.attempt).unwrap());
+        let mut overtaken = false;
+        let answer = f.store.result_writer_pin_after(&f.attempt, || {
+            mark(&f.store, &f.run);
+            let exclusive = RunPin::exclusive(f.dir.path(), &f.run).unwrap();
+            if rows_gone {
+                f.store.delete_run_for_test(&f.run);
+            }
+            std::fs::remove_file(pin_path(&f)).unwrap();
+            drop(exclusive);
+            overtaken = true;
+        });
+        assert!(overtaken, "the first check passed: the run had no mark");
+        let error = answer.expect_err("a writer overtaken by the pruning must be refused");
+        assert_eq!(error.code(), ErrorCode::NotFound, "{error}");
+        assert_eq!(
+            error.to_string().contains(RUN_PRUNED),
+            !rows_gone,
+            "{error}"
+        );
+        assert!(!pin_path(&f).exists(), "rows gone: {rows_gone}");
+    }
+}
+
+/// The writer that is refused with the pin held unlinks the file only when
+/// it holds it alone: a file somebody else holds is left where it is.
+#[test]
+fn a_refused_writer_of_results_leaves_a_pin_that_somebody_holds() {
+    let f = fx();
+    drop(f.store.result_writer_pin(&f.attempt).unwrap());
+    let mut held = None;
+    let answer = f.store.result_writer_pin_after(&f.attempt, || {
+        mark(&f.store, &f.run);
+        held = Some(RunPin::shared(f.dir.path(), &f.run).unwrap());
+    });
+    refused(answer);
+    assert!(pin_path(&f).exists());
+    // The refused writer let go of its own pin.
+    drop(held);
+    drop(RunPin::exclusive(f.dir.path(), &f.run).unwrap());
+}
+
+/// Every writer of a row that belongs to a run, given the run, a task, an
+/// attempt or a matrix group of it, refuses a marked run in its own
+/// transaction, and writes nothing. An event that names only an attempt is
+/// one of them.
+#[test]
+fn no_row_of_a_run_that_is_being_pruned_is_written_by_any_writer() {
+    use crate::results::plan::Verdict;
+    use crate::wire::LogStream;
+    use local_ci::artifact_io::{FileEntry, Receipt as Manifest};
+    for marked in [false, true] {
+        let f = fx();
+        f.store.create_matrix_group("held", &f.run, 2, 6).unwrap();
+        f.store
+            .prepare_log_progress(&f.attempt, LogStream::Stdout, 6)
+            .unwrap();
+        // The bytes of the workflow artifact are in the result store, so
+        // that its publication reaches its transaction.
+        let digest = Digest::of_bytes(b"result");
+        let files = crate::results::ResultStore::open(&f.dir.path().join("results")).unwrap();
+        files
+            .append_part(&f.attempt, &digest, 0, b"result")
+            .unwrap();
+        files.publish_artifact(&f.attempt, &digest, 6).unwrap();
+        if marked {
+            mark(&f.store, &f.run);
+        }
+        let before = f.store.snapshot_rows_for_test();
+        let worker = WorkerId::parse("mini-a").unwrap();
+        let file = ResultRef {
+            ref_id: "ref-of-a-file".into(),
+            kind: BlobKind::Result,
+            locator: "results/file".into(),
+        };
+        let receipt = ArtifactReceipt {
+            attempt_id: f.attempt.clone(),
+            name: "out".into(),
+            rel_path: "out".into(),
+            size: 1,
+            digest: digest.clone(),
+            source_id: SourceId::generate(),
+            plan_digest: digest.clone(),
+            profile_fingerprint: "profile".into(),
+        };
+        let upload = || WorkflowUpload {
+            run: &f.run,
+            workflow: "ci",
+            producer: &f.attempt,
+            key: &digest,
+            overwrite: false,
+            receipt: Manifest {
+                name: "build".into(),
+                version: 1,
+                files: vec![FileEntry {
+                    path: "out/app".into(),
+                    size: 6,
+                    sha256: digest.as_str().strip_prefix("sha256:").unwrap().into(),
+                }],
+                plan_digest: "plan".into(),
+                attempt_id: "run".into(),
+                job: "ci::build".into(),
+                display: "build".into(),
+                task: None,
+                retention_days: None,
+                compression_level: None,
+                restored_from: None,
+            },
+        };
+        let s = &f.store;
+        let null = serde_json::Value::Null;
+        let answers: Vec<(&str, Result<()>)> = vec![
+            (
+                "append_ci_driver_record",
+                s.append_ci_driver_record(&f.run, 0, 1, "record".into())
+                    .map(drop),
+            ),
+            (
+                "complete_ci_origin",
+                s.complete_ci_origin(&f.run, &f.waiting, 0, "success", 20)
+                    .map(drop),
+            ),
+            (
+                "append_event of the run",
+                s.append_event(Some(&f.run), None, "note", &null, 20)
+                    .map(drop),
+            ),
+            (
+                "append_event of an attempt alone",
+                s.append_event(None, Some(&f.attempt), "submit_deferred", &null, 20)
+                    .map(drop),
+            ),
+            (
+                "record_placement",
+                s.record_placement(&f.waiting, &worker, None, &json!({}), 20)
+                    .map(drop),
+            ),
+            (
+                "create_matrix_group",
+                s.create_matrix_group("fresh", &f.run, 1, 20),
+            ),
+            (
+                "acquire_permit",
+                s.acquire_permit("held", &PermitId::generate(), 20)
+                    .map(drop),
+            ),
+            (
+                "begin_collection",
+                s.begin_collection(&f.attempt, &digest, &json!({}), &[], &[], 20)
+                    .map(drop),
+            ),
+            (
+                "set_collection_logs",
+                s.set_collection_logs(&f.attempt, &digest, &json!({}), 20)
+                    .map(drop),
+            ),
+            (
+                "record_collected_artifact",
+                s.record_collected_artifact(&receipt, &file, 20),
+            ),
+            ("record_artifact", s.record_artifact(&receipt, 20)),
+            (
+                "recollect",
+                s.recollect(&f.attempt, true, &[], 20).map(drop),
+            ),
+            (
+                "strike_collection",
+                s.strike_collection(&f.attempt, "why", 20).map(drop),
+            ),
+            (
+                "close_collection",
+                s.close_collection(&f.attempt, None, Verdict::GaveUp, false, 20)
+                    .map(drop),
+            ),
+            (
+                "reopen_collection",
+                s.reopen_collection(&f.attempt, 20).map(drop),
+            ),
+            (
+                "prepare_log_progress",
+                s.prepare_log_progress(&f.attempt, LogStream::Stderr, 20)
+                    .map(drop),
+            ),
+            (
+                "commit_log_progress",
+                s.commit_log_progress(&f.attempt, LogStream::Stdout, 0, 1, false, false, 0, 20)
+                    .map(drop),
+            ),
+            (
+                "reserve_workflow_files",
+                s.reserve_workflow_files(upload(), 20),
+            ),
+            (
+                "publish_workflow_artifact",
+                s.publish_workflow_artifact(upload(), 20).map(drop),
+            ),
+            (
+                "workflow_download",
+                s.workflow_download(&f.run, "ci", &f.attempt, &digest, None, None)
+                    .map(drop),
+            ),
+        ];
+        let pruned = |answer: &Result<()>| {
+            answer.as_ref().is_err_and(|error| {
+                error.code() == ErrorCode::NotFound && error.to_string().contains(RUN_PRUNED)
+            })
+        };
+        if marked {
+            let written: Vec<_> = answers
+                .iter()
+                .filter(|(_, answer)| !pruned(answer))
+                .collect();
+            assert!(written.is_empty(), "not refused: {written:?}");
+            assert_eq!(f.store.snapshot_rows_for_test(), before, "no row changed");
+        } else {
+            let refused: Vec<_> = answers
+                .iter()
+                .filter(|(_, answer)| pruned(answer))
+                .collect();
+            assert!(refused.is_empty(), "refused without the mark: {refused:?}");
+            // The writers reach their rows: without the mark they write.
+            let failed: Vec<_> = answers
+                .iter()
+                .filter(|(name, answer)| {
+                    answer.is_err()
+                        && !["publish_workflow_artifact", "workflow_download"].contains(name)
+                })
+                .collect();
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_ne!(f.store.snapshot_rows_for_test(), before);
+        }
+    }
+}
+
+/// The check a retry makes after it read the files (the second of its
+/// preparation) and the check in the transaction that authorizes it: each
+/// refuses a run that was marked after the check before it passed.
+#[test]
+fn a_retry_overtaken_by_the_mark_is_refused_at_each_later_check() {
+    // Marked while the files are read: the preparation is refused.
+    let f = fx();
+    let before = f.store.snapshot_rows_for_test();
+    let mut overtaken = false;
+    let prepared =
+        f.store
+            .prepare_retry_after(Target::Task(f.task.clone()), 0, "retry-one".into(), || {
+                mark(&f.store, &f.run);
+                overtaken = true;
+            });
+    assert!(overtaken);
+    let error = prepared
+        .map(drop)
+        .expect_err("the second check of the preparation refuses");
+    assert_eq!(error.code(), ErrorCode::NotFound, "{error}");
+    assert!(error.to_string().contains(RUN_PRUNED), "{error}");
+    let mut after = f.store.snapshot_rows_for_test();
+    let unmark = |rows: &mut Vec<(String, Vec<Vec<rusqlite::types::Value>>)>| {
+        rows.retain(|(table, _)| table != "run");
+    };
+    let mut before = before;
+    unmark(&mut before);
+    unmark(&mut after);
+    assert_eq!(after, before, "no row but the mark changed");
+
+    // Marked after the preparation: the commit is refused.
+    let f = fx();
+    let mut overtaken = false;
+    let answer = f.store.retry(
+        Target::Task(f.task.clone()),
+        0,
+        "retry-one".into(),
+        20,
+        |_, _, _| {
+            mark(&f.store, &f.run);
+            overtaken = true;
+            Ok(false)
+        },
+    );
+    assert!(overtaken, "the preparation passed: the run had no mark");
+    let marked = f.store.snapshot_rows_for_test();
+    refused(answer);
+    assert_eq!(f.store.snapshot_rows_for_test(), marked, "no row changed");
+}
+
+/// An enqueue passed the check it makes before the pin file. The mark is
+/// written before its transaction, which refuses it: `run_pruned`, and not
+/// the answer of a run that exists already.
+#[test]
+fn an_enqueue_overtaken_by_the_mark_is_refused_in_its_transaction() {
+    let f = fx();
+    let source = f.store.source_mutation_guard().unwrap();
+    let mut overtaken = false;
+    let answer = f.store.enqueue_guarded_after(
+        &f.run,
+        None,
+        &json!({}),
+        &[(TaskId::generate(), json!({}))],
+        20,
+        source,
+        || {
+            mark(&f.store, &f.run);
+            overtaken = true;
+        },
+    );
+    assert!(overtaken, "the first check passed: the run had no mark");
+    refused(answer);
+}
+
+/// A query that reads a task several times is overtaken by the pruning
+/// after its reads: by the mark, or by the whole of the pruning, which
+/// leaves no row and no mark. Both are "not found", whatever was read.
+#[test]
+fn a_query_overtaken_by_the_pruning_after_its_reads_answers_not_found() {
+    let queries = |f: &Fx| {
+        vec![
+            Query::Attempts {
+                task_id: f.task.clone(),
+                limit: 10,
+                after: None,
+            },
+            Query::LogMetadata {
+                task_id: f.task.clone(),
+                attempt_id: f.attempt.clone(),
+            },
+            Query::OutputMetadata {
+                task_id: f.task.clone(),
+                attempt_id: f.attempt.clone(),
+                after: None,
+                limit: 10,
+            },
+        ]
+    };
+    for index in 0..3 {
+        for rows_gone in [false, true] {
+            let f = fx();
+            let reader = CoordinatorStore::open_read_only(f.dir.path()).unwrap();
+            let query = queries(&f).remove(index);
+            let mut overtaken = false;
+            let answer = reader.query_after(query, || {
+                if rows_gone {
+                    f.store.delete_run_for_test(&f.run);
+                } else {
+                    mark(&f.store, &f.run);
+                }
+                overtaken = true;
+            });
+            assert!(overtaken);
+            let error = answer.expect_err("a run pruned meanwhile is not found");
+            assert_eq!(error.code(), ErrorCode::NotFound, "{index} {error}");
+            assert_eq!(
+                error.to_string().contains(RUN_PRUNED),
+                !rows_gone,
+                "{index} {error}"
+            );
+        }
+    }
+    // Without the pruning the same queries answer.
+    let f = fx();
+    for query in queries(&f) {
+        f.store.query_after(query, || ()).unwrap();
+    }
+}
+
+/// A refusal that was read of a task whose row is gone says something of
+/// rows that were being deleted: it is "not found" too, and never "the
+/// attempt does not belong to the task".
+#[test]
+fn a_refusal_read_of_a_task_that_is_gone_is_not_found() {
+    let f = fx();
+    let query = || Query::OutputMetadata {
+        task_id: f.waiting.clone(),
+        attempt_id: f.attempt.clone(),
+        after: None,
+        limit: 10,
+    };
+    // With its row, the task is told that the attempt is not its own.
+    let error = f.store.query(query()).unwrap_err();
+    assert!(error.to_string().contains("does not belong"), "{error}");
+    delete_half(&f);
+    let error = f.store.query(query()).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NotFound, "{error}");
+}
+
+/// Spec 25.3 (a), rule 2, as the end of a run reads it for the files a
+/// later job may still download: a task without an attempt is settled by
+/// the close of its run, as it is for the retention of the inputs.
+#[test]
+fn a_closed_run_ends_for_its_workflow_files_with_a_task_that_was_never_placed() {
+    let f = fx();
+    assert_eq!(f.store.workflow_run_end_for_test(&f.run).unwrap(), None);
+    f.store.close_run(&f.run, 50).unwrap();
+    assert_eq!(f.store.workflow_run_end_for_test(&f.run).unwrap(), Some(50));
 }

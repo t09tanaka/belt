@@ -143,8 +143,20 @@ fn read_from(
     state_dir: &std::path::Path,
     run: &RunId,
 ) -> Result<Standing, ApiError> {
+    read_from_after(store, state_dir, run, || ())
+}
+
+/// [`read_from`]; `between` runs after the reads and before the check that
+/// follows the last of them (a test prunes the run there).
+fn read_from_after(
+    store: &crate::storage::CoordinatorStore,
+    state_dir: &std::path::Path,
+    run: &RunId,
+    between: impl FnOnce(),
+) -> Result<Standing, ApiError> {
     refuse_pruned(store, run)?;
     let standing = read_rows(store, state_dir, run);
+    between();
     refuse_pruned(store, run)?;
     // A run whose pruning ran to its end meanwhile has no row, and no mark.
     match store.run_is_whole(run) {
@@ -385,6 +397,45 @@ mod tests {
             assert_eq!(error.code, ErrorCode::NotFound);
             assert!(
                 error.message.contains(crate::storage::RUN_PRUNED),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// The reads of a status are overtaken by the pruning: by the mark, or
+    /// by the whole of it, which leaves no row and no mark. The answer is
+    /// "not found", and never what was read meanwhile.
+    #[test]
+    fn a_status_overtaken_by_the_pruning_after_its_reads_is_not_found() {
+        use crate::ids::TaskId;
+        for rows_gone in [false, true] {
+            let dir = crate::test_tmp::tempdir().unwrap();
+            let store = crate::storage::CoordinatorStore::open(dir.path(), 1).unwrap();
+            let (run, task) = (RunId::generate(), TaskId::generate());
+            let spec = serde_json::json!({});
+            store.create_run(&run, None, None, &spec, 1).unwrap();
+            store.create_task(&task, &run, &spec, 1).unwrap();
+            let reader = crate::storage::CoordinatorStore::open_read_only(dir.path()).unwrap();
+            // Not overtaken, the run is judged by what it is.
+            let judged = read_from(&reader, dir.path(), &run).err().unwrap();
+            assert!(judged.message.contains("is not a run of"), "{judged:?}");
+            let mut overtaken = false;
+            let error = read_from_after(&reader, dir.path(), &run, || {
+                if rows_gone {
+                    store.delete_run_for_test(&run);
+                } else {
+                    store.mark_pruning_for_test(&run);
+                }
+                overtaken = true;
+            })
+            .err()
+            .unwrap();
+            assert!(overtaken);
+            assert_eq!(error.code, ErrorCode::NotFound, "{error:?}");
+            assert!(!error.message.contains("is not a run of"), "{error:?}");
+            assert_eq!(
+                error.message.contains(crate::storage::RUN_PRUNED),
+                !rows_gone,
                 "{error:?}"
             );
         }

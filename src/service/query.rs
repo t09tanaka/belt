@@ -109,7 +109,16 @@ impl CoordinatorStore {
     /// never cleared and rows are deleted only after it, so every read
     /// before saw the run whole. Otherwise the answer is "not found", and
     /// nothing that was read of a run that was being deleted is used.
+    ///
+    /// That holds for a refusal too: an error that was read of a task whose
+    /// row was gone ("attempt does not belong to task") says something of
+    /// rows that were being deleted, and is "not found" as well.
     pub fn query(&self, query: Query) -> Result<Response> {
+        self.query_after(query, || ())
+    }
+    /// [`Self::query`]; `between` runs after the reads and before the check
+    /// that follows the last of them (a test prunes the run there).
+    pub(crate) fn query_after(&self, query: Query, between: impl FnOnce()) -> Result<Response> {
         let task = match &query {
             Query::OutputMetadata { task_id, .. }
             | Query::LogMetadata { task_id, .. }
@@ -117,9 +126,10 @@ impl CoordinatorStore {
             _ => None,
         };
         let answer = self.query_rows(query);
+        between();
         if let Some(task) = task {
             self.refuse_pruned_task_read(&task)?;
-            if answer.is_ok() && !self.task_is_whole(&task)? {
+            if !self.task_is_whole(&task)? {
                 return Err(crate::storage::StorageError::NotFound {
                     what: format!("task {task}"),
                 });

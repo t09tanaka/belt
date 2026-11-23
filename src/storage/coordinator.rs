@@ -292,6 +292,42 @@ fn refuse_pruned_task(c: &Connection, task: &str) -> Result<()> {
     }
 }
 
+/// [`refuse_pruned`] for the run of `attempt`: a writer that is given only
+/// an attempt (its collection, its logs, its artifacts, an event that names
+/// no run) finds the run through the task. An attempt without a row is left
+/// to the caller.
+fn refuse_pruned_attempt(c: &Connection, attempt: &str) -> Result<()> {
+    let run: Option<String> = c
+        .query_row(
+            "SELECT r.run_id FROM attempt a JOIN task t USING(task_id) JOIN run r USING(run_id)
+             WHERE a.attempt_id=?1 AND r.pruning_at_ms IS NOT NULL",
+            [attempt],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match run {
+        Some(run) => Err(run_pruned(&run)),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_pruned`] for the run of the matrix group `group`. A group
+/// without a row is left to the caller.
+fn refuse_pruned_group(c: &Connection, group: &str) -> Result<()> {
+    let run: Option<String> = c
+        .query_row(
+            "SELECT r.run_id FROM matrix_group g JOIN run r USING(run_id)
+             WHERE g.group_id=?1 AND r.pruning_at_ms IS NOT NULL",
+            [group],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match run {
+        Some(run) => Err(run_pruned(&run)),
+        None => Ok(()),
+    }
+}
+
 /// The condition of a run row `alias` that carries no mark, for a scan.
 fn unmarked(alias: &str, known: bool) -> String {
     if known {
@@ -492,15 +528,61 @@ impl CoordinatorStore {
     /// task and run have their rows and whose run carries no mark, read in
     /// one snapshot (spec 25.5): the pin of a run that is being pruned is
     /// never made again.
+    ///
+    /// The check before the pin is not enough alone (spec 25.3, 25.5):
+    /// between it and the pin the pruning can mark the run, delete its
+    /// results and rows and unlink its pin file, and this function would
+    /// make the file again and write results nothing deletes. So the same
+    /// check is made again with the pin held. A writer that is refused
+    /// there lets go of the pin and unlinks the file it made, when it gets
+    /// the pin exclusively (otherwise the scan at start removes it).
     pub(crate) fn result_writer_pin(
         &self,
         attempt: &AttemptId,
     ) -> Result<crate::results::pin::RunPin> {
+        self.result_writer_pin_after(attempt, || ())
+    }
+    /// [`Self::result_writer_pin`]; `between` runs after the first check of
+    /// the attempt and before the pin file is made (a test stops a writer
+    /// there).
+    pub(crate) fn result_writer_pin_after(
+        &self,
+        attempt: &AttemptId,
+        between: impl FnOnce(),
+    ) -> Result<crate::results::pin::RunPin> {
+        use crate::results::pin::RunPin;
         if self._lock.is_none() {
             return Err(StorageError::Invalid("read-only owner".into()));
         }
+        let run = self.result_writer_run(attempt)?;
+        between();
+        RunPin::ensure(&self.state_dir, &run)?;
+        let pin = RunPin::shared(&self.state_dir, &run)?;
+        match self.result_writer_run(attempt) {
+            Ok(again) if again == run => Ok(pin),
+            answer => {
+                drop(pin);
+                if let Ok(alone) = RunPin::exclusive(&self.state_dir, &run) {
+                    let path = self.state_dir.join(format!("reader-pins/{run}.lock"));
+                    match std::fs::remove_file(path) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(StorageError::Io(e))
+                        }
+                        _ => {}
+                    }
+                    drop(alone);
+                }
+                Err(answer
+                    .err()
+                    .unwrap_or_else(|| not_found("attempt, its task or its run")))
+            }
+        }
+    }
+    /// The run of an attempt that has its row, as its task and its run have,
+    /// and whose run carries no mark: one snapshot.
+    fn result_writer_run(&self, attempt: &AttemptId) -> Result<RunId> {
         let attempt = attempt.to_string();
-        let run = self.db.call(move |c| {
+        self.db.call(move |c| {
             let row: Option<(String, bool)> = c
                 .query_row(
                     "SELECT r.run_id, r.pruning_at_ms IS NOT NULL FROM attempt a
@@ -514,9 +596,7 @@ impl CoordinatorStore {
                 Some((run, true)) => Err(run_pruned(&run)),
                 Some((run, false)) => id("run_id", RunId::parse(&run)),
             }
-        })?;
-        crate::results::pin::RunPin::ensure(&self.state_dir, &run)?;
-        Ok(crate::results::pin::RunPin::shared(&self.state_dir, &run)?)
+        })
     }
     /// Whether `run` carries the mark of a pruned run. A reader that builds
     /// its answer from several reads asks this before the first of them and
@@ -1213,6 +1293,7 @@ impl CoordinatorStore {
         let a = attempt_id.map(ToString::to_string);
         let demand = demand.to_string();
         self.db.write(move |tx| {
+            refuse_pruned_task(tx, &task)?;
             tx.execute(
                 "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
                  VALUES (?1,?2,?3,?4,?5)",
@@ -1291,6 +1372,7 @@ impl CoordinatorStore {
     ) -> Result<()> {
         let (g, r) = (group_id.to_string(), run_id.to_string());
         self.db.write(move |tx| {
+            refuse_pruned(tx, &r)?;
             tx.execute(
                 "INSERT INTO matrix_group (group_id, run_id, max_parallel, created_at_ms)
                  VALUES (?1,?2,?3,?4)",
@@ -1313,7 +1395,10 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<Option<Permit>> {
         let (g, p) = (group_id.to_string(), permit_id.clone());
-        self.db.write(move |tx| reserve_permit(tx, &g, &p, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_group(tx, &g)?;
+            reserve_permit(tx, &g, &p, at_ms)
+        })
     }
 
     /// Give the permit back. Refused while its attempt is neither terminal nor
@@ -1374,6 +1459,15 @@ impl CoordinatorStore {
         );
         let (kind, payload) = (kind.to_string(), payload.clone());
         self.db.write(move |tx| {
+            // An event that names only an attempt belongs to the run of that
+            // attempt (spec 25.3 (b)): written while the run is pruned, it
+            // would be a row the pruning has already passed.
+            if let Some(run) = &r {
+                refuse_pruned(tx, run)?;
+            }
+            if let Some(attempt) = &a {
+                refuse_pruned_attempt(tx, attempt)?;
+            }
             common::append_event(tx, r.as_deref(), a.as_deref(), &kind, &payload, at_ms)
         })
     }
@@ -1438,8 +1532,10 @@ impl CoordinatorStore {
     /// same receipt again is a no-op, a different one is a conflict.
     pub fn record_artifact(&self, r: &ArtifactReceipt, at_ms: u64) -> Result<()> {
         let r = r.clone();
-        self.db
-            .write(move |tx| Self::record_artifact_in(tx, &r, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, r.attempt_id.as_str())?;
+            Self::record_artifact_in(tx, &r, at_ms)
+        })
     }
 
     /// [`Self::record_artifact`] in the transaction of the caller.

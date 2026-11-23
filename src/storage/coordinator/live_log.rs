@@ -191,8 +191,10 @@ impl CoordinatorStore {
         at: u64,
     ) -> Result<LogProgress> {
         let attempt = attempt.to_string();
-        self.db
-            .write(move |tx| prepare(tx, &attempt, stream_key(stream), at))
+        self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &attempt)?;
+            prepare(tx, &attempt, stream_key(stream), at)
+        })
     }
 
     /// Call only after append/fsync. False means a stale offset; no bytes were
@@ -212,6 +214,7 @@ impl CoordinatorStore {
     ) -> Result<bool> {
         let attempt = attempt.to_string();
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &attempt)?;
             let old = load(tx, &attempt, stream_key(stream))?
                 .ok_or_else(|| not_found("prepared log progress"))?;
             if next < expected
@@ -262,6 +265,7 @@ impl CoordinatorStore {
     ) -> Result<Option<LogProgress>> {
         self.db.write(move |tx| {
             let a = verified.attempt().as_str();
+            super::refuse_pruned_attempt(tx, a)?;
             let stream = stream_key(verified.stream());
             if let Some(old) = load(tx, a, stream)? {
                 return Ok(Some(old));

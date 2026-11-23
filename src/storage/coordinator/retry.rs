@@ -104,6 +104,18 @@ impl CoordinatorStore {
         expected: u64,
         request_id: String,
     ) -> Result<RetryPreparation> {
+        self.prepare_retry_after(target, expected, request_id, || ())
+    }
+    /// [`Self::prepare_retry`]; `between` runs after the files were read and
+    /// before the transaction that reads the target again (a test marks the
+    /// run there).
+    pub(crate) fn prepare_retry_after(
+        &self,
+        target: Target,
+        expected: u64,
+        request_id: String,
+        between: impl FnOnce(),
+    ) -> Result<RetryPreparation> {
         let source_guard = self.source_mutation_guard_foreground()?;
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(StorageError::Invalid("invalid retry request ID".into()));
@@ -126,6 +138,7 @@ impl CoordinatorStore {
         };
         // The files are read here, with no transaction open.
         let evidence = Evidence::read(&state_dir, candidates);
+        between();
         let preparation=self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
             refuse_pruned_target(&tx, &target)?;
