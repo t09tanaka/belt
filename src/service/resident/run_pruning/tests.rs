@@ -489,6 +489,7 @@ fn a_pass_after_a_stop_at_any_step_does_the_rest() {
         "prune_after_files",
         "after_inputs",
         "during_rows",
+        "before_source_rows",
         "after_rows",
     ] {
         let mut f = Fixture::new();

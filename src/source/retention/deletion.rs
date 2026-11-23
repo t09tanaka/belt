@@ -37,7 +37,7 @@ impl Gate {
     /// The first gate that is closed in the index `c`, if any.
     pub fn closed(c: &Connection) -> Result<Option<Gate>> {
         let (legacy, capture, graph): (bool, bool, bool) = c.query_row(
-            "SELECT coalesce((SELECT value FROM meta WHERE key='legacy_registration')<>'done',0), EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned'), EXISTS(SELECT 1 FROM graph WHERE done=0)",
+            "SELECT coalesce((SELECT value FROM meta WHERE key='legacy_registration'),'')<>'done', EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned'), EXISTS(SELECT 1 FROM graph WHERE done=0)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -59,7 +59,12 @@ impl Gate {
         if !path.is_file() {
             return Ok(None);
         }
-        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // As `inspect_owners`: read only, no symlink, a short wait.
+        let c = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        c.busy_timeout(std::time::Duration::from_secs(1))?;
         Self::closed(&c)
     }
 }

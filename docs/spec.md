@@ -2528,14 +2528,14 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
 | runの行（run・task・attempt・placement・collectionなど、25.5の段6の表） | `coordinator.db` | `show`・`ls`・`retry`・回収・復旧 | runの刈り取りで消す（終わってから `retention_days` 日） | runが在る間。刈り取りで消す | 2 | 25.5 |
-| event（runかattemptのもの） | `coordinator.db` の `event` | `show`・`logs`・配置の理由・GitHub status | runと一緒に消す（triggerは、行があって印の無いrunのeventの削除だけを禁じる） | runと一緒 | 2 | 25.5 |
+| event（runかattemptのもの） | `coordinator.db` の `event` | `show`・`logs`・配置の理由・GitHub status | runと一緒に消す（triggerは、行があって印の無いrunのeventの削除だけを禁じる。このrunのattemptを名指して別のrunを名指すものは、そのrunと一緒。行の無いattemptを名指すeventは書かない） | runと一緒 | 2 | 25.5 |
 | event（どちらも持たないもの） | 同上 | 診断 | 書いてから `retention_days` 日で消す（1 passで1,000行） | `retention_days` 日 | 2 | 時刻 |
 | `control_request` | `coordinator.db` | 同じ `request_id` の再送 | runと一緒に消す | runと一緒 | 1（列）、2 | 25.5 |
 | 行の無いrunへのcancelの行 | `coordinator.db` の `run_cancel_intent`・`control_request`・`event`（そのrun ID） | 後から届くenqueue | 持ち主の行が `capturing` の取り込み（進行中か、持ち主が `given_up` を書かずに終わったもの）のrunについてだけ書く。enqueueが届かなければ、放棄の処理で消す（段階1より前は、どのrun IDへのcancelでも書き、消さなかった） | 持ち主の行が `capturing` の取り込みのrunについてだけ書く（取り込み1つにつき、予約1行、cancelの要求ごとに受領とeventが1行ずつ）。enqueueが届けばrunと一緒に、届かなければ放棄の処理で消す | 1 | 25.4の (b) |
 | `pending_delete`・`result_delete_claim` | `coordinator.db` | 削除の再実行 | fileを消した後に消す | 同じ | 既存 | fileが無いこと |
 | `ci_test_timing` | `coordinator.db` | Shardの分割 | 最後に書いてから14日で消す（1 passで1,000行） | 最後に書いてから14日 | 2 | 時刻 |
 | 退役させたidentity | `coordinator.db` の `worker_identity_tombstone`・`identity_retired_notice` | 接続の拒否 | 消さない | 未決（25.16） | なし | なし |
-| 外したメンバー | `coordinator.db` の `removed_member`。coordinator DBの無いhostでは `removed-members.json`（固定のfile、1個） | 接続の拒否 | 戻したときに消す。coordinator DBのあるhostに残っていた `removed-members.json` は、次の鍵の更新（`group rotate`）が表へ移して消す | 外した名前ごとに1行 | 既存、2（fileの移し替え） | 利用者の操作 |
+| 外したメンバー | `coordinator.db` の `removed_member`。coordinator DBの無いhostでは `removed-members.json`（固定のfile、1個） | 接続の拒否 | 戻したときに消す。coordinator DBのあるhostに残っていた `removed-members.json` は、次の鍵の更新（`group rotate`）が表へ移して消す（読めなければ警告して残し、次の更新がまた試す） | 外した名前ごとに1行 | 既存、2（fileの移し替え） | 利用者の操作 |
 | 結果 | `results/<attempt>/`（result・log・artifact・`tmp/*.part`） | `logs`・`outputs`・CIの後のJobのdownload | attemptごとに、終了と回収を閉じた時点の遅い方から `retention_days` 日。workflow artifactは、runが終わってから `retention_days` 日。spoolは1 GiB/task、artifactは1 GiB/upload | 同じ。刈り取りの段3が残りを消す | 既存（残りは2） | 排他pinと、回収が閉じていること |
 | readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | runの刈り取りの最後にunlinkする。作るのは、行があって印が無いときだけ。行の無いrunのpinは、起動時の走査が消す | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
 | 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日（終点は25.3の (a)） | 同じ | 既存 | 索引に参照が無いこと、排他lock |
