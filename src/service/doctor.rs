@@ -1059,23 +1059,32 @@ pub fn capture_checks(spec: &Spec) -> Vec<Check> {
             Level::NotChecked,
             "the index of captured inputs cannot be read".into(),
         )],
-        Ok(Some(UnjudgedCaptures {
-            elsewhere: 0,
-            records: 0,
-            bindings: 0,
-            unnamed: 0,
-        })) => vec![check(
+        Ok(Some(counts)) => {
+            let (level, detail) = capture_detail(&counts);
+            vec![check(level, detail)]
+        }
+    }
+}
+
+/// The level and the text of the check for what [`unjudged_captures`] counted.
+fn capture_detail(counts: &UnjudgedCaptures) -> (Level, String) {
+    if *counts == UnjudgedCaptures::default() {
+        return (
             Level::Ok,
             "every capture that was not submitted has an owner this host can judge".into(),
-        )],
-        Ok(Some(counts)) => vec![check(
-            Level::Notice,
-            format!(
-                "kept because nothing proves they are abandoned: {} capture(s) whose owner was recorded on another machine or PID namespace, {} run record(s) and {} in-place binding(s) that no run and no capture owner claims, {} entr(ies) with a name that is not a run's; they are never deleted automatically",
-                counts.elsewhere, counts.records, counts.bindings, counts.unnamed
-            ),
-        )],
+        );
     }
+    let mut detail = format!(
+        "kept because nothing proves they are abandoned: {} capture(s) whose owner was recorded on another machine or PID namespace, {} run record(s) and {} in-place binding(s) that no run and no capture owner claims, {} entr(ies) with a name that is not a run's; they are never deleted automatically",
+        counts.elsewhere, counts.records, counts.bindings, counts.unnamed
+    );
+    if counts.corrupt_held > 0 {
+        detail.push_str(&format!(
+            "; {} file(s) of a stopped capture were kept because their content is wrong and another root holds them (belt cannot remove them while they are held)",
+            counts.corrupt_held
+        ));
+    }
+    (Level::Notice, detail)
 }
 
 /// The runs whose pruning began and has not reached its end (spec 25.5):
@@ -1137,6 +1146,9 @@ pub(crate) struct UnjudgedCaptures {
     pub(crate) bindings: usize,
     /// Entries of those two directories whose name is not a run's.
     pub(crate) unnamed: usize,
+    /// Files with wrong content that a deletion kept because another root
+    /// holds them.
+    pub(crate) corrupt_held: usize,
 }
 
 /// One `readdir` of `sources/runs/` and of `in-place/`, and one lookup by
@@ -1185,6 +1197,8 @@ pub(crate) fn unjudged_captures(
     let bindings = unclaimed(state.join("in-place"), ".json");
     counts.records = records;
     counts.bindings = bindings;
+    counts.corrupt_held = usize::try_from(crate::source::retention::inspect_corrupt_held(state)?)
+        .unwrap_or(usize::MAX);
     Ok(Some(counts))
 }
 

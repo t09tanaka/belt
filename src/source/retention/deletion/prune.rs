@@ -194,6 +194,13 @@ impl SourceStore {
             .retention
             .capture_owner(run.as_str())?
             .and_then(|row| row.root);
+        // The scratch directory of that capture goes first, whole, as in the
+        // deletion of an abandoned capture: a file whose install was cut
+        // short still has its staged name, and a file with two names is not
+        // provably ours.
+        if let Some(root) = pending.as_deref() {
+            self.retention.remove_scratch(root)?;
+        }
         let mut report = AbandonReport::default();
         let gone = self.abandon_roots(
             &mut c,

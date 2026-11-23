@@ -706,6 +706,34 @@ fn many_runs_share_the_bound_of_input_paths_of_a_pass() {
     }
 }
 
+/// A capture of the run that was cut short left its scratch directory,
+/// named by the pending root of its owner row: step 4 removes it whole
+/// before the roots, as the deletion of an abandoned capture does.
+#[test]
+fn the_scratch_directory_of_a_cut_short_capture_goes_with_the_run() {
+    let mut f = Fixture::new();
+    let made = f.run(1, true);
+    f.inputs().sources.own_capture(&made.run).unwrap();
+    let name = ulid::Ulid::new().to_string();
+    let c = rusqlite::Connection::open(f.state.join("sources/retention.db")).unwrap();
+    c.execute(
+        "UPDATE capture_owner SET root=?1 WHERE run_id=?2",
+        rusqlite::params![format!("capture:{name}"), made.run.as_str()],
+    )
+    .unwrap();
+    drop(c);
+    let scratch = f.state.join("sources/staging").join(&name);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(scratch.join("objects"))
+        .unwrap();
+    std::fs::write(scratch.join("objects/half"), b"half").unwrap();
+    assert_eq!(f.prune(), 1);
+    assert!(!scratch.exists());
+    f.nothing_left(&made);
+}
+
 /// The loop of the resident prunes: with the parent's stores it calls the
 /// pass after its page, and not while a version is on trial (25.1, 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

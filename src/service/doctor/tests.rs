@@ -2109,3 +2109,27 @@ fn runs_whose_pruning_is_not_finished_are_counted() {
     assert!(detail.ends_with("(gate=legacy_registration)"), "{detail}");
     assert_eq!(pruning_report(None, None).unwrap().0, Level::NotChecked);
 }
+
+#[test]
+fn wrong_content_files_kept_because_another_root_holds_them_are_shown() {
+    let none = UnjudgedCaptures::default();
+    assert_eq!(capture_detail(&none).0, Level::Ok);
+    let held = UnjudgedCaptures {
+        corrupt_held: 2,
+        ..Default::default()
+    };
+    let (level, detail) = capture_detail(&held);
+    assert_eq!(level, Level::Notice);
+    assert!(
+        detail.contains("2 file(s)") && detail.contains("cannot remove them while they are held"),
+        "{detail}"
+    );
+    assert_eq!(
+        capture_detail(&UnjudgedCaptures {
+            elsewhere: 1,
+            ..none
+        })
+        .0,
+        Level::Notice
+    );
+}

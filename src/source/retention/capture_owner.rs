@@ -212,6 +212,36 @@ pub fn inspect_owners(state: &Path) -> Result<Option<Vec<CaptureOwner>>> {
     Ok(Some(rows.collect::<std::result::Result<_, _>>()?))
 }
 
+/// How many wrong-content files a deletion kept because another root held
+/// them (`corrupt_held`), counted since the index was made; read like
+/// [`inspect_owners`]. Zero when there is no index.
+pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
+    let database = state.join("sources").join("retention.db");
+    if !database.is_file() {
+        return Ok(0);
+    }
+    let c = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let found: Option<String> =
+        match c.query_row("SELECT value FROM meta WHERE key='corrupt_held'", [], |r| {
+            r.get(0)
+        }) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            // An index from before the table existed has nothing counted.
+            Err(rusqlite::Error::SqliteFailure(_, Some(text)))
+                if text.contains("no such table") =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+    Ok(found.and_then(|value| value.parse().ok()).unwrap_or(0))
+}
+
 impl SourceStore {
     /// The first durable write of a capture that will be submitted: this
     /// process owns the capture of `run`. Nothing of the capture may exist
