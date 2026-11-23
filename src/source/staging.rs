@@ -18,12 +18,24 @@
 //! `before_install` hook sees the full list of what is about to be installed
 //! (once), and each file is installed without replacing anything.
 //!
+//! One scratch directory serves one capture at a time: the staged names are
+//! content-derived and a capture clears what it staged, so two captures in
+//! the same directory would remove each other's files. A capture holds an
+//! exclusive `flock` on the scratch directory itself while it runs (nothing is
+//! created for it, and it is released when the process ends, killed or not);
+//! a second capture in a directory that is in use is refused.
+//!
 //! Out of scope: the private Git repository under `git/<key>.git` (objects and
-//! refs) is written as before; it has a life cycle of its own.
+//! refs) is written as before; it has a life cycle of its own. So is a secret
+//! bundle at the path of `CaptureOptions::secret_bundle`: the caller named
+//! that path, so it already knows it, and it is written before
+//! `before_install` (a caller that is killed removes that path, which
+//! `save_new` guaranteed did not exist; see `CaptureOptions::secret_bundle`).
 
 use super::store::{write_atomic, ObjectStore};
 use super::SourceError;
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -39,7 +51,9 @@ pub type BeforeInstall = Arc<dyn Fn(&[Intent]) -> Result<()> + Send + Sync>;
 pub struct Staging {
     /// An existing directory on the file system of the store. Local-ci makes
     /// `objects/`, `manifests/`, `secrets/` and `tmp/` in it and removes the
-    /// files it staged; the directory itself is the caller's.
+    /// files it staged; the directory itself is the caller's. It serves one
+    /// capture at a time: a capture holds an exclusive `flock` on it while it
+    /// runs, and a second one in the same directory is refused.
     pub scratch_dir: PathBuf,
     /// Called once, after the capture is stable and the manifest sealed, with
     /// everything that is about to be installed in the store. An error stops
@@ -89,6 +103,43 @@ pub struct StagedSnapshot {
     pub reused: Vec<PathBuf>,
 }
 
+/// An install that stopped part-way. It is attached as context to the error
+/// of the install (`err.downcast_ref::<StagedInstallError>()`; the error
+/// underneath, such as [`SourceError::Corrupt`], can be downcast as well).
+///
+/// What was installed is not undone: another capture may be using those files
+/// already, and they are the content they say they are. The caller learns what
+/// this capture created (`installed`, to account for or remove) and what was
+/// there already (`reused`, not its to remove); the files that were not
+/// reached are not in the store and the staged ones are removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedInstallError {
+    /// Destinations this capture created before the failure.
+    pub installed: Vec<PathBuf>,
+    /// Destinations that were there already, with the same content.
+    pub reused: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for StagedInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the install stopped part-way: {} file(s) installed (kept), {} reused",
+            self.installed.len(),
+            self.reused.len()
+        )
+    }
+}
+
+impl std::error::Error for StagedInstallError {}
+
+/// One step of an install, for a test that checks their order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Step {
+    Link(PathBuf),
+    SyncDir(PathBuf),
+}
+
 #[derive(Debug)]
 enum Item {
     Object {
@@ -127,6 +178,8 @@ struct State {
 pub(crate) struct Stager {
     scratch: PathBuf,
     state: Mutex<State>,
+    /// The `flock` on the scratch directory, held while the capture runs.
+    _lock: std::fs::File,
 }
 
 fn dev_of(p: &Path) -> std::io::Result<u64> {
@@ -172,6 +225,20 @@ impl Stager {
         }
         check_same_filesystem(scratch, store.root(), dev)?;
         let scratch = std::fs::canonicalize(scratch)?;
+        let lock = std::fs::File::open(&scratch)
+            .with_context(|| format!("cannot open scratch directory {}", scratch.display()))?;
+        if let Err(e) = lock.try_lock_exclusive() {
+            if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                bail!(
+                    "the scratch directory {} is in use by another capture: one scratch directory serves one capture at a time",
+                    scratch.display()
+                );
+            }
+            return Err(anyhow::Error::from(e).context(format!(
+                "cannot lock scratch directory {}",
+                scratch.display()
+            )));
+        }
         for d in ["objects", "manifests", "secrets", "tmp"] {
             let p = scratch.join(d);
             std::fs::create_dir_all(&p)?;
@@ -180,6 +247,7 @@ impl Stager {
         Ok(Arc::new(Stager {
             scratch,
             state: Mutex::new(State::default()),
+            _lock: lock,
         }))
     }
 
@@ -249,9 +317,13 @@ impl Stager {
             .scratch
             .join("manifests")
             .join(format!("{}.json", m.source_id));
-        write_atomic(&path, &serde_json::to_vec_pretty(m)?, 0o644)?;
         let mut st = self.lock();
-        st.items.retain(|i| i.path() != path);
+        // the name is derived from the content: one that is staged is this
+        // one, and moving it to the end would shift the marks of the attempts
+        if st.items.iter().any(|i| i.path() == path) {
+            return Ok(());
+        }
+        write_atomic(&path, &serde_json::to_vec_pretty(m)?, 0o644)?;
         st.items.push(Item::Manifest {
             source_id: m.source_id.clone(),
             digest: m.manifest_digest.clone(),
@@ -269,9 +341,11 @@ impl Stager {
             .scratch
             .join("secrets")
             .join(format!("{source_id}.json"));
-        bundle.save(&path)?;
         let mut st = self.lock();
-        st.items.retain(|i| i.path() != path);
+        if st.items.iter().any(|i| i.path() == path) {
+            return Ok(());
+        }
+        bundle.save(&path)?;
         st.items.push(Item::Secret {
             source_id: source_id.to_string(),
             path,
@@ -298,7 +372,8 @@ impl Stager {
 
     /// Install what was staged: objects, then secret bundles, then manifests
     /// (a manifest that is there is complete). `before_install` sees the list
-    /// first; an error from it installs nothing.
+    /// first; an error from it installs nothing. An error part-way carries
+    /// what was installed and reused so far ([`StagedInstallError`]).
     pub(crate) fn install(
         &self,
         store: &ObjectStore,
@@ -306,43 +381,50 @@ impl Stager {
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let intents = self.intents(store);
         before_install(&intents)?;
+        self.install_intents(&intents, &mut |_| {})
+    }
+
+    /// The install of `intents`, `observe` told of each link and each sync.
+    ///
+    /// Durability: the objects and the secret bundle are linked first, their
+    /// directories (and the parent of one that was made, or `objects/` for an
+    /// `objects/<aa>` that anyone made) are synced, and only then are the
+    /// manifests linked and `manifests/` synced. A manifest that survives a
+    /// crash therefore names objects that survive it too.
+    fn install_intents(
+        &self,
+        intents: &[Intent],
+        observe: &mut dyn FnMut(Step),
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let mut installed = vec![];
         let mut reused = vec![];
-        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for i in &intents {
-            let dest = &i.destination;
-            let parent = dest.parent().context("no parent directory")?;
-            if !parent.is_dir() {
-                std::fs::create_dir_all(parent)?;
-                if let Some(grand) = parent.parent() {
-                    dirs.insert(grand.to_path_buf());
+        let res = (|| -> Result<()> {
+            for manifests in [false, true] {
+                let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+                for i in intents
+                    .iter()
+                    .filter(|i| matches!(i.kind, IntentKind::Manifest { .. }) == manifests)
+                {
+                    link_one(i, &mut installed, &mut reused, &mut dirs, observe)?;
+                }
+                for d in dirs {
+                    observe(Step::SyncDir(d.clone()));
+                    std::fs::File::open(&d)
+                        .and_then(|f| f.sync_all())
+                        .with_context(|| format!("cannot sync {}", d.display()))?;
                 }
             }
-            dirs.insert(parent.to_path_buf());
-            match std::fs::hard_link(&i.staged, dest) {
-                Ok(()) => installed.push(dest.clone()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_existing(&i.kind, &i.staged, dest)?;
-                    reused.push(dest.clone());
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::from(e).context(format!(
-                        "cannot install {} (the scratch directory must be on the file system of the store, with hard links)",
-                        dest.display()
-                    )))
-                }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                let mut st = self.lock();
+                st.items.clear();
+                st.objects.clear();
+                Ok((installed, reused))
             }
-            std::fs::remove_file(&i.staged)?;
+            Err(e) => Err(e.context(StagedInstallError { installed, reused })),
         }
-        for d in dirs {
-            std::fs::File::open(&d)
-                .and_then(|f| f.sync_all())
-                .with_context(|| format!("cannot sync {}", d.display()))?;
-        }
-        let mut st = self.lock();
-        st.items.clear();
-        st.objects.clear();
-        Ok((installed, reused))
     }
 
     fn intents(&self, store: &ObjectStore) -> Vec<Intent> {
@@ -390,6 +472,46 @@ impl Stager {
         }
         out
     }
+}
+
+/// Install one file: a link that does not replace; an existing destination is
+/// verified and reused. The staged name is removed afterwards.
+fn link_one(
+    i: &Intent,
+    installed: &mut Vec<PathBuf>,
+    reused: &mut Vec<PathBuf>,
+    dirs: &mut BTreeSet<PathBuf>,
+    observe: &mut dyn FnMut(Step),
+) -> Result<()> {
+    let dest = &i.destination;
+    let parent = dest.parent().context("no parent directory")?;
+    let made = !parent.is_dir();
+    if made {
+        std::fs::create_dir_all(parent)?;
+    }
+    dirs.insert(parent.to_path_buf());
+    if let Some(grand) = parent.parent() {
+        // `objects/` holds an `objects/<aa>` that this or any capture made
+        if made || matches!(i.kind, IntentKind::Object { .. }) {
+            dirs.insert(grand.to_path_buf());
+        }
+    }
+    observe(Step::Link(dest.clone()));
+    match std::fs::hard_link(&i.staged, dest) {
+        Ok(()) => installed.push(dest.clone()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_existing(&i.kind, &i.staged, dest)?;
+            reused.push(dest.clone());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "cannot install {} (the scratch directory must be on the file system of the store, with hard links)",
+                dest.display()
+            )))
+        }
+    }
+    std::fs::remove_file(&i.staged)?;
+    Ok(())
 }
 
 fn file_digest(p: &Path) -> Result<String> {
@@ -481,5 +603,109 @@ mod tests {
         assert!(Stager::with_dev(&staging(&scratch), &store, &|_| Ok(1)).is_ok());
         // and so is the real check, on one file system
         assert!(Stager::new(&staging(&scratch), &store).is_ok());
+    }
+
+    use crate::source::{
+        CanonicalConfig, ObjectManifest, SecretBundle, SourceKind, SourceManifest,
+    };
+    use crate::source::{RelPath, SCHEMA_VERSION};
+
+    fn manifest(id: &str) -> SourceManifest {
+        SourceManifest {
+            schema_version: SCHEMA_VERSION,
+            source_id: id.to_string(),
+            manifest_digest: format!("sha256:{id}"),
+            repository_id: None,
+            source_kind: SourceKind::Directory,
+            original_head: None,
+            index_tree: None,
+            worktree_tree: None,
+            execution_commit: None,
+            base: None,
+            merge_base: None,
+            branch: None,
+            cwd_relative: RelPath(vec![]),
+            object_manifest: ObjectManifest {
+                entries: vec![],
+                tree_digest: String::new(),
+                git_tips: vec![],
+            },
+            submodules: vec![],
+            lfs: vec![],
+            canonical: CanonicalConfig::default(),
+            secret_files: vec![],
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, ObjectStore, Arc<Stager>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path().join("store")).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let stager = Stager::new(&staging(&scratch), &store).unwrap();
+        (tmp, store, stager)
+    }
+
+    #[test]
+    fn staging_the_same_name_again_does_not_move_it_past_the_mark_of_an_attempt() {
+        let (_tmp, _store, stager) = setup();
+        let bundle = SecretBundle::new(vec![(RelPath::new("s"), 0o600, b"x".to_vec())]);
+        stager.stage_manifest(&manifest("src-one")).unwrap();
+        stager.stage_secrets("src-one", &bundle).unwrap();
+        let mark = stager.mark();
+        assert_eq!(mark, 2);
+        let (hash, _) = stager.put_reader(&mut &b"attempt"[..]).unwrap();
+        // the same names again, within the attempt: nothing is staged
+        stager.stage_manifest(&manifest("src-one")).unwrap();
+        stager.stage_secrets("src-one", &bundle).unwrap();
+        assert_eq!(stager.mark(), 3);
+        // so the reset to the mark removes the attempt's object and only that
+        stager.reset_to(mark);
+        assert!(stager.object_path(&hash).is_none());
+        assert!(stager.scratch.join("manifests/src-one.json").is_file());
+        assert!(stager.scratch.join("secrets/src-one.json").is_file());
+        assert_eq!(stager.mark(), 2);
+    }
+
+    #[test]
+    fn the_directories_of_objects_and_secrets_are_synced_before_a_manifest_is_linked() {
+        let (_tmp, store, stager) = setup();
+        stager.put_reader(&mut &b"one"[..]).unwrap();
+        stager.put_reader(&mut &b"two"[..]).unwrap();
+        stager
+            .stage_secrets(
+                "src-a",
+                &SecretBundle::new(vec![(RelPath::new("s"), 0o600, b"x".to_vec())]),
+            )
+            .unwrap();
+        stager.stage_manifest(&manifest("src-a")).unwrap();
+        let intents = stager.intents(&store);
+        let mut steps = vec![];
+        let (installed, reused) = stager
+            .install_intents(&intents, &mut |s| steps.push(s))
+            .unwrap();
+        assert_eq!(installed.len(), 4);
+        assert!(reused.is_empty());
+        let pos = |want: &Step| steps.iter().position(|s| s == want).unwrap();
+        let manifest_dest = store.manifest_path("src-a");
+        let first_manifest_link = pos(&Step::Link(manifest_dest.clone()));
+        // every object and the secret bundle is linked, and every directory
+        // that holds one synced, before the manifest is linked
+        for i in intents
+            .iter()
+            .filter(|i| !matches!(i.kind, IntentKind::Manifest { .. }))
+        {
+            assert!(pos(&Step::Link(i.destination.clone())) < first_manifest_link);
+            let dir = i.destination.parent().unwrap().to_path_buf();
+            assert!(pos(&Step::SyncDir(dir)) < first_manifest_link);
+        }
+        // `objects/` itself too (its `<aa>` was made by this install), and
+        // `secrets/`
+        assert!(pos(&Step::SyncDir(store.root().join("objects"))) < first_manifest_link);
+        assert!(pos(&Step::SyncDir(store.root().join("secrets"))) < first_manifest_link);
+        // and `manifests/` last, after the manifest is linked
+        let sync_manifests = pos(&Step::SyncDir(store.root().join("manifests")));
+        assert!(first_manifest_link < sync_manifests);
+        assert_eq!(sync_manifests, steps.len() - 1);
     }
 }

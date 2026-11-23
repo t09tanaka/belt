@@ -1050,8 +1050,17 @@ fn read_secret(
         return Err(unstable(format!("{} changed while read", p.display())));
     }
     *total += st.size;
-    Ok(Some((0o600, bytes)))
+    // The bundle records this mode and the manifest's HMAC (path and content
+    // only) does not cover it, which is sound because it is a constant: the
+    // mode of the file on disk is not read, so a `chmod` changes neither the
+    // source id nor the bundle. A mode taken from the file would have to enter
+    // `secret_digest`, or a bundle could change under an unchanged source id.
+    Ok(Some((SECRET_FILE_MODE, bytes)))
 }
+
+/// The mode of every secret file in a bundle (and of the file it is placed
+/// as by `materialize_secrets`).
+const SECRET_FILE_MODE: u32 = 0o600;
 
 // ---- LFS ------------------------------------------------------------------
 

@@ -4801,11 +4801,40 @@ fn a_bundle_whose_refs_git_cannot_list_is_an_error_and_is_not_published() {
     assert!(names_in(&f.home.join("sources/bundles")).is_empty());
 }
 
+// ---- the mode of a secret file -----------------------------------------------
+
+/// The HMAC of a secret file covers its path and content, not its mode. That
+/// is sound while the bundle's mode is not read from the file: this pins it,
+/// so that a change which reads the mode has to put it in the digest first
+/// (or a bundle could change under an unchanged source id).
+#[test]
+fn a_chmod_of_a_secret_file_changes_neither_the_source_id_nor_the_bundle() {
+    let p = plain_with_secrets();
+    let c = ctx(&p.home);
+    let o = secret_opts(vec![spec(".env", true)]);
+    let first = capture_directory(&c, &p.dir, &o).unwrap();
+    let before = std::fs::read(first.secrets.as_ref().unwrap()).unwrap();
+    std::fs::set_permissions(p.dir.join(".env"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let second = capture_directory(&c, &p.dir, &o).unwrap();
+    assert_eq!(first.manifest.source_id, second.manifest.source_id);
+    assert_eq!(first.secrets, second.secrets);
+    assert_eq!(
+        std::fs::read(second.secrets.as_ref().unwrap()).unwrap(),
+        before
+    );
+    let v: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert!(v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["mode"].as_u64() == Some(0o600)));
+}
+
 // ---- staged publication (opt-in) -------------------------------------------
 
 mod staged {
     use super::*;
-    use local_ci::source::{Intent, IntentKind, Staging};
+    use local_ci::source::{Intent, IntentKind, StagedInstallError, Staging};
     use std::sync::Mutex;
 
     /// Every file under `dir`, by path relative to it.
@@ -5122,5 +5151,162 @@ mod staged {
         };
         assert!(capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).is_err());
         assert!(store_files(&store_dir(&f)).is_empty());
+    }
+
+    #[test]
+    fn a_failure_part_way_reports_what_was_installed_and_reused_and_undoes_nothing() {
+        let f = fixture();
+        dirty(&f);
+        let planned: Seen = Arc::default();
+        let p2 = planned.clone();
+        let (st, scratch, _) = staging(&f, move |intents| {
+            assert!(intents.len() >= 4, "{intents:?}");
+            for i in &intents[..3] {
+                assert!(matches!(i.kind, IntentKind::Object { .. }));
+            }
+            // the first is there already, with its content: reused
+            std::fs::create_dir_all(intents[0].destination.parent().unwrap())?;
+            std::fs::copy(&intents[0].staged, &intents[0].destination)?;
+            // the third is there with other content: the install stops there
+            std::fs::create_dir_all(intents[2].destination.parent().unwrap())?;
+            std::fs::write(&intents[2].destination, "not what the name says")?;
+            p2.lock().unwrap().push(intents.to_vec());
+            Ok(())
+        });
+        let err = capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).unwrap_err();
+        let plan = planned.lock().unwrap()[0].clone();
+        let got = err
+            .downcast_ref::<StagedInstallError>()
+            .unwrap_or_else(|| panic!("not a StagedInstallError: {err:#}"));
+        assert_eq!(got.installed, vec![plan[1].destination.clone()]);
+        assert_eq!(got.reused, vec![plan[0].destination.clone()]);
+        // the cause is there too, and still a SourceError
+        assert!(matches!(
+            err.downcast_ref::<SourceError>(),
+            Some(SourceError::Corrupt { .. })
+        ));
+        // what was installed is kept (another capture may use it); what was
+        // not reached is not in the store; the scratch is clean
+        assert!(plan[1].destination.is_file());
+        assert_eq!(
+            std::fs::read(&plan[2].destination).unwrap(),
+            b"not what the name says"
+        );
+        for i in &plan[3..] {
+            assert!(!i.destination.exists(), "{:?}", i.destination);
+        }
+        assert!(files_under(&scratch).is_empty());
+    }
+
+    #[test]
+    fn a_staged_capture_after_a_chmod_of_a_secret_file_reuses_the_bundle() {
+        let f = fixture();
+        let dir = f.home.join("plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=1\n").unwrap();
+        let mut o = opts();
+        o.secret_files = vec![spec(".env", true)];
+        o.secret_key = KEY.to_vec();
+        let (st, scratch, _) = passthrough(&f);
+        let first = capture_directory_staged(&f.ctx(), &dir, &o, &st).unwrap();
+        std::fs::set_permissions(dir.join(".env"), std::fs::Permissions::from_mode(0o640)).unwrap();
+        let second = capture_directory_staged(&f.ctx(), &dir, &o, &st).unwrap();
+        // the same source: the bundle at the store is the one this capture
+        // staged, so the existing one verifies and is reused
+        assert_eq!(
+            first.snapshot.manifest.source_id,
+            second.snapshot.manifest.source_id
+        );
+        assert!(second.installed.is_empty(), "{:?}", second.installed);
+        assert!(second
+            .reused
+            .contains(second.snapshot.secrets.as_ref().unwrap()));
+        assert!(files_under(&scratch).is_empty());
+    }
+
+    #[test]
+    fn a_scratch_directory_in_use_by_a_capture_is_refused_to_another() {
+        let f = fixture();
+        dirty(&f);
+        let (st, scratch, _) = passthrough(&f);
+        let (inner_st, home, dir) = (st.clone(), f.home.clone(), f.dir.clone());
+        let inner: Arc<Mutex<Option<String>>> = Arc::default();
+        let i2 = inner.clone();
+        let mut o = opts();
+        o.hook = hook(move |s| {
+            if s == Stage::AfterRead(1) {
+                let r = capture_source_staged(&ctx(&home), &dir, &opts(), &inner_st);
+                *i2.lock().unwrap() = Some(match r {
+                    Ok(_) => "captured".to_string(),
+                    Err(e) => format!("{e:#}"),
+                });
+            }
+            Ok(())
+        });
+        capture_source_staged(&f.ctx(), &f.dir, &o, &st).unwrap();
+        let said = inner.lock().unwrap().clone().unwrap();
+        assert!(said.contains("in use by another capture"), "{said}");
+        // nothing of the refused capture touched the first one's files, and
+        // the directory is free again once the capture is over
+        assert!(files_under(&scratch).is_empty());
+        capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).unwrap();
+    }
+
+    #[test]
+    fn a_bundle_at_the_callers_path_is_removed_when_the_install_fails() {
+        let f = fixture();
+        let dir = f.home.join("plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=1\n").unwrap();
+        let bundle = f.home.join("run-secrets.json");
+        let mut o = opts();
+        o.secret_files = vec![spec(".env", true)];
+        o.secret_key = KEY.to_vec();
+        o.secret_bundle = Some(bundle.clone());
+        let b2 = bundle.clone();
+        let (st, scratch, _) = staging(&f, move |intents| {
+            // written before the hook, and not an intent: the caller named it
+            assert!(b2.is_file());
+            assert!(!intents
+                .iter()
+                .any(|i| matches!(i.kind, IntentKind::SecretBundle { .. })));
+            anyhow::bail!("refused")
+        });
+        let err = capture_directory_staged(&f.ctx(), &dir, &o, &st).unwrap_err();
+        assert!(format!("{err:#}").contains("refused"));
+        assert!(!bundle.exists(), "the bundle stayed at the caller's path");
+        assert!(files_under(&scratch).is_empty());
+        // and the path can be used for the next try
+        let (ok, _, _) = passthrough(&f);
+        assert!(capture_directory_staged(&f.ctx(), &dir, &o, &ok).is_ok());
+        assert!(bundle.is_file());
+    }
+
+    #[test]
+    fn an_unstable_directory_capture_leaves_nothing_staged_of_the_attempt() {
+        let f = fixture();
+        let dir = f.home.join("plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("x.txt"), "read once, then changed\n").unwrap();
+        let mut o = opts();
+        o.hook = unstable_once(dir.join("x.txt"));
+        let (st, scratch, seen) = passthrough(&f);
+        let r = capture_directory_staged(&f.ctx(), &dir, &o, &st).unwrap();
+        let stale = sha(b"read once, then changed\n");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0]
+            .iter()
+            .any(|i| matches!(&i.kind, IntentKind::Object { hash, .. } if *hash == stale)));
+        assert!(!store_dir(&f)
+            .join("objects")
+            .join(&stale[..2])
+            .join(&stale)
+            .exists());
+        assert!(!r.installed.iter().any(|p| p.ends_with(&stale)));
+        assert!(files_under(&scratch).is_empty());
     }
 }

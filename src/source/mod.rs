@@ -35,7 +35,7 @@ pub use materialize::{
     materialize_source, verify_materialized_except, verify_materialized_from,
 };
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
-pub use staging::{BeforeInstall, Intent, IntentKind, StagedSnapshot, Staging};
+pub use staging::{BeforeInstall, Intent, IntentKind, StagedInstallError, StagedSnapshot, Staging};
 pub use store::{ObjectStore, RelPath};
 pub use transfer::{
     export_from, export_objects, export_with_basis, import_objects, import_objects_for,
@@ -274,6 +274,15 @@ pub struct CaptureOptions {
     /// hard links, and a process that is killed during the write can leave a
     /// `.secrets.tmp-*` file (0600, the secret files in plain) in it, which
     /// the caller sweeps: see [`SecretBundle::save_new`].
+    ///
+    /// With [`capture_source_staged`] / [`capture_directory_staged`] the
+    /// bundle is still written here, outside the scratch directory, before
+    /// `before_install` is called, and it is not one of its intents: the
+    /// caller named the path, so it knows it without being told, and
+    /// `save_new` guaranteed nothing was there. A caller that is killed
+    /// before it has recorded the capture removes that path (and sweeps
+    /// `.secrets.tmp-*` from its directory). When the capture fails, local-ci
+    /// removes the file as it does for the other entry points.
     pub secret_bundle: Option<PathBuf>,
     pub max_attempts: u32,
     pub hook: Option<Hook>,

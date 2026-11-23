@@ -703,18 +703,32 @@ every file uses `capture_source_staged` / `capture_directory_staged` with a
   that exists is read in full and compared (an object by its hash, a manifest
   by its digest, a secret bundle by content) and reused; different content is
   an error and the destination is left as it is. The destination directories
-  are fsynced, so a returned capture is durable. Objects go first and
-  manifests last.
+  are fsynced, so a returned capture is durable: the objects and the secret
+  bundle are linked and their directories synced (`objects/` and `secrets/`,
+  and the parent of a directory that was made) before the manifests are
+  linked, and `manifests/` is synced last.
 - `StagedSnapshot::installed` are the destinations this capture created,
   `reused` the ones that were there already: those are not the caller's to
-  remove. Objects are always staged, so that a hit is known by content and an
+  remove. When the install stops part-way (a destination with other content,
+  a full disk), the error carries the same two lists as a
+  `StagedInstallError` (`err.downcast_ref::<StagedInstallError>()`; the cause,
+  for instance `SourceError::Corrupt`, is downcastable too). What was
+  installed is kept, since another capture may be using it already; the
+  staged files that were not reached are removed. Objects are always staged, so that a hit is known by content and an
   object cannot disappear between a check and the manifest.
 - Local-ci removes the files it staged and leaves `scratch_dir` itself to the
-  caller. Temporary files of a killed process stay in it.
+  caller. Temporary files of a killed process stay in it. One scratch
+  directory serves one capture at a time: the capture holds an exclusive
+  `flock` on the directory (nothing is created for it, and a killed process
+  releases it), and a second capture in a directory that is in use is
+  refused. Use one directory per capture.
 - Out of scope: the private Git repository under `git/<key>.git` (objects and
   refs) is written as before, as is a secret bundle at the path of
-  `CaptureOptions::secret_bundle` (written before `before_install`, removed if
-  the capture fails).
+  `CaptureOptions::secret_bundle`. That one is written before
+  `before_install` and is not an intent: the caller named the path, so it
+  knows it, and nothing was there before. A caller that is killed before it
+  has recorded the capture removes that path; if the capture fails, local-ci
+  removes it.
 
 ### Secret files
 
