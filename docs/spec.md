@@ -1967,10 +1967,10 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 ### (a) 入力の保持の終点
 
-**今の挙動。** 親の入力（source）とVaultの削除は、`input_retention_end_on`（`src/storage/coordinator/retention.rs`）が返す終点を待つ。この式は次の2つのrunで永久に終点を返さず、そのrunの入力は今のmainで消えない。
+**今の挙動。** 親の入力（source）とVaultの削除は、`input_retention_end_on`（`src/storage/coordinator/retention.rs`）が返す終点を待つ。この章の最初の版の時点で、この式は次の2つのrunで永久に終点を返さず、そのrunの入力は消えなかった。1つ目は、この章と並行して直してある。2つ目は残っている。
 
-- retire済みのattemptを持つrun。retire（`attempt.retired = 1`）はterminalでないattemptにだけ付き（`free_attempt`）、付いた後もterminalにはならない。式はすべてのattemptに `state = 'terminal'` と閉じた回収を求めるので、満たさない。容量の断りで送信結果が不確かなとき、`worker_cannot_run`、ACKを失ったときなどに日常的に起きる。
-- attemptを1つも持たないtaskを含むrun（配置前にcancelしたtask、適用済みのdiscoveryのprobe、joinの済んだmatrixの元）。式は「attemptの無いtaskがある」だけで終点なしとする。
+- retire済みのattemptを持つrun。retire（`attempt.retired = 1`）はterminalでないattemptにだけ付き（`free_attempt`）、付いた後もterminalにはならない。以前の式は、すべてのattemptに `state = 'terminal'` と閉じた回収を求めたので、満たさなかった。**直してある**: 今の式は `retired = 0` のattemptにだけそれを求め、終点に `retired_at_ms`・taskのcancelの時刻・runを閉じた時刻を入れる（下の規則の3・4と、終点の時刻の文のとおり）。
+- attemptを1つも持たないtaskを含むrun（配置前にcancelしたtask、適用済みのdiscoveryのprobe、joinの済んだmatrixの元）。式は「attemptの無いtaskがある」だけで終点なしとする。**残っている。** 段階0の (a) で実装するのは、この点（下の規則の2）である。
 
 **規則。** runが**終わった**とは、次のすべてが成り立つことである。入力・Vaultの保持の終点と、刈り取りの条件（25.5）は、この同じ述語を使う。
 
@@ -2502,7 +2502,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 外したメンバー | `coordinator.db` の `removed_member` | 接続の拒否 | 戻したときに消す | 外した名前ごとに1行 | 既存 | 利用者の操作 |
 | 結果 | `results/<attempt>/`（result・log・artifact・`tmp/*.part`） | `logs`・`outputs`・CIの後のJobのdownload | attemptごとに、終了と回収を閉じた時点の遅い方から `retention_days` 日。workflow artifactは、runが終わってから `retention_days` 日。spoolは1 GiB/task、artifactは1 GiB/upload | 同じ。刈り取りの段3が残りを消す | 既存（残りは2） | 排他pinと、回収が閉じていること |
 | readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | 消さない。結果のGCが、行の無いrunのpinも作る | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
-| 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日。ただし25.3の2つのrunでは消えない | 同じ（終点を直す） | 既存（修正は0） | 索引に参照が無いこと、排他lock |
+| 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日。ただし、attemptの無いtaskを含むrunでは消えない（25.3） | 同じ（終点を直す） | 既存（修正は0） | 索引に参照が無いこと、排他lock |
 | 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | 行を消さない。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
 | runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 消さない | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
 | 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る（親では、片付ける処理が呼ばれていない） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
