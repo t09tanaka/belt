@@ -663,6 +663,61 @@ async fn a_cancel_that_overlaps_the_commit_of_its_run_cancels_the_run() {
     }
 }
 
+/// The capture of a command goes on after its interrupt gave it up (the
+/// blocking capture is not stopped). Through the capture itself, on the
+/// handle that wrote the owner row: no pending root is created, with the row
+/// `given_up` and after the abandonment deleted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_that_goes_on_after_it_was_given_up_fails_and_leaves_no_root() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    let sources = &resident.captured.sources;
+    let run = RunId::generate();
+    sources.own_capture_as(&run, &me()).unwrap();
+    sources.give_up_capture(&run).unwrap();
+    let roots = || -> i64 {
+        rusqlite::Connection::open(
+            resident
+                .captured
+                .parent_state
+                .join("sources")
+                .join("retention.db"),
+        )
+        .unwrap()
+        .query_row("SELECT count(*) FROM root WHERE kind='pending'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    let capture_again = || {
+        crate::secrets::capture::capture_run(
+            &BTreeMap::new(),
+            sources,
+            &resident.captured.vault,
+            &crate::secrets::capture::SecretInputs {
+                key: &resident.captured.current_key().unwrap(),
+                declared: &[],
+            },
+            &run,
+            &SourceRequest::Directory {
+                dir: input(root.path()),
+            },
+            &CaptureParams::default(),
+        )
+    };
+    assert!(capture_again().is_err());
+    assert_eq!(roots(), 0);
+    for _ in 0..4 {
+        if pass(&resident).continuing == 0 {
+            break;
+        }
+    }
+    assert_eq!(rows(&resident, &run), (0, 0, 0, 0, 0));
+    assert!(capture_again().is_err());
+    assert_eq!(roots(), 0);
+}
+
 /// The tasks of the run and how many of them are cancelled.
 fn cancelled_tasks(resident: &Resident, run: &RunId) -> (i64, i64) {
     let id = run.to_string();
