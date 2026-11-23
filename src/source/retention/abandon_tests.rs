@@ -1294,6 +1294,11 @@ fn a_file_that_stopped_an_install_and_another_root_holds_is_kept_and_counted() {
         (1, 0, 1),
         "{report:?}"
     );
+    // What `doctor` reads from the index, which the report does not reach.
+    let shown = crate::service::doctor::unjudged_captures(&parts.state, &|_| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.corrupt_held, 1);
     assert_eq!(parts.stored_files(), held);
     assert_eq!(
         std::fs::read(&manifest).unwrap(),
@@ -1348,6 +1353,121 @@ fn a_reservation_of_a_file_never_installed_leaves_no_object_row() {
     parts.assert_nothing_left(&run);
     assert_eq!(parts.count("SELECT count(*) FROM object"), 0);
     assert_eq!(parts.count("SELECT count(*) FROM publication"), 0);
+}
+
+/// Passes over the capture of `run` only, until it has nothing to continue.
+fn abandon_run(parts: &Parts, run: &RunId) -> AbandonReport {
+    let mut report = AbandonReport::default();
+    for _ in 0..16 {
+        report = parts
+            .sources
+            .abandon_captures(
+                &parts.owner,
+                &parts.vault,
+                AbandonScope::Run(run),
+                &mut AbandonCursor::default(),
+            )
+            .unwrap();
+        if report.continuing == 0 {
+            break;
+        }
+    }
+    report
+}
+
+/// Two captures of the same content, both killed before the install, reserve
+/// the same objects. The first abandonment gives back its reservations and
+/// keeps the `object` rows the second still holds; the second removes them.
+/// A claim row of any kind keeps the row too.
+#[test]
+fn an_object_row_goes_only_when_no_member_and_no_claim_is_left() {
+    let parts = Parts::new();
+    let first = killed_at(&parts, "reserved");
+    let second = killed_at(&parts, "reserved");
+    let objects = parts.count("SELECT count(*) FROM object");
+    assert!(objects > 0);
+    assert_eq!(parts.count("SELECT count(*) FROM root"), 2);
+    // Nothing is unlinked while a root of unknown membership exists, so the
+    // second capture's root is already marked abandoned, as it is once its
+    // own pass has begun.
+    parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE root SET kind='abandoned' WHERE id=(SELECT root FROM capture_owner WHERE run_id=?1)",
+            [second.as_str()],
+        )
+        .unwrap();
+    let report = abandon_run(&parts, &first);
+    assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
+    assert_eq!(parts.count("SELECT count(*) FROM object"), objects);
+    assert_eq!(parts.count("SELECT count(*) FROM root"), 1);
+    assert!(parts.count("SELECT count(*) FROM member") > 0);
+    let report = abandon_run(&parts, &second);
+    assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
+    parts.assert_nothing_left(&second);
+    assert_eq!(parts.count("SELECT count(*) FROM object"), 0);
+    assert_eq!(parts.count("SELECT count(*) FROM publication"), 0);
+    // A finished claim of the object keeps its row.
+    let run = killed_at(&parts, "reserved");
+    let key: String = parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT object FROM member ORDER BY object LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO source_delete_claim VALUES(?1,1,'{}',1)",
+            [&key],
+        )
+        .unwrap();
+    abandon_run(&parts, &run);
+    assert_eq!(
+        parts.count(&format!("SELECT count(*) FROM object WHERE id='{key}'")),
+        1
+    );
+}
+
+/// A capture killed after it was registered (its root has its source) does
+/// not hold reservations: a file of it that is no longer its content is kept
+/// and counted as unknown, not removed.
+#[test]
+fn a_registered_capture_keeps_a_file_that_is_not_its_content() {
+    let parts = Parts::new();
+    let run = killed_at(&parts, "bound_in_place");
+    assert_eq!(
+        parts.count("SELECT count(*) FROM root WHERE source IS NULL"),
+        0
+    );
+    let victim = parts
+        .stored_files()
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("/objects/"))
+        .unwrap();
+    plant(&victim, b"not the content of this object");
+    let mut unknown = 0;
+    for _ in 0..4 {
+        let report = abandon_run(&parts, &run);
+        assert_eq!(report.corrupt_held, 0, "{report:?}");
+        unknown += report.unknown;
+    }
+    assert!(unknown > 0);
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"not the content of this object"
+    );
 }
 
 /// A capture whose input keeps changing gives up after its passes. Every
@@ -1728,6 +1848,29 @@ fn a_reservation_is_all_or_nothing_and_only_of_what_the_index_names() {
         .unwrap();
     assert_eq!(members(), before + 1);
     assert!(index.unreserve_capture(done.as_str(), &[]).is_err());
+    // The rows the reservation alone made go with it; the one still reserved
+    // keeps its rows.
+    let rows = |key: &str| {
+        parts.count(&format!(
+            "SELECT (SELECT count(*) FROM object WHERE id='{key}')+(SELECT count(*) FROM publication WHERE object='{key}')"
+        ))
+    };
+    let (two_key, manifest_key) = (format!("b:{two}"), format!("m:{id}"));
+    assert_eq!(rows(&two_key), 0);
+    assert_eq!(rows(&manifest_key), 2);
+    // A claim row of the object, finished or not, keeps them.
+    let reserved = index.reserve_capture(&root, &[object(&two)]).unwrap();
+    assert_eq!(reserved.len(), 1);
+    index
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO source_delete_claim VALUES(?1,1,'{}',1)",
+            [&two_key],
+        )
+        .unwrap();
+    index.unreserve_capture(&root, &[&two_key]).unwrap();
+    assert_eq!(rows(&two_key), 2);
 }
 
 /// "Not there" is said of a reservation only: of a root that never got its

@@ -498,7 +498,17 @@ impl SourceStore {
                         true,
                         unfinished,
                     )? {
-                        Released::Shared(corrupt) => report.corrupt_held += u32::from(corrupt),
+                        Released::Shared(corrupt) => {
+                            if corrupt {
+                                report.corrupt_held += 1;
+                                // One row, for `doctor`, which reads the
+                                // index and not this report.
+                                c.execute(
+                                    "INSERT INTO meta VALUES('corrupt_held','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+                                    [],
+                                )?;
+                            }
+                        }
                         Released::Unproven(error) => {
                             report.unknown += 1;
                             report.errors.push(error);
