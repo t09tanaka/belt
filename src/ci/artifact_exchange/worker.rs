@@ -12,6 +12,18 @@ use sha2::{Digest as _, Sha256};
 use std::sync::Mutex;
 use std::time::Duration;
 
+const SCRATCH_PREFIX: &str = ".belt-xchg.";
+
+/// The working directory of one artifact step in `root`
+/// (`attempts/<attempt>/ci/exchange/`). The one of a step whose supervisor
+/// was killed stays until the attempt's directory goes, which is days for an
+/// attempt that waits for its collection: the start of the next step removes
+/// those whose marker proves the owner gone (spec 25.4 (a)).
+fn scratch_in(root: &Path) -> std::io::Result<crate::platform::owned_temp::OwnedTemp> {
+    crate::platform::owned_temp::sweep(root, SCRATCH_PREFIX);
+    crate::platform::owned_temp::OwnedTemp::new_in(root, SCRATCH_PREFIX)
+}
+
 pub(crate) struct Host {
     pub root: PathBuf,
     pub workflow: Option<String>,
@@ -41,7 +53,7 @@ impl Host {
                 .map(|(_, v)| v.as_str())
                 .filter(|v| !v.trim().is_empty())
         };
-        let scratch = crate::platform::owned_temp::OwnedTemp::new_in(&self.root, ".belt-xchg.")?;
+        let scratch = scratch_in(&self.root)?;
         let area = Area {
             root: scratch.path().join("artifacts"),
             plan_digest: req.area.plan_digest.clone(),
@@ -225,5 +237,27 @@ impl Host {
             fs::remove_file(reply)?;
         }
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::owned_temp::testing::marker_dir;
+
+    /// The scratch of a step whose supervisor was killed goes at the next
+    /// step; the one of a live owner stays.
+    #[test]
+    fn a_step_starts_by_removing_the_scratch_of_a_killed_one() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let dead = marker_dir(root.path(), SCRATCH_PREFIX, true);
+        let live = marker_dir(root.path(), SCRATCH_PREFIX, false);
+        let other = marker_dir(root.path(), "pending.", true);
+        let scratch = scratch_in(root.path()).unwrap();
+        assert!(scratch.outer().starts_with(root.path()));
+        let name = scratch.outer().file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(SCRATCH_PREFIX), "{name}");
+        assert!(!dead.exists(), "the scratch of a killed step is left");
+        assert!(live.exists() && other.exists() && scratch.path().is_dir());
     }
 }
