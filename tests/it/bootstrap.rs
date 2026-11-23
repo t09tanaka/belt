@@ -4003,6 +4003,39 @@ bin="$NODENV_ROOT/versions/$version/bin"
     .unwrap();
     // A different snapshot requests Node22 without changing operator defaults.
     std::fs::write(input.join(".node-version"), "22.0.0\n").unwrap();
+    // What the worker accepted is read while each attempt is held: once the
+    // parent acknowledges a result the worker keeps no copy of it.
+    let view = |attempt: &belt::ids::AttemptId| {
+        let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+        let accepted = worker.get(attempt).unwrap().unwrap();
+        let payload: belt::wire::AttemptPayload = serde_json::from_value(accepted.spec).unwrap();
+        let binding: belt::toolchain::contract::ExecutionBinding = serde_json::from_slice(
+            &std::fs::read(
+                spec.worker_state_dir
+                    .join("attempts")
+                    .join(attempt.as_str())
+                    .join("execution-binding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (payload.toolchains.unwrap(), binding)
+    };
+    let held = |what: &'static str| {
+        let end = std::time::Instant::now() + Duration::from_secs(45);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < end, "{what} never started");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    held("the first attempt");
+    let mut views = Vec::new();
+    {
+        let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+        let attempts = owner.attempts_of_task(&first.task_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        views.push(view(&attempts[0].attempt_id));
+    }
     let second_script = format!("test \"$(node --version)\" = v22.0.0 || exit 94; i=0; while [ ! -f '{}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 95; : > '{}'", ready.display(), ready.display(), release.display());
     start_resident(&spec).await;
     let output = tokio::process::Command::new(&spec.executable)
@@ -4047,9 +4080,28 @@ bin="$NODENV_ROOT/versions/$version/bin"
         panic!("activated setup and command must both see Node20");
     }
     // Retry keeps the original capture and exact evidence even after changing the checkout.
+    std::fs::remove_file(&ready).unwrap();
+    std::fs::remove_file(&release).unwrap();
+    let before = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&first.task_id)
+        .unwrap();
     control::retry(&spec, Target::Run(first.run_id.clone()))
         .await
         .unwrap();
+    held("the retry");
+    {
+        let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+        let retried: Vec<_> = owner
+            .attempts_of_task(&first.task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| !before.iter().any(|b| b.attempt_id == a.attempt_id))
+            .collect();
+        assert_eq!(retried.len(), 1);
+        views.push(view(&retried[0].attempt_id));
+    }
+    std::fs::write(&release, "").unwrap();
     let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let done = tokio::time::timeout(
         Duration::from_secs(45),
@@ -4092,20 +4144,8 @@ bin="$NODENV_ROOT/versions/$version/bin"
     let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
     let mut bundles = Vec::new();
     let mut node20 = None;
-    for attempt in attempts {
-        let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
-        let payload: belt::wire::AttemptPayload = serde_json::from_value(accepted.spec).unwrap();
-        bundles.push(payload.toolchains.unwrap());
-        let binding: belt::toolchain::contract::ExecutionBinding = serde_json::from_slice(
-            &std::fs::read(
-                spec.worker_state_dir
-                    .join("attempts")
-                    .join(attempt.attempt_id.as_str())
-                    .join("execution-binding.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    for (bundle, binding) in views {
+        bundles.push(bundle);
         node20 = std::env::split_paths(&binding.activation.environment["PATH"])
             .next()
             .map(|bin| bin.join("node"));
