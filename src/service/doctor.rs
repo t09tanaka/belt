@@ -143,6 +143,31 @@ pub struct HostFacts {
     /// user service reports it; a helper that predates the check does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linger: Option<Linger>,
+    /// What released import tokens still hold in the worker's source store
+    /// (spec 25.8): `None` when there is no store, it could not be read, or
+    /// the host predates the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_imports: Option<AbandonedImports>,
+}
+
+/// Abandoned token roots, their memberships, and the bytes of the files
+/// only they hold (no paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbandonedImports {
+    pub roots: u64,
+    pub members: u64,
+    pub bytes: u64,
+}
+
+fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
+    // read only, never makes a store
+    let (roots, members, bytes) =
+        crate::source::retention::abandoned_imports_read_only(worker_state).ok()??;
+    Some(AbandonedImports {
+        roots,
+        members,
+        bytes,
+    })
 }
 
 /// Runs one bounded command in a given environment. `None`: it could not be
@@ -401,6 +426,7 @@ pub fn gather(
         docker: docker(env, runner),
         profile: profile(worker_state, env),
         linger: None,
+        abandoned_imports: abandoned_imports(worker_state),
     }
 }
 
@@ -651,6 +677,16 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
     });
     if let Some(linger) = &facts.linger {
         out.push(linger::check(host, linger));
+    }
+    if let Some(a) = facts.abandoned_imports.filter(|a| a.roots > 0) {
+        out.push(check(
+            "abandoned_imports",
+            Level::Notice,
+            format!(
+                "{} released import token(s) still hold {} membership(s), {} byte(s) only they hold; they go once the store's retention gates open",
+                a.roots, a.members, a.bytes
+            ),
+        ));
     }
     out
 }

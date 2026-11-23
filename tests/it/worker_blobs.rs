@@ -254,7 +254,9 @@ exec "{real}" "$@"
         for d in [dir.clone(), dir.join("parts"), dir.join("files")] {
             for e in std::fs::read_dir(d).into_iter().flatten() {
                 let name = e.unwrap().file_name().into_string().unwrap();
-                if !["parts", "files", "reserved"].contains(&name.as_str()) {
+                if !["parts", "files", "reserved", "import-token", "made-refs"]
+                    .contains(&name.as_str())
+                {
                     out.insert(name);
                 }
             }
@@ -3252,4 +3254,473 @@ fn an_old_bundle_file_that_cannot_be_removed_does_not_fail_the_export() {
         assert!(dest.is_file());
     }
     assert!(stuck.is_dir());
+}
+
+// ------------------------------------------- the owner of an import token
+
+/// The rows of the worker's retention index (spec 25.8): import sessions,
+/// pending roots, and the members of `root`.
+fn index_rows(f: &Fx, root: &str) -> (i64, i64, i64) {
+    let c = rusqlite::Connection::open_with_flags(
+        f.state().join("sources/retention.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let n = |sql: &str, p: &str| -> i64 { c.query_row(sql, [p], |r| r.get(0)).unwrap() };
+    (
+        n("SELECT count(*) FROM import_session WHERE ?1=?1", ""),
+        n(
+            "SELECT count(*) FROM root WHERE kind IN ('pending','receipt') AND ?1=?1",
+            "",
+        ),
+        n(
+            "SELECT count(*) FROM member WHERE root=?1 AND object LIKE 'b:%'",
+            root,
+        ),
+    )
+}
+
+fn root_count(f: &Fx) -> i64 {
+    let c = rusqlite::Connection::open_with_flags(
+        f.state().join("sources/retention.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    c.query_row("SELECT count(*) FROM root", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn files_of(m: &CiManifest) -> i64 {
+    m.object_manifest
+        .entries
+        .iter()
+        .map(|e| e.hash.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as i64
+}
+
+#[test]
+fn a_received_source_leaves_no_import_row_and_one_root_holds_it() {
+    let f = fx();
+    let dir = f.path("many");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..100 {
+        std::fs::write(dir.join(format!("f{i}")), format!("file {i}\n")).unwrap();
+    }
+    let p = f.capture(&SourceRequest::Directory { dir });
+    assert_eq!(p.blobs.len(), 100);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let receive = format!("receive:{}", p.root.source_id);
+    // (i) no import session, no pending root; the source's root has it all
+    assert_eq!(index_rows(&f, &receive), (0, 0, 100));
+    assert!(!f.incoming(&p.source).exists());
+    // (ii) the same source again: no new root
+    let roots = root_count(&f);
+    send_all(sink, &l, &p);
+    assert_eq!(root_count(&f), roots);
+    assert_eq!(index_rows(&f, &receive), (0, 0, 100));
+}
+
+#[test]
+fn a_source_with_a_submodule_leaves_no_import_row() {
+    let f = fx();
+    let lib = f.path("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q", "-b", "main"]);
+    std::fs::write(lib.join("lib.txt"), "lib\n").unwrap();
+    git(&lib, &["add", "."]);
+    git(&lib, &["commit", "-qm", "lib"]);
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(
+        &repo,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    git(&repo, &["commit", "-qm", "add submodule"]);
+    std::fs::write(repo.join("vendor/lib/lib.txt"), "edited lib\n").unwrap();
+    let p = f.capture(&SourceRequest::Worktree { dir: repo });
+    assert_eq!(p.manifests.len(), 2);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    // (vi) no import row; every manifest's files are in its own root
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert_eq!(index_rows(&f, "").1, 0);
+    let c = rusqlite::Connection::open_with_flags(
+        f.state().join("sources/retention.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for json in &p.manifests {
+        let man: CiManifest = serde_json::from_slice(json).unwrap();
+        for e in &man.object_manifest.entries {
+            let held: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM member WHERE root=?1 AND object=?2)",
+                    [
+                        format!("receive:{}", man.source_id),
+                        format!("b:{}", e.hash),
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(held, "{} of {}", e.hash, man.source_id);
+        }
+    }
+}
+
+/// Everything of a Git source sent, with the publication failing (Git
+/// cannot be asked, `INTERNAL`) after the files went into the store.
+fn cut_after_the_files(f: &Fx, sink: &dyn BlobSink, l: &BlobLimits, p: &Parcel) {
+    send_but_bundle(sink, l, p);
+    // (the first merge-base is the unpack's, the second the publication's)
+    f.git_fails("merge-base", Some((1, 128)));
+    let e = put_all(sink, l, &p.source, Bundle, p.bundle.as_ref().unwrap()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+    f.git_fails("merge-base", None);
+}
+
+#[test]
+fn a_publication_cut_after_its_files_resumes_with_its_one_token() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let receive = format!("receive:{}", p.root.source_id);
+    let l = limits();
+    let recorded = {
+        let m = f.machine();
+        let sink = m.blobs().unwrap();
+        cut_after_the_files(&f, sink, &l, &p);
+        let token = std::fs::read_to_string(f.incoming(&p.source).join("import-token")).unwrap();
+        // one token, recorded where the source waits, holding the files
+        assert_eq!(
+            index_rows(&f, &format!("import:{token}")),
+            (1, 1, files_of(&p.root))
+        );
+        // cut again: the same token, no second one
+        f.git_fails("merge-base", Some((1, 128)));
+        let e = put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+        f.git_fails("merge-base", None);
+        assert_eq!(index_rows(&f, &format!("import:{token}")).0, 1);
+        token
+    };
+    // (iii) another process: its start keeps the recorded token, and the
+    // publication goes on with it
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    let swept = sink.forget_unowned().unwrap().unwrap();
+    assert_eq!((swept.abandoned, swept.kept), (0, 0));
+    assert_eq!(index_rows(&f, &format!("import:{recorded}")).0, 1);
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert_eq!(index_rows(&f, &receive), (0, 0, files_of(&p.root)));
+    assert!(!f.incoming(&p.source).exists());
+}
+
+#[test]
+fn a_manifest_refused_after_the_files_keeps_its_token_until_the_source_is_done() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_but_bundle(sink, &l, &p);
+    // "no" as the manifest is published, after the files went in: the
+    // bundle goes, the rest waits for another one, with its token
+    f.git_fails("merge-base", Some((1, 1)));
+    let e = put_all(sink, &l, &p.source, Bundle, p.bundle.as_ref().unwrap()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    f.git_fails("merge-base", None);
+    let token = std::fs::read_to_string(f.incoming(&p.source).join("import-token")).unwrap();
+    assert_eq!(index_rows(&f, &format!("import:{token}")).0, 1);
+    put_all(sink, &l, &p.source, Bundle, p.bundle.as_ref().unwrap()).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert_eq!(index_rows(&f, "").1, 0);
+}
+
+#[test]
+fn the_start_removes_tokens_no_staging_directory_records() {
+    let f = fx();
+    let p = f.directory("plain", 41);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    // what the old intake left: a token for every blob
+    let store = f.worker_store();
+    for b in p.blobs.values() {
+        let want = belt::source::diff::BlobWant {
+            hash: hex(b),
+            size: b.len() as u64,
+        };
+        store.ingest_blob(&want, &mut &b[..]).unwrap();
+    }
+    // (rows the old intake made: their roots were `pending`)
+    rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .execute(
+            "UPDATE root SET kind='pending' WHERE id LIKE 'import:%'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(index_rows(&f, "").0, p.blobs.len() as i64);
+    // A record that cannot be read: nothing goes (it may name a token in use).
+    let other = f.directory("other", 42);
+    put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
+    let record = f.incoming(&other.source).join("import-token");
+    std::fs::create_dir(&record).unwrap();
+    assert!(sink.forget_unowned().is_err());
+    assert_eq!(index_rows(&f, "").0, p.blobs.len() as i64);
+    std::fs::remove_dir(&record).unwrap();
+    // (v) the agent's start: they go, and the source stays ready
+    f.start();
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert_eq!(index_rows(&f, "").1, 0);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+}
+
+fn hex(b: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(b))
+}
+
+#[test]
+fn a_source_nobody_added_to_goes_at_the_next_pass_with_its_token() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let fresh = f.directory("fresh", 43);
+    {
+        let m = f.machine();
+        let (sink, l) = (m.blobs().unwrap(), limits());
+        cut_after_the_files(&f, sink, &l, &p);
+        put_all(sink, &l, &fresh.source, Manifest, &fresh.manifests[0]).unwrap();
+    }
+    assert_eq!(index_rows(&f, "").0, 1);
+    std::thread::sleep(Duration::from_millis(1100));
+    // (vii) two of 16 places taken: the agent's pass drops the old one
+    let mut cfg = f.cfg();
+    cfg.blobs.stale_ms = 1000;
+    let agent = Agent::start(cfg, Arc::new(RealButCore(f.machine()))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    // (the start kept the recorded token)
+    assert_eq!(index_rows(&f, "").0, 1);
+    assert!(p.blobs.keys().all(|h| f.worker_store().has_blob(h)));
+    // (a store whose old manifests are all indexed: a file only the token
+    // held may go; a worker's store does not run that indexing yet)
+    rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+    std::fs::write(f.incoming(&fresh.source).join("touch"), "now").unwrap();
+    agent.supervise();
+    assert!(!f.incoming(&p.source).exists());
+    // the token's rows went, and with them what that failed receipt put
+    // into the store
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert!(p.blobs.keys().all(|h| !f.worker_store().has_blob(h)));
+    let claims: i64 = rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM source_delete_claim WHERE done=0)+(SELECT count(*) FROM publication WHERE state='claimed')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(claims, 0);
+    // a source written to within the limit stays
+    assert!(f.incoming(&fresh.source).exists());
+}
+
+#[test]
+fn files_cut_part_way_into_the_store_go_on_with_the_recorded_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let p = f.directory("cut", 44);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let hashes: Vec<&String> = p.blobs.keys().collect();
+    assert!(hashes.len() >= 3);
+    let (first, last) = (hashes[0], hashes[hashes.len() - 1]);
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    for (h, b) in &p.blobs {
+        if h != first {
+            put_all(sink, &l, &p.source, Content, b).unwrap();
+        }
+    }
+    // The files go into the store in the order of their hashes: the last
+    // one cannot be read, after the others went in.
+    let blocked = f.incoming(&p.source).join("files").join(staged_name(
+        Content,
+        last,
+        p.blobs[last].len() as u64,
+        true,
+    ));
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let e = put_all(sink, &l, &p.source, Content, &p.blobs[first]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+    assert_eq!(index_rows(&f, "").0, 1);
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Another process goes on with the token the directory records.
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert_eq!(index_rows(&f, "").1, 0);
+}
+
+#[test]
+fn a_record_left_after_the_publication_keeps_the_index_ref_of_the_source() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    let refs = git(&clones[0], &["for-each-ref"]);
+    let index = format!("refs/local-ci/index/{}", p.root.source_id);
+    assert!(refs.contains(&index), "{refs}");
+    // What a crash between the publication and the removal of the record
+    // leaves: the directory with the refs the bundle made.
+    let dir = f.incoming(&p.source);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("made-refs"),
+        format!(
+            "{}\n{index} - -\n",
+            p.root.repository_id.as_deref().unwrap()
+        ),
+    )
+    .unwrap();
+    // the next request finds the source published and throws the
+    // directory away: the ref of the published source stays
+    let b = p.blobs.values().next().unwrap();
+    assert!(put_all(sink, &l, &p.source, Content, b).unwrap().complete);
+    assert!(!dir.exists());
+    assert_eq!(git(&clones[0], &["for-each-ref"]), refs);
+}
+
+fn stale(l: &BlobLimits) -> BlobLimits {
+    std::thread::sleep(Duration::from_millis(1100));
+    BlobLimits {
+        stale_ms: 1000,
+        ..l.clone()
+    }
+}
+
+#[test]
+fn a_token_that_cannot_be_released_keeps_its_directory_for_the_next_pass() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    cut_after_the_files(&f, sink, &l, &p);
+    let dir = f.incoming(&p.source);
+    assert!(dir.join("import-token").exists());
+    let l = stale(&l);
+    // the store is held exclusively: the token cannot be released
+    let lock = std::fs::File::open(f.state().join("sources/mutation.lock")).unwrap();
+    lock.lock().unwrap();
+    sink.drop_stale(&l);
+    assert!(dir.join("import-token").exists());
+    assert_eq!(index_rows(&f, "").0, 1);
+    assert_eq!(index_rows(&f, "").1, 1);
+    lock.unlock().unwrap();
+    sink.drop_stale(&l);
+    assert!(!dir.exists());
+    // released (a worker's store keeps what only the token held)
+    assert_eq!(index_rows(&f, "").1, 0);
+}
+
+#[test]
+fn the_stale_drop_only_tries_a_busy_clone_and_keeps_the_refs_it_counts_on() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    let clone = f.clones()[0].clone();
+    // a ref another source's bundle made, and its directory
+    let commit = git(
+        &clone,
+        &["for-each-ref", "--count=1", "--format=%(objectname)"],
+    );
+    let other = f.directory("other", 44);
+    let name = &format!("refs/local-ci/snapshots/{}", other.root.source_id);
+    git(&clone, &["update-ref", name, commit.trim()]);
+    put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
+    let dir = f.incoming(&other.source);
+    std::fs::write(
+        dir.join("made-refs"),
+        format!(
+            "{}\n{name} {} {}\n",
+            p.root.repository_id.as_deref().unwrap(),
+            other.root.source_id,
+            commit.trim()
+        ),
+    )
+    .unwrap();
+    let l = stale(&l);
+    // an import into the clone is going on
+    let lock = std::fs::File::open(format!("{}.import.lock", clone.display())).unwrap();
+    lock.lock().unwrap();
+    let start = std::time::Instant::now();
+    sink.drop_stale(&l);
+    assert!(start.elapsed() < Duration::from_millis(l.lock_wait_ms / 2));
+    assert!(dir.exists());
+    assert!(git(&clone, &["for-each-ref"]).contains(name));
+    lock.unlock().unwrap();
+    sink.drop_stale(&l);
+    assert!(!dir.exists());
+    assert!(!git(&clone, &["for-each-ref"]).contains(name));
+}
+
+#[test]
+fn a_record_that_names_no_token_owns_nothing_and_the_source_comes_again() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    cut_after_the_files(&f, sink, &l, &p);
+    // what a power loss can leave of the record
+    let record = f.incoming(&p.source).join("import-token");
+    std::fs::write(&record, "").unwrap();
+    // the start sweeps the token it was
+    assert!(sink.forget_unowned().unwrap().is_some());
+    assert_eq!(index_rows(&f, "").1, 0);
+    // and the source is taken again, with a new token
+    std::fs::write(&record, "garbage").unwrap();
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert!(!f.incoming(&p.source).exists());
+    // a stale directory with such a record goes
+    let other = f.directory("other", 45);
+    put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
+    std::fs::write(f.incoming(&other.source).join("import-token"), "").unwrap();
+    sink.drop_stale(&stale(&l));
+    assert!(!f.incoming(&other.source).exists());
 }
