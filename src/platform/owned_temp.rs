@@ -57,6 +57,12 @@ impl Place {
     }
 }
 
+/// Whether this process cannot read the place it runs in (its machine
+/// identity, PID namespace or boot): then it can prove no owner gone.
+pub(crate) fn own_place_is_unknown() -> bool {
+    Place::here().is_none()
+}
+
 /// One line of a marker: not empty and on one line.
 fn one_line(s: &str) -> Option<&str> {
     (!s.is_empty() && !s.contains(['\n', '\r'])).then_some(s)

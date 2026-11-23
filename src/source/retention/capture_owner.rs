@@ -217,9 +217,13 @@ impl SourceStore {
     /// process owns the capture of `run`. Nothing of the capture may exist
     /// before this returns.
     pub fn own_capture(&self, run: &RunId) -> Result<()> {
-        let owner = OwnerRecord::this_process()
-            .context("this process cannot be recorded as the owner of a capture")?;
-        self.own_capture_as(run, &owner)
+        self.own_capture_with(run, OwnerRecord::this_process())
+    }
+    /// A process that cannot say who it is (`None`) still submits: its row
+    /// names nobody, so the owner is never proven gone and the capture ends
+    /// only through `given_up` (spec 25.4 (b)).
+    pub(crate) fn own_capture_with(&self, run: &RunId, owner: Option<OwnerRecord>) -> Result<()> {
+        self.own_capture_as(run, &owner.unwrap_or_else(OwnerRecord::unknown))
     }
     /// A command that captures the same run again (the capture of a run is
     /// made once and reused) keeps its row. A run that another process owns,

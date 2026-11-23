@@ -959,3 +959,39 @@ async fn an_enqueue_refused_as_busy_is_told_to_run_the_command_again() {
     );
     assert_eq!(rows(&resident, &captured.run).0, 0);
 }
+
+/// A resident that cannot read its own place judges no owner: the cancel of
+/// a capture that was not given up is recorded as for a capture in progress
+/// (not `NOT_FOUND`), whatever its owner's liveness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resident_that_cannot_read_its_place_accepts_the_cancel_of_a_capture() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    resident.captured.retention_test.place_unknown();
+    let mut command = Command::start();
+    let killed = capture(&resident, root.path(), Some(&command.record()));
+    command.kill();
+    let elsewhere = capture(
+        &resident,
+        root.path(),
+        Some(&OwnerRecord::on_another_machine()),
+    );
+    for captured in [&killed, &elsewhere] {
+        let reply = ask(&resident, cancel(&captured.run)).await;
+        assert!(
+            matches!(&reply, Reply::Cancelled { snapshot } if snapshot.cancel_requested),
+            "{reply:?}"
+        );
+        assert_eq!(rows(&resident, &captured.run), (0, 1, 1, 1, 1));
+    }
+    // A capture the owner gave up is still refused.
+    let given_up = capture(&resident, root.path(), Some(&me()));
+    resident
+        .captured
+        .sources
+        .give_up_capture(&given_up.run)
+        .unwrap();
+    let reply = ask(&resident, cancel(&given_up.run)).await;
+    assert!(not_found(&reply), "{reply:?}");
+}

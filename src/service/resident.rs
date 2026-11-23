@@ -1737,8 +1737,19 @@ async fn handle(
                 let (inputs, owned) = (captured.clone(), run.clone());
                 let found = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let guard = inputs.sources.foreground_guard()?;
+                    // A resident that cannot read its own place judges no
+                    // owner: a capture that was not given up counts as in
+                    // progress, and nothing is abandoned by liveness.
+                    #[cfg(test)]
+                    let unknown = inputs.retention_test.is_place_unknown()
+                        || crate::platform::owned_temp::own_place_is_unknown();
+                    #[cfg(not(test))]
+                    let unknown = crate::platform::owned_temp::own_place_is_unknown();
                     Ok(match inputs.sources.capture_owner(&owned)? {
                         None => UnsubmittedCancel::Unknown,
+                        Some(row) if unknown && !row.given_up => {
+                            UnsubmittedCancel::Capturing(guard)
+                        }
                         Some(row) => match row.verdict() {
                             crate::source::retention::CaptureVerdict::InProgress => {
                                 UnsubmittedCancel::Capturing(guard)

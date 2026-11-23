@@ -239,6 +239,7 @@ pub(super) async fn run(
 #[derive(Default)]
 pub(super) struct TestControl {
     cadence_ms: std::sync::atomic::AtomicU64,
+    place_unknown: std::sync::atomic::AtomicBool,
     pauses: std::sync::Mutex<std::collections::HashMap<&'static str, TestPause>>,
 }
 #[cfg(test)]
@@ -270,6 +271,14 @@ impl TestControl {
             let _ = entered.send(());
             let _ = resume.recv().await;
         }
+    }
+    /// Make this resident's own place read as unreadable.
+    pub(super) fn place_unknown(&self) {
+        self.place_unknown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(super) fn is_place_unknown(&self) -> bool {
+        self.place_unknown.load(std::sync::atomic::Ordering::SeqCst)
     }
     pub(super) fn fast(&self) {
         self.cadence_ms

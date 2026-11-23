@@ -53,6 +53,18 @@ impl OwnerRecord {
         })
     }
 
+    /// This process when its place or start cannot be read (Linux without a
+    /// usable `/etc/machine-id`, a macOS host UUID that times out): a record
+    /// of nobody. Its place does not parse, so [`Self::state`] is `Elsewhere`
+    /// for every reader and the owner is never proven gone.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            place: "unknown".to_string(),
+            pid: std::process::id(),
+            start: String::new(),
+        }
+    }
+
     /// This process as it would be recorded on another machine that has the
     /// same host name: only the machine identity differs.
     #[cfg(test)]

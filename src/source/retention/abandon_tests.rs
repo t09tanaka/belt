@@ -1007,3 +1007,31 @@ fn an_index_from_before_the_owner_table_gets_it_and_keeps_its_version() {
         .unwrap();
     assert_eq!(version, 1);
 }
+
+/// A process that cannot read its machine identity still submits: its row
+/// names nobody, so no pass proves the owner gone (the capture is kept and
+/// counted), and `given_up` still ends it.
+#[test]
+fn an_owner_that_cannot_say_who_it_is_still_captures_and_is_never_proven_gone() {
+    let parts = Parts::new();
+    let run = RunId::generate();
+    parts.sources.own_capture_with(&run, None).unwrap();
+    let got = parts.capture_of(&run, &parts.input);
+    bind_in_place(&parts.state, &run, &got, &parts.input);
+    let row = parts.sources.capture_owner(&run).unwrap().unwrap();
+    assert_eq!(row.verdict(), CaptureVerdict::Elsewhere);
+    // The same command captures the same run again: its own row is reused.
+    parts.sources.own_capture_with(&run, None).unwrap();
+    let before = (parts.stored_files(), parts.run_files(&run));
+    for _ in 0..2 {
+        let report = parts.pass();
+        assert_eq!((report.elsewhere, report.finished), (1, 0), "{report:?}");
+    }
+    assert_eq!(before, (parts.stored_files(), parts.run_files(&run)));
+    assert_eq!(parts.count("SELECT count(*) FROM capture_owner"), 1);
+    // Only the owner giving up abandons it.
+    parts.sources.give_up_capture(&run).unwrap();
+    let report = parts.passes();
+    assert_eq!(report.finished, 1, "{report:?}");
+    parts.assert_nothing_left(&run);
+}
