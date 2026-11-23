@@ -465,11 +465,11 @@ fn nothing_goes_by_size_during_a_recount() {
 #[test]
 fn a_blob_shared_with_a_detached_source_counts_as_freed() {
     let mut env = Env::new();
-    let shared = "s".repeat(4000);
+    let shared = "s".repeat(20_000);
     let a = env.source(&[("a", &"a".repeat(4000)), ("s", &shared)], 10);
     let b = env.source(&[("b", &"b".repeat(4000)), ("s", &shared)], 20);
     let c = env.source(&[("c", &"c".repeat(4000))], 30);
-    let cap = env.store_bytes() - 10_000;
+    let cap = env.store_bytes() - 16_000;
     let report = env
         .pass_with(cap, &|_, _| Ok(SourceUse::Ended(None)))
         .unwrap();
