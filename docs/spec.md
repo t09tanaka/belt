@@ -2624,7 +2624,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 
 ### 開発用の道具
 
-`scripts/s26` のDocker受入環境（`target/s26/` の中のbuild cacheと実行ごとのdirectory、Docker image）は製品のstateではない。`down` は実行ごとのcontainer・network・directoryを消す。build cacheとimageは次のbuildが読むので残す。`down --all` で消せるようにする（段階1と一緒に入れる）。
+`scripts/s26` のDocker受入環境（`target/s26/` の中のbuild cacheと実行ごとのdirectory、Docker image）は製品のstateではない。`down` は実行ごとのcontainer・network・directoryを消す。build cacheとimageは次のbuildが読むので残す。`down --all` は、そのうえでportoolの割り当てを返し（`portool release`）、build cache（`linux-cache`・`native`）、作ったLinuxのbinary、`resources` と、今の `S26_ARCH` のworkerのimageを消す。pullしたbase imageと `harness.lock` は残す。
 
 ## 25.11 消す処理の担当と費用
 
