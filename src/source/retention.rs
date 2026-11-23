@@ -8,7 +8,7 @@ pub use capture_owner::{inspect_owners, CaptureOwner, CaptureVerdict};
 #[cfg(test)]
 pub use deletion::set_prune_fault;
 pub use deletion::{
-    AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, PruneBudget, PruneInputs,
+    AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, Gate, PruneBudget, PruneInputs,
 };
 pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;

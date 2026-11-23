@@ -12,6 +12,58 @@ pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
 
+/// The gate that holds every deletion of an object of the source store
+/// (spec 25.5, step 4): nothing is unlinked while an unindexed manifest, a
+/// root of unknown membership or an unfinished graph could need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Gate {
+    /// The registration of the manifests from before the index is not done.
+    LegacyRegistration,
+    /// A capture is in progress (a root of unknown membership).
+    Capture,
+    /// A graph of a root is unfinished.
+    Graph,
+}
+
+impl Gate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gate::LegacyRegistration => "legacy_registration",
+            Gate::Capture => "capture",
+            Gate::Graph => "graph",
+        }
+    }
+
+    /// The first gate that is closed in the index `c`, if any.
+    pub fn closed(c: &Connection) -> Result<Option<Gate>> {
+        let (legacy, capture, graph): (bool, bool, bool) = c.query_row(
+            "SELECT coalesce((SELECT value FROM meta WHERE key='legacy_registration')<>'done',0), EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned'), EXISTS(SELECT 1 FROM graph WHERE done=0)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(if legacy {
+            Some(Gate::LegacyRegistration)
+        } else if capture {
+            Some(Gate::Capture)
+        } else if graph {
+            Some(Gate::Graph)
+        } else {
+            None
+        })
+    }
+
+    /// [`Self::closed`] for the source index below `state_dir`, opened read
+    /// only (`doctor`). `None` when there is no index.
+    pub fn closed_read_only(state_dir: &std::path::Path) -> Result<Option<Gate>> {
+        let path = state_dir.join("sources/retention.db");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::closed(&c)
+    }
+}
+
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;
 const BYTE_BUDGET: u64 = 64 * 1024 * 1024;

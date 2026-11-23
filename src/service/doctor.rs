@@ -1091,20 +1091,32 @@ pub fn pruning_checks(spec: &Spec) -> Vec<Check> {
     let Ok(store) = super::bootstrap::read_only_store(spec) else {
         return Vec::new();
     };
-    pruning_report(store.marked_run_count().ok())
+    let gate = crate::source::retention::Gate::closed_read_only(&spec.state_dir)
+        .ok()
+        .flatten();
+    pruning_report(store.marked_run_count().ok(), gate)
         .map(|(level, detail)| vec![check(level, detail)])
         .unwrap_or_default()
 }
 
 /// What [`pruning_checks`] says for a count of marked runs (`None`: the
 /// count could not be read). Nothing for no run.
-fn pruning_report(runs: Option<u64>) -> Option<(Level, String)> {
+/// `gate` is the gate of the source store that holds the deletion of their
+/// inputs, if one does.
+fn pruning_report(
+    runs: Option<u64>,
+    gate: Option<crate::source::retention::Gate>,
+) -> Option<(Level, String)> {
     match runs {
         Some(0) => None,
         Some(runs) => Some((
             Level::Notice,
             format!(
-                "{runs} run(s) past their retention are being deleted; they are no longer shown, and what is left of them (kept while a reader holds it or while it cannot be proven to be belt's) is tried again every minute"
+                "{runs} run(s) past their retention are being deleted; they are no longer shown, and what is left of them (kept while a reader holds it or while it cannot be proven to be belt's) is tried again every minute{}",
+                match gate {
+                    Some(gate) => format!("; their inputs wait for the source store (gate={})", gate.as_str()),
+                    None => String::new(),
+                }
             ),
         )),
         None => Some((

@@ -32,6 +32,8 @@ pub struct PruneInputs {
     /// What could not be proven or deleted: kept, and counted.
     pub unknown: u32,
     pub errors: Vec<String>,
+    /// The gate that held step 4, if one did.
+    pub gate: Option<super::Gate>,
 }
 
 /// The input bound of one pass of the pruning (spec 25.5): 32 object and
@@ -205,6 +207,7 @@ impl SourceStore {
             paths: report.paths,
             unknown: report.unknown,
             errors: report.errors,
+            gate: report.gate,
             ..Default::default()
         };
         if !gone {

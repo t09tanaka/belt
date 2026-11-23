@@ -2095,12 +2095,17 @@ fn removed_members_warn_without_registration_and_remain_after_failed_probe() {
 /// as it is and counted; no such run is no line at all.
 #[test]
 fn runs_whose_pruning_is_not_finished_are_counted() {
-    assert_eq!(pruning_report(Some(0)), None);
-    let (level, detail) = pruning_report(Some(3)).unwrap();
+    use crate::source::retention::Gate;
+    assert_eq!(pruning_report(Some(0), Some(Gate::Capture)), None);
+    let (level, detail) = pruning_report(Some(3), None).unwrap();
     assert_eq!(level, Level::Notice);
     assert!(
         detail.starts_with("3 run(s) past their retention"),
         "{detail}"
     );
-    assert_eq!(pruning_report(None).unwrap().0, Level::NotChecked);
+    assert!(!detail.contains("gate="), "{detail}");
+    // The gate of the source store that holds their inputs is named.
+    let (_, detail) = pruning_report(Some(3), Some(Gate::LegacyRegistration)).unwrap();
+    assert!(detail.ends_with("(gate=legacy_registration)"), "{detail}");
+    assert_eq!(pruning_report(None, None).unwrap().0, Level::NotChecked);
 }

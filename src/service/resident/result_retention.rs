@@ -19,11 +19,21 @@ fn entries_held(failures: u64, entries: u32) -> String {
 }
 
 /// The line logged when a pass of the pruning kept something: counts only.
-fn pruning_held(report: &run_pruning::PruneReport) -> String {
-    format!(
+/// With the gates that held runs at step 4, by name.
+pub(super) fn pruning_held(report: &run_pruning::PruneReport) -> String {
+    let mut line = format!(
         "run pruning held (validation/I/O); kept={}; continuing={}",
         report.unknown, report.continuing
-    )
+    );
+    if !report.gates.is_empty() {
+        let gates: Vec<String> = report
+            .gates
+            .iter()
+            .map(|(gate, runs)| format!("{}:{runs}", gate.as_str()))
+            .collect();
+        line.push_str(&format!("; gate={}", gates.join(",")));
+    }
+    line
 }
 
 /// `inputs` is the parent's source store and Vault: with them every tick
@@ -84,7 +94,9 @@ pub(super) async fn run(
         .await?;
         (cursor, pruning) = next;
         match pruned {
-            Some(Ok(report)) if report.unknown > 0 => eprintln!("{}", pruning_held(&report)),
+            Some(Ok(report)) if report.unknown > 0 || !report.gates.is_empty() => {
+                eprintln!("{}", pruning_held(&report))
+            }
             // Never the error itself: it can name a private path.
             Some(Err(_)) => eprintln!("{}", held(&mut failures)),
             _ => {}

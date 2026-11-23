@@ -795,6 +795,21 @@ fn the_rows_wait_until_the_inputs_are_gone() {
     for _ in 0..3 {
         let report = f.pass().unwrap();
         assert_eq!((report.finished, report.continuing), (0, 1));
+        // The hold is named, for the log line and `doctor`.
+        assert_eq!(
+            report.gates,
+            BTreeMap::from([(Gate::LegacyRegistration, 1)])
+        );
+        assert!(
+            super::super::result_retention::pruning_held(&report)
+                .ends_with("; gate=legacy_registration:1"),
+            "{}",
+            super::super::result_retention::pruning_held(&report)
+        );
+        assert_eq!(
+            Gate::closed_read_only(&f.state).unwrap(),
+            Some(Gate::LegacyRegistration)
+        );
     }
     assert!(f.db().has_run(&made.run).unwrap());
     assert!(!f.db().mentions_for_test(&made.ids()[1..]).is_empty());

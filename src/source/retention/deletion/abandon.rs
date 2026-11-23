@@ -52,6 +52,8 @@ pub struct AbandonReport {
     pub paths: u32,
     pub unknown: u32,
     pub errors: Vec<String>,
+    /// The gate that held the deletion of the objects, if one did.
+    pub gate: Option<super::Gate>,
 }
 
 /// Where the last pass stopped inside one root, so that members that cannot
@@ -409,12 +411,8 @@ impl SourceStore {
             // The gates of every other deletion of an object: nothing is
             // unlinked while an unindexed manifest, a root of unknown
             // membership or an unfinished graph could need it.
-            let held: bool = c.query_row(
-                "SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",
-                [],
-                |r| r.get(0),
-            )?;
-            if held {
+            if let Some(gate) = super::Gate::closed(c)? {
+                report.gate = Some(gate);
                 return Ok(false);
             }
             // A claim of this deletion that a crash left is finished first.

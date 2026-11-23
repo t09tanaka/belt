@@ -21,7 +21,7 @@ use super::*;
 use crate::results::retention::Cursor;
 use crate::results::store::{StoreError, LOCATOR_PREFIX};
 use crate::secrets::vault::Vault;
-use crate::source::retention::{AbandonCursor, PruneBudget};
+use crate::source::retention::{AbandonCursor, Gate, PruneBudget};
 use crate::source::SourceStore;
 use crate::storage::{RowsState, StorageError, ROWS_PER_TRANSACTION};
 
@@ -71,6 +71,8 @@ pub(super) struct PruneReport {
     /// Steps that failed, and files that could not be proven or deleted:
     /// kept, and tried again.
     pub unknown: u32,
+    /// Runs held at step 4, by the gate that held them.
+    pub gates: std::collections::BTreeMap<Gate, u32>,
     pub events: u32,
     pub timings: u32,
 }
@@ -231,6 +233,9 @@ fn prune(
     // 4 and 5. The inputs, then the files and index rows named by the run.
     let inputs = sources.prune_run_inputs(owner, run, &mut state.roots, &mut budget.inputs)?;
     report.unknown += inputs.unknown;
+    if let Some(gate) = inputs.gate {
+        *report.gates.entry(gate).or_default() += 1;
+    }
     if !inputs.done {
         return Ok(false);
     }
