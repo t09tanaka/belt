@@ -12,6 +12,20 @@ use super::WorkerStore;
 /// The marker that the roots found on disk at the first start with these
 /// tables have their rows (written in the same transaction as the rows).
 const SEEDED: &str = "toolchain_roots_seeded";
+/// Why the passes have removed nothing, and since when (`<reason> <ms>`),
+/// for `doctor`. Not there while a pass can remove.
+const HELD: &str = "toolchain_roots_held";
+/// How many removals failed in a way the next pass does not cure by waiting
+/// (the root went back to `live`), for `doctor`.
+const EVICT_FAILURES: &str = "toolchain_evict_failures";
+
+/// What `doctor` says of the passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootsStatus {
+    /// The reason the passes stop, and since when.
+    pub held: Option<(String, u64)>,
+    pub evict_failures: u64,
+}
 
 /// What a bind found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +42,9 @@ pub struct RootRow {
     pub evicting: bool,
     pub last_used_ms: u64,
     pub bytes: Option<u64>,
+    /// When the bytes were last measured or tried (a failure stamps it too,
+    /// so one unmeasurable root does not keep the others unmeasured).
+    pub measured_ms: Option<u64>,
 }
 
 impl WorkerStore {
@@ -174,22 +191,37 @@ impl WorkerStore {
         })
     }
 
-    /// References of a builder or a template to the roots it was made with.
+    /// References of a builder or a template to the roots it was made with,
+    /// in one transaction with the check that each is `live`: `false` (and
+    /// no reference) when one has no row or is being removed.
     pub fn toolchain_add_refs(
         &self,
         identities: Vec<String>,
         kind: &'static str,
         holder: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let holder = holder.to_string();
         self.db.write(move |tx| {
+            for identity in &identities {
+                let live = tx
+                    .query_row(
+                        "SELECT state = 'live' FROM toolchain_root WHERE identity = ?1",
+                        [identity],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !live {
+                    return Ok(false);
+                }
+            }
             for identity in &identities {
                 tx.execute(
                     "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder) VALUES (?1, ?2, ?3)",
                     params![identity, kind, holder],
                 )?;
             }
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -227,7 +259,7 @@ impl WorkerStore {
     pub fn toolchain_roots(&self) -> Result<Vec<RootRow>> {
         self.db.call(|c| {
             let mut stmt = c.prepare(
-                "SELECT identity, state = 'evicting', last_used_ms, bytes FROM toolchain_root ORDER BY last_used_ms, identity",
+                "SELECT identity, state = 'evicting', last_used_ms, bytes, measured_ms FROM toolchain_root ORDER BY last_used_ms, identity",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(RootRow {
@@ -235,6 +267,7 @@ impl WorkerStore {
                     evicting: r.get(1)?,
                     last_used_ms: r.get::<_, i64>(2)? as u64,
                     bytes: r.get::<_, Option<i64>>(3)?.map(|b| b as u64),
+                    measured_ms: r.get::<_, Option<i64>>(4)?.map(|b| b as u64),
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -283,14 +316,98 @@ impl WorkerStore {
         })
     }
 
-    pub fn toolchain_set_bytes(&self, identity: &str, bytes: u64) -> Result<()> {
+    /// The bytes of a root, measured at `now_ms`; `None` when measuring
+    /// failed (the time is still stamped).
+    pub fn toolchain_set_bytes(
+        &self,
+        identity: &str,
+        bytes: Option<u64>,
+        now_ms: u64,
+    ) -> Result<()> {
         let identity = identity.to_string();
         self.db.write(move |tx| {
             tx.execute(
-                "UPDATE toolchain_root SET bytes = ?2 WHERE identity = ?1",
-                params![identity, bytes as i64],
+                "UPDATE toolchain_root SET bytes = ?2, measured_ms = ?3 WHERE identity = ?1",
+                params![identity, bytes.map(|b| b as i64), now_ms as i64],
             )?;
             Ok(())
+        })
+    }
+
+    /// A claimed removal that failed in a way waiting does not cure: the root
+    /// is `live` again, counted as used now (so it is not picked again at
+    /// once), and the failure is counted.
+    pub fn toolchain_unclaim(&self, identity: &str, now_ms: u64) -> Result<()> {
+        let identity = identity.to_string();
+        self.db.write(move |tx| {
+            let n = tx.execute(
+                "UPDATE toolchain_root SET state = 'live', last_used_ms = max(last_used_ms, ?2)
+                 WHERE identity = ?1 AND state = 'evicting'",
+                params![identity, now_ms as i64],
+            )?;
+            if n == 1 {
+                tx.execute(
+                    "INSERT INTO schema_meta (key, value) VALUES (?1, '1')
+                     ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                    [EVICT_FAILURES],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Record why the pass stopped (`None`: it did not). The time is kept
+    /// while the reason stays the same.
+    pub fn toolchain_set_held(&self, reason: Option<&'static str>, now_ms: u64) -> Result<()> {
+        self.db.write(move |tx| {
+            let old: Option<String> = tx
+                .query_row("SELECT value FROM schema_meta WHERE key = ?1", [HELD], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            match reason {
+                None if old.is_some() => {
+                    tx.execute("DELETE FROM schema_meta WHERE key = ?1", [HELD])?;
+                }
+                None => {}
+                Some(reason) => {
+                    let same = old
+                        .as_deref()
+                        .and_then(|v| v.split_once(' '))
+                        .is_some_and(|(r, _)| r == reason);
+                    if !same {
+                        tx.execute(
+                            "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
+                             ON CONFLICT (key) DO UPDATE SET value = ?2",
+                            params![HELD, format!("{reason} {now_ms}")],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// What the passes recorded, for `doctor`.
+    pub fn toolchain_status(&self) -> Result<RootsStatus> {
+        self.db.call(|c| {
+            let get = |key: &str| -> rusqlite::Result<Option<String>> {
+                c.query_row("SELECT value FROM schema_meta WHERE key = ?1", [key], |r| {
+                    r.get(0)
+                })
+                .optional()
+            };
+            let held = get(HELD)?.and_then(|v| {
+                let (reason, since) = v.split_once(' ')?;
+                Some((reason.to_string(), since.parse().ok()?))
+            });
+            let evict_failures = get(EVICT_FAILURES)?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Ok(RootsStatus {
+                held,
+                evict_failures,
+            })
         })
     }
 }

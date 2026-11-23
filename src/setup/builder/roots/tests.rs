@@ -167,7 +167,7 @@ fn a_referenced_root_stays_for_each_kind_of_holder() {
     // A builder: while its directory is there.
     let builder = BuilderId::generate();
     private_dir(&s.cfg.builders().join(builder.as_str())).unwrap();
-    s.add_root_refs(vec![A.into()], "builder", builder.as_str());
+    assert!(s.add_root_refs(vec![A.into()], "builder", builder.as_str()));
     check("builder");
     std::fs::remove_dir(s.cfg.builders().join(builder.as_str())).unwrap();
     // A warm-up: until it is released.
@@ -182,7 +182,7 @@ fn a_referenced_root_stays_for_each_kind_of_holder() {
     let template = s.store.root_for_test().join("tpl");
     private_dir(&template).unwrap();
     std::fs::write(template.join("receipt.json"), b"{}").unwrap();
-    s.add_root_refs(vec![A.into()], "template", "tpl");
+    assert!(s.add_root_refs(vec![A.into()], "template", "tpl"));
     check("template");
     std::fs::remove_file(template.join("receipt.json")).unwrap();
     f.used(A, old);
@@ -208,7 +208,7 @@ fn a_removal_cut_short_is_finished_at_the_next_start() {
     let s = f.open();
     assert!(!root.exists());
     assert!(f.rows().is_empty());
-    assert!(!s.bind_root(&AttemptId::generate(), &plan_of(&s, A)));
+    assert_eq!(s.bind_root(&AttemptId::generate(), &plan_of(&s, A)), RootBind::Absent);
 }
 
 /// Spec 25.7 (b) acceptance (iv) and (vi): a builder directory with no
@@ -269,8 +269,8 @@ fn fourteen_days_and_twenty_gib() {
     // Measured: small, nothing goes.
     assert!(s.roots_pass(now).removed.is_empty());
     let db = s.db().unwrap();
-    db.toolchain_set_bytes(A, 11 << 30).unwrap();
-    db.toolchain_set_bytes(B, 10 << 30).unwrap();
+    db.toolchain_set_bytes(A, Some(11 << 30), now).unwrap();
+    db.toolchain_set_bytes(B, Some(10 << 30), now).unwrap();
     assert_eq!(s.roots_pass(now).removed, vec![A.to_string()]);
     assert_eq!(f.rows(), vec![B.to_string()]);
     assert!(s.roots_pass(now).removed.is_empty(), "10 GiB is within");

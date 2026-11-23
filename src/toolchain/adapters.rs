@@ -1208,6 +1208,18 @@ pub fn evict_root(toolchains: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether an installer holds the `install.lock` of the root `name` now
+/// (a root without one is not being installed into).
+pub fn root_install_busy(toolchains: &Path, name: &str) -> bool {
+    let Ok(dir) = open_dir_at(CWD, toolchains) else {
+        return false;
+    };
+    let Ok(root) = open_dir_at(&dir, name) else {
+        return false;
+    };
+    existing_lock(&root).is_some_and(|lock| lock.try_lock().is_err())
+}
+
 /// The bytes of the files below `root`, not following links and not
 /// entering another device. For the size limit of the roots.
 pub fn root_bytes(root: &Path) -> std::io::Result<u64> {

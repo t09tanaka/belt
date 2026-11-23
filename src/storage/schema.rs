@@ -296,7 +296,8 @@ CREATE TABLE toolchain_root (
     identity     TEXT PRIMARY KEY,
     state        TEXT NOT NULL CHECK (state IN ('live', 'evicting')),
     last_used_ms INTEGER NOT NULL,
-    bytes        INTEGER
+    bytes        INTEGER,
+    measured_ms  INTEGER
 ) WITHOUT ROWID;
 CREATE TABLE toolchain_ref (
     identity       TEXT NOT NULL,

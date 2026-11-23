@@ -10,8 +10,11 @@
 //! too: nothing is removed on a guess. The commands that place a version
 //! (`init`, `worker-service install` and `upgrade`) hold `init.lock` or
 //! `worker-service.lock` from before the directory is made until a journal
-//! names it; the pass takes both without waiting, and a directory younger
-//! than [`GRACE`] is kept besides (a first `init`, before `init.lock` exists).
+//! names it; the pass takes both without waiting. `init` creates
+//! `init.lock` and takes it before it places a version, but a pass that
+//! found no `init.lock` (and does not create one: a host where `init` never
+//! ran keeps none) cannot keep a first `init` from creating it after the
+//! look; so a directory younger than [`GRACE`] is kept besides.
 //!
 //! A `tool-bin/<id>/` goes with its version: when each of its links points
 //! at `<config>/bin/<digest>/belt` and that directory is gone. Anything else
@@ -115,6 +118,11 @@ fn pass(
     switch_held: bool,
     now: SystemTime,
 ) -> Result<Outcome, Held> {
+    // Nothing to remove: the service manager is not asked (every start of
+    // the resident and the worker comes here).
+    if !anything_to_remove(places) {
+        return Ok(Outcome::default());
+    }
     if on_trial(places)? {
         return Err(Held::Trial);
     }
@@ -162,6 +170,25 @@ fn pass(
     }
     outcome.tool_bins = sweep_tool_bins(places);
     Ok(outcome)
+}
+
+/// Whether there is a version directory that no link of `bin/` points at, or
+/// a tool link directory. Read errors count as something (the pass decides).
+fn anything_to_remove(places: &Places) -> bool {
+    let bin = places.bin();
+    let linked: Vec<String> = ["current", "resident"]
+        .iter()
+        .filter_map(|l| fs::read_link(bin.join(l)).ok())
+        .map(|t| t.to_string_lossy().into_owned())
+        .collect();
+    let versions = match entries(&bin) {
+        Ok(names) => names
+            .iter()
+            .any(|n| is_digest(n) && !linked.iter().any(|l| l.contains(n.as_str()))),
+        Err(_) => true,
+    };
+    versions
+        || entries(&places.worker_state.join("tool-bin")).map_or(true, |names| !names.is_empty())
 }
 
 fn euid() -> u32 {
@@ -256,13 +283,18 @@ struct Named {
 
 impl Named {
     fn read(places: &Places) -> Result<Self, Held> {
+        Self::read_why(places).map_err(|_| Held::Unreadable)
+    }
+
+    /// The same, saying what could not be read (for `doctor`; no paths).
+    fn read_why(places: &Places) -> Result<Self, &'static str> {
         let bin = places.bin();
         let mut links = Vec::new();
         for link in ["current", "resident"] {
             match fs::read_link(bin.join(link)) {
                 Ok(target) => links.push(target.to_string_lossy().into_owned()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => return Err(Held::Unreadable),
+                Err(_) => return Err("the link bin/current or bin/resident cannot be read"),
             }
         }
         if let Ok(exe) = std::env::current_exe() {
@@ -278,19 +310,23 @@ impl Named {
         let mut states = vec![places.worker_state.clone()];
         states.extend(places.parent_state.clone());
         for state in &states {
-            for name in entries(state)? {
+            for name in entries(state).map_err(|_| "a state directory cannot be listed")? {
                 if name.starts_with("upgrade-trial") {
                     journals.push(state.join(name));
                 }
             }
         }
         for dir in &places.services {
-            for name in entries(dir)? {
+            for name in
+                entries(dir).map_err(|_| "the directory of the service definitions cannot be listed")?
+            {
                 journals.push(dir.join(name));
             }
         }
         for path in journals {
-            if let Some(text) = read_text(&path)? {
+            if let Some(text) = read_text(&path).map_err(|_| {
+                "a journal or service definition cannot be read (or is larger than 1 MiB)"
+            })? {
                 texts.push(text);
             }
         }
@@ -317,8 +353,8 @@ fn read_text(path: &Path) -> Result<Option<String>, Held> {
         return Ok(None);
     }
     if meta.len() > TEXT_LIMIT {
-        // Too large to be belt's: it names nothing of belt's.
-        return Ok(None);
+        // Too large to read whole: what it names is not known.
+        return Err(Held::Unreadable);
     }
     match fs::read(path) {
         Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
@@ -395,6 +431,39 @@ pub(crate) fn sweep_at_start(env: &BTreeMap<String, String>) {
         false,
         SystemTime::now(),
     );
+}
+
+/// Spec 25.7 (a): a copy a command placed for a version and then refused at
+/// the version check goes at once (when it made the directory: `created`),
+/// unless a link of `bin/` points at it.
+pub(crate) fn remove_refused(config: &Path, digest: &str, created: bool) {
+    if !created || !is_digest(digest) {
+        return;
+    }
+    let bin = config.join("bin");
+    let linked = ["current", "resident"].iter().any(|l| {
+        fs::read_link(bin.join(l)).map_or(true, |t| t.to_string_lossy().contains(digest))
+    });
+    let dir = bin.join(digest);
+    let ours = fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && m.uid() == euid());
+    if !linked && ours {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// For `doctor`: what keeps every pass from removing anything for as long as
+/// it stays (a journal or definition that cannot be read, `init.json` that
+/// does not say where the guard is). `None` when the places can be read.
+pub(crate) fn unreadable_reason(env: &BTreeMap<String, String>) -> Option<&'static str> {
+    let launcher = super::worker_service::HostLauncher::native();
+    let places = Places::of(env, super::macos::Launcher::backend(&launcher)).ok()?;
+    if !places.config.join("init.json").is_file() && !places.config.is_dir() {
+        return None;
+    }
+    if !super::init::upgrade::guard_definition_known(&places.config) {
+        return Some("the resident's journal does not say where the upgrade guard's definition is");
+    }
+    Named::read_why(&places).err()
 }
 
 /// How many version directories other than the ones `bin/current` and

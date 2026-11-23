@@ -49,7 +49,7 @@ pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPag
 pub use coordinator::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use db::Db;
 pub use lock::ProcessLock;
-pub use toolchain_roots::{Bind, RootRow};
+pub use toolchain_roots::{Bind, RootRow, RootsStatus};
 pub(crate) use worker::MembershipImage;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,

@@ -16,7 +16,10 @@
 //! [`ROOT_MAX_BYTES`], the least recently used. It claims the removal in one
 //! transaction with the check (`evicting`), then renames the root into the
 //! trash and removes it, and forgets the row; a claim left by a crash is
-//! finished by the next pass.
+//! finished by the next pass. A removal that fails in a way waiting does
+//! not cure (another device, an unsafe directory, a rename refused) puts the
+//! root back to `live`, counted as used now, and is counted for `doctor`;
+//! only a busy `install.lock` keeps the claim for the next pass.
 
 use super::*;
 
@@ -29,6 +32,19 @@ pub(crate) const ROOT_MAX_BYTES: u64 = 20 << 30;
 const PASS_EVERY_MS: u64 = 60_000;
 /// How long a tool builder waits for a removal of its root to finish.
 const EVICTION_WAIT_MS: u64 = 60_000;
+
+/// A pass that stops this long for the same reason is told by `doctor`.
+pub(crate) const HELD_NOTICE_MS: u64 = 3600 * 1000;
+
+/// What a bind found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootBind {
+    Bound,
+    /// No `live` row: the root is treated as not there.
+    Absent,
+    /// The worker DB cannot be opened now: nothing is used (asked again).
+    NoDatabase,
+}
 
 /// What a pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,7 +64,14 @@ fn roots_in(environment: &BTreeMap<String, String>, toolchains: &Path) -> Vec<St
     let mut found = BTreeSet::new();
     for value in environment.values() {
         for entry in std::env::split_paths(std::ffi::OsStr::new(value)) {
-            let Ok(rest) = entry.strip_prefix(toolchains) else {
+            // Both sides canonical: a link in the state directory's path
+            // (macOS `/var`) is not a different place.
+            let canonical = std::fs::canonicalize(&entry).ok();
+            let Some(rest) = entry
+                .strip_prefix(toolchains)
+                .ok()
+                .or_else(|| canonical.as_deref()?.strip_prefix(toolchains).ok())
+            else {
                 continue;
             };
             if let Some(name) = rest.components().next() {
@@ -67,25 +90,31 @@ fn is_identity(name: &str) -> bool {
 }
 
 impl Setups {
+    /// The toolchain directory, canonical (as the bindings' paths are, which
+    /// come from `private_tool_root`).
     pub(super) fn toolchains(&self) -> PathBuf {
-        self.cfg.state_dir.join("toolchains")
+        std::fs::canonicalize(&self.cfg.state_dir)
+            .unwrap_or_else(|_| self.cfg.state_dir.clone())
+            .join("toolchains")
     }
 
-    /// At the open of the setup area, under `agent.lock`: give the roots
-    /// installed before these tables a row (once), let go of the warm-ups of
-    /// an earlier start (they lived in that agent's memory), and run a pass
-    /// (which finishes a claimed removal).
-    /// The worker DB, opened (and the roots from before given rows, the
-    /// warm-ups of an earlier start let go) at the first use: the agent's
-    /// first tick or the first bind, whichever comes first.
+    /// The worker DB, opened at the first use (the agent's first tick or the
+    /// first bind, whichever comes first): the roots installed before these
+    /// tables get a row (once), and the warm-ups of an earlier start are let
+    /// go. A failed open is not kept: the next use tries again, and until
+    /// then nothing binds, installs or removes.
     pub(super) fn db(&self) -> Option<&WorkerStore> {
-        self.roots
-            .get_or_init(|| {
-                let db = WorkerStore::open(&self.cfg.state_dir, &self.cfg.worker_id).ok()?;
-                self.open_roots(&db);
-                Some(db)
-            })
-            .as_ref()
+        if let Some(db) = self.roots.get() {
+            return Some(db);
+        }
+        let _opening = lock(&self.roots_opening);
+        if let Some(db) = self.roots.get() {
+            return Some(db);
+        }
+        let db = WorkerStore::open(&self.cfg.state_dir, &self.cfg.worker_id).ok()?;
+        self.open_roots(&db);
+        let _ = self.roots.set(db);
+        self.roots.get()
     }
 
     fn open_roots(&self, db: &WorkerStore) {
@@ -110,26 +139,51 @@ impl Setups {
     }
 
     /// The bind of `consumer` to the root of `plan`, before its receipt is
-    /// read. Without the worker DB nothing can remove a root either, and the
-    /// root is used as before.
-    pub(super) fn bind_root(&self, consumer: &AttemptId, root: &Path) -> bool {
+    /// read.
+    pub(super) fn bind_root(&self, consumer: &AttemptId, root: &Path) -> RootBind {
         let Some(db) = self.db() else {
-            return true;
+            return RootBind::NoDatabase;
         };
         let Some(identity) = root.file_name().and_then(|n| n.to_str()) else {
-            return false;
+            return RootBind::Absent;
         };
-        matches!(
-            db.toolchain_bind(identity, consumer.as_str(), platform::wall_ms()),
-            Ok(crate::storage::Bind::Bound)
-        )
+        match db.toolchain_bind(identity, consumer.as_str(), platform::wall_ms()) {
+            Ok(crate::storage::Bind::Bound) => RootBind::Bound,
+            Ok(crate::storage::Bind::Absent) => RootBind::Absent,
+            Err(_) => RootBind::NoDatabase,
+        }
+    }
+
+    /// The consumers waiting for the tool builder `id` are bound to the root
+    /// it installed before the builder's own reference goes: no pass can
+    /// take the root between the install and their next poll. Under
+    /// `inner`, so a consumer released at the same time either is not bound
+    /// here or has its reference let go by its release afterwards.
+    pub(super) fn hand_off_root(&self, id: &BuilderId, root: &Path) {
+        let (Some(db), Some(identity)) = (self.db(), root.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+        let inner = lock(&self.inner);
+        let Some(flight) = inner.flights.get(id) else {
+            return;
+        };
+        let now = platform::wall_ms();
+        for consumer in &flight.refs {
+            if !inner.consumers.contains_key(consumer) {
+                continue;
+            }
+            if let Some((attempt, _)) = consumer.rsplit_once("/tool:") {
+                let _ = db.toolchain_bind(identity, attempt, now);
+            }
+        }
     }
 
     /// A tool builder references the root it installs into before its helper
     /// starts; while the root is being removed it waits (bounded).
     pub(super) fn hold_root_for_install(&self, id: &BuilderId, root: &Path) -> Result<(), String> {
         let Some(db) = self.db() else {
-            return Ok(());
+            return Err("the worker database cannot be opened".into());
         };
         let identity = root
             .file_name()
@@ -157,12 +211,23 @@ impl Setups {
         }
     }
 
-    pub(super) fn add_root_refs(&self, identities: Vec<String>, kind: &'static str, holder: &str) {
-        if let Some(db) = self.db() {
-            if !identities.is_empty() {
-                let _ = db.toolchain_add_refs(identities, kind, holder);
-            }
+    /// References of a builder or template to the roots it is made with,
+    /// each of which must be `live` (one transaction). `false`: a root is
+    /// being removed or the database cannot be written; the build fails.
+    pub(super) fn add_root_refs(
+        &self,
+        identities: Vec<String>,
+        kind: &'static str,
+        holder: &str,
+    ) -> bool {
+        if identities.is_empty() {
+            return true;
         }
+        let Some(db) = self.db() else {
+            return false;
+        };
+        db.toolchain_add_refs(identities, kind, holder)
+            .unwrap_or(false)
     }
 
     /// The builder's directory is gone (so is everything it started): its
@@ -207,11 +272,20 @@ impl Setups {
     /// One pass (see the module): release what is provably over, then
     /// remove at most one root.
     pub(crate) fn roots_pass(&self, now_ms: u64) -> RootPass {
-        let mut pass = RootPass::default();
         let Some(db) = self.db() else {
-            pass.held = Some("no_database");
-            return pass;
+            return RootPass {
+                held: Some("no_database"),
+                ..RootPass::default()
+            };
         };
+        let pass = self.roots_pass_on(db, now_ms);
+        // For `doctor` (L3): a pass that keeps stopping says why.
+        let _ = db.toolchain_set_held(pass.held, now_ms);
+        pass
+    }
+
+    fn roots_pass_on(&self, db: &WorkerStore, now_ms: u64) -> RootPass {
+        let mut pass = RootPass::default();
         // 25.1 principle 8: nothing is removed while an upgrade is on trial.
         if crate::worker::control::in_trial(&self.cfg.state_dir) {
             pass.held = Some("trial");
@@ -254,6 +328,11 @@ impl Setups {
                 rd.flatten()
                     .any(|e| !referenced.contains(e.file_name().to_string_lossy().as_ref()))
             })
+            .or_else(|e| match e.kind() {
+                // No builders directory: no builder.
+                std::io::ErrorKind::NotFound => Ok(false),
+                _ => Err(e),
+            })
             .unwrap_or(true);
         if unrecorded {
             pass.held = Some("builder_without_references");
@@ -265,7 +344,7 @@ impl Setups {
         };
         // A claim a crash left, first.
         if let Some(row) = rows.iter().find(|r| r.evicting) {
-            if self.evict_root(db, &row.identity) {
+            if self.evict_root(db, &row.identity, now_ms) {
                 pass.removed.push(row.identity.clone());
             }
             return pass;
@@ -278,19 +357,26 @@ impl Setups {
                     .toolchain_claim(&row.identity, Some(before))
                     .unwrap_or(false)
                 {
-                    if self.evict_root(db, &row.identity) {
+                    if self.evict_root(db, &row.identity, now_ms) {
                         pass.removed.push(row.identity.clone());
                     }
                     return pass;
                 }
             }
         }
-        // Over the size: measure one unmeasured root a pass, and judge by
-        // what is measured (an unmeasured root counts nothing).
-        if let Some(row) = rows.iter().find(|r| r.bytes.is_none()) {
-            if let Ok(bytes) = adapters::root_bytes(&self.toolchains().join(&row.identity)) {
-                let _ = db.toolchain_set_bytes(&row.identity, bytes);
-            }
+        // Over the size: measure one unmeasured root a pass (the one tried
+        // longest ago; a failure stamps the time too, so it does not keep the
+        // others unmeasured), not one an installer is writing now, and judge
+        // by what is measured (an unmeasured root counts nothing).
+        let toolchains = self.toolchains();
+        if let Some(row) = rows
+            .iter()
+            .filter(|r| r.bytes.is_none() && !r.evicting)
+            .filter(|r| !adapters::root_install_busy(&toolchains, &r.identity))
+            .min_by_key(|r| r.measured_ms)
+        {
+            let bytes = adapters::root_bytes(&toolchains.join(&row.identity)).ok();
+            let _ = db.toolchain_set_bytes(&row.identity, bytes, now_ms);
         }
         let Ok(rows) = db.toolchain_roots() else {
             return pass;
@@ -299,7 +385,7 @@ impl Setups {
         if total > ROOT_MAX_BYTES {
             for row in &rows {
                 if db.toolchain_claim(&row.identity, None).unwrap_or(false) {
-                    if self.evict_root(db, &row.identity) {
+                    if self.evict_root(db, &row.identity, now_ms) {
                         pass.removed.push(row.identity.clone());
                     }
                     return pass;
@@ -309,13 +395,66 @@ impl Setups {
         pass
     }
 
-    /// Remove a claimed root and forget its row. `false` when the root could
-    /// not be moved now (the claim stays and the next pass tries again).
-    fn evict_root(&self, db: &WorkerStore, identity: &str) -> bool {
+    /// Remove a claimed root and forget its row. `false` when it was not
+    /// removed: a busy `install.lock` keeps the claim (the next pass tries
+    /// again); any other failure puts the root back to `live`, used now.
+    fn evict_root(&self, db: &WorkerStore, identity: &str, now_ms: u64) -> bool {
         match adapters::evict_root(&self.toolchains(), identity) {
             Ok(()) => db.toolchain_forget(identity).is_ok(),
-            Err(_) => false,
+            Err("install_lock_busy") => false,
+            Err(_) => {
+                let _ = db.toolchain_unclaim(identity, now_ms);
+                false
+            }
         }
+    }
+}
+
+/// The notices of the roots for `doctor`, from the worker DB of
+/// `state_dir` (read only): a pass that has stopped for an hour or more for
+/// the same reason, and removals that failed.
+pub(crate) fn doctor_notices(state_dir: &Path, now_ms: u64) -> Vec<String> {
+    if !state_dir.join("worker.db").is_file() {
+        return Vec::new();
+    }
+    let Ok(status) =
+        WorkerStore::open_read_only(state_dir).and_then(|db| db.toolchain_status())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some((reason, since)) = status.held {
+        if now_ms.saturating_sub(since) >= HELD_NOTICE_MS {
+            out.push(format!(
+                "the toolchain roots have not been cleaned for {} hour(s): {}",
+                now_ms.saturating_sub(since) / 3_600_000,
+                held_meaning(&reason)
+            ));
+        }
+    }
+    if status.evict_failures > 0 {
+        out.push(format!(
+            "{} removal(s) of a toolchain root failed (another device, an unsafe directory or a refused rename); the root was kept and is tried again later",
+            status.evict_failures
+        ));
+    }
+    out
+}
+
+fn held_meaning(reason: &str) -> &'static str {
+    match reason {
+        "trial" => "an upgrade is on trial; it ends with its commit or rollback",
+        "attempt_from_before" => {
+            "an attempt accepted before this version is not finished; it clears when that attempt ends"
+        }
+        "unknown_builder" => {
+            "a setup builder left by an earlier start could not be identified; it clears at the next start that settles it"
+        }
+        "builder_without_references" => {
+            "a setup builder directory without references is there (a builder that is running, or one of an earlier version); it clears when that builder ends and its directory is removed"
+        }
+        "database" | "no_database" => "the worker database could not be read",
+        _ => "a gate stopped the pass",
     }
 }
 

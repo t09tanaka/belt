@@ -530,17 +530,25 @@ pub fn begin<L: Launcher>(
             );
             anyhow::bail!("{live} attempt(s) are still live after waiting; nothing was switched");
         }
+        let created = !paths.config.join("bin").join(&to).try_exists()?;
         let placed = ws::place_binary_with(
             &ws::Paths::resolve_for(env, paths.backend)?,
             &to,
             current_exe,
             0o700,
         )?;
-        ensure!(
-            placed == retargeted(&paths, &from, &to).spec.executable,
-            "the version directory is not where the resident's binaries are"
-        );
-        identity_checked(&paths, &from)?;
+        let checked = (|| -> anyhow::Result<()> {
+            ensure!(
+                placed == retargeted(&paths, &from, &to).spec.executable,
+                "the version directory is not where the resident's binaries are"
+            );
+            identity_checked(&paths, &from)
+        })();
+        if let Err(e) = checked {
+            // Spec 25.7 (a): a copy the version check refused goes at once.
+            crate::service::old_binaries::remove_refused(&paths.config, &to, created);
+            return Err(e);
+        }
         ensure!(!interrupted(), "interrupted; nothing was switched");
         Ok(())
     })();
@@ -812,6 +820,14 @@ pub(crate) fn guard_present<L: Launcher>(config: &Path, launcher: &mut L) -> any
     } = watch(config)?;
     Ok(paths.services.join(guard.filename()).try_exists()?
         || launcher.loaded_state(&guard, &named) != LoadedState::Absent)
+}
+
+/// Whether `guard_present` can tell where the guard's definition is (for
+/// `doctor`): no resident journal, or one `watch` reads.
+pub(crate) fn guard_definition_known(config: &Path) -> bool {
+    let journal = config.join("init.json").try_exists().unwrap_or(true)
+        || config.join("upgrade").join(KEPT_JOURNAL).try_exists().unwrap_or(true);
+    !journal || watch(config).is_ok()
 }
 
 /// Remove the versions nothing names any more (spec 25.7 (a)), after the

@@ -187,9 +187,14 @@ pub fn upgrade<L: Launcher>(
     hook(Step::Drain)?;
     own_drain(&paths, &mut journal)?;
     hook(Step::Place)?;
+    let created = absent(&paths.config.join("bin").join(&digest))?;
     place_binary(&paths, &digest, current_exe)?;
     hook(Step::Compat)?;
-    compatible(&paths, &journal)?;
+    if let Err(e) = compatible(&paths, &journal) {
+        // Spec 25.7 (a): a copy the version check refused goes at once.
+        crate::service::old_binaries::remove_refused(&paths.config, &digest, created);
+        return Err(e);
+    }
     switch_to(&paths, journal, &digest, launcher, options, hook)
 }
 
@@ -583,14 +588,19 @@ pub fn commit<L: Launcher>(
         save_journal(&paths, &journal)?;
     }
     // Spec 25.7 (a): this host's commit removes the versions nothing names.
-    let places = crate::service::old_binaries::Places::of(env, launcher.backend())?;
-    let config = paths.config.clone();
-    crate::service::old_binaries::sweep(
-        &places,
-        &mut || crate::service::init::upgrade::guard_present(&config, &mut launcher),
-        true,
-        std::time::SystemTime::now(),
-    );
+    // The upgrade is committed: a failure here is not the commit's.
+    match crate::service::old_binaries::Places::of(env, launcher.backend()) {
+        Ok(places) => {
+            let config = paths.config.clone();
+            crate::service::old_binaries::sweep(
+                &places,
+                &mut || crate::service::init::upgrade::guard_present(&config, &mut launcher),
+                true,
+                std::time::SystemTime::now(),
+            );
+        }
+        Err(e) => eprintln!("belt: the old versions were not looked at: {e:#}"),
+    }
     let plan = plan(&paths, &journal)?;
     let ready = agent_reachable(&paths.state);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
