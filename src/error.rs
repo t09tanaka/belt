@@ -133,6 +133,11 @@ pub enum OverloadedReason {
     /// this worker (spec 25.6 (c)): the member reconciles with
     /// `list_unreleased` and releases what it no longer reads.
     AttemptRecords,
+    /// A new `submit_attempt` found the worker's source store busy: a
+    /// deleting pass holds its mutation lock for one step (spec 25.8 5b
+    /// (a)). The worker stored nothing and did not wait; the same attempt
+    /// may be sent again.
+    SourceStore,
     /// A reason this version does not know (a newer peer sent it): the
     /// caller treats the error as a plain `OVERLOADED`.
     #[serde(other)]

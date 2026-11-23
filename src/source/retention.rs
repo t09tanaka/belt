@@ -1024,6 +1024,16 @@ impl Index {
             |r| r.get(0),
         )?)
     }
+    /// The time of the root `receive:<id>` when it is `received` (spec 25.8
+    /// 5b (c), an acceptance). Only that root: a carried submodule is kept
+    /// by its parent's graph row.
+    pub(crate) fn touch_received(&self, id: &str, at_ms: u64) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE root SET used_ms=?2 WHERE id='receive:'||?1 AND source=?1 AND kind='received'",
+            params![id, i64::try_from(at_ms)?],
+        )?;
+        Ok(())
+    }
     pub(crate) fn legacy_registration_pending(&self) -> Result<bool> {
         Ok(self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_registration' AND value<>'done')",

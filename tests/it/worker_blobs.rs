@@ -404,6 +404,12 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn hold_source(&self) -> Result<Option<belt::source::retention::Guard>, ApiError> {
+        self.0.hold_source()
+    }
+    fn source_used(&self, held: &belt::source::retention::Guard, p: &AttemptPayload) {
+        self.0.source_used(held, p)
+    }
     fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
         self.0.secret_paths(p, w)
     }

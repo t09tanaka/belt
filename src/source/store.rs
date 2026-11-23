@@ -803,6 +803,13 @@ impl SourceStore {
         }
         Ok(self.inner.manifest_path(id).is_file())
     }
+    /// The acceptance of an attempt that names `id` is committed: its
+    /// `received` root gets the time now (spec 25.8 5b (c)). Call under a
+    /// shared mutation lock (`_held`).
+    pub fn touch_received(&self, _held: &super::retention::Guard, id: &str) -> Result<()> {
+        self.retention
+            .touch_received(id, crate::platform::clock::wall_ms())
+    }
     /// The completed claim rows an older version kept (`done=1`) are
     /// deleted, a page of 1,000 per transaction and at most
     /// [`CLAIM_PAGES`] pages per call (spec 25.8 5b (h)3). They are inert,

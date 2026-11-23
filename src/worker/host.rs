@@ -71,6 +71,18 @@ pub trait Host: Send + Sync {
         }
         Ok(())
     }
+    /// The shared source mutation lock, taken without waiting by a new
+    /// attempt's acceptance and held until its commit (spec 25.8 5b (a)):
+    /// while it is held no deleting pass's step runs, so a source found here
+    /// stays until the attempt that names it is terminal. A busy store is
+    /// `OVERLOADED` (`source_store`). `None`: this host has no source store.
+    fn hold_source(&self) -> Result<Option<crate::source::retention::Guard>, ApiError> {
+        Ok(None)
+    }
+    /// The acceptance of an attempt that names the payload's source is
+    /// committed: the source's `received` root gets the time (spec 25.8 5b
+    /// (c)). Called under the lock of [`Self::hold_source`]; best effort.
+    fn source_used(&self, _held: &crate::source::retention::Guard, _payload: &AttemptPayload) {}
     /// Once, before any secret is read (process-wide).
     fn disable_core_dumps(&self) -> Result<(), ApiError>;
     /// Plaintext secret bundles a crashed capture left in the source store.

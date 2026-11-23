@@ -3126,6 +3126,7 @@ impl Agent {
         let fresh = store.get(&r.attempt_id).map_err(api)?.is_none()
             && store.tombstone(&r.attempt_id).map_err(api)?.is_none()
             && store.attempt_record(&r.attempt_id).map_err(api)?.is_none();
+        let mut held = None;
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
             super::ci_task::check_accepted(&self.cfg.state_dir, &r.payload)?;
@@ -3139,6 +3140,10 @@ impl Agent {
             if let Some(setup) = &r.payload.setup {
                 crate::setup::policy::validate(setup).map_err(invalid)?;
             }
+            // The source store stays as it is from here to the commit: no
+            // deleting step runs while the shared lock is held, and a busy
+            // store is answered at once (spec 25.8 5b (a)).
+            held = self.host.hold_source()?;
             // Against the secret files of its source, when that source is
             // already here. When it is not, the same check runs before the
             // supervisor's spec is written ([`Self::prepare`]): a
@@ -3199,7 +3204,12 @@ impl Agent {
                 now(),
             )
             .map_err(api)?;
-        // The acceptance is committed; only now may anything start.
+        // The acceptance is committed; only now may anything start. The
+        // source was used: its time, under the same shared lock.
+        if let (Some(held), SubmitOutcome::Accepted(_)) = (&held, &outcome) {
+            self.host.source_used(held, &r.payload);
+        }
+        drop(held);
         drop(one);
         let (rec, duplicate) = match outcome {
             SubmitOutcome::Accepted(rec) => {

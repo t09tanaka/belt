@@ -492,6 +492,28 @@ impl Host for Machine {
         }
     }
 
+    fn hold_source(&self) -> Result<Option<crate::source::retention::Guard>, ApiError> {
+        match self.store.mutation_guard() {
+            Ok(held) => Ok(Some(held)),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                Err(ApiError::overloaded(
+                    crate::error::OverloadedReason::SourceStore,
+                    "the source store is busy with a deleting step; send again",
+                ))
+            }
+            Err(e) => Err(internal("source store", format!("{e:#}"))),
+        }
+    }
+
+    fn source_used(&self, held: &crate::source::retention::Guard, payload: &AttemptPayload) {
+        if let Some(id) = ci_id_of(&payload.source_id) {
+            let _ = self.store.touch_received(held, &id);
+        }
+    }
+
     fn secret_paths(
         &self,
         payload: &AttemptPayload,
