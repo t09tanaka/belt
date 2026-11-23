@@ -883,8 +883,10 @@ HOME="$home" exec {} worker --stdio
         u32::MAX,
     )
     .await;
+    // The file exists before the shell has written into it: wait for the
+    // whole line, not for the name.
     wait_for("ephemeral command started", || {
-        root.join("pid-ephemeral").exists()
+        std::fs::read_to_string(root.join("pid-ephemeral")).is_ok_and(|text| text.ends_with('\n'))
     })
     .await;
     assert_eq!(attempt(&state, &task).unwrap().worker_id, worker);
