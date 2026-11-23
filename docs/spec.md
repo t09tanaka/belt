@@ -2193,7 +2193,7 @@ memberになる前のfile（上の3の行）を除いて、どの時点でも、
 | 7 | 最後のtransaction（`run` の行を消すもの）のcommitの後、そのrunのattemptのうち、workerが受理していて、ACK済みでないものに `release_attempt` を送る（段階3が入っていれば。届かなくてよい。25.6）。送る相手の一覧（workerとattempt ID）は、段6でattemptの行を消すtransactionが、消す前に読んでメモリに持つ | 一覧は失われる。送らなかった分は、接続時の照合（25.6）が拾う |
 | 8 | `reader-pins/<run>.lock` をunlinkし、排他pinを手放す（25.1の (B)）。結果のGCのcursorがこのrunを指していれば、cursorを捨てる（下） | 行が無くpinだけが残る。起動時の走査が消す（25.11） |
 
-**1 passの上限。** runは32件（印のあるrunを先に、run IDの順で。進めないrunが後ろのrunを待たせないように、続きの位置をメモリに持つ）、結果のpathは32件、入力のpathは32件と検証64 MiB（段階1の放棄の処理と同じ関数の上限）、行は1,000行のtransactionを64回までである。上限に達したrunは、印を持ったまま次のpassが続ける。印のあるrunは、部分索引 `run(run_id) WHERE pruning_at_ms IS NOT NULL` で探す（全runを読まない）。印のあるrunの数は `doctor` が示す。
+**1 passの上限。** runは32件（印のあるrunを先に、run IDの順で。進めないrunが後ろのrunを待たせないように、続きの位置をメモリに持つ）、結果のpathは32件（段3のclaimと、attemptごとのdirectory `results/<attempt>/` の削除を1件ずつ数える）、入力のpathは32件と検証64 MiB（段階1の放棄の処理と同じ関数の上限）、行は1,000行のtransactionを64回までである。どの上限も、1 passの全runで共有する（runごとに取り直さない）。上限に達したrunは、印を持ったまま次のpassが続ける。attemptのdirectoryの走査は、続きの位置（task IDとattempt IDの順）をメモリに持ち、次のpassがそこから続ける（失っても、走査をやり直すだけで、消してよいものは変わらない）。印のあるrunは、部分索引 `run(run_id) WHERE pruning_at_ms IS NOT NULL` で探す（全runを読まない）。印のあるrunの数は `doctor` が示す。段4が入力の保持のgate（旧形式のmanifestの登録が済んでいない、進行中の取り込みがある、graphが終わっていない）で止まっている間は、`doctor` の行と、residentのログの `run pruning held` の行が、そのgateの名前（`legacy_registration`・`capture`・`graph`）を示す。
 
 **段4・段5の実装。** 段階1の「放棄された取り込み」の処理（25.4の (b)）と同じ関数を使う: sourceの変更lockを待たずに排他で取り、親DBでrunに印があることを確かめ直してから、runのroot（と、取り込みの持ち主の行が名指すpending root）の所属を外し、他のrootが持たないfileを、証明・claim・unlinkの順で消す。したがって、段4は第23章のBのpage（時計と `input_retention_binding` を確かめる）を経ずに、印を根拠に消す。証明できないfile、進行中の取り込み（所属の分からないroot）がある間は、そのrunをそこで止めて次のpassに回す。段2のVaultも、同じく放棄の処理の関数（Vaultのclaim・unlink・完了）を使う。
 
@@ -2210,7 +2210,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 
 **段6の行を消す順。** 外部キー（`PRAGMA foreign_keys=ON`）を満たすため、子から先に消す。runのattemptとtaskは `task(run_id, task_id)`・`attempt(task_id, attempt_id)` の索引でたどる。
 
-1. `event`: `run_id` がこのrunのもの（新しい索引 `event(run_id, seq)`）と、このrunの各attemptの `attempt_id` を持つもの（既存の索引 `event(attempt_id, seq)`）。後者は、`run_id` がNULLでattemptだけを持つevent（`submit_deferred`・`worker_excluded` など、`Coordinator::note` が書くもの）を拾う。
+1. `event`: `run_id` がこのrunのもの（新しい索引 `event(run_id, seq)`）と、このrunの各attemptの `attempt_id` を持つもの（既存の索引 `event(attempt_id, seq)`）。後者は、`run_id` がNULLでattemptだけを持つevent（`submit_deferred`・`worker_excluded` など、`Coordinator::note` が書くもの）を拾う。後者で消すのは `run_id` がNULLかこのrunのものだけで、このrunのattemptを名指して別のrunを名指すeventは、そのrunのものとして残し、数える（この版の書き手は、どれもattemptの属するrunを名指すので、作られない）。行の無いattemptを名指すeventは、`append_event` と `append_events_unseen` が `NOT_FOUND` で断る（どのrunの刈り取りにも拾われないeventを作らない）。
 2. `result_delete_claim`・`pending_delete`（このrunのlocatorのもの。段3で空になっているはずで、残っていれば段3へ戻る）。
 3. `result_gc_ref`、`blob_ref`（attemptごと。`result_gc_ref` は `blob_ref` の削除に連鎖する）。
 4. `workflow_download`（consumerがこのrunのattempt）、`workflow_upload_inflight`、`workflow_artifact`（`run_id`）。
@@ -2218,7 +2218,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 6. `attempt`。
 7. `matrix_group`、`ci_driver_transition`、`run_cancel_intent`、`control_request`（`run_id`）。
 8. `task`。
-9. `run`。同じtransactionで、どのrunも参照しなくなった `source_ref`・`secret_bundle_ref` の行（新しい索引 `run(source_id)`・`run(secret_bundle_id)` で確かめる）。
+9. `run`。同じtransactionで、どのrunも参照しなくなった `source_ref`・`secret_bundle_ref` の行（新しい索引 `run(source_id)`・`run(secret_bundle_id)` で確かめる）。このtransactionだけは、sourceのlockを排他で、待たずに取ってから行う。submitは、sourceのlockを共有で持ったまま `source_ref` を書き、その後の別のtransactionでrunの行を入れる。排他で持つ間はその2つの間にsubmitが居ないので、変わらないtreeの再submitが、消えた `source_ref` を外部キーで指して失敗することは無い。lockが取れなければ（submitか取り込みの最中）、このrunは次のpassが続ける。
 
 1つのtransactionの中でもこの順を守る。途中のtransactionで止まっても、残っている行は常に「親の行がある子」だけなので、外部キーは満たされる。
 
@@ -2246,7 +2246,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 
 - **runもattemptも持たないevent**（起動、epoch、GCの失敗の記録など）: 診断のために読む。書いてから `retention_days` 日で、`seq` の小さい順に消す。1 passで1,000行まで。新しい部分索引 `event(seq) WHERE run_id IS NULL AND attempt_id IS NULL` を使う。
 - **`ci_test_timing`**: Shardの分割が読む。行に最後に書いた時刻を足し、14日（setup templateの放置の日数と同じ。読み手は「最近動いたtestの時間」だけを使う）書かれなかった行を消す。1 passで1,000行まで。
-- **`removed_member` と `removed-members.json`**: 外したメンバーを断るために読む。coordinator DBのあるhostでは表が正で、以前の形式の `removed-members.json` は、読んで表へ移した時点で消す。coordinator DBの無いhost（workerだけのhost）では、移す先が無いので `removed-members.json` が正のまま残る（`src/service/group/rotate.rs`）。これは固定のfile（1個。中の項目は利用者が外した名前の数）として25.10に挙げる。どちらも、そのメンバーを戻したときに項目を消す。
+- **`removed_member` と `removed-members.json`**: 外したメンバーを断るために読む。coordinator DBのあるhostでは表が正で、以前の形式の `removed-members.json` は、読んで表へ移した時点で消す。読めないfileや移せないfileは、警告を出してそのまま残し、`group rotate` は失敗しない（次のrotateがまた試す）。coordinator DBの無いhost（workerだけのhost）では、移す先が無いので `removed-members.json` が正のまま残る（`src/service/group/rotate.rs`）。これは固定のfile（1個。中の項目は利用者が外した名前の数）として25.10に挙げる。どちらも、そのメンバーを戻したときに項目を消す。
 - **退役させたidentityの記録**（`worker_identity_tombstone`・`identity_retired_notice`）: 消す時点は未決である（25.16）。段階2では消さず、triggerも外さない。
 - **`stats/costs-v1.sqlite`**: 配置の見積が読む実測。`costs` は4,096行、`preparation_namespaces` は4,096、`preparation_receipts` と `cost_eviction` はそれに従う。書くたびに古いものを消す（既存）。
 
