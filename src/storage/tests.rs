@@ -436,10 +436,12 @@ fn the_event_journal_is_append_only_with_increasing_sequence() {
         .db
         .call(|c| Ok(c.execute("UPDATE event SET kind='x'", [])?))
         .is_err());
-    assert!(f
+    // A row is never rewritten. A row can be deleted since spec 25.4 (b):
+    // the events of a run that was never submitted go with its capture.
+    assert!(!f
         .store
         .db
-        .call(|c| Ok(c.execute("DELETE FROM event", [])?))
+        .call(|c| Ok(c.execute("DELETE FROM event WHERE seq<0", [])?))
         .is_err());
     // A sequence number is never reused, even after the newest row would go.
     let s3 = f.store.append_event(None, None, "c", &json!(3), 3).unwrap();
@@ -3873,8 +3875,16 @@ fn run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate() {
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
-    store.cancel_run(&run, 2).unwrap();
-    store.cancel_run(&run, 3).unwrap();
+    // The premise of a cancel before the enqueue (spec 25.4 (b)): the
+    // capture of the run is in progress. Without it the cancel is refused
+    // and nothing is written.
+    assert!(matches!(
+        store.cancel_run(&run, 1),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert!(store.completion(Target::Run(run.clone())).is_err());
+    store.cancel_run_of_capture(&run, 2).unwrap();
+    store.cancel_run_of_capture(&run, 3).unwrap();
     let before = store.completion(Target::Run(run.clone())).unwrap();
     assert!(!before.accepted);
     assert!(before.cancel_requested);
@@ -3988,7 +3998,7 @@ fn run_cancel_races_enqueue_and_place_without_losing_the_intent() {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 barrier.wait();
-                store.cancel_run(&run, 5).unwrap();
+                store.cancel_run_of_capture(&run, 5).unwrap();
             });
             scope.spawn(|| {
                 barrier.wait();
@@ -4502,7 +4512,7 @@ fn retry_same_run_rejects_closed_and_unconfirmed_retirement() {
 }
 
 #[test]
-fn retry_same_run_migration_preserves_v5_cancellation_tombstones() {
+fn the_cancel_intent_an_older_file_holds_for_a_run_without_a_row_is_deleted_by_migration() {
     use crate::service::completion::Target;
     let dir = crate::test_tmp::tempdir().unwrap();
     let run = RunId::generate();
@@ -4525,16 +4535,19 @@ fn retry_same_run_migration_preserves_v5_cancellation_tombstones() {
     })
     .unwrap();
     drop(old);
+    // Spec 25.4 (b): no owner row says that a capture of this run is in
+    // progress, so the reservation is not inherited by a later enqueue.
     let owner = CoordinatorStore::open(dir.path(), 8).unwrap();
-    let before = owner.completion(Target::Run(run.clone())).unwrap();
-    assert_eq!(before.control_revision, 0);
-    assert!(before.cancel_requested);
+    assert!(matches!(
+        owner.completion(Target::Run(run.clone())),
+        Err(StorageError::NotFound { .. })
+    ));
     let task = TaskId::generate();
     owner
         .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 9)
         .unwrap();
-    assert_eq!(owner.task_cancel_requested(&task).unwrap(), Some(7));
-    assert!(owner.queued_tasks(10).unwrap().is_empty());
+    assert_eq!(owner.task_cancel_requested(&task).unwrap(), None);
+    assert_eq!(owner.queued_tasks(10).unwrap().len(), 1);
 }
 #[test]
 fn retry_same_run_keeps_old_collection_and_atomic_run_selection() {
@@ -4953,8 +4966,14 @@ fn control_fence_pre_enqueue_revision_is_inherited_and_cancel_receipt_survives_r
     let run = RunId::generate();
     let task = TaskId::generate();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    // Without a capture in progress the cancel of a run that has no row is
+    // refused and leaves no receipt (spec 25.4 (b)).
+    assert!(matches!(
+        store.cancel_control(Target::Run(run.clone()), 0, "no-capture".into(), 1),
+        Err(StorageError::NotFound { .. })
+    ));
     let ack = store
-        .cancel_control(Target::Run(run.clone()), 0, "before-submit".into(), 2)
+        .cancel_control_of_capture(Target::Run(run.clone()), 0, "before-submit".into(), 2)
         .unwrap();
     assert_eq!(ack.control_revision, 1);
     assert!(!ack.accepted);
@@ -6262,7 +6281,10 @@ fn the_github_status_of_a_run_is_kept_in_its_journal_and_the_last_one_is_shown()
         })
         .unwrap();
     assert!(
-        plan.iter().any(|line| line.contains("event_attempt")),
+        plan.iter().all(|line| line.starts_with("SEARCH"))
+            && plan
+                .iter()
+                .any(|line| line.contains("event_attempt") || line.contains("event_run")),
         "{plan:?}"
     );
 }
@@ -6603,4 +6625,163 @@ fn result_retention_collects_a_retired_attempt_that_never_ended_only_after_confi
     assert_eq!(left(), sorted(&[&unconfirmed, &running]));
     assert_eq!(claim(100_000, 99_810).removed, 0);
     assert_eq!(left(), sorted(&[&unconfirmed, &running]));
+}
+
+/// The step of spec 25.4 (b): a receipt of an older file gets the run of its
+/// target (a task target through its task), the rows an older binary wrote
+/// for a run that has no row are deleted, the rows of a run that has one are
+/// kept, and an event can be deleted afterwards.
+#[test]
+fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_without_a_row() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let ghost = RunId::generate();
+    f.store
+        .cancel_control(Target::Run(f.run.clone()), 0, "of-run".into(), 2)
+        .unwrap();
+    f.store
+        .cancel_control(Target::Task(f.task.clone()), 1, "of-task".into(), 3)
+        .unwrap();
+    f.store
+        .cancel_control_of_capture(Target::Run(ghost.clone()), 0, "of-ghost".into(), 4)
+        .unwrap();
+    let dir = f._dir;
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch(schema::UNDO_CAPTURE_STEP)?;
+            tx.execute(
+                "UPDATE schema_meta SET value='23' WHERE key='schema_version'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let counts = |store: &CoordinatorStore, run: &RunId| -> (i64, i64, i64) {
+        let run = run.to_string();
+        store
+            .db
+            .call(move |c| {
+                let count =
+                    |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [&run], |r| r.get(0))?) };
+                Ok((
+                    count("SELECT count(*) FROM run_cancel_intent WHERE run_id=?1")?,
+                    count(
+                        "SELECT count(*) FROM control_request WHERE target_json LIKE '%'||?1||'%'",
+                    )?,
+                    count("SELECT count(*) FROM event WHERE run_id=?1")?,
+                ))
+            })
+            .unwrap()
+    };
+    // The older file holds the three rows of the run that was never submitted.
+    assert_eq!(counts(&f.store, &ghost), (1, 1, 1));
+    let kept = counts(&f.store, &f.run);
+    assert_eq!((kept.0, kept.1), (1, 1));
+    drop(f.store);
+    let store = CoordinatorStore::open(path_state(&dir), 2).unwrap();
+    assert_eq!(counts(&store, &ghost), (0, 0, 0));
+    assert_eq!(counts(&store, &f.run), kept);
+    let run = f.run.to_string();
+    let named: Vec<(String, Option<String>)> = store
+        .db
+        .call(|c| {
+            let mut q =
+                c.prepare("SELECT request_id,run_id FROM control_request ORDER BY request_id")?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        named,
+        vec![
+            ("of-run".to_string(), Some(run.clone())),
+            ("of-task".to_string(), Some(run.clone())),
+        ]
+    );
+    // The receipts are found by run, and a new one names its run.
+    let plan: Vec<String> = store
+        .db
+        .call(|c| {
+            let mut q =
+                c.prepare("EXPLAIN QUERY PLAN DELETE FROM control_request WHERE run_id=?1")?;
+            let rows = q.query_map(["r"], |r| r.get::<_, String>(3))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("control_request_run")),
+        "{plan:?}"
+    );
+    // The journal can lose the events of a run now; it still cannot be rewritten.
+    let deleted = store
+        .db
+        .write(move |tx| Ok(tx.execute("DELETE FROM event WHERE run_id=?1", [&run])?))
+        .unwrap();
+    assert!(deleted >= 1);
+    assert!(store
+        .db
+        .write(|tx| Ok(tx.execute("UPDATE event SET kind='x'", [])?))
+        .is_err());
+}
+
+/// The cancel of a run that has no row is refused unless its capture is in
+/// progress, and a refused one writes no intent, no receipt and no event.
+/// What an accepted one wrote is deleted, with nothing else, when the
+/// capture is abandoned; a run that has a row keeps every row.
+#[test]
+fn the_rows_of_a_cancel_before_the_enqueue_exist_only_for_a_capture_and_are_forgotten_with_it() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let total = |store: &CoordinatorStore| -> i64 {
+        store
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT (SELECT count(*) FROM run_cancel_intent)+(SELECT count(*) FROM control_request)+(SELECT count(*) FROM event)",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    };
+    let ghost = RunId::generate();
+    let before = total(&f.store);
+    let refused = f
+        .store
+        .cancel_control(Target::Run(ghost.clone()), 0, "refused".into(), 2)
+        .unwrap_err();
+    assert!(
+        matches!(refused, StorageError::NotFound { .. }),
+        "{refused}"
+    );
+    assert!(matches!(
+        f.store.cancel_run(&ghost, 2),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert_eq!(total(&f.store), before);
+    f.store
+        .cancel_control_of_capture(Target::Run(ghost.clone()), 0, "accepted".into(), 3)
+        .unwrap();
+    // The same request sent again is answered from its receipt.
+    f.store
+        .cancel_control(Target::Run(ghost.clone()), 0, "accepted".into(), 4)
+        .unwrap();
+    f.store
+        .cancel_control(Target::Run(f.run.clone()), 0, "of-run".into(), 5)
+        .unwrap();
+    let with_run = total(&f.store);
+    assert_eq!(with_run, before + 3 + 3);
+    // A run that has a row: nothing is deleted, and the caller is told.
+    assert!(f.store.forget_unsubmitted_run(&f.run).unwrap());
+    assert_eq!(total(&f.store), with_run);
+    assert!(!f.store.forget_unsubmitted_run(&ghost).unwrap());
+    assert_eq!(total(&f.store), before + 3);
+    assert!(f.store.completion(Target::Run(ghost)).is_err());
+    assert!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .accepted
+    );
 }

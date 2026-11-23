@@ -146,8 +146,6 @@ impl SourceStore {
             }
             Err(error) => return Err(error),
         };
-        #[cfg(test)]
-        self.retention.pause_page();
         let rows = match scope {
             AbandonScope::All => self.retention.capture_owners()?,
             AbandonScope::Run(run) | AbandonScope::Refused(run) => self
@@ -160,6 +158,8 @@ impl SourceStore {
         if rows.is_empty() {
             return Ok(report);
         }
+        #[cfg(test)]
+        self.retention.pause_page();
         self.retention.check_anchor()?;
         let identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let mut c = self.retention.connect()?;
@@ -408,16 +408,28 @@ impl SourceStore {
             if held {
                 return Ok(false);
             }
-            // A claim that is not completed (one a crash left, of this
-            // deletion or of the page of expired runs) is replayed by that
-            // page, under its own rules; no new claim is added next to it.
-            let pending: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM source_delete_claim WHERE done=0)",
-                [],
-                |r| r.get(0),
-            )?;
-            if pending {
-                return Ok(false);
+            // A claim of this deletion that a crash left is finished first.
+            // The claims of the page of expired runs are that page's.
+            let replay: Vec<String> = {
+                let mut s = c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
+                let rows = s.query_map([], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for raw in replay {
+                let claim: Claim = serde_json::from_str(&raw)?;
+                if !claim.abandoned {
+                    continue;
+                }
+                if budget.paths == 0 {
+                    return Ok(false);
+                }
+                budget.paths -= 1;
+                report.paths += 1;
+                if let Err(error) = self.retention.drain_claim(c, &claim, &mut budget.bytes) {
+                    report.unknown += 1;
+                    report.errors.push(format!("{error:#}"));
+                    return Ok(false);
+                }
             }
         }
         let mut gone = true;
@@ -438,10 +450,14 @@ impl SourceStore {
                         return Ok(false);
                     }
                     cursor.object = object.clone();
-                    match self
-                        .retention
-                        .release_member(c, root, object, path, &mut budget.bytes)?
-                    {
+                    match self.retention.release_member(
+                        c,
+                        root,
+                        object,
+                        path,
+                        &mut budget.bytes,
+                        true,
+                    )? {
                         Released::Shared => {}
                         Released::Unproven(error) => {
                             report.unknown += 1;

@@ -2209,6 +2209,8 @@ pub(super) fn reject_symlinks(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+mod capture_tests;
+#[cfg(test)]
 mod tests;
 
 /// Open private regular files without following a link or blocking on a FIFO.

@@ -3,7 +3,8 @@
 mod capture_owner;
 mod deletion;
 mod foreground;
-pub use capture_owner::{CaptureOwner, CaptureVerdict};
+pub(crate) use capture_owner::stop_point;
+pub use capture_owner::{inspect_owners, CaptureOwner, CaptureVerdict};
 pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
 pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
@@ -392,7 +393,9 @@ impl Index {
             directory: None,
             metadata: None,
         });
-        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {}
+        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {
+            stop_point("registering");
+        }
         Ok(())
     }
     fn complete(&self, root: &str, id: &str) -> Result<bool> {
@@ -711,7 +714,9 @@ impl Index {
             "source root handoff mismatch"
         );
         tx.commit()?;
-        while !self.handoff_page(pending, run)? {}
+        while !self.handoff_page(pending, run)? {
+            stop_point("handing_off");
+        }
         Ok(())
     }
     fn handoff_page(&self, pending: &str, run: &str) -> Result<bool> {
@@ -1241,6 +1246,8 @@ impl SourceStore {
     }
 }
 
+#[cfg(test)]
+mod abandon_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

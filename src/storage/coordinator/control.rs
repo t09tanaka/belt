@@ -22,6 +22,27 @@ impl CoordinatorStore {
         })
     }
 
+    /// [`Self::cancel_run`] under the premise of
+    /// [`Self::cancel_control_of_capture`]: the capture of the run is in
+    /// progress.
+    #[cfg(test)]
+    pub(crate) fn cancel_run_of_capture(&self, run: &RunId, at_ms: u64) -> Result<()> {
+        let target = Target::Run(run.clone());
+        self.db.write(move |tx| {
+            let (run, _) = resolve(tx, &target)?;
+            let expected = revision(tx, &run)?;
+            apply_cancel(
+                tx,
+                target,
+                expected,
+                RunId::generate().to_string(),
+                at_ms,
+                true,
+            )
+            .map(|_| ())
+        })
+    }
+
     /// A fresh internal invocation; worker delivery uses request_cancel instead.
     pub fn cancel_task(&self, task_id: &TaskId, at_ms: u64) -> Result<Option<AttemptRecord>> {
         let target = Target::Task(task_id.clone());

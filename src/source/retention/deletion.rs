@@ -75,6 +75,12 @@ struct Claim {
     parents: Vec<(u64, u64)>,
     leaf: Identity,
     digest: String,
+    /// The claim of a file that only an abandoned capture held (spec 25.4
+    /// (b)). Its deletion follows an event, not a period, so the pass over
+    /// the abandoned captures replays it without waiting for a clock; every
+    /// other claim is replayed by the page of expired runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    abandoned: bool,
 }
 fn directory(file: &File, private: bool) -> Result<(u64, u64)> {
     let m = file.metadata()?;
@@ -224,6 +230,7 @@ impl Index {
             parents,
             leaf,
             digest,
+            abandoned: false,
         })
     }
     fn drain_claim(&self, c: &mut Connection, claim: &Claim, budget: &mut u64) -> Result<()> {
@@ -345,6 +352,7 @@ impl Index {
         object: &str,
         path: &str,
         budget: &mut u64,
+        abandoned: bool,
     ) -> Result<Released> {
         let shared: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
@@ -361,7 +369,7 @@ impl Index {
         // Half the page budget remains for immediate content revalidation.
         let mut proof_budget = *budget / 2;
         let claim = match self.proof(object, path, &mut proof_budget) {
-            Ok(claim) => claim,
+            Ok(claim) => Claim { abandoned, ..claim },
             Err(error) => return Ok(Released::Unproven(format!("{error:#}"))),
         };
         *budget -= claim.leaf.size;
@@ -571,7 +579,7 @@ impl SourceStore {
             cursor.object = object.clone();
             match self
                 .retention
-                .release_member(&mut c, &run, object, path, &mut budget)?
+                .release_member(&mut c, &run, object, path, &mut budget, false)?
             {
                 Released::Shared => report.shared += 1,
                 Released::Unproven(error) => {

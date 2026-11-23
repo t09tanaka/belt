@@ -18,6 +18,22 @@ use crate::platform::owned_temp::{OwnerRecord, OwnerState};
 /// not part of what an upgrade rollback restores (spec 24.8).
 pub(super) const TABLE: &str = "CREATE TABLE IF NOT EXISTS capture_owner(run_id TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('capturing','given_up')),root TEXT,place TEXT NOT NULL,pid INTEGER NOT NULL,start TEXT NOT NULL);";
 
+/// A place at which a test child that makes a capture stops, says so and
+/// waits to be killed (the kill points of spec 25.4 (b)). Not compiled into
+/// the product.
+#[cfg(test)]
+pub(crate) fn stop_point(name: &str) {
+    if std::env::var("BELT_TEST_CAPTURE_STOP").as_deref() == Ok(name) {
+        crate::test_child::publish_ready().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn stop_point(_name: &str) {}
+
 /// What the resident may do with a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureVerdict {
@@ -121,6 +137,33 @@ impl Index {
         let rows = s.query_map([], row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+}
+
+/// The owner rows of the store of `state`, read without creating, locking or
+/// changing anything (for `doctor`). `None` when there is no index.
+pub fn inspect_owners(state: &Path) -> Result<Option<Vec<CaptureOwner>>> {
+    let database = state.join("sources").join("retention.db");
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let c = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let present: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capture_owner')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(Some(Vec::new()));
+    }
+    let mut s = c.prepare(&format!(
+        "SELECT {COLUMNS} FROM capture_owner ORDER BY run_id"
+    ))?;
+    let rows = s.query_map([], row)?;
+    Ok(Some(rows.collect::<std::result::Result<_, _>>()?))
 }
 
 impl SourceStore {
