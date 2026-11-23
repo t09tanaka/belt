@@ -930,6 +930,28 @@ impl WorkerStore {
             .call(move |c| load(c, &owner_in(c, &scope, Some(&a))?, &a))
     }
 
+    /// For the deleting pass of received sources (spec 25.8 5b (a) (1), L6),
+    /// across every member: whether a non-terminal attempt names `source`
+    /// (one lookup of the partial index), and the newest `terminal_at_ms` of
+    /// the terminal ones that do (a scan of the terminal rows, which stage 3
+    /// keeps bounded).
+    pub fn source_use(&self, source: &crate::ids::SourceId) -> Result<(bool, Option<i64>)> {
+        let source = source.to_string();
+        self.db.call(move |c| {
+            let live: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_attempt WHERE source_id = ?1 AND state <> 'terminal')",
+                [&source],
+                |r| r.get(0),
+            )?;
+            let ended: Option<i64> = c.query_row(
+                "SELECT max(terminal_at_ms) FROM worker_attempt WHERE source_id = ?1 AND state = 'terminal'",
+                [&source],
+                |r| r.get(0),
+            )?;
+            Ok((live, ended))
+        })
+    }
+
     /// Every member's attempts that are not terminal, oldest first.
     pub fn list_nonterminal(&self) -> Result<Vec<AcceptedAttempt>> {
         self.db.call(|c| {

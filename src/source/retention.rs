@@ -20,6 +20,7 @@ pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
+pub use deletion::{ReceivedPassInputs, ReceivedPassReport, SourceUse};
 pub use deletion::{RetentionCursor, RetentionPage};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::fs::{File, TryLockError};
@@ -2216,6 +2217,8 @@ impl SourceStore {
 
 #[cfg(test)]
 mod abandon_tests;
+#[cfg(test)]
+mod received_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

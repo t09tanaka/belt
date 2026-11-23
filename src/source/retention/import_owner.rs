@@ -77,7 +77,7 @@ impl Index {
     }
 }
 
-fn would_block(e: &anyhow::Error) -> bool {
+pub(super) fn would_block(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
