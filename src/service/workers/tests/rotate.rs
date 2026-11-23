@@ -332,6 +332,27 @@ fn a_removal_record_from_before_the_database_moves_into_the_table_and_its_file_g
     assert!(!path.exists());
 }
 
+/// A removal record beside the worker state that cannot be read does not
+/// fail the rotation of a host with a database: it is left in place, and
+/// the new removal is in the table.
+#[test]
+fn an_unreadable_removal_record_from_before_the_database_is_kept() {
+    let (w, mut n) = fixture();
+    let path = w.spec.worker_state_dir.join("removed-members.json");
+    fs::create_dir_all(&w.spec.worker_state_dir).unwrap();
+    fs::set_permissions(&w.spec.worker_state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&path, b"not json").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    run(&w, &mut n, &["b"], &[]).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"not json");
+    let removed = CoordinatorStore::open_read_only(&w.spec.state_dir)
+        .unwrap()
+        .removed_members()
+        .unwrap();
+    let names: Vec<&str> = removed.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert_eq!(names, ["b"]);
+}
+
 #[test]
 fn explicitly_removed_unknown_union_member_is_allowed() {
     let (w, mut n) = fixture();
