@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-23
+
 ### Breaking for library users
 
 - `Config` has two new public fields, `history_keep_days` and `jobs_log_max_mib`: code that builds a `Config` with a struct literal naming every field no longer compiles (add `..Config::default()`). `jobs::remove_files` now returns `bool`. `lock::sweep_orphan_leases` now returns how many files it removed. `managed::gc_sidecars` no longer removes files that are not sidecars. `Context` has a new public field, `sweep_budget` (build it with `Context::new`).
