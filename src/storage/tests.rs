@@ -640,7 +640,7 @@ fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
                  DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended;
                  DROP INDEX matrix_permit_held;
                  DROP TABLE identity_retired_notice; DROP TABLE removed_member;
-                 ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
+                 ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
                  UPDATE schema_meta SET value='12' WHERE key='schema_version';",
             )?;
             Ok(())
@@ -5395,7 +5395,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -6630,7 +6630,7 @@ fn result_retention_collects_a_retired_attempt_that_never_ended_only_after_confi
 /// The step of spec 25.4 (b): a receipt of an older file gets the run of its
 /// target (a task target through its task), the rows an older binary wrote
 /// for a run that has no row are deleted, the rows of a run that has one are
-/// kept, and an event can be deleted afterwards.
+/// kept, and afterwards only an event of a run without a row can be deleted.
 #[test]
 fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_without_a_row() {
     use crate::service::completion::Target;
@@ -6713,12 +6713,46 @@ fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_
         plan.iter().any(|line| line.contains("control_request_run")),
         "{plan:?}"
     );
-    // The journal can lose the events of a run now; it still cannot be rewritten.
-    let deleted = store
-        .db
-        .write(move |tx| Ok(tx.execute("DELETE FROM event WHERE run_id=?1", [&run])?))
+    // The journal can lose the events of a run that has no row, and only
+    // those: an event of a run that has a row, and an event of no run, stay.
+    // It still cannot be rewritten.
+    let unsubmitted = RunId::generate();
+    store
+        .cancel_control_of_capture(Target::Run(unsubmitted.clone()), 0, "of-capture".into(), 5)
         .unwrap();
-    assert!(deleted >= 1);
+    let delete = |sql: &'static str, run: Option<String>| {
+        store.db.write(move |tx| {
+            Ok(match run {
+                Some(run) => tx.execute(sql, [&run])?,
+                None => tx.execute(sql, [])?,
+            })
+        })
+    };
+    let of_run = "DELETE FROM event WHERE run_id=?1";
+    assert!(delete(of_run, Some(run.clone())).is_err());
+    store
+        .db
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO event(kind,payload_json,at_ms) VALUES('of_no_run','null',1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(delete("DELETE FROM event WHERE run_id IS NULL", None).is_err());
+    assert!(delete(of_run, Some(unsubmitted.to_string())).unwrap() >= 1);
+    let kept: i64 = store
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM event WHERE run_id=?1 OR run_id IS NULL",
+                [&run],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(kept >= 2);
     assert!(store
         .db
         .write(|tx| Ok(tx.execute("UPDATE event SET kind='x'", [])?))

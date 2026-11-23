@@ -103,9 +103,27 @@ impl Index {
     /// moment at which the root exists and the row does not name it. A
     /// capture without a row (a plan draft, whose owner is its directory)
     /// changes no row.
+    ///
+    /// The row names one root. While the root it names exists (an earlier
+    /// capture of the run failed before its hand-off), a second root is
+    /// refused and nothing is written: the earlier root would lose its only
+    /// name, and a pending root nothing names is never deleted and holds
+    /// every deletion of the store. The owner of the refused capture gives
+    /// up, and the abandonment deletes the root the row still names.
     pub(crate) fn pending_of_capture(&self, id: &str, run: Option<&RunId>) -> Result<()> {
         let mut c = self.connect_for_import()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(run) = run {
+            let named: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_owner o JOIN root r ON r.id=o.root WHERE o.run_id=?1)",
+                [run.as_str()],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                !named,
+                "an earlier capture of this run left a pending root; the run is not captured again"
+            );
+        }
         tx.execute(
             "INSERT OR IGNORE INTO root(id,kind) VALUES(?1,'pending')",
             [id],

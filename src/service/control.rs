@@ -148,12 +148,17 @@ pub async fn wait(
     }
 }
 /// An interrupt while the submission of `run` was still being made (spec
-/// 25.4 (b)). Before the owner row of its capture is written nothing exists,
-/// so nothing is cancelled. After it, the cancel is sent first (the resident
-/// accepts it for a capture in progress, and an enqueue already on its way
-/// inherits it), and then the capture is given up: the resident deletes it,
-/// with the rows of the cancel, unless the enqueue made it a run.
-pub(super) async fn stop_submission(
+/// 25.4 (b)). Before the submission began its capture nothing exists and
+/// nothing was sent, so nothing is cancelled (`not_submitted`). After that
+/// the cancel is always sent, whatever the owner row says and whether or
+/// not it can be read: the resident may already have accepted the enqueue
+/// and released the row, or the enqueue may be on its way (it inherits the
+/// cancel of a capture in progress). A cancel of a run that is neither a run
+/// nor a capture in progress is answered "not found" and writes nothing.
+/// Then the capture is given up, which changes only a row that is still
+/// there: the resident deletes the capture, with the rows of the cancel,
+/// unless the enqueue made it a run.
+pub async fn stop_submission(
     context: &Context,
     run: &RunId,
     signals: &mut mpsc::UnboundedReceiver<()>,
@@ -161,7 +166,7 @@ pub(super) async fn stop_submission(
 ) -> Report {
     let target = Target::Run(run.clone());
     let state = context.state_dir().to_owned();
-    if !super::input::owns_capture(state.clone(), run.clone()).await {
+    if !super::input::capture_begun(run) {
         return report(target, None, "not_submitted", 130);
     }
     let stopped = cancel_and_stop(&context.bootstrap, target, signals, budget).await;

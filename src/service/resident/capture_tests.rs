@@ -108,6 +108,19 @@ impl Drop for Command {
 }
 
 async fn ask(resident: &Resident, operation: Operation) -> Reply {
+    let (mut client, job) = send(resident, operation).await;
+    let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
+        .await
+        .unwrap();
+    job.await.unwrap().unwrap();
+    reply
+}
+
+/// Send a request and leave its answer unread: the stream and the handler.
+async fn send(
+    resident: &Resident,
+    operation: Operation,
+) -> (UnixStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let (mut client, server) = UnixStream::pair().unwrap();
     let (stop, _keep) = watch::channel(false);
     let job = tokio::spawn(handle(
@@ -133,11 +146,7 @@ async fn ask(resident: &Resident, operation: Operation) -> Reply {
     )
     .await
     .unwrap();
-    let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
-        .await
-        .unwrap();
-    job.await.unwrap().unwrap();
-    reply
+    (client, job)
 }
 
 fn submit(captured: &Captured) -> Operation {
@@ -582,4 +591,165 @@ async fn an_owner_row_left_after_the_commit_goes_and_the_run_stays() {
     assert_eq!(pass(&resident).handed_off, 1);
     assert!(matches!(rows(&resident, &captured.run), (1, 0, 0, _, 0)));
     assert_eq!(files(&resident, &captured.run), before);
+}
+
+/// The cancel of a run without a row lets go of the admission lock before it
+/// reads the owner row, and an enqueue can commit the run and release the
+/// row in between. Then "no row", "abandoned" and "the row cannot be read"
+/// say nothing about the run: the cancel looks for the run again and cancels
+/// it. Without that the command would be told `NOT_FOUND` for the run it
+/// just submitted, and the run would go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_that_overlaps_the_commit_of_its_run_cancels_the_run() {
+    for case in ["released", "abandoned", "busy"] {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let resident = delivery_resident(root.path()).await;
+        registration_done(&resident);
+        let mut command = Command::start();
+        let captured = capture(&resident, root.path(), Some(&command.record()));
+        let before = files(&resident, &captured.run);
+        // "abandoned": the owner is gone when the row is read, and the
+        // enqueue it sent commits after that read. The others: the enqueue
+        // commits, and releases the row, before the row is read.
+        let point = if case == "abandoned" {
+            command.kill();
+            "cancel_before_answer"
+        } else {
+            "cancel_before_owner"
+        };
+        let (mut paused, resume) = resident.captured.retention_test.pause_at(point);
+        let (mut client, job) = send(&resident, cancel(&captured.run)).await;
+        paused.recv().await.unwrap();
+        let reply = ask(&resident, submit(&captured)).await;
+        assert!(matches!(reply, Reply::Accepted { .. }), "{case}: {reply:?}");
+        assert!(matches!(rows(&resident, &captured.run), (1, 0, 0, _, 0)));
+        // "busy": a deletion holds the source lock for longer than the
+        // cancel waits for it.
+        let other = (case == "busy").then(|| {
+            let mut gone = Command::start();
+            let dead = capture(&resident, root.path(), Some(&gone.record()));
+            gone.kill();
+            let (entered, release) = resident.captured.sources.pause_retention_page();
+            let (coordinator, inputs) = (resident.coordinator.clone(), resident.captured.clone());
+            let abandonment = std::thread::spawn(move || {
+                inputs
+                    .sources
+                    .abandon_captures(
+                        coordinator.store(),
+                        &inputs.vault,
+                        AbandonScope::Run(&dead.run),
+                        &mut AbandonCursor::default(),
+                    )
+                    .unwrap()
+            });
+            entered.recv().unwrap();
+            (release, abandonment)
+        });
+        resume.send(()).unwrap();
+        let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
+            .await
+            .unwrap();
+        if let Some((release, abandonment)) = other {
+            release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || abandonment.join().unwrap())
+                .await
+                .unwrap();
+        }
+        job.await.unwrap().unwrap();
+        assert!(
+            matches!(&reply, Reply::Cancelled { snapshot } if snapshot.accepted && snapshot.cancel_requested),
+            "{case}: {reply:?}"
+        );
+        assert!(matches!(rows(&resident, &captured.run), (1, 1, 1, _, 0)));
+        // The run took the capture over: the cancel deleted nothing of it.
+        assert_eq!(files(&resident, &captured.run), before, "{case}");
+    }
+}
+
+/// The answer to a refusal is written before the deletion of the capture
+/// begins: the deletion waits for locks and syncs every unlink, and the
+/// client waits five seconds for its answer. Here the deletion stops at its
+/// start, holding the source lock, until the answer was read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_is_answered_before_the_capture_is_deleted() {
+    for cancelling in [true, false] {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let resident = delivery_resident(root.path()).await;
+        registration_done(&resident);
+        let captured = capture(&resident, root.path(), Some(&me()));
+        resident
+            .captured
+            .sources
+            .give_up_capture(&captured.run)
+            .unwrap();
+        let before = files(&resident, &captured.run);
+        let (entered, release) = resident.captured.sources.pause_retention_page();
+        let operation = if cancelling {
+            cancel(&captured.run)
+        } else {
+            submit(&captured)
+        };
+        let (mut client, job) = send(&resident, operation).await;
+        let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(5))
+            .await
+            .expect("the answer does not wait for the deletion");
+        assert!(not_found(&reply), "cancelling={cancelling}: {reply:?}");
+        // The deletion runs in the same request, after the answer.
+        tokio::task::spawn_blocking(move || entered.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(files(&resident, &captured.run), before);
+        assert_eq!(rows(&resident, &captured.run), (0, 0, 0, 0, 1));
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        assert_eq!(rows(&resident, &captured.run), (0, 0, 0, 0, 0));
+        assert_eq!(files(&resident, &captured.run), Vec::<PathBuf>::new());
+    }
+}
+
+/// An enqueue that cannot take the source lock in time is refused as busy,
+/// and the answer does not ask for the same request again: the refusal ends
+/// the capture, so only the command can be run again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enqueue_refused_as_busy_is_told_to_run_the_command_again() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    let captured = capture(&resident, root.path(), Some(&me()));
+    let mut gone = Command::start();
+    let dead = capture(&resident, root.path(), Some(&gone.record()));
+    gone.kill();
+    let (entered, release) = resident.captured.sources.pause_retention_page();
+    let (coordinator, inputs) = (resident.coordinator.clone(), resident.captured.clone());
+    let abandonment = std::thread::spawn(move || {
+        inputs
+            .sources
+            .abandon_captures(
+                coordinator.store(),
+                &inputs.vault,
+                AbandonScope::Run(&dead.run),
+                &mut AbandonCursor::default(),
+            )
+            .unwrap()
+    });
+    entered.recv().unwrap();
+    let (mut client, job) = send(&resident, submit(&captured)).await;
+    let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    tokio::task::spawn_blocking(move || abandonment.join().unwrap())
+        .await
+        .unwrap();
+    job.await.unwrap().unwrap();
+    let Reply::ControlError { error } = &reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(error.code, crate::error::ErrorCode::SourceBusy);
+    assert!(
+        error.message.contains("run the command again") && !error.message.contains("retry"),
+        "{}",
+        error.message
+    );
+    assert_eq!(rows(&resident, &captured.run).0, 0);
 }

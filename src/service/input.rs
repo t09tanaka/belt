@@ -43,18 +43,32 @@ pub async fn give_up_now(state: std::path::PathBuf, run: RunId) {
     let _ = tokio::task::spawn_blocking(move || give_up(&state, &run)).await;
 }
 
-/// Whether this command has written the owner row of the capture of `run`.
-/// Before it has, nothing of the capture exists and there is nothing to
-/// cancel.
-pub async fn owns_capture(state: std::path::PathBuf, run: RunId) -> bool {
-    tokio::task::spawn_blocking(move || {
-        state.join("sources").join("retention.db").is_file()
-            && SourceStore::open_foreground(&state)
-                .and_then(|(store, _source)| store.capture_owner(&run))
-                .is_ok_and(|row| row.is_some())
-    })
-    .await
-    .unwrap_or(false)
+/// The runs whose capture this process began. A command submits one run, so
+/// this holds one entry for the life of the process.
+static BEGUN: std::sync::Mutex<Vec<RunId>> = std::sync::Mutex::new(Vec::new());
+
+/// The submission of `run` is about to start its capture. Said on the
+/// submitting task itself, before the capture is handed to a blocking
+/// thread: until it is said, nothing of the capture exists and no request
+/// that names the run was sent.
+pub fn capture_begins(run: &RunId) {
+    let mut begun = BEGUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !begun.contains(run) {
+        begun.push(run.clone());
+    }
+}
+
+/// Whether [`capture_begins`] was said for `run`. This is the only thing an
+/// interrupt may read to decide that there is nothing to cancel: the owner
+/// row cannot say it (it is gone once the resident took the run over, and it
+/// cannot be read while a retention pass holds the source lock).
+pub fn capture_begun(run: &RunId) -> bool {
+    BEGUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(run)
 }
 
 /// Use the same capture path with an explicitly owned source/Vault destination.

@@ -239,7 +239,10 @@ pub(super) async fn run(
 #[derive(Default)]
 pub(super) struct TestControl {
     cadence_ms: std::sync::atomic::AtomicU64,
+    pauses: std::sync::Mutex<std::collections::HashMap<&'static str, TestPause>>,
 }
+#[cfg(test)]
+type TestPause = (mpsc::UnboundedSender<()>, mpsc::UnboundedReceiver<()>);
 #[cfg(test)]
 impl TestControl {
     pub(super) fn cadence(&self) -> Duration {
@@ -248,6 +251,24 @@ impl TestControl {
             Duration::from_secs(60)
         } else {
             Duration::from_millis(ms)
+        }
+    }
+    /// Stop the next request that reaches `point`: it says so on the first
+    /// channel and waits for the second.
+    pub(super) fn pause_at(
+        &self,
+        point: &'static str,
+    ) -> (mpsc::UnboundedReceiver<()>, mpsc::UnboundedSender<()>) {
+        let (entered, wait) = mpsc::unbounded_channel();
+        let (resume, drain) = mpsc::unbounded_channel();
+        self.pauses.lock().unwrap().insert(point, (entered, drain));
+        (wait, resume)
+    }
+    pub(super) async fn reached(&self, point: &'static str) {
+        let pause = self.pauses.lock().unwrap().remove(point);
+        if let Some((entered, mut resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.recv().await;
         }
     }
     pub(super) fn fast(&self) {

@@ -405,6 +405,60 @@ fn the_owner_row_exists_before_anything_of_the_capture_and_names_the_pending_roo
     assert!(parts.sources.own_capture_as(&run, &me()).is_err());
 }
 
+/// The owner row names one pending root. A second capture of the run while
+/// the root of the first exists is refused and writes nothing, so the first
+/// root keeps its name and goes with the abandonment; once that root is gone
+/// (the hand-off deleted it) the run may get another; a capture that has no
+/// row is never refused.
+#[test]
+fn a_second_pending_root_is_refused_while_the_row_names_one_that_exists() {
+    let parts = Parts::new();
+    let run = RunId::generate();
+    parts.sources.own_capture_as(&run, &gone()).unwrap();
+    let first = parts.sources.capture_pending_root(Some(&run)).unwrap();
+    let roots = || parts.count("SELECT count(*) FROM root WHERE kind='pending'");
+    assert!(parts.sources.capture_pending_root(Some(&run)).is_err());
+    assert_eq!(roots(), 1);
+    assert_eq!(
+        parts.sources.capture_owner(&run).unwrap().unwrap().root,
+        Some(first.clone())
+    );
+    // Without a row nothing names a root, and nothing is refused.
+    let draft = RunId::generate();
+    parts.sources.capture_pending_root(Some(&draft)).unwrap();
+    parts.sources.capture_pending_root(Some(&draft)).unwrap();
+    parts.sources.capture_pending_root(None).unwrap();
+    assert_eq!(roots(), 4);
+    parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM root WHERE id<>?1", [&first])
+        .unwrap();
+    // The abandonment finds the first root by the row and leaves no root
+    // without a source behind: nothing holds the other deletions.
+    let report = parts.passes();
+    assert_eq!(report.finished, 1, "{report:?}");
+    assert_eq!(parts.count("SELECT count(*) FROM root"), 0);
+    // A row whose root is gone names nothing: the next root is its.
+    let again = RunId::generate();
+    parts.sources.own_capture_as(&again, &me()).unwrap();
+    let old = parts.sources.capture_pending_root(Some(&again)).unwrap();
+    parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM root WHERE id=?1", [&old])
+        .unwrap();
+    let new = parts.sources.capture_pending_root(Some(&again)).unwrap();
+    assert_eq!(
+        parts.sources.capture_owner(&again).unwrap().unwrap().root,
+        Some(new)
+    );
+}
+
 /// "3の途中": the owner died while the members of its pending root were
 /// being registered. The root has no source and an unfinished graph, which
 /// holds every other deletion of the store; the abandonment exempts exactly
@@ -452,6 +506,128 @@ fn a_capture_killed_while_registering_loses_what_its_root_names_and_only_that() 
     assert_eq!(parts.index_rows(), 0);
     assert_eq!(parts.run_files(&run), Vec::<PathBuf>::new());
     assert_eq!(parts.stored_files().len(), files - registered);
+}
+
+/// An abandoned root that a pass could not finish (one of its files cannot
+/// be proven ours) stays, with no source, as `abandoned`. It protects
+/// nothing, so it holds none of the other pages: not the page of expired
+/// runs (B), not the Vault page, not the preview. The same root holds all
+/// three while it is still `pending`.
+#[test]
+fn an_abandoned_root_that_stays_holds_no_other_page() {
+    let parts = Parts::new();
+    let run = RunId::generate();
+    let got = parts.capture_of(&run, &parts.input);
+    parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .execute_batch("DELETE FROM member; DELETE FROM graph; DELETE FROM root; DELETE FROM object; DELETE FROM publication; DELETE FROM run_expiry; DELETE FROM import_session;")
+        .unwrap();
+    parts.sources.own_capture_as(&run, &me()).unwrap();
+    let pending = parts.sources.capture_pending_root(Some(&run)).unwrap();
+    // One bounded step, as when the owner stops while registering: the root
+    // has no source and its graph is unfinished.
+    assert!(!parts
+        .sources
+        .retention
+        .register_step(
+            &pending,
+            "pending",
+            &got.manifest.ci_source_id,
+            1,
+            &mut None,
+            u64::MAX
+        )
+        .unwrap());
+    assert_eq!(
+        (
+            parts.count("SELECT count(*) FROM root WHERE source IS NULL AND kind='pending'"),
+            parts.count("SELECT count(*) FROM graph WHERE done=0"),
+        ),
+        (1, 1)
+    );
+    let mut clock = 0u64;
+    let mut held = |parts: &Parts| -> (bool, bool, bool) {
+        let mut last = (true, true, true);
+        // A clock holds by itself until its quarantine (here 10) is over.
+        for _ in 0..4 {
+            clock += 5;
+            let boot = || Some("boot".to_string());
+            last = (
+                parts
+                    .sources
+                    .retention_page(
+                        &parts.owner,
+                        &mut RetentionCursor::default(),
+                        100 + clock,
+                        10 + clock,
+                        boot(),
+                        10,
+                    )
+                    .unwrap()
+                    .held,
+                parts
+                    .sources
+                    .vault_retention_page(
+                        &parts.owner,
+                        &parts.vault,
+                        &mut VaultCursor::default(),
+                        100 + clock,
+                        10 + clock,
+                        boot(),
+                    )
+                    .unwrap()
+                    .held,
+                parts
+                    .sources
+                    .retention_preview(
+                        &parts.owner,
+                        &mut PreviewCursor::default(),
+                        100 + clock,
+                        10 + clock,
+                        boot(),
+                        10,
+                    )
+                    .unwrap()
+                    .held,
+            );
+        }
+        last
+    };
+    assert_eq!(held(&parts), (true, true, true));
+    // The owner gives up; one object file has a second name, so the pass
+    // cannot prove it and the root stays.
+    let path: String = parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root=?1 ORDER BY m.object LIMIT 1",
+            [&pending],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let file = parts.state.join("sources").join(&path);
+    assert!(file.is_file(), "{path}");
+    std::fs::hard_link(&file, parts.root.path().join("second-name")).unwrap();
+    parts.sources.give_up_capture(&run).unwrap();
+    for _ in 0..3 {
+        let report = parts.pass();
+        assert_eq!((report.finished, report.continuing), (0, 1), "{report:?}");
+    }
+    assert_eq!(
+        (
+            parts.count("SELECT count(*) FROM root WHERE source IS NULL AND kind='abandoned'"),
+            parts.count("SELECT count(*) FROM root"),
+            parts.count("SELECT count(*) FROM member"),
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(held(&parts), (false, false, false));
+    assert!(file.is_file());
 }
 
 /// (ii) A capture whose owner is alive is never touched, by any number of

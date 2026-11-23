@@ -278,6 +278,7 @@ async fn submit_run(
         .await
         .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
     let (frozen_context, frozen_run) = (context.clone(), run_id.clone());
+    super::input::capture_begins(&run_id);
     // Blocking source IO keeps its own ownership when this future is dropped.
     let frozen = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
         let (context, run_id) = (frozen_context, frozen_run);

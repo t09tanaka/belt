@@ -709,7 +709,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // feature markers as well as tables so every migration can run again.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX event_run; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX event_run; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
@@ -1664,6 +1664,138 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
         "{}",
         String::from_utf8_lossy(&receipt.stdout)
     );
+    shutdown(&load(&spec)).await;
+}
+/// Spec 25.4 (b): once a submission began its capture, an interrupt always
+/// sends the cancel. The owner row cannot tell it that there is nothing to
+/// cancel: (a) the resident deletes the row when it accepts the enqueue, so
+/// a command that is interrupted before it read the answer finds no row for
+/// a run that is running; (b) while a deletion holds the source lock the row
+/// cannot be read at all, and the enqueue may be on its way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_after_the_capture_began_always_sends_the_cancel() {
+    use belt::service::{completion::Target, context::Context, control, input};
+    let (_root, spec, input_dir) = control_fixture();
+    let context = Context::load(spec.env.clone(), input_dir, spec.clone()).unwrap();
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    // (a) The enqueue was accepted and the owner row released.
+    let run = belt::ids::RunId::generate();
+    belt::service::submit::command_with_ids(
+        context.clone(),
+        vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        None,
+        run.clone(),
+        belt::ids::TaskId::generate(),
+    )
+    .await
+    .unwrap();
+    assert!(open_sources(&spec.state_dir)
+        .capture_owner(&run)
+        .unwrap()
+        .is_none());
+    let report =
+        control::stop_submission(&context, &run, &mut signals, Duration::from_secs(30)).await;
+    assert_eq!(report.state, "stop_confirmed", "{:?}", report.error);
+    assert!(report.cancel_acknowledged);
+    assert!(report.snapshot.as_ref().unwrap().accepted);
+    assert!(matches!(report.target, Target::Run(ref cancelled) if *cancelled == run));
+    // (b) The capture is in progress and the source lock is held exclusively
+    // for longer than a reader waits for it.
+    let run = belt::ids::RunId::generate();
+    input::capture_begins(&run);
+    open_sources(&spec.state_dir).own_capture(&run).unwrap();
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(spec.state_dir.join("sources/mutation.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        drop(lock);
+    });
+    let report =
+        control::stop_submission(&context, &run, &mut signals, Duration::from_secs(30)).await;
+    holder.join().unwrap();
+    assert_eq!(report.state, "stop_confirmed", "{:?}", report.error);
+    assert!(report.cancel_acknowledged);
+    assert!(!report.snapshot.as_ref().unwrap().accepted);
+    // The capture was given up after the cancel: the row says so until the
+    // resident deletes it.
+    assert!(open_sources(&spec.state_dir)
+        .capture_owner(&run)
+        .unwrap()
+        .is_none_or(|row| row.given_up));
+    shutdown(&load(&spec)).await;
+}
+/// Spec 25.4 (b): a submission that fails after it began its capture says
+/// `given_up` on its way out, through `submit` and through `ci run`. The
+/// owner (this process) is alive, so nothing else makes the capture
+/// deletable: the resident answers a cancel of the run "not found" and
+/// deletes the capture in that request, where it would accept the cancel of
+/// a capture that is still `capturing`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submission_that_fails_after_its_capture_began_gives_the_capture_up() {
+    use belt::service::{completion::Target, context::Context, control};
+    let (_root, spec, input_dir) = control_fixture();
+    let mut context = Context::load(spec.env.clone(), input_dir, spec.clone()).unwrap();
+    // The capture fails after the owner row was written: a required secret
+    // file is missing.
+    context
+        .config
+        .secret_files
+        .value
+        .push(belt::config::model::SecretSpec {
+            glob: "absent.env".into(),
+            required: true,
+        });
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    for ci in [false, true] {
+        let run = belt::ids::RunId::generate();
+        let failed = if ci {
+            belt::service::ci_run::submit(context.clone(), None, run.clone())
+                .await
+                .is_err()
+        } else {
+            belt::service::submit::command_with_ids(
+                context.clone(),
+                vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                None,
+                run.clone(),
+                belt::ids::TaskId::generate(),
+            )
+            .await
+            .is_err()
+        };
+        assert!(failed, "ci={ci}");
+        assert!(belt::service::input::capture_begun(&run), "ci={ci}");
+        let row = open_sources(&spec.state_dir).capture_owner(&run).unwrap();
+        assert!(row.is_some_and(|row| row.given_up), "ci={ci}");
+        let report = control::cancel_and_stop(
+            &spec,
+            Target::Run(run.clone()),
+            &mut signals,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(report.state, "run_not_found", "ci={ci}");
+        assert!(!report.cancel_acknowledged);
+        // The deletion follows the answer, in the same request.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while open_sources(&spec.state_dir)
+            .capture_owner(&run)
+            .unwrap()
+            .is_some()
+        {
+            assert!(std::time::Instant::now() < deadline, "ci={ci}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!spec
+            .state_dir
+            .join("sources/runs")
+            .join(format!("{run}.lock"))
+            .exists());
+    }
     shutdown(&load(&spec)).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

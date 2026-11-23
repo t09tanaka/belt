@@ -121,6 +121,7 @@ async fn submit_command(
         .owner()
         .await
         .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    super::input::capture_begins(&run_id);
     let (context, captured, run_id) = tokio::task::spawn_blocking(move || {
         let captured = super::input::capture(&context, &run_id, revision.as_deref());
         (context, captured, run_id)

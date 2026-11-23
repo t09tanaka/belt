@@ -650,8 +650,11 @@ CREATE TABLE removed_member (
             // of an older file gets the run of its target (a task target
             // through its task; a target that names nothing stays NULL and
             // is not touched). The events of a run get an index too, and the
-            // journal may lose rows: the events of a run that was never
-            // submitted are deleted with its abandoned capture. Last, the
+            // journal may lose the events of a run that has no row, and only
+            // those: the events of a run that was never submitted are
+            // deleted with its abandoned capture, and the trigger still
+            // refuses the delete of every other event (an event of no run,
+            // or of a run that has a row). Last, the
             // rows an older binary wrote for runs that have no row (the
             // cancel of a run ID that was never submitted) are deleted: no
             // enqueue of this binary inherits a cancel that it did not accept
@@ -664,6 +667,9 @@ UPDATE control_request SET run_id=CASE json_extract(target_json,'$.kind')
 CREATE INDEX control_request_run ON control_request(run_id);
 CREATE INDEX event_run ON event(run_id, seq);
 DROP TRIGGER event_no_delete;
+CREATE TRIGGER event_no_delete BEFORE DELETE ON event
+WHEN OLD.run_id IS NULL OR EXISTS (SELECT 1 FROM run WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
 DELETE FROM run_cancel_intent WHERE run_id NOT IN (SELECT run_id FROM run);
 DELETE FROM control_request WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM run);
 DELETE FROM event WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM run);"#.into(),
@@ -677,7 +683,7 @@ DELETE FROM event WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM
 /// What takes a coordinator file back to before the step of spec 25.4 (b)
 /// (the tests that rewind a file run every later step again).
 #[cfg(test)]
-pub(crate) const UNDO_CAPTURE_STEP: &str = "DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;";
+pub(crate) const UNDO_CAPTURE_STEP: &str = "DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;";
 
 /// The compatibility table for a list of migration steps.
 pub(crate) fn compat(step_count: usize) -> CompatTable {
