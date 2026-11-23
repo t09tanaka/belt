@@ -1408,7 +1408,7 @@ on the same repository and state directories at the same time.
 ```toml
 [dependencies]
 # `default-features = false` leaves the command-line parser (clap) out.
-fast-worktree = { version = "0.6", default-features = false }
+fast-worktree = { version = "0.7", default-features = false }
 ```
 
 ```rust

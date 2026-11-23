@@ -7,6 +7,8 @@ change bumps the minor version).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-23
+
 ### Changed
 
 - Nothing fast-worktree keeps is kept without bound, and no command has to
