@@ -1698,10 +1698,12 @@ impl Incoming {
             let info = &st.manifests[&id];
             let name = staged_name(SourceBlobKind::Manifest, &info.hex, info.size, true);
             let m = read_manifest(&dir.join(name), limits)?;
-            let Err(e) =
-                self.store
-                    .publish_received_one(&m, carried.contains(&id), objects.as_ref())
-            else {
+            let Err(e) = self.store.publish_received_one(
+                &m,
+                carried.contains(&id),
+                id == root_id,
+                objects.as_ref(),
+            ) else {
                 continue;
             };
             if !input_fault(&e) {

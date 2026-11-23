@@ -515,7 +515,7 @@ mod tests {
                 let hash = format!("{:x}", sha2::Sha256::digest(format!("{i}/{j}")));
                 let key = format!("b:{hash}");
                 tx.execute(
-                    "INSERT INTO object(id,path) VALUES(?1,?2)",
+                    "INSERT INTO object VALUES(?1,?2)",
                     params![key, format!("objects/{}/{hash}", &hash[..2])],
                 )
                 .unwrap();
@@ -573,7 +573,7 @@ mod tests {
             tx.execute("INSERT INTO root(id,kind) VALUES(?1,'abandoned')", [&root])
                 .unwrap();
             tx.execute(
-                "INSERT INTO object(id,path) VALUES(?1,?2)",
+                "INSERT INTO object VALUES(?1,?2)",
                 params![key, format!("objects/{}/{hash}", &hash[..2])],
             )
             .unwrap();

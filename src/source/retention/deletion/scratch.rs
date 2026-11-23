@@ -147,7 +147,7 @@ impl Index {
                 [key],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO object(id,path) VALUES(?1,?2)",
+                "INSERT OR IGNORE INTO object VALUES(?1,?2)",
                 params![key, path],
             )?;
             tx.execute(
