@@ -1788,15 +1788,17 @@ fn sidecar_view(ctx: &Context, id: &str, in_ledger: bool) -> Option<crate::reten
 /// Whether the child a sidecar file records (`child.pid`, and
 /// `child.pgid` when there is one) is running, asked with signal 0 only
 /// ([`crate::retention::pid_alive`]). Read from the JSON as it is, so another
-/// version's file is understood too. No child recorded: not alive. A pid
-/// that cannot be read or must never be signalled counts as alive.
+/// version's file is understood too. No child recorded: not alive. A file
+/// or pid that cannot be read, or a pid that must never be signalled,
+/// counts as alive.
 fn recorded_child_alive(path: &Path) -> bool {
     use crate::retention::pid_alive;
+    // It was read as JSON a moment ago: failing now proves nothing.
     let Ok(bytes) = std::fs::read(path) else {
-        return false;
+        return true;
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
+        return true;
     };
     let Some(child) = v.get("child").filter(|c| !c.is_null()) else {
         return false;
