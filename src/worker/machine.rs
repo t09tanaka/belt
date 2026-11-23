@@ -424,6 +424,11 @@ impl Host for Machine {
         }
     }
 
+    fn toolchain_tick(&self) {
+        if let Some(s) = &self.setups {
+            s.roots_tick();
+        }
+    }
     fn setup_release(&self, attempt: &AttemptId) {
         if let Some(s) = &self.setups {
             s.release(attempt);

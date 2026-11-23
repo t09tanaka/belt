@@ -2122,6 +2122,7 @@ impl Agent {
         // asks about must be let go here too, or its install is never stopped.
         self.reap_warmups();
         self.supervise_attempts();
+        self.host.toolchain_tick();
         self.cleanup_terminal(32);
     }
 
@@ -2174,6 +2175,7 @@ impl Agent {
         self.apply_control();
         self.reap_warmups();
         self.supervise_attempts();
+        self.host.toolchain_tick();
         self.clean_ended();
         if let Err(e) = self.gc() {
             self.note_global(

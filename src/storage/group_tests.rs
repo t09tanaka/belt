@@ -206,7 +206,7 @@ fn a_worker_database_with_an_uncollected_result_is_refused_until_it_is_collected
     collected(&previous, "att_done2");
     drop(previous);
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
     // What was dropped is listed for the agent, in bounded pages, until the
     // agent says its directory is gone.
     assert_eq!(
@@ -245,7 +245,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     drop(old);
 
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
     assert_eq!(store.worker_id(), &worker());
     for table in [
         "worker_attempt",
@@ -295,7 +295,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     // Opening again changes nothing.
     drop((store, member));
     WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
 }
 
 struct Two {

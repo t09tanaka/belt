@@ -315,6 +315,10 @@ pub struct Setups {
     leftover: Mutex<BTreeSet<AttemptId>>,
     /// Where the builders found unsettled at the start are.
     leftover_dirs: Mutex<HashMap<AttemptId, PathBuf>>,
+    /// The worker DB, for the references to the toolchain roots (25.7 (b)).
+    roots: Option<WorkerStore>,
+    /// When the agent's tick last ran a pass over the roots.
+    last_roots_pass: AtomicU64,
 }
 
 impl Setups {
@@ -329,6 +333,7 @@ impl Setups {
         let store = TemplateStore::open(cfg.root().join("templates"))
             .map_err(|e| internal("template store", e))?;
         store.sweep().map_err(|e| internal("template store", e))?;
+        let (cfg_state, cfg_worker) = (cfg.state_dir.clone(), cfg.worker_id.clone());
         let s = Setups {
             probe_gate: Mutex::new(()),
             owner_generation: BuilderId::generate(),
@@ -339,12 +344,15 @@ impl Setups {
             started: AtomicU64::new(0),
             leftover: Mutex::new(BTreeSet::new()),
             leftover_dirs: Mutex::new(HashMap::new()),
+            roots: WorkerStore::open(&cfg_state, &cfg_worker).ok(),
+            last_roots_pass: AtomicU64::new(0),
         };
         s.recover();
         // What a clear renamed aside and did not get to remove. An installer
         // of an earlier run that still works holds the lock of its root, and
         // its trash is left alone.
         adapters::sweep_trash(&s.cfg.state_dir.join("toolchains"));
+        s.open_roots();
         let s = Arc::new(s);
         // A builder that could not be settled now (its supervisor is still
         // alive and was asked to stop) is looked at again until it is.
@@ -544,10 +552,16 @@ impl Setups {
         let root = self.private_tool_root()?;
         let plan = request.plan(&root).map_err(invalid)?;
         self.poll_tool_checked(attempt, request, &plan, |receipt| match receipt {
+            // Spec 25.7 (b): the root is bound before it is used.
+            Some(_) if !self.bind_root(attempt, plan.root()) => ToolPreparationPoll::Failed(
+                PreparationFailure("the installed toolchain root was removed; ask again".into()),
+            ),
             Some(receipt) => match receipt.validate(&plan) {
                 Ok(()) => ToolPreparationPoll::Installed(receipt),
                 Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
             },
+            // No live row (none yet, or being removed): installed again.
+            None if !self.bind_root(attempt, plan.root()) => ToolPreparationPoll::Pending,
             None => match adapters::detect(&plan) {
                 Availability::Installed(receipt) => ToolPreparationPoll::Installed(receipt),
                 // An installer failed or was stopped in this root and none
@@ -774,6 +788,9 @@ impl Setups {
             if self.wanted(id).0 == 0 {
                 return Err("tool preparation cancelled".into());
             }
+            // Spec 25.7 (b): referenced before the helper can write in it.
+            let root = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
+            self.hold_root_for_install(id, root.root())?;
             let exe = std::fs::canonicalize(&self.cfg.supervisor_exe).map_err(|e| e.to_string())?;
             let node = preparation::helper_node(&exe, &dir, request)?;
             self.write_nodes(&dir, attempt, vec![node], Vec::new())?;
@@ -790,7 +807,10 @@ impl Setups {
             // is not there) is not what the helper said: not remembered.
             let plan = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
             match adapters::detect(&plan) {
-                Availability::Installed(receipt) => Ok(*receipt),
+                Availability::Installed(receipt) => {
+                    self.root_installed(plan.root());
+                    Ok(*receipt)
+                }
                 Availability::Unknown(e) | Availability::ManualRequired(e) => Err(e.into()),
                 Availability::Missing => Err("installer ended without receipt".into()),
             }
@@ -817,8 +837,8 @@ impl Setups {
             }
             Err(_) => {}
         }
-        if !lock(&self.leftover).contains(attempt) {
-            let _ = remove_tree(&dir);
+        if !lock(&self.leftover).contains(attempt) && remove_tree(&dir).is_ok() {
+            self.release_builder_roots(id);
         }
         result
     }
@@ -1019,6 +1039,9 @@ impl Setups {
     /// The consumer is gone (cancelled, ended): its reference goes. The last
     /// reference of a builder that is still working stops the builder.
     pub fn release(&self, attempt: &AttemptId) {
+        // A warm-up's references to roots go with it (an attempt's go when
+        // it is terminal).
+        self.release_warmup_roots(attempt);
         let a = attempt.to_string();
         let mut inner = lock(&self.inner);
         let prefix = format!("{a}/tool:");
@@ -1330,6 +1353,11 @@ impl Setups {
     ) -> BuildEnd {
         let spec = payload.setup.as_ref().expect("a builder is for a setup");
         let dir = self.cfg.builders().join(id.as_str());
+        // Spec 25.7 (b): the roots its steps run from, while it is there.
+        let roots = binding
+            .map(|b| roots::roots_of(b, &self.toolchains()))
+            .unwrap_or_default();
+        self.add_root_refs(roots, "builder", id.as_str());
         let mut made: Option<Workspace> = None;
         let end = self.build(
             id, attempt, key, source, payload, spec, &dir, &mut made, binding,
@@ -1340,8 +1368,8 @@ impl Setups {
         }
         // unless its processes could not be confirmed stopped: then the
         // next start's recovery needs what it recorded
-        if !lock(&self.leftover).contains(attempt) {
-            let _ = remove_tree(&dir);
+        if !lock(&self.leftover).contains(attempt) && remove_tree(&dir).is_ok() {
+            self.release_builder_roots(id);
         }
         end
     }
@@ -1421,6 +1449,11 @@ impl Setups {
             .publish(key, &receipt, &ws.root, run.as_deref(), now)
         {
             Ok(template) => {
+                // Spec 25.7 (b): a template made on roots references them.
+                let roots = binding
+                    .map(|b| roots::roots_of(b, &self.toolchains()))
+                    .unwrap_or_default();
+                self.add_root_refs(roots, "template", &self.store.name_of(key));
                 // Publication can legitimately retain an older pinned template.
                 // Its success is not proof of this builder's completed artifact.
                 if template.receipt.builder_id == *id
@@ -2569,3 +2602,4 @@ mod tool_validation_tests {
 }
 
 mod probe;
+mod roots;

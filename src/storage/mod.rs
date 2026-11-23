@@ -29,6 +29,7 @@ mod retry_dependents_tests;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod toolchain_roots;
 mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
@@ -44,6 +45,7 @@ pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;
+pub use toolchain_roots::{Bind, RootRow};
 pub(crate) use worker::MembershipImage;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
