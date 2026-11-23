@@ -33,6 +33,12 @@ impl CoordinatorStore {
             .call(move |c| input_retention_end_on(c, &run, &source))
     }
 
+    #[cfg(test)]
+    pub(crate) fn workflow_run_end_for_test(&self, run: &RunId) -> Result<Option<u64>> {
+        let run = run.to_string();
+        self.db.call(move |c| workflow_run_end(c, &run))
+    }
+
     /// Source EX must already be held. Require this live writable owner and a
     /// physical source directory belonging to its configured state directory.
     pub(crate) fn check_input_store(
@@ -145,10 +151,27 @@ impl CoordinatorStore {
     }
 
     /// One durable run pin backfill, bounded by the caller's keyset run page.
+    ///
+    /// This makes the pin file, so it answers "not found" and touches no
+    /// pin for a run that has no row or carries the mark of a pruned run
+    /// (spec 25.5): the collection of results never makes the pin of such a
+    /// run again, and its caller goes on to the next run.
     pub fn result_gc_guard(&self, run: &RunId) -> Result<RunPin> {
         if self._lock.is_none() {
             return Err(StorageError::Invalid("read-only owner".into()));
         }
+        let id = run.to_string();
+        self.db.call(move |c| {
+            let known: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if !known {
+                return Err(not_found(format!("run {id}")));
+            }
+            refuse_pruned(c, &id)
+        })?;
         RunPin::ensure(&self.state_dir, run)?;
         Ok(RunPin::exclusive(&self.state_dir, run)?)
     }
@@ -277,11 +300,17 @@ impl CoordinatorStore {
 /// applied, and the origin of a matrix once its members were joined. The end
 /// is the latest moment an attempt ended, a task was cancelled or the run
 /// was closed.
+///
+/// A task is settled as in spec 25.3 (a) rule 2, the predicate of
+/// `input_retention_end_on`: its current attempt has a termination, or it
+/// has no current attempt and was cancelled, is an applied probe or a joined
+/// matrix origin, or its run is closed (a closed run places no task).
 fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
     let (live, ended): (bool, i64) = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1 AND a.retired=0 AND a.state<>'terminal')
               OR EXISTS(SELECT 1 FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND a.termination_json IS NULL AND (t.cancel_requested_at_ms IS NULL OR a.attempt_id IS NOT NULL)
+                 AND (a.attempt_id IS NOT NULL OR EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL))
                  AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0
                  AND NOT (coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=1 AND json_extract(t.spec_json,'$.ci.core_outcome') IS NOT NULL)),
             max((SELECT coalesce(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0)),0) FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1),
@@ -304,13 +333,21 @@ fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
 /// task was cancelled or the run was closed (as in `workflow_run_end`): a
 /// task left with only retired attempts ends by its cancel or by the close
 /// of its run, and the retention to retry in starts there, not at the retire.
+///
+/// A task that has no attempt at all is judged the same way (spec 25.3 (a),
+/// rule 2): it holds the inputs while it may still be placed, and no longer
+/// once it was cancelled, its run was closed, or it is a task that is never
+/// placed itself, as `workflow_run_end` reads it (a probe whose discovery
+/// was applied, the origin of a matrix whose members were joined).
 fn input_retention_end_on(c: &Connection, run: &str, source: &str) -> Result<Option<u64>> {
     let ended:Option<i64>=c.query_row("SELECT CASE WHEN
               EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
               AND EXISTS(SELECT 1 FROM task WHERE run_id=?1)
               AND NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
-                (NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
-                 OR (t.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal')))))
+                t.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL)
+                AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0
+                AND NOT (coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=1 AND json_extract(t.spec_json,'$.ci.core_outcome') IS NOT NULL)
+                AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal')))
               AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
                 WHERE t.run_id=?1 AND a.retired=0 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
               THEN max((SELECT coalesce(max(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0),coalesce(x.closed_at_ms,0))),0) FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id) WHERE t.run_id=?1),

@@ -640,6 +640,11 @@ CREATE TABLE removed_member (
             // its worker first.
             "ALTER TABLE placement ADD COLUMN submit_sends INTEGER;".into(),
             "ALTER TABLE removed_member ADD COLUMN ssh TEXT;".into(),
+            // Spec 25.3 (b). The mark of a run that is being pruned: not
+            // NULL once the pruning of the run began, and never cleared.
+            // Nothing writes it yet; every reader and writer of a run
+            // already answers "not found" for a run that carries it.
+            "ALTER TABLE run ADD COLUMN pruning_at_ms INTEGER;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

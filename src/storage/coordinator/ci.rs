@@ -90,12 +90,12 @@ impl CoordinatorStore {
         record: String,
     ) -> Result<bool> {
         let run = run.to_string();
-        self.db.write(move |tx| Ok(tx.execute(
+        self.db.write(move |tx| { super::refuse_pruned(tx, &run)?; Ok(tx.execute(
             "INSERT INTO ci_driver_transition(run_id,authorization,revision,record)
              SELECT ?1,?2,?3,?4 WHERE ?3=(SELECT coalesce(max(revision),0)+1 FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2)
              AND ?2=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)
              AND EXISTS (SELECT 1 FROM run WHERE run_id=?1 AND closed_at_ms IS NULL)",
-            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1))
+            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1) })
     }
 
     /// Add the complete derived membership before releasing any variant. The
@@ -110,6 +110,7 @@ impl CoordinatorStore {
     ) -> Result<bool> {
         let (run, origin) = (run.to_string(), origin.to_string());
         self.db.write(move|tx|{
+            super::refuse_pruned(tx,&run)?;
             let current:i64=tx.query_row("SELECT coalesce(max(authorization_revision),0) FROM task WHERE run_id=?1",[&run],|r|r.get(0))?;
             if to_u64(current)?!=authorization { return Err(StorageError::Busy); }
             let mut stmt=tx.prepare("SELECT json_extract(spec_json,'$.ci.task.task_id'),json_extract(spec_json,'$.ci.task.dispatch')
@@ -151,6 +152,7 @@ impl CoordinatorStore {
     ) -> Result<bool> {
         let (run, origin, status) = (run.to_string(), origin.to_string(), status.to_string());
         self.db.write(move|tx|{
+            super::refuse_pruned(tx, &run)?;
             let changed=tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.core_outcome',?3) WHERE run_id=?1 AND task_id=?2
                 AND json_extract(spec_json,'$.ci.dynamic_origin')=1 AND json_extract(spec_json,'$.ci.core_outcome') IS NULL
                 AND ?4=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)",
@@ -171,7 +173,7 @@ impl CoordinatorStore {
             let mut query = c.prepare(&format!(
                 "SELECT t.run_id FROM task t JOIN run r ON r.run_id=t.run_id
                  WHERE (({HELD} AND t.cancel_requested_at_ms IS NULL AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL) OR ({UNJOINED_SHARD}))
-                 AND r.closed_at_ms IS NULL
+                 AND r.closed_at_ms IS NULL AND r.pruning_at_ms IS NULL
                  GROUP BY t.run_id ORDER BY min(t.created_at_ms), min(t.rowid) LIMIT ?1"
             ))?;
             let rows = query.query_map([i64::from(limit)], |r| r.get::<_, String>(0))?;
@@ -192,6 +194,7 @@ impl CoordinatorStore {
             if !known {
                 return Err(StorageError::NotFound { what: "run".into() });
             }
+            super::refuse_pruned(tx, &run)?;
             common::append_event(tx, Some(&run), None, GITHUB_STATUS_EVENT, &record, at_ms)?;
             Ok(())
         })
@@ -204,9 +207,17 @@ impl CoordinatorStore {
     }
 
     /// Every task of `run`, in the order they were made.
+    ///
+    /// A run that carries the mark of a pruned run is not found, by the same
+    /// snapshot that reads its tasks (spec 25.3 (b)): rows of it may be gone.
     pub fn ci_run_tasks(&self, run: &RunId) -> Result<Vec<CiTaskRow>> {
         let run = run.to_string();
+        let pruning = self.pruning;
         self.db.call(move |c| {
+            let c = &c.unchecked_transaction()?;
+            if super::run_marked(c, &run, pruning)? {
+                return Err(super::run_pruned(&run));
+            }
             let mut query = c.prepare(
                 "SELECT t.task_id,t.spec_json,t.cancel_requested_at_ms IS NOT NULL,
                         a.attempt_id,a.state,a.termination_json,
@@ -409,6 +420,7 @@ impl CoordinatorStore {
         let run = run.to_string();
         let (previous, next) = (previous.to_string(), next.to_string());
         self.db.write(move |tx| {
+            super::refuse_pruned(tx, &run)?;
             for id in &probe_ids {
                 let pending: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM task WHERE run_id=?1 AND task_id=?2
