@@ -249,7 +249,9 @@ pub enum Gated {
 
 /// Callbacks into the caller of [`run_gated`].
 pub struct Hooks<'a> {
-    /// Polled while waiting; true cancels the run (as SIGTERM would).
+    /// Polled while waiting; true cancels the run (as SIGTERM would). Also
+    /// asked after the command, before and between the items of the
+    /// retention sweep: true means no sweep, or ends it.
     pub cancelled: &'a dyn Fn() -> bool,
     /// Receives each "waiting ..." progress line.
     pub progress: &'a dyn Fn(&str),

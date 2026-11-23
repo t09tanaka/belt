@@ -77,6 +77,29 @@ pub fn load(ctx: &Context, id: &str) -> Result<Job> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// The ids that have a descriptor (`<id>.json`), the one written longest
+/// ago first: a listing only, no descriptor is read.
+pub fn ids_oldest_first(ctx: &Context) -> Result<Vec<String>> {
+    let rd = match fs::read_dir(ctx.paths.jobs_dir()) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut found = Vec::new();
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+            continue;
+        };
+        let Ok(modified) = ent.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        found.push((modified, id.to_string()));
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, id)| id).collect())
+}
+
 /// All jobs, newest first. Unreadable descriptors are skipped.
 pub fn list(ctx: &Context) -> Result<Vec<Job>> {
     let mut out = Vec::new();

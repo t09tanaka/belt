@@ -47,6 +47,9 @@ extern "C" fn on_signal(sig: libc::c_int) {
     // The interrupted code may be between a failing call and its `errno`
     // check: leave `errno` as found.
     let saved_errno = unsafe { *errno_location() };
+    // A stop that is forwarded to the command is taken out of PENDING at
+    // once: this is what still says, afterwards, that one came.
+    STOP_SEEN.store(true, Ordering::SeqCst);
     forward_from_handler(sig);
     unsafe { *errno_location() = saved_errno };
 }
@@ -85,7 +88,8 @@ extern "C" fn ignore_in_wrapper(_sig: libc::c_int) {
     STOP_SEEN.store(true, Ordering::SeqCst);
 }
 
-/// A SIGINT or SIGQUIT came while the command ran.
+/// A stop signal came: SIGINT or SIGQUIT while the command ran, or one
+/// that is recorded and forwarded.
 static STOP_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Signals that were `SIG_IGN` when the process started (one bit each),

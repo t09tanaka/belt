@@ -67,10 +67,27 @@ pub const AUTO_MAX_CUTS: usize = 4;
 /// ([`Context::sweep_budget`]). The sweep runs in the process whose command
 /// just ended, so it is what the caller waits for after its result is
 /// known: a fifth of a second is not noticed after a command worth
-/// queueing, and is some thousand small files. It is looked at between two
+/// queueing, and is some thousand small files. It is split in
+/// [`SWEEP_SLICES`] equal parts ([`slice_of`]) and looked at between two
 /// items (a file looked at or removed, one log cut, one rewrite of the
-/// history), so the sweep ends at most one item later. `gc` has no budget.
+/// history, one listing of a directory), so each part ends at most one
+/// item late. `gc` has no budget.
 pub const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The parts the budget is split in: each of the four stages (ledger and
+/// receipts, history, jobs, stray files) has one for looking and one for
+/// removing.
+pub const SWEEP_SLICES: u32 = 8;
+
+/// The time one stage of the sweep has for looking, and again for
+/// removing, out of `budget`. The two are counted from the stage's first
+/// look and from its first removal, so a stage that has more to look at
+/// than its time allows still removes what it found, and the stages after
+/// it still run: every sweep gets something done, however large a
+/// directory is, and the oldest files are looked at first.
+pub fn slice_of(budget: std::time::Duration) -> std::time::Duration {
+    budget / SWEEP_SLICES
+}
 
 /// A job with no exit file, no ledger entry and no lease older than this is
 /// dead (its runner was killed). Far above the few seconds a runner needs
@@ -438,48 +455,60 @@ pub fn time_is_up(end: Option<Instant>, now: Instant) -> bool {
     end.is_some_and(|end| now >= end)
 }
 
-/// The end of a stage that starts at `now`, when the whole sweep ends at
-/// `end` and `stages` stages are still to run (this one included): an equal
-/// share of what is left, so a stage that has much to look at cannot keep
-/// the later ones from ever running.
-pub fn stage_end(end: Option<Instant>, now: Instant, stages: u32) -> Option<Instant> {
-    let end = end?;
-    Some(now + end.saturating_duration_since(now) / stages.max(1))
-}
-
 /// What is left of a sweep's allowance.
 struct Allowance<'a> {
     left: usize,
     /// Log cuts left: each copies up to `jobs_log_max_mib`.
     cuts: usize,
-    /// When the sweep must be over (`None`: no budget).
-    end: Option<Instant>,
-    /// When the stage that is running must be ([`stage_end`]).
-    stage: Option<Instant>,
+    /// How long a stage may look, and how long it may remove
+    /// ([`slice_of`]; `None`: no budget).
+    slice: Option<std::time::Duration>,
+    /// When the stage that is running must stop looking, once it has
+    /// begun to.
+    look: Option<Instant>,
+    /// When it must stop removing, once it has begun to.
+    act: Option<Instant>,
     stop: &'a dyn Fn() -> bool,
     /// Something was left undone.
     short: bool,
 }
 
 impl Allowance<'_> {
-    /// A stage begins; `stages` are left, this one included.
-    fn begin(&mut self, stages: u32) {
-        self.stage = stage_end(self.end, Instant::now(), stages);
+    /// A stage begins: its time for looking starts with its first look,
+    /// its time for removing with its first removal.
+    fn begin(&mut self) {
+        self.look = None;
+        self.act = None;
     }
 
-    /// Whether the sweep may go on to its next item: there is time left
-    /// and nobody asked for a stop. Notes when it may not.
-    fn go(&mut self) -> bool {
-        if time_is_up(self.stage, Instant::now()) || (self.stop)() {
+    /// Whether there is time left until `end`, which is set at the first
+    /// call, and nobody asked for a stop. Notes when not.
+    fn within(&mut self, looking: bool) -> bool {
+        let now = Instant::now();
+        let slice = self.slice;
+        let end = if looking {
+            &mut self.look
+        } else {
+            &mut self.act
+        };
+        if end.is_none() {
+            *end = slice.map(|s| now + s);
+        }
+        if time_is_up(*end, now) || (self.stop)() {
             self.short = true;
             return false;
         }
         true
     }
 
+    /// Whether the sweep may look at its next item.
+    fn go(&mut self) -> bool {
+        self.within(true)
+    }
+
     /// Whether one more action may be done; notes when it may not.
     fn take(&mut self) -> bool {
-        if !self.go() {
+        if !self.within(false) {
             return false;
         }
         if self.left == 0 {
@@ -491,6 +520,9 @@ impl Allowance<'_> {
     }
 
     fn take_cut(&mut self) -> bool {
+        if !self.within(false) {
+            return false;
+        }
         if self.cuts == 0 {
             self.short = true;
             return false;
@@ -534,7 +566,6 @@ fn run(
     budget: Option<std::time::Duration>,
     stop: &dyn Fn() -> bool,
 ) -> Report {
-    let started = Instant::now();
     let auto = budget.is_some();
     let now = ctx.clock.now();
     let path = ctx.paths.sweep_stamp();
@@ -554,8 +585,9 @@ fn run(
     let mut allow = Allowance {
         left: if auto { AUTO_MAX_ACTIONS } else { usize::MAX },
         cuts: if auto { AUTO_MAX_CUTS } else { usize::MAX },
-        end: budget.map(|b| started + b),
-        stage: None,
+        slice: budget.map(slice_of),
+        look: None,
+        act: None,
         stop,
         short: false,
     };
@@ -564,8 +596,8 @@ fn run(
     // What may go is found first, without any lock (the listing, the reads
     // and the parsing); the ledger lock is then held only to look at each
     // of those again and remove it, which the allowance bounds.
-    allow.begin(4);
-    let leases = lock::old_lease_ids(ctx, &mut || allow.go());
+    allow.begin();
+    let leases = lock::old_lease_ids(ctx, &mut || true);
     let sidecars = managed::sidecar_candidates(ctx, keep.managed_keep_days, &mut || allow.go());
     if !auto {
         lock::refresh_verdicts(ctx);
@@ -603,7 +635,7 @@ fn run(
 
     // Stage 2: the history and the measurement markers, under the history
     // lock. One rewrite of the history is one item.
-    allow.begin(3);
+    allow.begin();
     if allow.go() {
         let guard = if auto {
             errors
@@ -640,10 +672,10 @@ fn run(
     }
 
     if let Some(ledger) = &ledger {
-        allow.begin(2);
-        sweep_jobs(ctx, &keep, ledger, &mut r, &mut errors, &mut allow);
-        allow.begin(1);
-        sweep_strays(ctx, ledger, &mut r, &mut errors, &mut allow);
+        allow.begin();
+        let unreadable = sweep_jobs(ctx, &keep, ledger, &mut r, &mut errors, &mut allow);
+        allow.begin();
+        sweep_strays(ctx, ledger, &unreadable, &mut r, &mut errors, &mut allow);
     } else {
         allow.short = true;
     }
@@ -857,16 +889,19 @@ pub fn pid_alive(pid: u32) -> bool {
 /// The ids in `jobs/` that have no readable descriptor and whose files
 /// (`<id>.json`, `.log`, `.exit`, `.waiter`) are all [`STRAY_AFTER_SECS`]
 /// old and not of a live job: what a crash while removing a job left, or a
-/// descriptor that was damaged. `readable` are the ids whose descriptor
-/// loads (those are the job rule's). Files with any other name are not
+/// descriptor that was damaged. An id has no readable descriptor when no
+/// `<id>.json` is among `files`, or when it is in `unreadable` (the ids
+/// whose descriptor was found not to load; the others are the job rule's).
+/// Whether a job is live is asked last. Files with any other name are not
 /// looked at.
 pub fn orphan_job_ids(
     files: &[FileInfo],
-    readable: &HashSet<String>,
+    unreadable: &HashSet<String>,
     live: &dyn Fn(&str) -> bool,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    let mut all_old: BTreeMap<&str, bool> = BTreeMap::new();
+    // Per id: every file is old, and there is a descriptor.
+    let mut seen: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
     for f in files {
         let Some((id, ext)) = f.name.rsplit_once('.') else {
             continue;
@@ -874,11 +909,14 @@ pub fn orphan_job_ids(
         if id.is_empty() || !matches!(ext, "json" | "log" | "exit" | "waiter") {
             continue;
         }
-        *all_old.entry(id).or_insert(true) &= old_enough(f, now);
+        let e = seen.entry(id).or_insert((true, false));
+        e.0 &= old_enough(f, now);
+        e.1 |= ext == "json";
     }
-    all_old
-        .into_iter()
-        .filter(|(id, old)| *old && !readable.contains(*id) && !live(id))
+    seen.into_iter()
+        .filter(|(id, (old, described))| {
+            *old && (!described || unreadable.contains(*id)) && !live(id)
+        })
         .map(|(id, _)| id.to_string())
         .collect()
 }
@@ -909,7 +947,10 @@ fn job_is_live(ctx: &Context, ledger: &Ledger, id: &str) -> bool {
 }
 
 /// Apply [`job_action`] to every job, and cut the logs of the jobs that are
-/// over. A job that fails is noted and the next one is looked at.
+/// over. A job that fails is noted and the next one is looked at. The
+/// descriptors are read one by one, the one written longest ago first, so
+/// a sweep that runs out of time has looked at the jobs most likely to go.
+/// Returns the ids whose descriptor it found not to load.
 fn sweep_jobs(
     ctx: &Context,
     keep: &Keep,
@@ -917,19 +958,21 @@ fn sweep_jobs(
     r: &mut Report,
     errors: &mut Errors,
     allow: &mut Allowance,
-) {
+) -> HashSet<String> {
     let now = ctx.clock.now();
     let max = keep.jobs_log_max_bytes();
-    if !allow.go() {
-        return;
-    }
-    let Some(all) = errors.ok("jobs", jobs::list(ctx)) else {
-        return;
+    let mut unreadable = HashSet::new();
+    let Some(ids) = errors.ok("jobs", jobs::ids_oldest_first(ctx)) else {
+        return unreadable;
     };
-    for job in all {
+    for id in ids {
         if !allow.go() {
-            return;
+            break;
         }
+        let Ok(job) = jobs::load(ctx, &id) else {
+            unreadable.insert(id);
+            continue;
+        };
         let exit_written = match job.finished_at {
             Some(_) => None,
             None => std::fs::metadata(ctx.paths.job_exit(&job.id))
@@ -951,9 +994,8 @@ fn sweep_jobs(
             continue;
         }
         if action != JobAction::Keep && !allow.take() {
-            return;
+            break;
         }
-        let id = job.id.clone();
         match action {
             JobAction::Remove => {
                 // False when a `wait` took the job meanwhile: it stays.
@@ -978,6 +1020,7 @@ fn sweep_jobs(
             }
         }
     }
+    unreadable
 }
 
 fn mark_finished(ctx: &Context, mut job: Job, at: DateTime<Utc>) -> Result<()> {
@@ -992,6 +1035,7 @@ fn mark_finished(ctx: &Context, mut job: Job, at: DateTime<Utc>) -> Result<()> {
 fn sweep_strays(
     ctx: &Context,
     ledger: &Ledger,
+    unreadable: &HashSet<String>,
     r: &mut Report,
     errors: &mut Errors,
     allow: &mut Allowance,
@@ -1009,9 +1053,6 @@ fn sweep_strays(
         }
     }
     for (dir, legacy) in dirs {
-        if !allow.go() {
-            return;
-        }
         for name in stale_temp_files(&list_files(&dir), &pid_alive, legacy, now) {
             if !allow.take() {
                 return;
@@ -1023,15 +1064,8 @@ fn sweep_strays(
             }
         }
     }
-    if !allow.go() {
-        return;
-    }
-    let Some(jobs) = errors.ok("jobs", jobs::list(ctx)) else {
-        return;
-    };
-    let readable: HashSet<String> = jobs.into_iter().map(|j| j.id).collect();
     let live = |id: &str| job_is_live(ctx, ledger, id);
-    for id in orphan_job_ids(&list_files(&ctx.paths.jobs_dir()), &readable, &live, now) {
+    for id in orphan_job_ids(&list_files(&ctx.paths.jobs_dir()), unreadable, &live, now) {
         if !allow.take() {
             return;
         }
@@ -1141,16 +1175,52 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_gets_an_equal_share_of_what_is_left() {
-        let now = Instant::now();
+    fn the_budget_is_split_in_eight_equal_parts() {
         let ms = std::time::Duration::from_millis;
-        assert_eq!(stage_end(None, now, 4), None);
-        assert_eq!(stage_end(Some(now + ms(200)), now, 4), Some(now + ms(50)));
-        assert_eq!(stage_end(Some(now + ms(200)), now, 1), Some(now + ms(200)));
-        // Nothing left: the stage is over as it begins.
-        assert_eq!(stage_end(Some(now), now + ms(5), 2), Some(now + ms(5)));
-        // Never a division by nothing.
-        assert_eq!(stage_end(Some(now + ms(200)), now, 0), Some(now + ms(200)));
+        assert_eq!(slice_of(SWEEP_BUDGET), ms(25));
+        assert_eq!(slice_of(ms(8)), ms(1));
+        assert_eq!(slice_of(ms(0)), ms(0));
+    }
+
+    /// Looking and removing each have their own time in a stage, counted
+    /// from the first look and the first removal: what was found can be
+    /// removed even when looking took all its time.
+    #[test]
+    fn a_stage_that_ran_out_of_time_looking_still_removes() {
+        let mut allow = Allowance {
+            left: 2,
+            cuts: 1,
+            slice: Some(std::time::Duration::from_secs(3600)),
+            look: None,
+            act: None,
+            stop: &|| false,
+            short: false,
+        };
+        assert!(allow.go());
+        // Its time for looking is over.
+        allow.look = Some(Instant::now());
+        assert!(!allow.go());
+        assert!(allow.short);
+        // Removing has not begun: it has its whole time, and its count.
+        assert!(allow.take() && allow.take_cut() && allow.take());
+        assert!(!allow.take() && !allow.take_cut());
+        // The next stage starts afresh; a stop ends everything.
+        allow.begin();
+        assert!(allow.go());
+        allow.left = 1;
+        allow.cuts = 1;
+        allow.act = Some(Instant::now());
+        assert!(!allow.take() && !allow.take_cut());
+        assert_eq!((allow.left, allow.cuts), (1, 1));
+        allow.begin();
+        allow.stop = &|| true;
+        assert!(!allow.go() && !allow.take() && !allow.take_cut());
+        // No budget: never out of time.
+        allow.stop = &|| false;
+        allow.slice = None;
+        allow.begin();
+        assert!(allow.go() && allow.take());
+        assert_eq!((allow.look, allow.act), (None, None));
     }
 
     #[test]
@@ -1430,7 +1500,7 @@ mod tests {
     #[test]
     fn job_files_without_a_readable_descriptor_go_unless_young_live_or_unknown() {
         let now = t(0);
-        let readable: HashSet<String> = ["kept".to_string()].into();
+        let unreadable: HashSet<String> = ["damaged".to_string()].into();
         let live = |id: &str| id == "alive";
         let files = [
             file("kept.log", 9 * DAY),
@@ -1445,12 +1515,14 @@ mod tests {
             file("young.log", 9 * DAY),
             file("young.json", STRAY_AFTER_SECS - 1),
             file("alive.log", 9 * DAY),
+            // A descriptor nobody found damaged is the job rule's.
+            file("whole.json", 9 * DAY),
             file("notes.txt", 9 * DAY),
             file("README", 9 * DAY),
             file(".log", 9 * DAY),
         ];
         assert_eq!(
-            orphan_job_ids(&files, &readable, &live, now),
+            orphan_job_ids(&files, &unreadable, &live, now),
             vec!["damaged", "gone"]
         );
     }

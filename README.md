@@ -885,10 +885,15 @@ The automatic sweep never delays or fails anything:
   program that embeds the library), and a stop that arrives while it runs
   ends it too. Both are looked at between two items, an item being one
   file looked at or removed, one log cut (a copy of up to
-  `jobs_log_max_mib`) or one rewrite of the history, so it ends at most one
-  item later. Each of its four stages gets an equal share of the time that
-  is left, so one with much to look at does not keep the others from
-  running. What is left is done 10 minutes later;
+  `jobs_log_max_mib`), one rewrite of the history or one listing of a
+  directory, so it ends at most one item later. The time is split in eight
+  parts of 25 ms: each of the four stages (ledger and receipts, history,
+  jobs, stray files) has one for looking and one for removing, counted
+  from its first look and its first removal. So a directory with more in
+  it than can be read in that time does not keep the sweep from removing
+  what it found, or the other stages from running: every sweep gets
+  something done, the files written longest ago are looked at first, and
+  what is left is done 10 minutes later;
 - it takes no lock it would have to wait for. A stage whose lock is busy is
   skipped, the sweep is not recorded as done, and it is tried again 10
   minutes later. The jobs and the stray files are swept all the same: they
@@ -909,7 +914,7 @@ The automatic sweep never delays or fails anything:
 `gc` applies the same rules on demand, waits for the locks, has no limit
 and no time budget, and exits 2 after printing every error.
 
-When the sweep is due is read from `last-sweep` (under a hundred bytes of
+When the sweep is due is read from `last-sweep` (about a hundred bytes of
 JSON: when a sweep last finished and when one was last started, nothing
 else). Only a missing file starts the 6-hour clock (the first command in a
 new state directory). A file that is empty or cannot be read means "due",

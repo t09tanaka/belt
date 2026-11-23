@@ -764,35 +764,38 @@ fn a_config_file_that_is_not_valid_is_said_once_and_the_defaults_stand_in() {
 /// again and find it was done.
 #[test]
 fn only_one_of_many_that_find_the_sweep_due_sweeps() {
-    let dir = tempfile::tempdir().unwrap();
-    let (ctx, clock) = ctx(dir.path());
-    let now = clock.now();
-    for i in 0..40 {
-        finished_job(
-            &ctx,
-            &format!("j{i}"),
-            now - Span::days(4),
-            now - Span::days(3),
-        );
-    }
-    old_stamp(&ctx);
-    let gate = Arc::new(std::sync::Barrier::new(8));
-    let sweepers: Vec<_> = (0..8)
-        .map(|_| {
-            let (ctx, gate) = (ctx.clone(), gate.clone());
-            std::thread::spawn(move || {
-                gate.wait();
-                retention::sweep_if_due(&ctx, &Config::default())
+    // The window is a few instructions wide: many rounds, to meet it.
+    for round in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, clock) = ctx(dir.path());
+        let now = clock.now();
+        for i in 0..10 {
+            finished_job(
+                &ctx,
+                &format!("j{i}"),
+                now - Span::days(4),
+                now - Span::days(3),
+            );
+        }
+        old_stamp(&ctx);
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let sweepers: Vec<_> = (0..8)
+            .map(|_| {
+                let (ctx, gate) = (ctx.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    retention::sweep_if_due(&ctx, &Config::default())
+                })
             })
-        })
-        .collect();
-    let reports: Vec<_> = sweepers
-        .into_iter()
-        .filter_map(|t| t.join().unwrap())
-        .collect();
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert_eq!(reports[0].jobs_removed, 40);
-    assert!(reports[0].complete);
+            .collect();
+        let reports: Vec<_> = sweepers
+            .into_iter()
+            .filter_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(reports.len(), 1, "round {round}: {reports:?}");
+        assert_eq!(reports[0].jobs_removed, 10);
+        assert!(reports[0].complete);
+    }
 }
 
 /// The stamp is replaced whole: whoever reads it, at any moment, finds a
@@ -860,6 +863,51 @@ fn a_sweep_that_is_out_of_time_stops_and_is_tried_again() {
     finished_job(&ctx, "old", now - Span::days(4), now - Span::days(3));
     ctx.sweep_budget = Duration::ZERO;
     assert_eq!(retention::sweep(&ctx, &cfg).jobs_removed, 1);
+}
+
+/// However little time a sweep has and however much there is to look at,
+/// every sweep that finds something due removes some of it, the oldest
+/// first: looking and removing have their own time in each stage, and a
+/// stage's time starts with its first look.
+#[test]
+fn a_sweep_with_almost_no_time_still_gets_everything_done_in_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, clock) = ctx(dir.path());
+    let now = clock.now();
+    const N: usize = 30;
+    std::fs::create_dir_all(ctx.paths.managed_dir()).unwrap();
+    for i in 0..N {
+        finished_job(
+            &ctx,
+            &format!("j{i}"),
+            now - Span::days(4),
+            now - Span::days(3),
+        );
+        let cut_short = ctx.paths.managed_file(&format!("m{i}"));
+        std::fs::write(&cut_short, "{").unwrap();
+        age(&cut_short, STRAY_AFTER_SECS + 5);
+    }
+    old_stamp(&ctx);
+    // Eight nanoseconds: one for each stage to look, one to remove.
+    ctx.sweep_budget = Duration::from_nanos(8);
+    let cfg = Config::default();
+    let left = |ctx: &Context| jobs::list(ctx).unwrap().len() + count_in(&ctx.paths.managed_dir());
+    let mut rounds = 0;
+    while left(&ctx) > 0 {
+        let before = left(&ctx);
+        let report = retention::sweep_if_due(&ctx, &cfg).expect("due");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report.jobs_removed > 0 && report.receipts_removed > 0 || left(&ctx) == 0,
+            "round {rounds}: {report:?}"
+        );
+        assert!(left(&ctx) < before);
+        rounds += 1;
+        assert!(rounds <= N, "not done after {rounds} sweeps");
+        clock.advance(Duration::from_secs(retention::RETRY_AFTER_SECS as u64));
+    }
+    // It did take more than one: the budget is real.
+    assert!(rounds > 1, "{rounds}");
 }
 
 /// What a caller's supervisor says about a stop: asked for after `after`
