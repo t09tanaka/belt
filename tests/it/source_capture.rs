@@ -1006,8 +1006,9 @@ fn a_submodule_capture_that_has_not_arrived_blocks_publication() {
         .objects
         .receive_bundle(&bundle, &ci, &a.dirty_below(&ci).unwrap())
         .unwrap();
+    // (not a broken input: the child is gone, spec 25.8 5b (b))
     let err = b.publish_received(&ci, Some(&other.objects)).unwrap_err();
-    assert!(err.to_string().contains("submodule"), "{err}");
+    assert!(belt::source::store::input_gone(&err).is_some(), "{err}");
     assert!(b.manifest(&ci.source_id).unwrap().is_none());
 }
 

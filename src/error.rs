@@ -268,7 +268,7 @@ pub struct ApiError {
     /// Set when `code` is `INPUT_MISSING`: which source is missing, and at
     /// a publication the blobs that are not in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_missing: Option<InputMissing>,
+    pub input_missing: Option<Box<InputMissing>>,
 }
 
 /// What an `INPUT_MISSING` refusal names (spec 25.8 5b (b)).
@@ -326,10 +326,10 @@ impl ApiError {
         message: impl Into<String>,
     ) -> Self {
         ApiError {
-            input_missing: Some(InputMissing {
+            input_missing: Some(Box::new(InputMissing {
                 source_id: source_id.into(),
                 missing,
-            }),
+            })),
             ..ApiError::new(ErrorCode::InputMissing, message)
         }
     }
@@ -395,7 +395,10 @@ mod tests {
     fn exit_codes_are_unique_except_documented_overlaps() {
         let mut seen = HashSet::new();
         for c in ErrorCode::ALL {
-            let documented_overlap = matches!(c, ErrorCode::Retired | ErrorCode::LeaseNotRenewable);
+            let documented_overlap = matches!(
+                c,
+                ErrorCode::Retired | ErrorCode::LeaseNotRenewable | ErrorCode::InputMissing
+            );
             assert!(
                 seen.insert(c.exit_code()) || documented_overlap,
                 "duplicate exit code for {c}"

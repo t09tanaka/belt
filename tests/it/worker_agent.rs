@@ -450,6 +450,20 @@ impl Fx {
         ));
         connect(a, client_cfg(&self.cluster)).await.unwrap().client
     }
+    /// [`Fx::connect`] for a parent that does not know `input_missing_v1`
+    /// (spec 25.8 5b (b), old peers).
+    async fn connect_old(&self, agent: &Arc<Agent>) -> Client {
+        let (a, b) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            self.cluster.clone(),
+            Arc::new(Semaphore::new(64)),
+        ));
+        let mut cfg = client_cfg(&self.cluster);
+        cfg.features.retain(|v| v != INPUT_MISSING_FEATURE);
+        connect(a, cfg).await.unwrap().client
+    }
     /// [`Fx::connect`] with `ci_task_v1` offered by both sides explicitly
     /// (every build that delivers the frozen plan offers it anyway).
     async fn connect_ci(&self, agent: &Arc<Agent>) -> Client {
@@ -3425,18 +3439,7 @@ async fn acceptance_refuses_a_source_not_in_the_store_with_input_missing() {
     assert!(f.store().tombstone(&a).unwrap().is_none());
 
     // A parent that does not know the code: accepted, as before.
-    let old = {
-        let (x, y) = duplex_pair(64 * 1024);
-        tokio::spawn(serve_connection(
-            agent.clone(),
-            y,
-            f.cluster.clone(),
-            Arc::new(Semaphore::new(64)),
-        ));
-        let mut cfg = client_cfg(&f.cluster);
-        cfg.features.retain(|v| v != INPUT_MISSING_FEATURE);
-        connect(x, cfg).await.unwrap().client
-    };
+    let old = f.connect_old(&agent).await;
     let b = AttemptId::generate();
     submit(&old, &b, &p).await;
     assert!(f.store().get(&b).unwrap().is_some());
@@ -3556,8 +3559,11 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
     wait_for("the workspace to go", || !cwd.exists());
     assert!(plain.join("sub/x.txt").exists());
 
-    // A source that never arrived, and a source whose manifest is not the
-    // one the attempt names, fail as such; nothing is started.
+    // A source that never arrived (sent by a parent that does not know
+    // `INPUT_MISSING`: an agreeing one is refused at acceptance), and a
+    // source whose manifest is not the one the attempt names, fail as such;
+    // nothing is started.
+    let c = f.connect_old(&agent).await;
     let absent = payload("true");
     let mut other_manifest = p.clone();
     other_manifest.task_id = TaskId::generate();
