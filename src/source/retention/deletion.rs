@@ -15,6 +15,8 @@ pub use import_release::{abandoned_imports_read_only, ImportReleaseReport};
 #[cfg(test)]
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
+#[cfg(test)]
+pub(in crate::source::retention) use received::PLANNED;
 pub use received::{ReceivedPassInputs, ReceivedPassReport, SourceUse};
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
@@ -482,7 +484,8 @@ impl Index {
             return Ok(Released::Shared(corrupt));
         }
         // Half the page budget remains for immediate content revalidation.
-        let mut proof_budget = *budget / 2;
+        let half = *budget / 2;
+        let mut proof_budget = half;
         let examined = if reservation {
             self.examine(object, path, &mut proof_budget)
                 .map(|(claim, _)| claim)
@@ -491,7 +494,11 @@ impl Index {
         };
         let claim = match examined {
             Ok(claim) => Claim { abandoned, ..claim },
-            Err(error) => return Ok(Released::Unproven(format!("{error:#}"))),
+            Err(error) => {
+                // (what was read to find it out counts against the budget)
+                *budget -= half - proof_budget;
+                return Ok(Released::Unproven(format!("{error:#}")));
+            }
         };
         *budget -= claim.leaf.size;
         let tx = c.transaction()?;

@@ -107,7 +107,7 @@ impl Env {
     fn pass_with(
         &self,
         cap: u64,
-        uses: &dyn Fn(&str) -> Result<SourceUse>,
+        uses: &dyn Fn(&str, Option<&crate::ids::SourceId>) -> Result<SourceUse>,
     ) -> Result<ReceivedPassReport> {
         self.receiver.received_pass(&ReceivedPassInputs {
             wall: NOW,
@@ -119,7 +119,7 @@ impl Env {
         })
     }
     fn pass(&self) -> ReceivedPassReport {
-        self.pass_with(u64::MAX, &|_| Ok(SourceUse::Ended(None)))
+        self.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)))
             .unwrap()
     }
     /// The sizes of the object files the index has a row for.
@@ -209,7 +209,7 @@ fn a_referenced_source_stays() {
     let broken = env.source(&[("b", "broken")], OLD);
     env.trust_clock();
     let report = env
-        .pass_with(u64::MAX, &|s| {
+        .pass_with(u64::MAX, &|s, _| {
             if s == live {
                 Ok(SourceUse::Live)
             } else if s == broken {
@@ -232,7 +232,7 @@ fn an_attempt_that_ended_later_counts_as_the_last_use() {
     let id = env.source(&[("a", "ended")], OLD);
     env.trust_clock();
     let report = env
-        .pass_with(u64::MAX, &|_| Ok(SourceUse::Ended(Some(YOUNG))))
+        .pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(Some(YOUNG))))
         .unwrap();
     assert_eq!(report.detached, 0, "{report:?}");
     assert!(env.received(&id));
@@ -275,13 +275,15 @@ fn over_the_cap_the_oldest_go_until_it_is_met() {
     let cap = total - 3000;
     env.sql("UPDATE meta SET value='' WHERE key='bytes_fill'");
     assert_eq!(
-        env.pass_with(cap, &|_| Ok(SourceUse::Ended(None)))
+        env.pass_with(cap, &|_, _| Ok(SourceUse::Ended(None)))
             .unwrap()
             .detached,
         0
     );
     env.sql("UPDATE meta SET value='done' WHERE key='bytes_fill'");
-    let report = env.pass_with(cap, &|_| Ok(SourceUse::Ended(None))).unwrap();
+    let report = env
+        .pass_with(cap, &|_, _| Ok(SourceUse::Ended(None)))
+        .unwrap();
     assert!(report.clock_held, "{report:?}");
     assert_eq!(report.detached, 1, "{report:?}");
     assert!(!env.received(&a));
@@ -342,7 +344,7 @@ fn a_claim_left_by_a_crash_is_finished_by_the_next_pass() {
     let old = env.source(&[("a", "old")], OLD);
     env.trust_clock();
     set_fault(Some("after_claim"));
-    let failed = env.pass_with(u64::MAX, &|_| Ok(SourceUse::Ended(None)));
+    let failed = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
     set_fault(None);
     assert!(failed.is_err());
     assert!(env.count("SELECT count(*) FROM source_delete_claim WHERE done=0") > 0);
@@ -407,7 +409,7 @@ fn a_section_checks_at_most_32_candidates() {
     env.trust_clock();
     let asked = RefCell::new(0usize);
     let report = env
-        .pass_with(u64::MAX, &|_| {
+        .pass_with(u64::MAX, &|_, _| {
             *asked.borrow_mut() += 1;
             Ok(SourceUse::Live)
         })
@@ -417,4 +419,224 @@ fn a_section_checks_at_most_32_candidates() {
     // candidate, a fourth only that step 0 has nothing)
     assert_eq!(*asked.borrow(), 33);
     assert_eq!(report.sections, 4, "{report:?}");
+}
+
+/// Review M1: nothing is detached while a root waits for its `clone_ref`
+/// retry (its time is not known: a missing one would sort it oldest), and
+/// nothing by size while a size waits for its retry.
+#[test]
+fn a_pending_clone_ref_or_bytes_retry_holds_the_rules() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.sql(&format!(
+        "UPDATE root SET used_ms=NULL WHERE id='receive:{old}'; INSERT INTO clone_ref_retry VALUES('receive:{old}',1,0)"
+    ));
+    env.trust_clock();
+    assert_eq!(env.pass().detached, 0);
+    assert!(env.received(&old));
+    env.sql("DELETE FROM clone_ref_retry; INSERT INTO bytes_retry VALUES('b:x',1,0)");
+    env.sql(&format!(
+        "UPDATE root SET used_ms={YOUNG} WHERE id='receive:{old}'"
+    ));
+    let ended = |_: &str, _: Option<&crate::ids::SourceId>| Ok(SourceUse::Ended(None));
+    assert_eq!(env.pass_with(0, &ended).unwrap().detached, 0);
+    assert!(env.received(&old));
+    env.sql("DELETE FROM bytes_retry");
+    assert_eq!(env.pass_with(0, &ended).unwrap().detached, 1);
+}
+
+/// Review M2: nothing goes by size while a recount runs or waits.
+#[test]
+fn nothing_goes_by_size_during_a_recount() {
+    let mut env = Env::new();
+    let a = env.source(&[("a", "a")], YOUNG);
+    let ended = |_: &str, _: Option<&crate::ids::SourceId>| Ok(SourceUse::Ended(None));
+    for key in ["bytes_recount", "bytes_recount_wait"] {
+        env.sql(&format!("INSERT INTO meta VALUES('{key}','')"));
+        assert_eq!(env.pass_with(0, &ended).unwrap().detached, 0, "{key}");
+        assert!(env.received(&a));
+        env.sql(&format!("DELETE FROM meta WHERE key='{key}'"));
+    }
+    assert_eq!(env.pass_with(0, &ended).unwrap().detached, 1);
+}
+
+/// Review M3: a blob shared only with a source detached earlier in the
+/// section counts as freed: the cap does not take one source too many.
+#[test]
+fn a_blob_shared_with_a_detached_source_counts_as_freed() {
+    let mut env = Env::new();
+    let shared = "s".repeat(4000);
+    let a = env.source(&[("a", &"a".repeat(4000)), ("s", &shared)], 10);
+    let b = env.source(&[("b", &"b".repeat(4000)), ("s", &shared)], 20);
+    let c = env.source(&[("c", &"c".repeat(4000))], 30);
+    let cap = env.store_bytes() - 10_000;
+    let report = env
+        .pass_with(cap, &|_, _| Ok(SourceUse::Ended(None)))
+        .unwrap();
+    assert_eq!(report.detached, 2, "{report:?}");
+    assert!(!env.received(&a) && !env.received(&b));
+    assert!(env.received(&c));
+    assert!(env.store_bytes() <= cap);
+}
+
+/// Review M4: the clone refs of the children a root carried get their
+/// `ref_drop:` rows as well.
+#[test]
+fn a_detach_records_the_carried_children_clone_refs() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.sql(&format!(
+        "INSERT INTO clone_ref(clone,source,root) VALUES('c1','{old}','receive:{old}'),('c3','child','receive:{old}')"
+    ));
+    env.trust_clock();
+    assert_eq!(env.pass().detached, 1);
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM meta WHERE key IN ('ref_drop:c1:{old}','ref_drop:c3:child')"
+        )),
+        2
+    );
+}
+
+/// Review M5: the pass asks with the CI id (the pins) and the converted
+/// `SourceId` (`worker.db`): a pinned source and one a live attempt names
+/// stay, the third goes.
+#[test]
+fn the_pins_and_the_attempts_are_asked_with_their_own_ids() {
+    let mut env = Env::new();
+    let pinned = env.source(&[("a", "pinned")], OLD);
+    let attempted = env.source(&[("b", "attempted")], OLD);
+    let free = env.source(&[("c", "free")], OLD);
+    let pins = crate::worker::pins::SourcePins::default();
+    let _pin = pins.pin(&env.receiver, &pinned).unwrap();
+    // (worker.db names sources as `src_<ULID>`)
+    let live = crate::source::classify::source_id_of_ci(&attempted)
+        .unwrap()
+        .to_string();
+    assert!(live.starts_with("src_"));
+    env.trust_clock();
+    let report = env
+        .pass_with(u64::MAX, &|ci, id| {
+            if pins.pinned(ci) || id.is_some_and(|id| id.as_str() == live) {
+                Ok(SourceUse::Live)
+            } else {
+                Ok(SourceUse::Ended(None))
+            }
+        })
+        .unwrap();
+    assert_eq!(report.detached, 1, "{report:?}");
+    assert!(env.received(&pinned) && env.received(&attempted));
+    assert!(!env.received(&free));
+}
+
+/// Review L1: an empty abandoned root goes with its graph rows.
+#[test]
+fn an_empty_root_goes_with_its_graph_rows() {
+    let env = Env::new();
+    env.sql("INSERT INTO root(id,kind,source) VALUES('drop:x:1','abandoned',NULL); INSERT INTO graph(root,source,done) VALUES('drop:x:1','y',1)");
+    let (what, _) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id='drop:x:1'"),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM graph WHERE root='drop:x:1'"),
+        0
+    );
+}
+
+/// Review L2: the reads of files that cannot be proven count against the
+/// section budget, and the section ends once they took half of it.
+#[test]
+fn unproven_reads_spend_the_section_budget() {
+    let mut env = Env::new();
+    let mut files = Vec::new();
+    for i in 0..3 {
+        let content = format!("{i}").repeat(30);
+        let id = env.source(&[("f", &content)], YOUNG);
+        let hash = env
+            .receiver
+            .manifest(&id)
+            .unwrap()
+            .unwrap()
+            .object_manifest
+            .entries[0]
+            .hash
+            .clone();
+        // the source becomes a `drop:` root holding only its blob, whose
+        // size is not counted and whose content changed
+        env.sql(&format!(
+            "INSERT INTO root(id,kind,source) VALUES('drop:{id}:1','abandoned',NULL);
+             DELETE FROM member WHERE root='receive:{id}' AND object<>'b:{hash}';
+             UPDATE member SET root='drop:{id}:1' WHERE root='receive:{id}';
+             DELETE FROM root WHERE id='receive:{id}';
+             DELETE FROM object_bytes WHERE id='b:{hash}'"
+        ));
+        let path: String = env
+            .receiver
+            .retention
+            .connect()
+            .unwrap()
+            .query_row("SELECT path FROM object WHERE id='b:'||?1", [&hash], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let file = env.receiver.root().join(&path);
+        let mut perm = std::fs::metadata(&file).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&file, perm).unwrap();
+        std::fs::write(&file, "x".repeat(30)).unwrap();
+        files.push(file);
+    }
+    // 100 bytes: the first two reads (30 each) reach half of it
+    let (what, report) = env.receiver.retention.leftovers_with(100).unwrap();
+    assert_eq!(what, "stuck");
+    assert_eq!(report.kept, 2, "{report:?}");
+    assert!(files.iter().all(|f| f.exists()));
+}
+
+/// Review L3: a claim the rest of the section cannot verify waits for the
+/// next section; the pass does not stop on it.
+#[test]
+fn a_claim_larger_than_the_rest_of_the_budget_waits() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.trust_clock();
+    set_fault(Some("after_claim"));
+    let failed = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
+    set_fault(None);
+    assert!(failed.is_err());
+    let pending = env.count("SELECT count(*) FROM source_delete_claim WHERE done=0");
+    assert!(pending > 0);
+    let (what, _) = env.receiver.retention.leftovers_with(1).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim WHERE done=0"),
+        pending
+    );
+    let report = env.pass();
+    assert!(!report.stuck, "{report:?}");
+    assert!(!env.received(&old));
+}
+
+/// Review L4: step 0's page and the candidates follow an index: no scan of
+/// a whole table and no sort of every received root.
+#[test]
+fn the_pass_queries_follow_an_index() {
+    let env = Env::new();
+    let c = env.receiver.retention.connect().unwrap();
+    for sql in super::deletion::PLANNED {
+        let mut s = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args: Vec<i64> = vec![0; s.parameter_count()];
+        let plan: Vec<String> = s
+            .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let text = plan.join("\n");
+        eprintln!("{text}");
+        assert!(!text.contains("TEMP B-TREE"), "{sql}\n{text}");
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN")), "{sql}\n{text}");
+    }
 }

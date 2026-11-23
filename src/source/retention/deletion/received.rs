@@ -34,8 +34,15 @@ pub struct ReceivedPassInputs<'a> {
     pub max_age_ms: u64,
     /// 20 GiB in production.
     pub cap_bytes: u64,
-    /// Read under the exclusive lock; an error counts as referenced.
-    pub uses: &'a dyn Fn(&str) -> Result<SourceUse>,
+    /// Read under the exclusive lock; an error counts as referenced. It is
+    /// asked with the source's two ids: the CI id (`src-<32 hex>`, the form
+    /// the index and the in-process pins use) and the same source as a
+    /// [`crate::ids::SourceId`] (`src_<ULID>`, the form `worker.db`'s
+    /// `source_use` takes), converted by
+    /// [`crate::source::classify::source_id_of_ci`]. `None` there is an id
+    /// that does not convert: the pass keeps such a source whatever the
+    /// answer, so a caller may answer `Live` without a lookup.
+    pub uses: &'a dyn Fn(&str, Option<&crate::ids::SourceId>) -> Result<SourceUse>,
 }
 
 /// What one pass did.
@@ -82,6 +89,33 @@ const CLOCK: &str = "received_clock";
 /// The pause between sections, so a waiting reader takes the lock first.
 const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Step 0's page: the abandoned roots from the cursor in `root_kind`
+/// order, then each one's members by the primary key (no scan of the other
+/// roots' members, no sort).
+const STEP0_ROOTS: &str = "SELECT id FROM root WHERE kind='abandoned' AND id>=?1
+     AND (id LIKE 'import:%' OR id LIKE 'drop:%' OR id LIKE 'receive:%') ORDER BY id LIMIT ?2";
+const STEP0_MEMBERS: &str = "SELECT m.object,o.path,b.bytes FROM member m
+     JOIN object o ON o.id=m.object LEFT JOIN object_bytes b ON b.id=m.object
+     WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT ?3";
+/// The candidates of steps 2 and 3, oldest first: the roots without a time
+/// (counted as -1) by id, then the others by time and id, each in the order
+/// of `root_used_id` (no sort of every received root). A root waiting for
+/// its `clone_ref` retry is not one.
+const UNTIMED: &str = "SELECT r.id,r.source,r.used_ms FROM root r WHERE r.kind='received' AND r.used_ms IS NULL AND r.id>?1
+     AND r.source IS NOT NULL AND r.id='receive:'||r.source
+     AND NOT EXISTS(SELECT 1 FROM graph g WHERE g.source=r.source AND g.root<>r.id)
+     AND NOT EXISTS(SELECT 1 FROM clone_ref_retry t WHERE t.root=r.id)
+     ORDER BY r.id LIMIT ?2";
+const TIMED: &str = "SELECT r.id,r.source,r.used_ms FROM root r WHERE r.kind='received' AND r.used_ms IS NOT NULL AND (r.used_ms,r.id)>(?1,?2)
+     AND r.source IS NOT NULL AND r.id='receive:'||r.source
+     AND NOT EXISTS(SELECT 1 FROM graph g WHERE g.source=r.source AND g.root<>r.id)
+     AND NOT EXISTS(SELECT 1 FROM clone_ref_retry t WHERE t.root=r.id)
+     ORDER BY r.used_ms,r.id LIMIT ?3";
+/// The queries whose plans a test checks.
+#[cfg(test)]
+pub(in crate::source::retention) const PLANNED: [&str; 4] =
+    [STEP0_ROOTS, STEP0_MEMBERS, UNTIMED, TIMED];
+
 /// A member step 0 looks at: root, object, path, counted bytes.
 type Member = (String, String, String, Option<i64>);
 
@@ -108,7 +142,7 @@ impl SourceStore {
         }
         let mut step0 = 0usize;
         let mut cutoff: Option<Option<u64>> = None;
-        let mut after: Option<(i64, String)> = None;
+        let mut after: Option<(Option<i64>, String)> = None;
         // (steps 2 and 3 end at the first candidate the rules do not allow;
         // the sections go on while step 0 has work)
         let mut detaching = true;
@@ -185,6 +219,24 @@ impl SourceStore {
 }
 
 impl Index {
+    /// Step 0 alone with `budget`, for tests: what it returned and did.
+    #[cfg(test)]
+    pub(in crate::source::retention) fn leftovers_with(
+        &self,
+        budget: u64,
+    ) -> Result<(&'static str, ReceivedPassReport)> {
+        let mut c = self.connect()?;
+        let mut budget = budget;
+        let mut report = ReceivedPassReport::default();
+        let what = match self.leftovers(&mut c, &mut budget, &mut report)? {
+            Leftover::None => "none",
+            Leftover::Progress => "progress",
+            Leftover::Stuck => "stuck",
+            Leftover::Stop => "stop",
+        };
+        Ok((what, report))
+    }
+
     /// The trusted now of the expiry, `None` while the clock holds.
     fn received_clock(&self, c: &Connection, inputs: &ReceivedPassInputs) -> Result<Option<u64>> {
         let previous: Option<String> = c
@@ -226,6 +278,11 @@ impl Index {
         if !replay.is_empty() {
             for raw in replay {
                 let claim: Claim = serde_json::from_str(&raw)?;
+                // (one the rest of this section cannot verify waits for
+                // the next one, whose budget is whole)
+                if claim.leaf.size > *budget {
+                    return Ok(Leftover::Progress);
+                }
                 if self.drain_claim(c, &claim, budget).is_err() {
                     return Ok(Leftover::Stop);
                 }
@@ -241,17 +298,27 @@ impl Index {
             .unwrap_or_default();
         let (root_after, object_after) = stored.split_once('\n').unwrap_or(("", ""));
         let page = |c: &Connection, root: &str, object: &str| -> Result<Vec<Member>> {
-            let mut s = c.prepare(
-                "SELECT m.root,m.object,o.path,b.bytes FROM member m JOIN root r ON r.id=m.root
-                 JOIN object o ON o.id=m.object LEFT JOIN object_bytes b ON b.id=m.object
-                 WHERE r.kind='abandoned' AND (r.id LIKE 'import:%' OR r.id LIKE 'drop:%' OR r.id LIKE 'receive:%')
-                 AND (m.root>?1 OR (m.root=?1 AND m.object>?2))
-                 ORDER BY m.root,m.object LIMIT ?3",
-            )?;
-            let rows = s.query_map(params![root, object, ROWS as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?;
-            Ok(rows.collect::<std::result::Result<_, _>>()?)
+            let roots: Vec<String> = {
+                let mut s = c.prepare(STEP0_ROOTS)?;
+                let rows = s.query_map(params![root, ROWS as i64], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let mut members = Vec::new();
+            let mut s = c.prepare(STEP0_MEMBERS)?;
+            for id in roots {
+                let left = ROWS - members.len();
+                if left == 0 {
+                    break;
+                }
+                let from = if id == root { object } else { "" };
+                let rows = s.query_map(params![id, from, left as i64], |r| {
+                    Ok((id.clone(), r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                for row in rows {
+                    members.push(row?);
+                }
+            }
+            Ok(members)
         };
         let mut members = page(c, root_after, object_after)?;
         if members.is_empty() && !stored.is_empty() {
@@ -259,10 +326,18 @@ impl Index {
         }
         // Roots left empty (by a shared detach elsewhere, or a member a
         // crash took) go in the same section.
-        let empty = c.execute(
-            "DELETE FROM root WHERE kind='abandoned' AND (id LIKE 'drop:%' OR id LIKE 'receive:%') AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id)",
-            [],
-        )?;
+        // (their graph rows go in the same transaction)
+        let empty = {
+            const EMPTY: &str = "kind='abandoned' AND (id LIKE 'drop:%' OR id LIKE 'receive:%') AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id)";
+            let tx = c.transaction()?;
+            tx.execute(
+                &format!("DELETE FROM graph WHERE root IN (SELECT id FROM root WHERE {EMPTY})"),
+                [],
+            )?;
+            let empty = tx.execute(&format!("DELETE FROM root WHERE {EMPTY}"), [])?;
+            tx.commit()?;
+            empty
+        };
         report.forgotten += empty;
         if members.is_empty() {
             if !stored.is_empty() {
@@ -277,7 +352,15 @@ impl Index {
         let mut changed = empty > 0;
         let mut cursor = stored.clone();
         let mut touched = std::collections::BTreeSet::new();
+        // What the unproven files' reads took: once it reaches half of the
+        // section's budget, the section ends (the hashing of files that
+        // stay is bounded like that of files that go).
+        let start = *budget;
+        let mut unproven_read = 0u64;
         for (root, object, path, bytes) in &members {
+            if unproven_read >= start / 2 {
+                break;
+            }
             // A known size the rest of the section cannot verify waits for
             // the next section (the cursor stays before it); one larger
             // than a whole section's half is kept (spec: the large-blob
@@ -301,12 +384,16 @@ impl Index {
                 changed = true;
                 continue;
             }
+            let before = *budget;
             match self.release_member(c, root, object, path, budget, true, false)? {
                 Released::Shared(_) => {
                     report.forgotten += 1;
                     changed = true;
                 }
-                Released::Unproven(_) => report.kept += 1,
+                Released::Unproven(_) => {
+                    report.kept += 1;
+                    unproven_read += before - *budget;
+                }
                 Released::Claimed(Ok(())) => {
                     report.unlinked += 1;
                     changed = true;
@@ -356,13 +443,17 @@ impl Index {
         budget: &mut u64,
         inputs: &ReceivedPassInputs,
         now: Option<u64>,
-        after: &mut Option<(i64, String)>,
+        after: &mut Option<(Option<i64>, String)>,
         report: &mut ReceivedPassReport,
     ) -> Result<Option<usize>> {
         // The cap counts only once every size is known (spec (g)13); what
         // the `drop:` roots alone hold is already on its way out.
         let filled: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='bytes_fill' AND value='done')",
+            // (and no size waits for a retry, and no recount runs: its
+            // `store_bytes` is rewritten when it ends)
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='bytes_fill' AND value='done')
+             AND NOT EXISTS(SELECT 1 FROM bytes_retry)
+             AND NOT EXISTS(SELECT 1 FROM meta WHERE key IN ('bytes_recount','bytes_recount_wait'))",
             [],
             |r| r.get(0),
         )?;
@@ -385,10 +476,11 @@ impl Index {
             _ => None,
         };
         // A requested source's time is known once the `clone_ref` fill
-        // (which writes it for the roots made before) is done; until then
-        // nothing is detached.
+        // (which writes it for the roots made before) is done and no root
+        // waits for its retry; until then nothing is detached.
         let timed: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')",
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')
+             AND NOT EXISTS(SELECT 1 FROM clone_ref_retry)",
             [],
             |r| r.get(0),
         )?;
@@ -396,33 +488,53 @@ impl Index {
             return Ok(None);
         }
         let expired_before = now.map(|now| now.saturating_sub(inputs.max_age_ms));
-        let (used_after, id_after) = after.clone().unwrap_or((i64::MIN, String::new()));
-        let candidates: Vec<(String, String, i64)> = {
-            let mut s = c.prepare(
-                "SELECT r.id,r.source,ifnull(r.used_ms,-1) FROM root r WHERE r.kind='received' AND r.source IS NOT NULL AND r.id='receive:'||r.source
-                 AND NOT EXISTS(SELECT 1 FROM graph g WHERE g.source=r.source AND g.root<>r.id)
-                 AND (ifnull(r.used_ms,-1)>?1 OR (ifnull(r.used_ms,-1)=?1 AND r.id>?2))
-                 ORDER BY ifnull(r.used_ms,-1),r.id LIMIT ?3",
-            )?;
-            let rows = s.query_map(params![used_after, id_after, CANDIDATES as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
-            rows.collect::<std::result::Result<_, _>>()?
+        type Candidate = (String, String, Option<i64>);
+        let fetch =
+            |out: &mut Vec<Candidate>, sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let mut s = c.prepare(sql)?;
+                let rows = s.query_map(p, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(())
+            };
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let (used_after, id_after) = match after.clone() {
+            None => (None, String::new()),
+            Some((used, id)) => (used, id),
         };
+        let mut timed_from = (i64::MIN, String::new());
+        if used_after.is_none() {
+            fetch(&mut candidates, UNTIMED, &[&id_after, &(CANDIDATES as i64)])?;
+        } else {
+            timed_from = (used_after.unwrap_or(i64::MIN), id_after);
+        }
+        let room = CANDIDATES - candidates.len();
+        if room > 0 {
+            fetch(
+                &mut candidates,
+                TIMED,
+                &[&timed_from.0, &timed_from.1, &(room as i64)],
+            )?;
+        }
         if candidates.is_empty() {
             return Ok(None);
         }
         let mut detached = 0;
-        for (root, source, used) in &candidates {
-            *after = Some((*used, root.clone()));
+        for (root, source, used_ms) in &candidates {
+            *after = Some((*used_ms, root.clone()));
+            let used = &used_ms.unwrap_or(-1);
             let expired = expired_before.is_some_and(|before| *used < before as i64);
             let capped = over.is_some_and(|bytes| bytes > inputs.cap_bytes);
             if !expired && !capped {
                 // (oldest first: no later one is allowed either)
                 return Ok(None);
             }
-            // (a) (1) and the pins, read under the lock; an error keeps it
-            match (inputs.uses)(source) {
+            // (a) (1) and the pins, read under the lock; an error, or an id
+            // that does not convert, keeps it
+            let id = crate::source::classify::source_id_of_ci(source);
+            match (inputs.uses)(source, id.as_ref()) {
+                _ if id.is_none() => continue,
                 Ok(SourceUse::Live) | Err(_) => continue,
                 Ok(SourceUse::Ended(Some(at))) if at > *used => {
                     // L6: used at its attempt's terminal time; looked at
@@ -482,7 +594,8 @@ impl Index {
     /// new `drop:<source>:<ulid>` root, and its row, graph rows and
     /// `clone_ref` rows go; a `(clone, source)` with no `clone_ref` row left
     /// gets a `ref_drop:` row (step 4). Returns the bytes only this root
-    /// held, or `None` when it no longer qualifies.
+    /// held, alone or with `drop:` roots (whose bytes the cap already counts as
+    /// leaving), or `None` when it no longer qualifies.
     fn detach(&self, c: &mut Connection, root: &str, source: &str) -> Result<Option<u64>> {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let still: bool = tx.query_row(
@@ -496,7 +609,8 @@ impl Index {
         }
         let freed: i64 = tx.query_row(
             "SELECT coalesce(sum(b.bytes),0) FROM member m JOIN object_bytes b ON b.id=m.object
-             WHERE m.root=?1 AND NOT EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>?1)",
+             WHERE m.root=?1 AND NOT EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>?1
+             AND NOT (o.root>='drop:' AND o.root<'drop;'))",
             [root],
             |r| r.get(0),
         )?;
@@ -509,16 +623,18 @@ impl Index {
             "UPDATE member SET root=?2 WHERE root=?1",
             params![root, drop],
         )?;
-        let refs: Vec<String> = {
-            let mut s = tx.prepare("SELECT DISTINCT clone FROM clone_ref WHERE root=?1")?;
-            let rows = s.query_map([root], |r| r.get(0))?;
+        // (every source the root's clones named: its own and those of the
+        // children it carried)
+        let refs: Vec<(String, String)> = {
+            let mut s = tx.prepare("SELECT DISTINCT clone,source FROM clone_ref WHERE root=?1")?;
+            let rows = s.query_map([root], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
         tx.execute("DELETE FROM clone_ref WHERE root=?1", [root])?;
-        for clone in refs {
+        for (clone, named) in refs {
             tx.execute(
                 "INSERT OR IGNORE INTO meta(key,value) SELECT 'ref_drop:'||?1||':'||?2,'' WHERE NOT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
-                params![clone, source],
+                params![clone, named],
             )?;
         }
         tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
