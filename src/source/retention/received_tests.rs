@@ -32,6 +32,8 @@ impl Env {
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
         );
+        // (this process has started its recount, as the caller ensures)
+        *env.receiver.retention.recounted.lock().unwrap() = Some(std::time::Instant::now());
         env
     }
     fn sql(&self, s: &str) {
@@ -721,4 +723,26 @@ fn an_empty_import_root_goes_with_its_session() {
         env.count("SELECT count(*) FROM import_session WHERE token='t1'"),
         0
     );
+}
+
+/// Caller condition L5: nothing is detached before this process started
+/// its recount (the rewind of the fills).
+#[test]
+fn nothing_is_detached_before_the_process_recounts() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.trust_clock();
+    *env.receiver.retention.recounted.lock().unwrap() = None;
+    let report = env.pass();
+    assert_eq!(report.detached, 0, "{report:?}");
+    assert!(env.received(&old));
+    // the recount starts (and, the fills done again, ends)
+    while !env.receiver.retention.recount_bytes(1000).unwrap() {
+        env.sql("UPDATE meta SET value='done' WHERE key IN ('bytes_fill','clone_ref_fill')");
+    }
+    assert!(env.receiver.retention.recounted.lock().unwrap().is_some());
+    env.trust_clock();
+    let report = env.pass();
+    assert_eq!(report.detached, 1, "{report:?}");
+    assert!(!env.received(&old));
 }

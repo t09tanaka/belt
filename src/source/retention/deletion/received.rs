@@ -504,6 +504,12 @@ impl Index {
         if !timed {
             return Ok(None);
         }
+        // (L5) Nor before this process started its recount, which rewinds
+        // both fills: an older binary may have left roots without a time
+        // or a size since this store last counted (spec 25.8 5b (c)).
+        if self.recounted.lock().unwrap().is_none() {
+            return Ok(None);
+        }
         let expired_before = now.map(|now| now.saturating_sub(inputs.max_age_ms));
         type Candidate = (String, String, Option<i64>);
         let fetch =
