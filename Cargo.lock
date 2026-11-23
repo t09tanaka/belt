@@ -1383,9 +1383,9 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "portool"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd66c51b0103479efb6e34c815d2e78266498cbd1f10c541f78eac7adaecbc1"
+checksum = "acca58dd13ae5710e66c155fff693828b03913a4947a3896ae2135d4890ae5b1"
 dependencies = [
  "chrono",
  "clap",
