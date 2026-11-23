@@ -225,6 +225,12 @@ pub trait WorkerLink: Send + Sync {
     fn ci_discovery_negotiated(&self) -> bool {
         false
     }
+    /// The worker takes `release_attempt` and `list_unreleased`, and
+    /// deletes an attempt at its acknowledgement (`attempt_release_v1`,
+    /// spec 25.6). A worker that does not is sent neither.
+    fn attempt_release_negotiated(&self) -> bool {
+        false
+    }
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
     }
@@ -277,6 +283,7 @@ pub struct ClientLink {
     matrix_dispatch: bool,
     ci_discovery: bool,
     workflow_artifacts: bool,
+    attempt_release: bool,
 }
 
 impl ClientLink {
@@ -292,6 +299,7 @@ impl ClientLink {
             matrix_dispatch: false,
             ci_discovery: false,
             workflow_artifacts: false,
+            attempt_release: false,
         }
     }
 }
@@ -309,6 +317,7 @@ impl ClientLink {
             matrix_dispatch: false,
             ci_discovery: false,
             workflow_artifacts: false,
+            attempt_release: false,
         }
     }
 }
@@ -343,6 +352,10 @@ impl ClientLink {
         self.ci_task = negotiated;
         self
     }
+    pub fn with_attempt_release(mut self, negotiated: bool) -> Self {
+        self.attempt_release = negotiated;
+        self
+    }
 }
 impl WorkerLink for ClientLink {
     fn preparation_probe_negotiated(&self) -> bool {
@@ -366,6 +379,9 @@ impl WorkerLink for ClientLink {
 
     fn ci_discovery_negotiated(&self) -> bool {
         self.ci_discovery
+    }
+    fn attempt_release_negotiated(&self) -> bool {
+        self.attempt_release
     }
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.gate.as_ref().is_some_and(|g| g.cold_eligible(task))
@@ -467,6 +483,9 @@ impl WorkerLink for Budgeted {
 
     fn ci_discovery_negotiated(&self) -> bool {
         self.inner.ci_discovery_negotiated()
+    }
+    fn attempt_release_negotiated(&self) -> bool {
+        self.inner.attempt_release_negotiated()
     }
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.inner.cold_eligible(task)

@@ -133,6 +133,11 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::CI_TASK_FEATURE);
+        let attempt_release = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::wire::ATTEMPT_RELEASE_FEATURE);
         if let Some(gate) = &gate {
             gate.set_ci_task(ci_task);
             gate.set_ci_discovery(discovery);
@@ -149,7 +154,8 @@ impl ResolvedConfig {
             .with_ci_task(ci_task)
             .with_matrix_dispatch(matrix_dispatch)
             .with_ci_discovery(discovery)
-            .with_workflow_artifacts(workflow_artifacts),
+            .with_workflow_artifacts(workflow_artifacts)
+            .with_attempt_release(attempt_release),
         );
         {
             use crate::coordinator::identity::Admission;

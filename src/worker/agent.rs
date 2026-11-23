@@ -392,6 +392,10 @@ fn api(e: StorageError) -> ApiError {
     if matches!(e, StorageError::Capacity { .. }) {
         return ApiError::overloaded(OverloadedReason::Capacity, e.to_string());
     }
+    // Spec 25.6 (c): the member holds its bound of dedup records here.
+    if matches!(e, StorageError::AttemptRecords(_)) {
+        return ApiError::overloaded(OverloadedReason::AttemptRecords, e.to_string());
+    }
     // A busy database committed nothing: the same request may be sent again.
     let code = if e.is_retryable() {
         ErrorCode::Overloaded

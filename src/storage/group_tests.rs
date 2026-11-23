@@ -206,7 +206,7 @@ fn a_worker_database_with_an_uncollected_result_is_refused_until_it_is_collected
     collected(&previous, "att_done2");
     drop(previous);
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
     // What was dropped is listed for the agent, in bounded pages, until the
     // agent says its directory is gone.
     assert_eq!(
@@ -245,7 +245,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     drop(old);
 
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
     assert_eq!(store.worker_id(), &worker());
     for table in [
         "worker_attempt",
@@ -295,7 +295,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     // Opening again changes nothing.
     drop((store, member));
     WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "4");
+    assert_eq!(version(dir.path()), "5");
 }
 
 struct Two {
@@ -460,10 +460,9 @@ fn a_tombstone_of_an_attempt_that_never_arrived_goes_with_the_epoch_and_an_accep
     t.a.retire(&known, CoordinatorEpoch(1), 3).unwrap();
     t.b.retire(&never, CoordinatorEpoch(1), 3).unwrap();
     assert_eq!(t.a.count_undelivered_tombstones().unwrap(), 1);
-    // SQL cannot delete the tombstone of an accepted attempt, nor turn one
-    // kind of tombstone into the other.
+    // SQL cannot turn one kind of tombstone into the other (the tombstone of
+    // an accepted attempt goes with it from stage 3 on, spec 25.6).
     let sql = |q: &'static str| t.own.db.call(move |c| Ok(c.execute(q, [])?));
-    assert!(sql("DELETE FROM tombstone WHERE delivered = 1").is_err());
     assert!(sql("UPDATE tombstone SET delivered = 0").is_err());
     assert!(sql("UPDATE tombstone SET delivered = 1").is_err());
     assert!(sql("UPDATE tombstone SET coordinator_id = 'co_x'").is_err());

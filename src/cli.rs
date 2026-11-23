@@ -121,6 +121,9 @@ pub enum GroupSub {
         #[arg(long)]
         skip: Vec<String>,
     },
+    /// On this machine's worker, delete every record of a member that is not
+    /// coming back and refuse it for good (remove it from the list first).
+    Forget { member: String },
     /// Join through an existing member, registering both directions.
     Join {
         existing_member_ssh: String,
@@ -561,6 +564,9 @@ pub fn run(cli: Cli) -> i32 {
             }
             Some(GroupSub::RotateKey { remove, skip }) => {
                 crate::service::group::rotate::command(remove, skip, cli.json)
+            }
+            Some(GroupSub::Forget { member }) => {
+                crate::service::group::forget_command(member, cli.json)
             }
             Some(GroupSub::Join {
                 existing_member_ssh,

@@ -18,6 +18,8 @@ pub use coordinator::query;
 mod db;
 #[cfg(test)]
 mod group_tests;
+#[cfg(test)]
+mod release_tests;
 mod lock;
 #[cfg(test)]
 mod paging_tests;

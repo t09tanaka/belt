@@ -37,6 +37,7 @@ mod link;
 pub(crate) mod member_contact;
 pub mod policy;
 mod prefetch;
+pub(crate) mod release;
 mod preparation;
 mod preparation_identity;
 mod workflow_artifact;
@@ -509,6 +510,11 @@ pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
+    /// The submits on their way: no acknowledgement or release of them is
+    /// sent until they are answered (spec 25.6 (c)).
+    submits: Arc<release::InFlight>,
+    /// The workers whose `list_unreleased` reconciliation is due.
+    unreleased_due: Mutex<BTreeSet<WorkerId>>,
     parent_local: Mutex<Option<WorkerId>>,
     preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
     preparation_query: tokio::sync::Mutex<()>,
@@ -581,6 +587,8 @@ impl Coordinator {
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
+            submits: Arc::default(),
+            unreleased_due: Mutex::default(),
             parent_local: Mutex::default(),
             preparation_identities: Mutex::default(),
             preparation_query: tokio::sync::Mutex::new(()),
@@ -790,6 +798,7 @@ impl Coordinator {
     /// commits, without holding up forecasts or blocking the async executor.
     pub async fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
         let _commit = self.placement_fence.lock().await;
+        self.reconcile_due(&worker_id);
         self.workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -804,6 +813,7 @@ impl Coordinator {
         link: Arc<dyn WorkerLink>,
     ) -> std::result::Result<(), tokio::sync::TryLockError> {
         let _commit = self.placement_fence.try_lock()?;
+        self.reconcile_due(&worker_id);
         self.workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1516,7 +1526,9 @@ impl Coordinator {
         let id = a.attempt_id.clone();
         let sends_before = self.db(move |s| s.count_submit_send(&id)).await?;
         drop(actor);
+        let sending = self.submits.sending(&a.attempt_id);
         let answer = link.call(Request::SubmitAttempt(request)).await;
+        drop(sending);
         let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
             return Ok(Sent::NotTaken);
         };
@@ -1538,6 +1550,11 @@ impl Coordinator {
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
+                if e.overloaded_reason == Some(OverloadedReason::AttemptRecords) {
+                    // Spec 25.6 (c): the worker holds its bound of records of
+                    // this parent; what it can let go of is released.
+                    self.reconcile_due(&a.worker_id);
+                }
                 let unstored = match e.overloaded_reason {
                     Some(OverloadedReason::Capacity) if replaceable => Some(Unstored::Capacity),
                     Some(OverloadedReason::AttemptIdInUse) if replaceable => {

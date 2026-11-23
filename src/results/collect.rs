@@ -320,6 +320,9 @@ pub struct Collector {
     live_waits: Arc<Waits>,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
     collecting: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    /// The submits on their way (spec 25.6 (c)): no acknowledgement or
+    /// release of one is sent before its answer.
+    submits: Arc<crate::coordinator::release::InFlight>,
 }
 
 enum LogRead {
@@ -345,7 +348,13 @@ impl Collector {
             live_waits: Arc::default(),
             stop: None,
             collecting: None,
+            submits: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_submits(mut self, submits: Arc<crate::coordinator::release::InFlight>) -> Self {
+        self.submits = submits;
+        self
     }
 
     pub(crate) fn with_costs(
@@ -601,6 +610,16 @@ impl Collector {
                     })
                     .await?;
                     self.tidy(&a).await;
+                    // Spec 25.6 (a): nothing reads the worker's copy of a
+                    // collection that gave up; it is released right after
+                    // the commit. Lost on the way, the next connection's
+                    // reconciliation sends it again.
+                    crate::coordinator::release::release_over(
+                        link,
+                        &self.submits,
+                        std::slice::from_ref(&a),
+                    )
+                    .await;
                     Ok(End::Closed(Verdict::GaveUp))
                 }
             };
@@ -1478,6 +1497,11 @@ impl Collector {
         result: &GetResultResponse,
     ) -> Result<Flow> {
         let a = rec.attempt_id.clone();
+        if self.submits.contains(&a) {
+            // Spec 25.6 (c): not while a submit of it waits for its answer;
+            // the next pass acknowledges it.
+            return Ok(Flow::Later);
+        }
         let request = Request::AckCollected(AckCollectedRequest {
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),

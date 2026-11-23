@@ -69,6 +69,7 @@ pub(crate) fn observed_refusal(state: &Path, member: &WorkerId) -> std::io::Resu
         "group_key_mismatch",
         "member_identity_mismatch",
         "identity_retired",
+        "member_forgotten",
     ]
     .contains(&reason.as_str())
     {
@@ -205,6 +206,58 @@ pub fn command(json_output: bool) -> i32 {
     let text = result
         .as_ref()
         .map(|value| serde_json::to_string_pretty(value).expect("JSON value"))
+        .unwrap_or_default();
+    workers::emit(json_output, result, || text)
+}
+
+/// `belt group forget <member>` (spec 25.6 (d)): on this machine's worker,
+/// delete every record of a member that is not coming back, and refuse its
+/// coordinator id for good. Refused while the member is on this machine's
+/// list, or has attempts here that are not terminal.
+pub(crate) fn forget(
+    env: &BTreeMap<String, String>,
+    spec: &Spec,
+    member: &str,
+) -> Result<Value, ApiError> {
+    if workers::registrations(env)?.iter().any(|e| e.id == member) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidInput,
+            format!("{member} is still on this machine's list; remove it first"),
+        ));
+    }
+    let store = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id).map_err(|e| {
+        ApiError::new(e.code(), e.to_string())
+    })?;
+    let attempts = store
+        .forget_member(member, crate::platform::wall_ms())
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+    // The directories and locks of its attempts, after the commit.
+    let dropped = crate::worker::agent::remove_dropped_attempts(
+        &spec.worker_state_dir.join("attempts"),
+        &store,
+    )
+    .map_err(internal)?;
+    Ok(json!({
+        "member": member,
+        "attempts": attempts.len(),
+        "kept": dropped.failed.len(),
+    }))
+}
+
+pub fn forget_command(member: &str, json_output: bool) -> i32 {
+    let env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let result = load_spec(&env).and_then(|spec| forget(&env, &spec, member));
+    let text = result
+        .as_ref()
+        .map(|v| {
+            format!(
+                "Forgot member {}: {} attempts removed; it is refused from now on.",
+                v["member"].as_str().unwrap_or_default(),
+                v["attempts"]
+            )
+        })
         .unwrap_or_default();
     workers::emit(json_output, result, || text)
 }
