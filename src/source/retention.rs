@@ -1,7 +1,10 @@
 //! Persistent roots and cross-process exclusion for captured inputs.
 //! Explicit parent retention pages are separate from the nondeleting preview.
+mod capture_owner;
 mod deletion;
 mod foreground;
+pub use capture_owner::{CaptureOwner, CaptureVerdict};
+pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
 pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
 use super::SourceStore;
@@ -144,7 +147,7 @@ impl Index {
         let mut db = self.connect().context("connect source index")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
-            return Ok(());
+            return self.ensure_capture_owner_table(&mut db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
@@ -170,6 +173,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
+        tx.execute_batch(capture_owner::TABLE)?;
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         Ok(())
@@ -901,9 +905,11 @@ impl SourceStore {
         }
         Ok(())
     }
-    pub(crate) fn capture_pending_root(&self) -> Result<String> {
+    /// `run` is the run this capture is made for, if any: its owner row,
+    /// when it has one, names the new root from the same transaction.
+    pub(crate) fn capture_pending_root(&self, run: Option<&crate::ids::RunId>) -> Result<String> {
         let id = format!("capture:{}", ulid::Ulid::new());
-        self.retention.pending(&id)?;
+        self.retention.pending_of_capture(&id, run)?;
         Ok(id)
     }
 }
@@ -1144,7 +1150,7 @@ impl SourceStore {
             });
         }
         let unknown: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned')",
             [],
             |r| r.get(0),
         )?;

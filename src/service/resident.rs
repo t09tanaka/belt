@@ -1345,6 +1345,64 @@ enum Control {
     Forget(WorkerId, oneshot::Sender<Reply>),
 }
 #[allow(clippy::too_many_arguments)]
+/// Why the enqueue of a run whose capture has no live claim is refused (spec
+/// 25.4 (b)): its `capture_owner` row is not `capturing` (the owner gave up,
+/// or the capture was abandoned and deleted, or no row was ever written), or
+/// its run record is missing. Nothing is created for such a run.
+pub(crate) const CAPTURE_ABANDONED: &str = "capture_abandoned";
+#[derive(Debug, thiserror::Error)]
+#[error("run {0} not found ({CAPTURE_ABANDONED})")]
+struct CaptureAbandoned(RunId);
+
+/// Run the abandonment of the capture of `run` now, in the request that
+/// refused it (spec 25.4 (b), "消す時点" (1) and (2)). `refused`: this
+/// resident refused the enqueue of the run, which ends the capture whatever
+/// its owner's state; otherwise the capture is judged by its row. Nothing is
+/// deleted while a new version is on trial. A busy source lock or a failure
+/// leaves the work to the retention driver's next pass.
+async fn abandon_capture(
+    coordinator: Arc<Coordinator>,
+    captured: Arc<CapturedInputs>,
+    run: RunId,
+    refused: bool,
+) {
+    let done = crate::results::retention::owned_blocking(coordinator, move |owner| {
+        if owner.is_fenced() || owner.in_trial() {
+            return anyhow::Ok(0);
+        }
+        let scope = if refused {
+            crate::source::retention::AbandonScope::Refused(&run)
+        } else {
+            crate::source::retention::AbandonScope::Run(&run)
+        };
+        captured
+            .sources
+            .abandon_captures(
+                owner.store(),
+                &captured.vault,
+                scope,
+                &mut crate::source::retention::AbandonCursor::default(),
+            )
+            .map(|report| report.unknown)
+    })
+    .await;
+    if !matches!(done, Ok(Ok(0))) {
+        // Counts only: an error can hold a private path.
+        eprintln!("abandoned capture retained for the next retention pass");
+    }
+}
+
+/// What a cancel of a run without a row found under the source guard.
+enum UnsubmittedCancel {
+    /// The capture of the run is in progress: the guard under which that was
+    /// read is held until the cancel is written.
+    Capturing(crate::source::retention::Guard),
+    /// The capture was given up or its owner is gone.
+    Abandoned,
+    /// No row, or an owner that cannot be judged from here.
+    Unknown,
+}
+
 async fn handle(
     mut stream: UnixStream,
     coordinator: Arc<Coordinator>,
@@ -1616,24 +1674,120 @@ async fn handle(
             } => {
                 let clear_target = target.clone();
                 let owner = coordinator.clone();
-                match tokio::task::spawn_blocking(move || {
+                let (first_target, first_id) = (target.clone(), request_id.clone());
+                let first = tokio::task::spawn_blocking(move || {
                     owner.store().cancel_control(
-                        target,
+                        first_target,
                         expected_control_revision,
-                        request_id,
+                        first_id,
                         wall_ms(),
                     )
                 })
-                .await?
-                {
-                    Ok(snapshot) => {
-                        coordinator.clear_prefetch(&clear_target);
-                        Reply::Cancelled { snapshot }
+                .await?;
+                let unsubmitted = match (&first, &target) {
+                    (Err(error), super::completion::Target::Run(run))
+                        if error.code() == crate::error::ErrorCode::NotFound =>
+                    {
+                        Some(run.clone())
                     }
-                    Err(error) => Reply::ControlError {
-                        error: crate::error::ApiError::new(error.code(), error.to_string()),
-                    },
-                }
+                    _ => None,
+                };
+                let Some(run) = unsubmitted else {
+                    return write_message(
+                        &mut stream,
+                        &match first {
+                            Ok(snapshot) => {
+                                coordinator.clear_prefetch(&clear_target);
+                                Reply::Cancelled { snapshot }
+                            }
+                            Err(error) => Reply::ControlError {
+                                error: crate::error::ApiError::new(error.code(), error.to_string()),
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(Into::into);
+                };
+                // The run has no row (spec 25.4 (b)). Its cancel is recorded
+                // only for a capture in progress, read under the source guard
+                // an enqueue holds too; the guard is never awaited under the
+                // admission lock.
+                drop(gate);
+                let not_found = |error: crate::storage::StorageError| Reply::ControlError {
+                    error: crate::error::ApiError::new(error.code(), error.to_string()),
+                };
+                let first_error = match first {
+                    Err(error) => error,
+                    Ok(_) => unreachable!("an accepted cancel was answered above"),
+                };
+                let (inputs, owned) = (captured.clone(), run.clone());
+                let found = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let guard = inputs.sources.foreground_guard()?;
+                    Ok(match inputs.sources.capture_owner(&owned)? {
+                        None => UnsubmittedCancel::Unknown,
+                        Some(row) => match row.verdict() {
+                            crate::source::retention::CaptureVerdict::InProgress => {
+                                UnsubmittedCancel::Capturing(guard)
+                            }
+                            crate::source::retention::CaptureVerdict::Abandoned => {
+                                UnsubmittedCancel::Abandoned
+                            }
+                            crate::source::retention::CaptureVerdict::Elsewhere => {
+                                UnsubmittedCancel::Unknown
+                            }
+                        },
+                    })
+                })
+                .await?;
+                let answer = match found {
+                    Ok(UnsubmittedCancel::Capturing(guard)) => {
+                        let gate = admission.lock().await;
+                        if *gate || coordinator.is_fenced() {
+                            Reply::ControlError {
+                                error: crate::error::ApiError::new(
+                                    crate::error::ErrorCode::CommunicationUnknown,
+                                    "resident is stopping",
+                                ),
+                            }
+                        } else {
+                            let owner = coordinator.clone();
+                            let accepted = tokio::task::spawn_blocking(move || {
+                                let accepted = owner.store().cancel_control_of_capture(
+                                    target,
+                                    expected_control_revision,
+                                    request_id,
+                                    wall_ms(),
+                                );
+                                // Held until the cancel is committed.
+                                drop(guard);
+                                accepted
+                            })
+                            .await?;
+                            match accepted {
+                                Ok(snapshot) => {
+                                    coordinator.clear_prefetch(&clear_target);
+                                    Reply::Cancelled { snapshot }
+                                }
+                                Err(error) => not_found(error),
+                            }
+                        }
+                    }
+                    Ok(UnsubmittedCancel::Abandoned) => {
+                        // Refused, and what the capture left is deleted here.
+                        abandon_capture(coordinator.clone(), captured.clone(), run, false).await;
+                        not_found(first_error)
+                    }
+                    Ok(UnsubmittedCancel::Unknown) => not_found(first_error),
+                    Err(error) if error.is::<crate::source::retention::ForegroundBusy>() => {
+                        Reply::ControlError {
+                            error: crate::source::classify::api_error_of(&error),
+                        }
+                    }
+                    Err(_) => not_found(first_error),
+                };
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
             }
             Operation::Health => match super::macos::RunningIdentity::observe(std::process::id()) {
                 Ok(process) => Reply::Health {
@@ -1768,9 +1922,27 @@ async fn handle(
                 let run = run_id.clone();
                 let capture = captured.clone();
                 let mut stopping = stop.subscribe();
+                let owner = coordinator.clone();
                 let checked = tokio::task::spawn_blocking(
                     move || -> anyhow::Result<(Digest, bool, crate::source::retention::Guard)> {
                         let mutation = capture.sources.foreground_guard()?;
+                        // Spec 25.4 (b): under the guard this enqueue holds
+                        // until its commit, the capture of a run that has no
+                        // row yet must still be claimed by its owner and
+                        // bound. The abandonment takes the same lock
+                        // exclusively, so it either ran before this (and the
+                        // row is gone) or runs after the commit (and finds
+                        // the run).
+                        if !owner.store().has_run(&run)? {
+                            let capturing = capture
+                                .sources
+                                .capture_owner(&run)?
+                                .is_some_and(|row| !row.given_up);
+                            if !capturing || capture.sources.run_record(&run)?.is_none() {
+                                return Err(CaptureAbandoned(run).into());
+                            }
+                        }
+                        drop(owner);
                         let id = crate::source::classify::ci_id_of(&source)
                             .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                         anyhow::ensure!(
@@ -1825,6 +1997,30 @@ async fn handle(
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
+                // The hand-over (spec 25.4 (b)): the run row is committed, so
+                // the capture is the run's and its owner row goes. A refusal
+                // ends the capture instead: what it left is deleted in this
+                // request, unless the resident is stopping (then the next
+                // start's first pass does it).
+                match &result {
+                    Ok(()) => {
+                        let (inputs, run) = (captured.clone(), run_id.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            inputs.sources.release_capture(&run)
+                        })
+                        .await;
+                    }
+                    Err(_) if *stop.borrow() || coordinator.is_fenced() => {}
+                    Err(_) => {
+                        abandon_capture(
+                            coordinator.clone(),
+                            captured.clone(),
+                            run_id.clone(),
+                            true,
+                        )
+                        .await;
+                    }
+                }
                 let answer = match result {
                     Ok(()) => Reply::Accepted { run_id },
                     Err(e) if e.is::<crate::source::retention::ForegroundBusy>() => {
@@ -1832,6 +2028,12 @@ async fn handle(
                             error: crate::source::classify::api_error_of(&e),
                         }
                     }
+                    Err(e) if e.is::<CaptureAbandoned>() => Reply::ControlError {
+                        error: crate::error::ApiError::new(
+                            crate::error::ErrorCode::NotFound,
+                            e.to_string(),
+                        ),
+                    },
                     Err(e) => Reply::Error {
                         message: e.to_string(),
                     },

@@ -14,16 +14,72 @@ pub fn capture(
     run: &RunId,
     revision: Option<&str>,
 ) -> Result<Captured, ApiError> {
-    capture_into(context, run, revision, context.state_dir())
+    capture_at(context, run, revision, context.state_dir(), true)
+}
+
+/// The owner of the capture of `run` will not submit it (spec 25.4 (b)): its
+/// capture failed, its enqueue was refused, or it was interrupted. The row
+/// stays for the resident, which deletes it and what it names. Best effort:
+/// when this cannot be written, the end of this process says the same.
+pub fn give_up(state: &std::path::Path, run: &RunId) {
+    if !state.join("sources").join("retention.db").is_file() {
+        return;
+    }
+    if let Ok((store, _source)) = SourceStore::open_foreground(state) {
+        let _ = store.give_up_capture(run);
+    }
+}
+
+/// [`give_up`] after a submission ended with `error`, off the async thread.
+/// An unconfirmed submission is not given up: its enqueue may still commit.
+pub async fn give_up_after(state: std::path::PathBuf, run: RunId, error: &ApiError) {
+    if error.code == ErrorCode::CommunicationUnknown {
+        return;
+    }
+    give_up_now(state, run).await;
+}
+
+pub async fn give_up_now(state: std::path::PathBuf, run: RunId) {
+    let _ = tokio::task::spawn_blocking(move || give_up(&state, &run)).await;
+}
+
+/// Whether this command has written the owner row of the capture of `run`.
+/// Before it has, nothing of the capture exists and there is nothing to
+/// cancel.
+pub async fn owns_capture(state: std::path::PathBuf, run: RunId) -> bool {
+    tokio::task::spawn_blocking(move || {
+        state.join("sources").join("retention.db").is_file()
+            && SourceStore::open_foreground(&state)
+                .and_then(|(store, _source)| store.capture_owner(&run))
+                .is_ok_and(|row| row.is_some())
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Use the same capture path with an explicitly owned source/Vault destination.
 /// Authentication and runtime identity continue to come from the original context.
+/// The destination is the owner of what is captured (a plan draft: its
+/// directory is removed as a whole), so no `capture_owner` row is written.
 pub fn capture_into(
     context: &Context,
     run: &RunId,
     revision: Option<&str>,
     input_state: &std::path::Path,
+) -> Result<Captured, ApiError> {
+    capture_at(context, run, revision, input_state, false)
+}
+
+/// `own`: write the owner row of the capture first (spec 25.4 (b)). The
+/// store's own fixed files exist before it; nothing of this capture does:
+/// not the run lock, not the pending root, not an object, not the secret
+/// bundle.
+fn capture_at(
+    context: &Context,
+    run: &RunId,
+    revision: Option<&str>,
+    input_state: &std::path::Path,
+    own: bool,
 ) -> Result<Captured, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     let request = match (context.repo_root.as_ref(), context.config.source_mode.value) {
@@ -57,6 +113,14 @@ pub fn capture_into(
             invalid(error.to_string())
         }
     })?;
+    if own {
+        store.own_capture(run).map_err(|error| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("cannot record the owner of the capture: {error:#}"),
+            )
+        })?;
+    }
     let vault = Vault::open(input_state).map_err(|e| e.to_api())?;
     let key =
         crate::secrets::key::load(&context.bootstrap.cluster_key_path).map_err(|e| e.to_api())?;

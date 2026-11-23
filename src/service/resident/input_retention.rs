@@ -1,7 +1,9 @@
 //! Parent input retention: one bounded registration OR deletion page per tick.
 //! All filesystem work and cursors stay with the process owner until actual drain.
 use super::*;
-use crate::source::retention::{PreviewCursor, RetentionCursor, VaultCursor};
+use crate::source::retention::{
+    AbandonCursor, AbandonScope, PreviewCursor, RetentionCursor, VaultCursor,
+};
 
 #[derive(Default)]
 struct Driver {
@@ -10,6 +12,7 @@ struct Driver {
     registration: PreviewCursor,
     source: RetentionCursor,
     vault: VaultCursor,
+    abandon: AbandonCursor,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -98,6 +101,30 @@ impl Driver {
         sample: Sample,
     ) -> anyhow::Result<Report> {
         let mut report = Report::default();
+        // Every pass first looks at the owner rows of captures that were not
+        // submitted (spec 25.4 (b)): as many rows as there are captures in
+        // progress or abandoned, usually none. This deletion follows an
+        // event (the owner gave up or is gone), not a period, so it does not
+        // wait for a clock. A pass that deleted files here does no other
+        // page: the bound on paths is one bound for the whole pass.
+        match captured.sources.abandon_captures(
+            owner,
+            &captured.vault,
+            AbandonScope::All,
+            &mut self.abandon,
+        ) {
+            Ok(page) => {
+                report.paths = page.paths;
+                report.unknown = page.unknown;
+                if page.paths > 0 {
+                    return Ok(report);
+                }
+            }
+            // Counted and tried again on the next pass; the pages below are
+            // not held back by it.
+            Err(_) => report.unknown = 1,
+        }
+        let abandoned_unknown = report.unknown;
         let phase = self.phase;
         self.phase = match phase {
             Phase::Registration => Phase::Vault,
@@ -141,6 +168,7 @@ impl Driver {
                 report.unknown = page.unknown;
             }
         }
+        report.unknown += abandoned_unknown;
         Ok(report)
     }
 }

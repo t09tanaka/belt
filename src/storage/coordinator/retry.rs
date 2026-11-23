@@ -262,12 +262,13 @@ impl CoordinatorStore {
                 min_generation: scan.boundary,
             };
             tx.execute(
-                "INSERT INTO control_request(request_id,operation,target_json,expected_revision,reply_json) VALUES(?1,'retry',?2,?3,?4)",
+                "INSERT INTO control_request(request_id,operation,target_json,expected_revision,reply_json,run_id) VALUES(?1,'retry',?2,?3,?4,?5)",
                 params![
                     prepared.request_id,
                     json(&prepared.target),
                     to_i64(prepared.expected)?,
-                    json(&receipt)
+                    json(&receipt),
+                    binding.run.as_str()
                 ],
             )?;
             common::append_event(

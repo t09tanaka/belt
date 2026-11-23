@@ -12,6 +12,9 @@
 //! readable marker is never touched, and no process is ever signalled here.
 
 use super::{boot_id, process_start_identity, StartIdentity};
+
+mod record;
+pub(crate) use record::{OwnerRecord, OwnerState};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};

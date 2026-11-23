@@ -147,7 +147,32 @@ pub async fn wait(
         tokio::select! {biased; _=interrupted(signals)=>return Ok(report(target,last,"wait_interrupted",130)),_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
 }
+/// An interrupt while the submission of `run` was still being made (spec
+/// 25.4 (b)). Before the owner row of its capture is written nothing exists,
+/// so nothing is cancelled. After it, the cancel is sent first (the resident
+/// accepts it for a capture in progress, and an enqueue already on its way
+/// inherits it), and then the capture is given up: the resident deletes it,
+/// with the rows of the cancel, unless the enqueue made it a run.
+pub(super) async fn stop_submission(
+    context: &Context,
+    run: &RunId,
+    signals: &mut mpsc::UnboundedReceiver<()>,
+    budget: Duration,
+) -> Report {
+    let target = Target::Run(run.clone());
+    let state = context.state_dir().to_owned();
+    if !super::input::owns_capture(state.clone(), run.clone()).await {
+        return report(target, None, "not_submitted", 130);
+    }
+    let stopped = cancel_and_stop(&context.bootstrap, target, signals, budget).await;
+    super::input::give_up_now(state, run.clone()).await;
+    stopped
+}
+
 /// First SIGINT requests durable cancellation; another interrupt only detaches.
+/// A run the owner does not know (it was never submitted and its capture is
+/// not in progress, or it was pruned) has nothing to stop: that answer ends
+/// the wait at once.
 pub async fn cancel_and_stop(
     spec: &super::bootstrap::Spec,
     target: Target,
@@ -170,6 +195,14 @@ pub async fn cancel_and_stop(
             }
         };
         let status = tokio::select! {biased; _=interrupted(signals)=>return unknown(target,last,acknowledged),_=tokio::time::sleep_until(deadline)=>return unknown(target,last,acknowledged),status=next=>status};
+        if let Err(error) = &status {
+            if error.code == ErrorCode::NotFound && matches!(target, Target::Run(_)) {
+                let mut report = report(target, last, "run_not_found", 130);
+                report.cancel_acknowledged = acknowledged;
+                report.error = Some(error.clone());
+                return report;
+            }
+        }
         if let Ok(snapshot) = status {
             if acknowledged_revision.is_some_and(|revision| snapshot.control_revision != revision) {
                 return unknown(target, last, acknowledged);
@@ -215,12 +248,12 @@ pub async fn exec_mode(
         context.clone(),
         command,
         revision,
-        run_id,
+        run_id.clone(),
         task_id.clone(),
         mode,
     );
     let mut result = tokio::select! {biased;
-        _=interrupted(signals)=>Ok(cancel_and_stop(&context.bootstrap,target.clone(),signals,Duration::from_secs(30)).await),
+        _=interrupted(signals)=>Ok(stop_submission(&context,&run_id,signals,Duration::from_secs(30)).await),
         receipt=submitted=>{
             let receipt=receipt?;for warning in receipt.warnings {eprintln!("warning: {warning}");}
             let observed=wait(&context.bootstrap,target.clone(),signals).await?;

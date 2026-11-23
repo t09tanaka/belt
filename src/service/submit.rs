@@ -55,6 +55,23 @@ pub async fn command_with_ids(
 }
 
 pub async fn command_with_mode(
+    context: Context,
+    command: Vec<String>,
+    revision: Option<String>,
+    run_id: RunId,
+    task_id: TaskId,
+    mode: Mode,
+) -> Result<Receipt, ApiError> {
+    let (state, run) = (context.state_dir().to_owned(), run_id.clone());
+    let result = submit_command(context, command, revision, run_id, task_id, mode).await;
+    if let Err(error) = &result {
+        // A submission that failed or was refused will not be sent again.
+        super::input::give_up_after(state, run, error).await;
+    }
+    result
+}
+
+async fn submit_command(
     mut context: Context,
     command: Vec<String>,
     revision: Option<String>,

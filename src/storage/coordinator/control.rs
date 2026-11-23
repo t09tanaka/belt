@@ -10,7 +10,15 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             let (run, _) = resolve(tx, &target)?;
             let expected = revision(tx, &run)?;
-            apply_cancel(tx, target, expected, RunId::generate().to_string(), at_ms).map(|_| ())
+            apply_cancel(
+                tx,
+                target,
+                expected,
+                RunId::generate().to_string(),
+                at_ms,
+                false,
+            )
+            .map(|_| ())
         })
     }
 
@@ -21,7 +29,14 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             let (run, _) = resolve(tx, &target)?;
             let expected = revision(tx, &run)?;
-            apply_cancel(tx, target, expected, RunId::generate().to_string(), at_ms)?;
+            apply_cancel(
+                tx,
+                target,
+                expected,
+                RunId::generate().to_string(),
+                at_ms,
+                false,
+            )?;
             let live: Option<String> = tx.query_row(
                 "SELECT attempt_id FROM attempt WHERE task_id=?1 AND state<>'terminal' AND retired=0",
                 [&task], |row| row.get(0),
@@ -66,6 +81,7 @@ impl CoordinatorStore {
                 expected,
                 RunId::generate().to_string(),
                 at_ms,
+                false,
             )?;
             tx.execute(
                 "UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?2) WHERE task_id=?1",
@@ -128,6 +144,7 @@ impl CoordinatorStore {
                     expected,
                     RunId::generate().to_string(),
                     at_ms,
+                    false,
                 )?;
                 common::append_event(
                     tx,
@@ -144,6 +161,9 @@ impl CoordinatorStore {
     }
 
     /// A transport request retains its original identity and expected revision.
+    /// A run that has no row is refused (`NOT_FOUND`) and nothing is written
+    /// (spec 25.4 (b)); the cancel of a capture in progress is
+    /// [`Self::cancel_control_of_capture`].
     pub fn cancel_control(
         &self,
         target: Target,
@@ -152,7 +172,63 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<Snapshot> {
         self.db
-            .write(move |tx| apply_cancel(tx, target, expected, request_id, at_ms))
+            .write(move |tx| apply_cancel(tx, target, expected, request_id, at_ms, false))
+    }
+
+    /// [`Self::cancel_control`] for a run whose capture is in progress: the
+    /// caller holds the source guard and has read, under it, that the run's
+    /// `capture_owner` row is `capturing` and its owner is alive here. Only
+    /// then may the cancel of a run without a row be recorded (the enqueue
+    /// that follows inherits it; if none follows, the abandonment of the
+    /// capture deletes the rows). The row of the run is looked for again in
+    /// this transaction: a run that has one is cancelled as any other.
+    pub fn cancel_control_of_capture(
+        &self,
+        target: Target,
+        expected: u64,
+        request_id: String,
+        at_ms: u64,
+    ) -> Result<Snapshot> {
+        self.db
+            .write(move |tx| apply_cancel(tx, target, expected, request_id, at_ms, true))
+    }
+
+    /// Whether the run has a row. A marked run (spec 25.3) has one.
+    pub fn has_run(&self, run: &RunId) -> Result<bool> {
+        let run = run.to_string();
+        self.db.call(move |c| run_exists(c, &run))
+    }
+
+    /// The parent rows of a run that was never submitted (spec 25.4 (b),
+    /// "消すもの" 1): its cancel intent, the receipts of its cancel requests
+    /// and its events. The caller holds the source lock exclusively, so no
+    /// enqueue of the run commits meanwhile. Returns `true`, and deletes
+    /// nothing, when the run has a row: then these rows are the run's.
+    /// Each transaction looks for the row again and deletes at most 1,000
+    /// rows of a table.
+    pub(crate) fn forget_unsubmitted_run(&self, run: &RunId) -> Result<bool> {
+        let run = run.to_string();
+        loop {
+            let run = run.clone();
+            let (exists, more) = self.db.write(move |tx| {
+                if run_exists(tx, &run)? {
+                    return Ok((true, false));
+                }
+                tx.execute("DELETE FROM run_cancel_intent WHERE run_id=?1", [&run])?;
+                let receipts = tx.execute(
+                    "DELETE FROM control_request WHERE request_id IN (SELECT request_id FROM control_request WHERE run_id=?1 LIMIT 1000)",
+                    [&run],
+                )?;
+                let events = tx.execute(
+                    "DELETE FROM event WHERE seq IN (SELECT seq FROM event WHERE run_id=?1 ORDER BY seq LIMIT 1000)",
+                    [&run],
+                )?;
+                Ok((false, receipts == 1000 || events == 1000))
+            })?;
+            if exists || !more {
+                return Ok(exists);
+            }
+        }
     }
 
     pub fn completion(&self, target: Target) -> Result<Snapshot> {
@@ -170,12 +246,24 @@ impl CoordinatorStore {
     }
 }
 
+fn run_exists(c: &Connection, run: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+        [run],
+        |row| row.get(0),
+    )?)
+}
+
+/// `capturing` is true only for the cancel of a capture in progress (spec
+/// 25.4 (b)): every other cancel of a run without a row is `NOT_FOUND`, and
+/// writes no intent, no event and no receipt.
 fn apply_cancel(
     c: &Connection,
     target: Target,
     expected: u64,
     request_id: String,
     at_ms: u64,
+    capturing: bool,
 ) -> Result<Snapshot> {
     check_request_id(&request_id)?;
     refuse_pruned_target(c, &target)?;
@@ -183,6 +271,9 @@ fn apply_cancel(
         return Ok(snapshot);
     }
     let (run, task) = resolve(c, &target)?;
+    if !capturing && !run_exists(c, &run)? {
+        return Err(not_found(format!("run {run}")));
+    }
     if revision(c, &run)? != expected {
         return Err(StorageError::Immutable("stale control revision".into()));
     }
@@ -214,8 +305,8 @@ fn apply_cancel(
     c.execute("UPDATE attempt SET cancel_requested_at_ms=?1 WHERE task_id IN (SELECT task_id FROM task WHERE run_id=?2 AND (?3 IS NULL OR task_id=?3)) AND state<>'terminal' AND retired=0 AND cancel_requested_at_ms IS NULL",
         params![at, run, task])?;
     let snapshot = completion_on(c, target.clone(), true, true, true)?;
-    c.execute("INSERT INTO control_request(request_id,operation,target_json,expected_revision,reply_json) VALUES(?1,'cancel',?2,?3,?4)",
-        params![request_id, json(&target), to_i64(expected)?, json(&snapshot)])?;
+    c.execute("INSERT INTO control_request(request_id,operation,target_json,expected_revision,reply_json,run_id) VALUES(?1,'cancel',?2,?3,?4,?5)",
+        params![request_id, json(&target), to_i64(expected)?, json(&snapshot), run])?;
     Ok(snapshot)
 }
 

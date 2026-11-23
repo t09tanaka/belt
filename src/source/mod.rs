@@ -117,6 +117,19 @@ pub fn capture(
     request: &SourceRequest,
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
+    capture_of(env, store, None, request, params)
+}
+
+/// [`capture`] for the capture of `run`: the owner row of the run, when it
+/// has one, names the pending root from the transaction that creates it
+/// (spec 25.4 (b)).
+fn capture_of(
+    env: &BTreeMap<String, String>,
+    store: &SourceStore,
+    run: Option<&RunId>,
+    request: &SourceRequest,
+    params: &CaptureParams,
+) -> Result<Captured, ApiError> {
     let _mutation = store
         .foreground_guard()
         .map_err(|e| classify::api_error_of(&e))?;
@@ -124,7 +137,7 @@ pub fn capture(
         .ensure_sdk_available()
         .map_err(|e| classify::api_error_of(&e))?;
     let retention_root = store
-        .capture_pending_root()
+        .capture_pending_root(run)
         .map_err(|e| classify::api_error_of(&e))?;
     let ctx = ExecContext::new(env.clone());
     let opts = CaptureOptions {
@@ -319,7 +332,7 @@ pub fn capture_for_run(
             _ => {}
         }
     }
-    let mut got = capture(env, store, request, params)?;
+    let mut got = capture_of(env, store, Some(run), request, params)?;
     let record = RunRecord {
         ci_source_id: got.manifest.ci_source_id.clone(),
         ..wanted

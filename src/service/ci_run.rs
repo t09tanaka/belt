@@ -245,6 +245,20 @@ pub async fn submit(
     revision: Option<String>,
     run_id: RunId,
 ) -> Result<Receipt, ApiError> {
+    let (state, run) = (context.state_dir().to_owned(), run_id.clone());
+    let result = submit_run(context, revision, run_id).await;
+    if let Err(error) = &result {
+        // A submission that failed or was refused will not be sent again.
+        super::input::give_up_after(state, run, error).await;
+    }
+    result
+}
+
+async fn submit_run(
+    context: Context,
+    revision: Option<String>,
+    run_id: RunId,
+) -> Result<Receipt, ApiError> {
     let requirements = crate::toolchain::capability::ExecutionRequirements::parse(
         context.config.profile.value.clone(),
         &context.config.requires.value,
@@ -403,7 +417,7 @@ pub async fn run(
     let submitted = submit(context.clone(), revision, run_id.clone());
     let (report, receipt) = tokio::select! {biased;
         _ = control::interrupted(signals) => {
-            (control::cancel_and_stop(&context.bootstrap, target.clone(), signals, budget).await, None)
+            (control::stop_submission(&context, &run_id, signals, budget).await, None)
         }
         receipt = submitted => {
             let receipt = receipt?;
