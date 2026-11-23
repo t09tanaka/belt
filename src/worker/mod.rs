@@ -21,7 +21,8 @@ pub mod machine;
 pub mod pins;
 pub mod policy;
 pub(crate) mod rekey;
+pub mod release;
 pub mod serve;
 
-pub use agent::{Agent, AgentConfig, Probe, ProbePoint, Session, StartupReport};
+pub use agent::{Agent, AgentConfig, Link, Probe, ProbePoint, Session, StartupReport};
 pub use host::Host;

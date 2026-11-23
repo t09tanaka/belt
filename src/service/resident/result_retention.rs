@@ -96,6 +96,20 @@ pub(super) async fn run(
         })
         .await?;
         (cursor, pruning) = next;
+        // Spec 25.5 step 7: after the commits that deleted the rows. A
+        // worker that is not attached lists them at its next connection.
+        if let Some(Ok(report)) = &pruned {
+            let mut by_worker: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+            for (worker, attempt) in &report.released {
+                by_worker
+                    .entry(worker.clone())
+                    .or_default()
+                    .push(attempt.clone());
+            }
+            for (worker, attempts) in by_worker {
+                coordinator.release_on(&worker, &attempts).await;
+            }
+        }
         match pruned {
             Some(Ok(report))
                 if report.unknown > 0 || report.kept_events > 0 || !report.gates.is_empty() =>

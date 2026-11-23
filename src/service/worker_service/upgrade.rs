@@ -291,8 +291,14 @@ fn save_database(paths: &Paths, digest: &str) -> anyhow::Result<bool> {
         remove_if_present(&saved)?;
         return Ok(false);
     }
+    // No deletion (a `belt group forget`, the agent's stage 3 passes) runs
+    // between this copy and the trial that keeps them out until the switch
+    // is committed or undone: the copy may be put back (spec 25.1 rule 8).
+    let _forget =
+        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     checkpoint(&database)?;
     copy_private(&database, &saved)?;
+    crate::worker::control::begin_trial(&paths.state)?;
     Ok(true)
 }
 
@@ -305,6 +311,8 @@ fn restore_database(paths: &Paths, digest: &str) -> anyhow::Result<()> {
         !absent(&saved)?,
         "the worker database saved for version {digest} is gone, so that version cannot be restored; run upgrade again to finish the switch"
     );
+    let _forget =
+        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     if !absent(&database)? {
         checkpoint(&database)?;
     }
@@ -557,6 +565,11 @@ fn switch_to<L: Launcher>(
         journal.switch = None;
         save_journal(paths, &journal)?;
     }
+    // The marker follows the journal: with no switch recorded (also one that
+    // stopped before it was recorded) nothing is on trial.
+    if journal.switch.is_none() {
+        crate::worker::control::end_trial(&paths.state)?;
+    }
     status_with(paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
 
@@ -587,6 +600,9 @@ pub fn commit<L: Launcher>(
         remove_if_present(&saved_database(&paths, &switch.from))?;
         save_journal(&paths, &journal)?;
     }
+    // Also when no switch is recorded: a marker left by a switch that stopped
+    // before it was recorded must not outlive the commit.
+    crate::worker::control::end_trial(&paths.state)?;
     if journal.drained_by_upgrade {
         // The marker first: a crash in between leaves the ownership recorded
         // and the next commit finishes, never a drain nobody owns.

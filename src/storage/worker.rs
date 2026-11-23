@@ -35,6 +35,12 @@ use std::path::Path;
 
 const ATTEMPT: &str = "worker_attempt";
 
+mod release;
+pub use release::{
+    uptime_step, DedupRecord, Leave, Released, Uptime, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
+    MAX_UNRELEASED_PAGE, RELEASE_BATCH, UPTIME_WRITE_MS,
+};
+
 /// How long a worker waits for `ack_collected` after an attempt ended before
 /// it stops protecting the attempt's files from GC (spec chapter 13: seven
 /// days after terminal).
@@ -394,6 +400,15 @@ fn owner_in(conn: &Connection, scope: &Option<String>, attempt_id: Option<&str>)
         )
         .optional()?;
     Ok(found.unwrap_or_else(unowned))
+}
+
+/// Whether `attempt_id` has a `worker_attempt` row (of any member).
+fn attempt_row_exists(conn: &Connection, attempt_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM worker_attempt WHERE attempt_id = ?1)",
+        [attempt_id],
+        |r| r.get(0),
+    )?)
 }
 
 impl WorkerStore {
@@ -791,6 +806,9 @@ impl WorkerStore {
             new.coordinator_epoch,
             move |tx, o| {
                 let aid = new.attempt_id.to_string();
+                // Spec 25.6 (d): a member forgotten while its connection
+                // stayed open gets nothing accepted either.
+                release::not_refused(tx, o)?;
                 let existing = load(tx, o, &aid)?;
                 let tombstoned = tx
                     .query_row(
@@ -799,7 +817,8 @@ impl WorkerStore {
                         |_| Ok(()),
                     )
                     .optional()?
-                    .is_some();
+                    .is_some()
+                    || release::recorded(tx, o, &aid)?;
                 let verdict = decide_submit(
                     existing.as_ref().map(|e| ExistingAttempt {
                         key: SubmitKey {
@@ -854,6 +873,9 @@ impl WorkerStore {
                         if let Some(live) = live {
                             return Err(StorageError::LiveAttemptExists(live));
                         }
+                        // Spec 25.6 (c): a member at its bound of records is
+                        // refused a new attempt (a resend was answered above).
+                        release::record_room(tx, o)?;
                         if let Some(window) = window {
                             let live: i64 = tx.query_row(
                                 "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal'",
@@ -1073,7 +1095,8 @@ impl WorkerStore {
                         |_| Ok(()),
                     )
                     .optional()?
-                    .is_some();
+                    .is_some()
+                    || release::recorded(tx, o, &a)?;
                 if !known {
                     undelivered_room(tx, o)?;
                     tx.execute(
@@ -1117,6 +1140,11 @@ impl WorkerStore {
         let a = attempt_id.to_string();
         under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
             let existing = load(tx, o, &a)?;
+            // An attempt that left a record ended and was deleted: there is
+            // nothing to stop, and its record refuses a late submit.
+            if existing.is_none() && release::recorded(tx, o, &a)? {
+                return Ok(None);
+            }
             let updated = tx.execute(
                 "UPDATE tombstone SET kind = 'retire' WHERE coordinator_id = ?1 AND attempt_id = ?2",
                 [o, a.as_str()],
@@ -1684,7 +1712,7 @@ impl WorkerStore {
         epoch: CoordinatorEpoch,
         at_ms: u64,
     ) -> Result<bool> {
-        self.ack(attempt_id, epoch, at_ms, None)
+        self.ack(attempt_id, epoch, at_ms, None, false)
     }
 
     /// [`Self::ack_collected`] for a parent whose digest was checked against
@@ -1699,7 +1727,22 @@ impl WorkerStore {
         at_ms: u64,
         had_result: bool,
     ) -> Result<bool> {
-        self.ack(attempt_id, epoch, at_ms, Some(had_result))
+        self.ack(attempt_id, epoch, at_ms, Some(had_result), false)
+    }
+
+    /// [`Self::ack_collected_as_read`] from a member that agreed
+    /// `attempt_release_v1` (spec 25.6 (b)): the acknowledged attempt is
+    /// deleted in the same transaction and a released record is left; its
+    /// id is queued in `dropped_attempt` for the directory and the lock.
+    /// Returns false for a resend (nothing left but the record).
+    pub fn ack_and_release(
+        &self,
+        attempt_id: &AttemptId,
+        epoch: CoordinatorEpoch,
+        at_ms: u64,
+        had_result: bool,
+    ) -> Result<bool> {
+        self.ack(attempt_id, epoch, at_ms, Some(had_result), true)
     }
 
     fn ack(
@@ -1708,6 +1751,7 @@ impl WorkerStore {
         epoch: CoordinatorEpoch,
         at_ms: u64,
         had_result: Option<bool>,
+        release: bool,
     ) -> Result<bool> {
         let a = attempt_id.to_string();
         under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
@@ -1750,6 +1794,9 @@ impl WorkerStore {
                     at_ms,
                 )?;
             }
+            if release {
+                release::drop_attempt(tx, o, &a, Leave::Released, at_ms)?;
+            }
             Ok(n == 1)
         })
     }
@@ -1771,6 +1818,14 @@ impl WorkerStore {
         let (kind, payload) = (kind.to_string(), payload.clone());
         let scope = self.scope.clone();
         self.db.write(move |tx| {
+            // Spec 25.6 (e): an attempt's events go with its row. One
+            // written after the row went (a late cleanup note, a supervisor
+            // after the release) would have no deletion, so it is dropped.
+            if let Some(a) = a.as_deref() {
+                if !attempt_row_exists(tx, a)? {
+                    return Ok(0);
+                }
+            }
             let o = owner_in(tx, &scope, a.as_deref())?;
             common::append_event_owned(
                 tx,
@@ -1830,6 +1885,10 @@ impl WorkerStore {
         let wanted = wanted.to_vec();
         let o = self.scope.clone();
         self.db.write(move |tx| {
+            // As in [`Self::append_event`]: no row, no events.
+            if !attempt_row_exists(tx, &a)? {
+                return Ok(0);
+            }
             let o = owner_in(tx, &o, Some(&a))?;
             common::append_events_unseen_owned(
                 tx,
@@ -1877,6 +1936,19 @@ impl WorkerStore {
             let mut stmt =
                 c.prepare("SELECT attempt_id FROM dropped_attempt ORDER BY attempt_id LIMIT ?1")?;
             let rows = stmt.query_map([limit], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+        })
+    }
+
+    /// [`Self::dropped_attempts`] after `after` in id order: a caller that
+    /// keeps the last id goes through every entry, whichever keep failing.
+    pub fn dropped_attempts_after(&self, after: &str, limit: u32) -> Result<Vec<String>> {
+        let after = after.to_string();
+        self.db.call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT attempt_id FROM dropped_attempt WHERE attempt_id > ?1 ORDER BY attempt_id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, limit], |r| r.get(0))?;
             Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
         })
     }

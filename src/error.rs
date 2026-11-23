@@ -129,6 +129,10 @@ pub enum OverloadedReason {
     /// stored nothing, no tombstone either: an attempt that was sent once
     /// and got this answer exists nowhere.
     Capacity,
+    /// A `submit_attempt` of a member that holds 10,000 dedup records on
+    /// this worker (spec 25.6 (c)): the member reconciles with
+    /// `list_unreleased` and releases what it no longer reads.
+    AttemptRecords,
     /// A reason this version does not know (a newer peer sent it): the
     /// caller treats the error as a plain `OVERLOADED`.
     #[serde(other)]
@@ -265,6 +269,13 @@ pub enum GroupRefusal {
     MemberIdentityMismatch,
     /// The peer told this worker that it retired the identity it still has.
     IdentityRetired,
+    /// `belt group forget` removed this member on the worker (spec 25.6
+    /// (d)): its coordinator id is refused for good.
+    MemberForgotten,
+    /// A reason this version does not know (a newer peer sent it): the
+    /// caller treats the refusal as a plain refused proof.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ApiError {
@@ -490,6 +501,16 @@ mod tests {
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
         let blocked = ApiError::blocked(BlockedReason::SecretUnavailable, "x");
         assert_eq!(blocked.conflict_reason, None);
+    }
+
+    #[test]
+    fn a_group_refusal_of_a_newer_peer_is_read_as_unknown() {
+        let unknown: GroupRefusal =
+            serde_json::from_value(json!({"reason": "some_later_reason", "x": 1})).unwrap();
+        assert_eq!(unknown, GroupRefusal::Unknown);
+        let known: GroupRefusal =
+            serde_json::from_value(json!({"reason": "member_forgotten"})).unwrap();
+        assert_eq!(known, GroupRefusal::MemberForgotten);
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub(crate) fn refusal_code(reason: &GroupRefusal) -> &'static str {
         GroupRefusal::GroupKeyMismatch { .. } => "group_key_mismatch",
         GroupRefusal::MemberIdentityMismatch => "member_identity_mismatch",
         GroupRefusal::IdentityRetired => "identity_retired",
+        GroupRefusal::MemberForgotten => "member_forgotten",
+        GroupRefusal::Unknown => "unknown",
     }
 }
 
@@ -68,6 +70,7 @@ pub(crate) fn observed_refusal(state: &Path, member: &WorkerId) -> std::io::Resu
         "group_key_mismatch",
         "member_identity_mismatch",
         "identity_retired",
+        "member_forgotten",
     ]
     .contains(&reason.as_str())
     {
@@ -208,6 +211,79 @@ pub fn command(json_output: bool) -> i32 {
     workers::emit(json_output, result, || text)
 }
 
+/// `belt group forget <member>` (spec 25.6 (d)): on this machine's worker,
+/// delete every record of a member that is not coming back, and refuse its
+/// coordinator id for good. Refused while the member is on this machine's
+/// list, or has attempts here that are not terminal.
+/// The lock `belt group forget` and the start (and the undoing) of an
+/// upgrade's trial share in the worker's state directory.
+pub(crate) const FORGET_LOCK: &str = "forget.lock";
+
+pub(crate) fn forget(
+    env: &BTreeMap<String, String>,
+    spec: &Spec,
+    member: &str,
+) -> Result<Value, ApiError> {
+    // Spec 25.1 rule 8: no deletion while an upgrade is on trial (a
+    // rollback would restore a database whose rows lost their directories,
+    // and the refusal of the member with it). Held to the end: an upgrade
+    // takes the same lock to copy the databases and begin its trial (and to
+    // put them back), so the look below cannot go stale under it.
+    let _trial = crate::storage::ProcessLock::acquire(&spec.worker_state_dir, FORGET_LOCK)
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::Conflict,
+                "an upgrade of this worker is starting or rolling back; forget the member later",
+            )
+        })?;
+    if crate::worker::control::in_trial(&spec.worker_state_dir) {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "an upgrade of this worker is on trial; forget the member after it is committed or rolled back",
+        ));
+    }
+    if workers::registrations(env)?.iter().any(|e| e.id == member) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidInput,
+            format!("{member} is still on this machine's list; remove it first"),
+        ));
+    }
+    let store = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id)
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+    let attempts = store
+        .forget_member(member, crate::platform::wall_ms())
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+    // The directories and locks of its attempts, after the commit.
+    let dropped = crate::worker::agent::remove_dropped_attempts(
+        &spec.worker_state_dir.join("attempts"),
+        &store,
+    )
+    .map_err(internal)?;
+    Ok(json!({
+        "member": member,
+        "attempts": attempts.len(),
+        "kept": dropped.failed.len(),
+    }))
+}
+
+pub fn forget_command(member: &str, json_output: bool) -> i32 {
+    let env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let result = load_spec(&env).and_then(|spec| forget(&env, &spec, member));
+    let text = result
+        .as_ref()
+        .map(|v| {
+            format!(
+                "Forgot member {}: {} attempts removed; it is refused from now on.",
+                v["member"].as_str().unwrap_or_default(),
+                v["attempts"]
+            )
+        })
+        .unwrap_or_default();
+    workers::emit(json_output, result, || text)
+}
+
 /// A receiving-only member can inspect its group without acquiring a coordinator identity.
 pub(super) fn load_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError> {
     match super::context::runtime_spec(env) {
@@ -287,6 +363,38 @@ mod tests {
             std::fs::set_permissions(&resident, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(run().stdout, format!("path {action}").as_bytes());
         }
+    }
+
+    #[test]
+    fn forget_is_refused_while_an_upgrade_is_on_trial() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = BTreeMap::from([("HOME".into(), root.path().to_str().unwrap().into())]);
+        let worker = WorkerId::parse("local").unwrap();
+        let spec = Spec {
+            state_dir: root.path().into(),
+            worker_state_dir: root.path().into(),
+            worker_id: worker,
+            cluster_key_path: root.path().join("deliberately-absent-key"),
+            executable: root.path().join("belt"),
+            env: env.clone(),
+            repo_root: None,
+            expected_cluster: None,
+            managed_service: None,
+        };
+        std::fs::write(crate::worker::control::trial_path(root.path()), b"{}").unwrap();
+        let member = crate::ids::CoordinatorId::generate().to_string();
+        let e = forget(&env, &spec, &member).unwrap_err();
+        assert!(e.message.contains("on trial"), "{e:?}");
+        // Nothing was written: no database, no refusal.
+        assert!(!root.path().join("worker.db").exists());
+        // An upgrade between its copy of the databases and its trial (or
+        // putting them back) holds the lock: refused too.
+        std::fs::remove_file(crate::worker::control::trial_path(root.path())).unwrap();
+        let _upgrade = crate::storage::ProcessLock::acquire(root.path(), FORGET_LOCK).unwrap();
+        let e = forget(&env, &spec, &member).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
+        assert!(!root.path().join("worker.db").exists());
     }
 
     #[test]
@@ -438,6 +546,7 @@ mod tests {
                 "member_identity_mismatch",
             ),
             (GroupRefusal::IdentityRetired, "identity_retired"),
+            (GroupRefusal::MemberForgotten, "member_forgotten"),
         ] {
             record_refusal(root.path(), &member, Some(&reason)).unwrap();
             assert_eq!(

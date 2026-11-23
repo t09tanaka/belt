@@ -89,6 +89,9 @@ impl Coordinator {
             })
             .await?;
         if matches!(admission, Admission::First | Admission::Same) {
+            // Spec 25.6 (a): each connection reconciles what the worker
+            // holds of this parent and nobody releases.
+            self.reconcile_due(&worker);
             self.workers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

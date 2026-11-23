@@ -77,6 +77,10 @@ pub(super) struct PruneReport {
     pub kept_events: u32,
     pub events: u32,
     pub timings: u32,
+    /// Step 7: the attempts of the runs pruned in this pass, with their
+    /// worker, read before their rows went. The caller sends
+    /// `release_attempt` for them after the pass (spec 25.5, 25.6).
+    pub released: Vec<(WorkerId, AttemptId)>,
 }
 
 pub(super) struct Sample {
@@ -274,8 +278,9 @@ fn prune(
     }
     drop(source);
     fault("after_rows")?;
-    // 7. After the commit that deleted the row of the run.
-    release_attempts(ended);
+    // 7. After the commit that deleted the row of the run: handed to the
+    // caller, which sends `release_attempt` outside this blocking job.
+    report.released.extend(ended);
     // 8. The pin file goes last. A stop before this line leaves a pin of a
     // run without a row, which the scan at the next start removes.
     gc.forget(run);
@@ -369,16 +374,6 @@ fn results(
     }
     state.sweeps.insert(run.clone(), Sweep::Done);
     Ok(true)
-}
-
-/// Step 7 (spec 25.5): the attempts of a pruned run that a worker accepted
-/// and that were not acknowledged are released on their workers. The
-/// operation (`release_attempt`, 25.6) comes with stage 3; until then
-/// nothing is sent, and the worker deletes its copy after its own wait, as
-/// before. The list is exactly what the transactions of step 6 read before
-/// they deleted the attempt rows; stage 3 selects from it and sends here.
-fn release_attempts(attempts: Vec<(WorkerId, AttemptId)>) {
-    drop(attempts);
 }
 
 #[cfg(test)]

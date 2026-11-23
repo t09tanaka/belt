@@ -267,21 +267,37 @@ fn foreign_supervisors(state_dir: &Path, scope: &Path) -> Vec<String> {
             .unwrap_or_default()
     };
     // (the directory the supervisor lock is kept under, the stored spec)
+    // An attempt's lock is checked without creating its file (spec 25.6
+    // (b)): the agent deletes the directory before the lock, so a check that
+    // read `supervise.json` just before both went never makes the lock
+    // again. A builder's lock lives in the builder's directory and goes
+    // with it.
     let attempts = subdirs(state_dir.join("attempts"))
         .into_iter()
-        .map(|dir| (state_dir.to_path_buf(), dir.join("supervise.json")));
+        .map(|dir| (state_dir.to_path_buf(), dir.join("supervise.json"), false));
     let builders = subdirs(state_dir.join("setup").join("builders"))
         .into_iter()
-        .map(|dir| (dir.clone(), dir.join("spec.json")));
+        .map(|dir| (dir.clone(), dir.join("spec.json"), true));
     let mut found: Vec<String> = attempts
         .chain(builders)
-        .filter_map(|(lock_dir, file)| {
+        .filter_map(|(lock_dir, file, builder)| {
             let stored: StoredScope = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
             if stored.traffic_state_dir == scope {
                 return None;
             }
             // A lock that can be taken proves the supervisor is gone.
-            if let Ok(Some(_free)) = SupervisorLock::try_acquire(&lock_dir, &stored.attempt_id) {
+            let free = if builder {
+                matches!(
+                    SupervisorLock::try_acquire(&lock_dir, &stored.attempt_id),
+                    Ok(Some(_))
+                )
+            } else {
+                matches!(
+                    SupervisorLock::try_acquire_existing(&lock_dir, &stored.attempt_id),
+                    Ok(Some(_))
+                )
+            };
+            if free {
                 return None;
             }
             Some(format!(

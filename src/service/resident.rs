@@ -1044,10 +1044,24 @@ impl Resident {
         loops.spawn(async move {
             let mut timer = tokio::time::interval(heartbeat);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The agent's retention GC, which a worker-only host runs in its
+            // `tick`, runs here at the cadence of the result GC, in the same
+            // blocking pass so it never overlaps `supervise`.
+            let mut last_gc: Option<std::time::Instant> = None;
             loop {
                 tokio::select! { _ = maintain_stop.changed() => return Ok(()), _ = timer.tick() => {} }
                 let agent = agent.clone();
-                tokio::task::spawn_blocking(move || agent.supervise()).await?;
+                let gc = last_gc.is_none_or(|at| at.elapsed() >= gc_cadence);
+                if gc {
+                    last_gc = Some(std::time::Instant::now());
+                }
+                tokio::task::spawn_blocking(move || {
+                    agent.supervise();
+                    if gc {
+                        agent.collect_garbage();
+                    }
+                })
+                .await?;
             }
         });
         let mut deliveries = JoinSet::new();

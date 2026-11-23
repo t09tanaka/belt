@@ -39,6 +39,7 @@ pub mod policy;
 mod prefetch;
 mod preparation;
 mod preparation_identity;
+pub(crate) mod release;
 mod workflow_artifact;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
@@ -509,6 +510,20 @@ pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
+    /// The submits on their way: no acknowledgement or release of them is
+    /// sent until they are answered (spec 25.6 (c)).
+    submits: Arc<release::InFlight>,
+    /// The workers whose `list_unreleased` reconciliation is due.
+    unreleased_due: Mutex<BTreeSet<WorkerId>>,
+    /// Where the reconciliation of each worker goes on (the last attempt
+    /// it read), so a pass does not read the same first pages again. In
+    /// memory: a lost cursor only means the next pass starts at the front.
+    unreleased_after: Mutex<BTreeMap<WorkerId, AttemptId>>,
+    /// Workers whose reconciliation had nothing left to send again but did
+    /// not read the whole list in one pass: due again at this instant, not
+    /// at once (a worker with many unreleasable attempts is not read on
+    /// every pass).
+    unreleased_resume: Mutex<BTreeMap<WorkerId, tokio::time::Instant>>,
     parent_local: Mutex<Option<WorkerId>>,
     preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
     preparation_query: tokio::sync::Mutex<()>,
@@ -581,6 +596,10 @@ impl Coordinator {
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
+            submits: Arc::default(),
+            unreleased_due: Mutex::default(),
+            unreleased_after: Mutex::default(),
+            unreleased_resume: Mutex::default(),
             parent_local: Mutex::default(),
             preparation_identities: Mutex::default(),
             preparation_query: tokio::sync::Mutex::new(()),
@@ -790,6 +809,7 @@ impl Coordinator {
     /// commits, without holding up forecasts or blocking the async executor.
     pub async fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
         let _commit = self.placement_fence.lock().await;
+        self.reconcile_due(&worker_id);
         self.workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -804,6 +824,7 @@ impl Coordinator {
         link: Arc<dyn WorkerLink>,
     ) -> std::result::Result<(), tokio::sync::TryLockError> {
         let _commit = self.placement_fence.try_lock()?;
+        self.reconcile_due(&worker_id);
         self.workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1487,6 +1508,21 @@ impl Coordinator {
         asked: &Attached,
     ) -> Result<Sent> {
         let a = &live.record;
+        // Marked at the decision, before anything is awaited (spec 25.6
+        // (xvi)): from here no acknowledgement or release of the attempt is
+        // sent. A collection that made it terminal before the mark is seen
+        // by the look at the record below, and sends nothing.
+        let sending = self.submits.sending(&a.attempt_id);
+        let id = a.attempt_id.clone();
+        let ended = self
+            .db(move |s| {
+                Ok(s.get_attempt(&id)?
+                    .is_none_or(|r| r.state == AttemptState::Terminal))
+            })
+            .await?;
+        if ended {
+            return Ok(Sent::NotTaken);
+        }
         let payload: Option<AttemptPayload> = live
             .placement
             .as_ref()
@@ -1517,6 +1553,7 @@ impl Coordinator {
         let sends_before = self.db(move |s| s.count_submit_send(&id)).await?;
         drop(actor);
         let answer = link.call(Request::SubmitAttempt(request)).await;
+        drop(sending);
         let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
             return Ok(Sent::NotTaken);
         };
@@ -1538,6 +1575,11 @@ impl Coordinator {
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
+                if e.overloaded_reason == Some(OverloadedReason::AttemptRecords) {
+                    // Spec 25.6 (c): the worker holds its bound of records of
+                    // this parent; what it can let go of is released.
+                    self.reconcile_due(&a.worker_id);
+                }
                 let unstored = match e.overloaded_reason {
                     Some(OverloadedReason::Capacity) if replaceable => Some(Unstored::Capacity),
                     Some(OverloadedReason::AttemptIdInUse) if replaceable => {
@@ -2696,5 +2738,7 @@ fn demand_of(
 
 #[cfg(test)]
 mod paging_tests;
+#[cfg(test)]
+mod release_tests;
 #[cfg(test)]
 mod tests;

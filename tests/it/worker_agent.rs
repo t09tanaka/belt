@@ -33,6 +33,7 @@ use tokio::sync::Semaphore;
 const T: Duration = Duration::from_secs(20);
 
 mod group_membership;
+mod release;
 
 /// The machine, reduced to plain directories, with a record of every call.
 struct DirHost {
@@ -1152,6 +1153,23 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let worker = WorkerId::parse("snapshot-worker").unwrap();
     let store = WorkerStore::open(dir.path(), &worker).unwrap();
+    // An event of an attempt is written only while the attempt has a row.
+    let attempt = AttemptId::generate();
+    store
+        .for_member(&CoordinatorId::generate())
+        .submit(
+            belt::storage::NewAcceptance {
+                attempt_id: attempt.clone(),
+                run_id: RunId::generate(),
+                task_id: TaskId::generate(),
+                generation: Generation(1),
+                payload_hash: PayloadHash::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+                coordinator_epoch: CoordinatorEpoch(1),
+                spec: serde_json::json!({"cmd": "true"}),
+            },
+            1,
+        )
+        .unwrap();
     // Put the schema in the main DB first. The following single event commit
     // then stays below SQLite's automatic WAL checkpoint threshold.
     let checkpoint = rusqlite::Connection::open(dir.path().join("worker.db")).unwrap();
@@ -1159,7 +1177,6 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     drop(checkpoint);
-    let attempt = AttemptId::generate();
     let marker = "synthetic-snapshot-marker-123456789";
     store
         .append_event(
@@ -1508,7 +1525,7 @@ async fn a_command_s_own_timeout_overrides_the_default_of_the_attempt() {
 // ------------------------------------------------- results, events, GC
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nothing_is_collected_as_garbage_before_ack_collected() {
+async fn nothing_is_collected_before_ack_collected_and_the_acknowledged_attempt_goes_at_once() {
     let f = fx();
     let mut cfg = f.cfg("boot-a");
     // Keep nothing longer than necessary: only the missing ACK protects.
@@ -1561,24 +1578,33 @@ async fn nothing_is_collected_as_garbage_before_ack_collected() {
     assert!(agent.gc().unwrap().removed.is_empty());
     assert!(stored());
 
-    for _ in 0..2 {
-        let Response::AckCollected(r) = call(&c, ack(result.result_digest.clone())).await.unwrap()
-        else {
-            panic!()
-        };
-        assert!(r.released);
-    }
-    assert!(f.rec(&a).acked_at_ms.is_some());
-    let report = agent.gc().unwrap();
-    assert_eq!(report.removed.len(), 1);
+    let spec: AttemptPayload = serde_json::from_value(f.rec(&a).spec).unwrap();
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    let Response::AckCollected(r) = call(&c, ack(result.result_digest.clone())).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(r.released);
+    // Spec 25.6 (i): with attempt_release_v1 the acknowledged attempt goes
+    // at once: its directory, its row, its children and its events; a
+    // record answers for it.
     assert!(!logs.exists());
-    // The attempt's record and tombstone-level facts stay: a resend is still
-    // the same attempt, never a new run.
-    assert!(
-        submit(&c, &a, &serde_json::from_value(f.rec(&a).spec).unwrap())
-            .await
-            .duplicate
-    );
+    assert!(!f.state().join("attempts").join(a.as_str()).exists());
+    assert!(!f
+        .state()
+        .join("supervisors")
+        .join(format!("{a}.lock"))
+        .exists());
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(f.store().events_of_attempt(&a, 10).unwrap().is_empty());
+    // The acknowledgement sent again finds nothing (the parent closes on it).
+    let e = call(&c, ack(result.result_digest.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    // No submit was in flight: the released record went at once.
+    assert_eq!(agent.releases_waiting(), 0);
+    let _ = spec;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2708,13 +2734,13 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
         panic!()
     };
     assert!(r.released);
-    assert!(f.rec(&a).acked_at_ms.is_some());
-    // And the lock is free again for whoever comes next.
-    assert!(
-        belt::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
-            .unwrap()
-            .is_some()
-    );
+    // Accepted under the lock: the attempt and its lock are gone (spec 25.6).
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(!f
+        .state()
+        .join("supervisors")
+        .join(format!("{a}.lock"))
+        .exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
