@@ -2718,13 +2718,9 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
         panic!()
     };
     assert!(r.released);
-    assert!(f.rec(&a).acked_at_ms.is_some());
-    // And the lock is free again for whoever comes next.
-    assert!(
-        belt::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
-            .unwrap()
-            .is_some()
-    );
+    // Accepted under the lock: the attempt and its lock are gone (spec 25.6).
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(!f.state().join("supervisors").join(format!("{a}.lock")).exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
