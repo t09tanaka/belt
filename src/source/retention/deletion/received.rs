@@ -99,9 +99,18 @@ const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Step 0's page: the abandoned roots from the cursor in `root_kind`
 /// order, then each one's members by the primary key (no scan of the other
 /// roots' members, no sort).
+/// A root whose next try is not due (`drop_retry`, written when one of its
+/// members could not be proven) is passed over, except the one the cursor
+/// is in, so a sweep through it ends; a next try more than an hour ahead
+/// (the clock went back) is due.
 const STEP0_ROOTS: &str = "SELECT id FROM root WHERE kind='abandoned' AND id>=?1
      AND (id LIKE 'import:%' OR id LIKE 'drop:%' OR id LIKE 'receive:%')
-     AND EXISTS(SELECT 1 FROM member WHERE root=root.id) ORDER BY id LIMIT ?2";
+     AND EXISTS(SELECT 1 FROM member WHERE root=root.id)
+     AND (id=?1 OR NOT EXISTS(SELECT 1 FROM drop_retry t WHERE t.root=root.id AND t.next_ms>?3 AND t.next_ms<=?3+3600000))
+     ORDER BY id LIMIT ?2";
+/// How long a root with an unproven member waits before step 0 reads it
+/// again (spec 25.8 5b, 「rootごとに次に試す時刻」).
+const RETRY_MS: i64 = 3_600_000;
 const STEP0_MEMBERS: &str = "SELECT m.object,o.path,b.bytes FROM member m
      JOIN object o ON o.id=m.object LEFT JOIN object_bytes b ON b.id=m.object
      WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT ?3";
@@ -144,6 +153,9 @@ enum Leftover {
     Stuck,
     /// A claim did not drain: the pass stops.
     Stop,
+    /// A large file was claimed (or a claim too large to hash in the
+    /// section is left): the caller hashes it with the lock let go.
+    Large(Box<Claim>),
 }
 
 impl SourceStore {
@@ -161,11 +173,12 @@ impl SourceStore {
         // (steps 2 and 3 end at the first candidate the rules do not allow;
         // the sections go on while step 0 has work)
         let mut detaching = true;
+        let mut large = true;
         for section in 0..SECTIONS {
             if section > 0 {
                 std::thread::sleep(PAUSE);
             }
-            let _guard = match self.retention.guard(true) {
+            let guard = match self.retention.guard(true) {
                 Ok(guard) => guard,
                 Err(e) if super::super::import_owner::would_block(&e) => {
                     report.busy = true;
@@ -188,9 +201,15 @@ impl SourceStore {
                 return Ok(report);
             }
             report.sections += 1;
-            let mut budget = BYTE_BUDGET;
+            let mut budget = section_budget();
             if step0 < STEP0_SECTIONS {
-                match self.retention.leftovers(&mut c, &mut budget, &mut report)? {
+                match self.retention.leftovers(
+                    &mut c,
+                    &mut budget,
+                    inputs.wall,
+                    large,
+                    &mut report,
+                )? {
                     Leftover::None => {}
                     Leftover::Progress => {
                         step0 += 1;
@@ -204,6 +223,38 @@ impl SourceStore {
                     Leftover::Stop => {
                         report.stuck = true;
                         return Ok(report);
+                    }
+                    Leftover::Large(claim) => {
+                        // One per pass ((g)14), hashed with the lock let go.
+                        large = false;
+                        step0 += 1;
+                        drop(guard);
+                        let digest = self.retention.hash_outside(&claim);
+                        let _guard = match self.retention.guard(true) {
+                            Ok(guard) => guard,
+                            Err(e) if super::super::import_owner::would_block(&e) => {
+                                // (the claim stays; the next pass hashes again)
+                                report.busy = true;
+                                return Ok(report);
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        if (inputs.stop)() {
+                            return Ok(report);
+                        }
+                        let mut c = self.retention.connect()?;
+                        match self
+                            .retention
+                            .finish_large(&mut c, &claim, digest, inputs.wall)?
+                        {
+                            Some(true) => report.unlinked += 1,
+                            Some(false) => report.kept += 1,
+                            None => {
+                                report.stuck = true;
+                                return Ok(report);
+                            }
+                        }
+                        continue;
                     }
                 }
             }
@@ -246,13 +297,56 @@ impl Index {
         let mut c = self.connect()?;
         let mut budget = budget;
         let mut report = ReceivedPassReport::default();
-        let what = match self.leftovers(&mut c, &mut budget, &mut report)? {
+        let what = match self.leftovers(&mut c, &mut budget, now_ms(), true, &mut report)? {
             Leftover::None => "none",
             Leftover::Progress => "progress",
             Leftover::Stuck => "stuck",
             Leftover::Stop => "stop",
+            Leftover::Large(_) => "large",
         };
         Ok((what, report))
+    }
+
+    /// The end of a large claim, under the exclusive lock taken again:
+    /// `digest` is what [`Index::hash_outside`] read. The content its name
+    /// says (or an absent file) is unlinked (`Some(true)`); anything else
+    /// withdraws the claim and the file stays with its root, whose next try
+    /// waits (`Some(false)`). A claim another pass finished meanwhile is
+    /// done (`Some(false)`). `None`: a claim that could neither drain nor be
+    /// withdrawn (an older shape): the pass stops.
+    fn finish_large(
+        &self,
+        c: &mut Connection,
+        claim: &Claim,
+        digest: Result<Option<String>>,
+        now: u64,
+    ) -> Result<Option<bool>> {
+        let still: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1 AND incarnation=?2 AND done=0)",
+            params![claim.object, claim.incarnation],
+            |r| r.get(0),
+        )?;
+        if !still {
+            return Ok(Some(false));
+        }
+        let expected = match &claim.root {
+            Some(_) => claim.object.strip_prefix("b:").unwrap_or(""),
+            None => claim.digest.as_str(),
+        };
+        let content = match &digest {
+            Ok(None) => true,
+            Ok(Some(d)) => !expected.is_empty() && d == expected,
+            Err(_) => false,
+        };
+        if content {
+            return Ok(self.drain(c, claim, None).is_ok().then_some(true));
+        }
+        let Some(root) = &claim.root else {
+            return Ok(None);
+        };
+        self.unclaim(c, claim)?;
+        retry_root(c, root, now)?;
+        Ok(Some(false))
     }
 
     /// The trusted now of the expiry, `None` while the clock holds.
@@ -286,8 +380,15 @@ impl Index {
         &self,
         c: &mut Connection,
         budget: &mut u64,
+        now: u64,
+        large: bool,
         report: &mut ReceivedPassReport,
     ) -> Result<Leftover> {
+        // (next tries of roots that are gone go with them)
+        c.execute(
+            "DELETE FROM drop_retry WHERE NOT EXISTS(SELECT 1 FROM root WHERE id=drop_retry.root)",
+            [],
+        )?;
         let replay: Vec<String> = {
             let mut s = c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
             let rows = s.query_map([], |r| r.get(0))?;
@@ -296,10 +397,15 @@ impl Index {
         if !replay.is_empty() {
             for raw in replay {
                 let claim: Claim = serde_json::from_str(&raw)?;
-                // (one the rest of this section cannot verify waits for
-                // the next one, whose budget is whole)
-                if claim.leaf.size > *budget {
-                    return Ok(Leftover::Progress);
+                // A large claim, or one the section cannot hash (it starts
+                // here with its whole budget), is hashed with the lock let
+                // go: one per pass; after it, step 0 waits for the next.
+                if claim.root.is_some() || claim.leaf.size > *budget {
+                    return Ok(if large {
+                        Leftover::Large(Box::new(claim))
+                    } else {
+                        Leftover::Stuck
+                    });
                 }
                 if self.drain_claim(c, &claim, budget).is_err() {
                     return Ok(Leftover::Stop);
@@ -318,7 +424,7 @@ impl Index {
         let page = |c: &Connection, root: &str, object: &str| -> Result<Vec<Member>> {
             let roots: Vec<String> = {
                 let mut s = c.prepare(STEP0_ROOTS)?;
-                let rows = s.query_map(params![root, ROWS as i64], |r| r.get(0))?;
+                let rows = s.query_map(params![root, ROWS as i64, now as i64], |r| r.get(0))?;
                 rows.collect::<std::result::Result<_, _>>()?
             };
             let mut members = Vec::new();
@@ -364,6 +470,7 @@ impl Index {
                     )?;
                 }
                 tx.execute("DELETE FROM graph WHERE root=?1", [id])?;
+                tx.execute("DELETE FROM drop_retry WHERE root=?1", [id])?;
                 removed += tx.execute("DELETE FROM root WHERE id=?1", [id])?;
             }
             tx.commit()?;
@@ -388,18 +495,50 @@ impl Index {
         // stay is bounded like that of files that go).
         let start = *budget;
         let mut unproven_read = 0u64;
+        let mut claimed = None;
+        let mut retry = std::collections::BTreeSet::new();
         for (root, object, path, bytes) in &members {
             if unproven_read >= start / 2 {
                 break;
             }
-            // A known size the rest of the section cannot verify waits for
-            // the next section (the cursor stays before it); one larger
-            // than a whole section's half is kept (spec: the large-blob
-            // rule is a later change).
-            let half = BYTE_BUDGET / 2;
-            match bytes.and_then(|b| u64::try_from(b).ok()) {
-                Some(bytes) => {
-                    if bytes <= half && bytes > *budget / 2 {
+            let shared: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
+                params![object, root],
+                |r| r.get(0),
+            )?;
+            // A size the in-lock proof (half a section) cannot read is a
+            // large file: a blob no other root holds is claimed here and
+            // hashed with the lock let go, one per pass (spec (d) 「1回の
+            // 上限」); a manifest that large is kept. A known size the rest
+            // of the section cannot verify waits for the next section (the
+            // cursor stays before it).
+            let half = start / 2;
+            let size = match bytes.and_then(|b| u64::try_from(b).ok()) {
+                Some(size) => Some(size),
+                None if !shared => self.leaf_size(object, path),
+                None => None,
+            };
+            match size {
+                Some(size) if size > half && !shared && object.starts_with("b:") => {
+                    if !large {
+                        break;
+                    }
+                    cursor = format!("{root}\n{object}");
+                    touched.insert(root.clone());
+                    match self.claim_large(c, root, object, path)? {
+                        Some(claim) => {
+                            claimed = Some(Box::new(claim));
+                            break;
+                        }
+                        None => {
+                            report.kept += 1;
+                            retry.insert(root.clone());
+                            continue;
+                        }
+                    }
+                }
+                Some(size) => {
+                    if size <= half && size > *budget / 2 {
                         break;
                     }
                 }
@@ -413,11 +552,6 @@ impl Index {
             }
             cursor = format!("{root}\n{object}");
             touched.insert(root.clone());
-            let shared: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
-                params![object, root],
-                |r| r.get(0),
-            )?;
             if !shared && self.destination_absent(object, path) {
                 forget_member(c, root, object)?;
                 report.forgotten += 1;
@@ -433,6 +567,7 @@ impl Index {
                 Released::Unproven(_) => {
                     report.kept += 1;
                     unproven_read += before - *budget;
+                    retry.insert(root.clone());
                 }
                 Released::Claimed(Ok(())) => {
                     report.unlinked += 1;
@@ -449,6 +584,7 @@ impl Index {
             )?;
             if removed == 1 {
                 tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
+                tx.execute("DELETE FROM drop_retry WHERE root=?1", [root])?;
                 if let Some(token) = root.strip_prefix("import:") {
                     tx.execute(
                         "DELETE FROM import_session WHERE token=?1 AND state='pending' AND source IS NULL AND run_id IS NULL",
@@ -465,7 +601,13 @@ impl Index {
                 params![DROP_CURSOR, cursor],
             )?;
         }
+        for root in &retry {
+            retry_root(&tx, root, now)?;
+        }
         tx.commit()?;
+        if let Some(claim) = claimed {
+            return Ok(Leftover::Large(claim));
+        }
         Ok(if changed {
             Leftover::Progress
         } else {
@@ -688,4 +830,37 @@ impl Index {
         tx.commit()?;
         Ok(Some(u64::try_from(freed).unwrap_or(0)))
     }
+}
+
+/// The root `root` has a member that could not be proven: step 0 reads it
+/// again after [`RETRY_MS`] (one row per abandoned root, gone with it).
+fn retry_root(c: &Connection, root: &str, now: u64) -> Result<()> {
+    c.execute(
+        "INSERT INTO drop_retry(root,next_ms) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM root WHERE id=?1)
+         ON CONFLICT(root) DO UPDATE SET next_ms=excluded.next_ms",
+        params![root, now as i64 + RETRY_MS],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! { static BUDGET: std::cell::Cell<u64> = const { std::cell::Cell::new(BYTE_BUDGET) }; }
+/// A section's byte budget (64 MiB; tests set a small one, (g)14).
+fn section_budget() -> u64 {
+    #[cfg(test)]
+    return BUDGET.get();
+    #[cfg(not(test))]
+    BYTE_BUDGET
+}
+#[cfg(test)]
+pub(in crate::source::retention) fn set_budget(bytes: u64) {
+    BUDGET.set(bytes);
 }

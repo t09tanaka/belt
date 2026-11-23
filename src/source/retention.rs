@@ -248,7 +248,7 @@ impl Index {
     fn ensure_size_accounting(db: &mut Connection) -> Result<()> {
         const CHECK: &str = "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')
             AND EXISTS(SELECT 1 FROM pragma_table_info('root') WHERE name='used_ms')
-            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','root_used','root_used_id','graph_source','clone_ref_root'))=10
+            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','drop_retry','root_used','root_used_id','graph_source','clone_ref_root'))=11
             AND (SELECT count(*) FROM meta WHERE key IN ('store_bytes','bytes_fill','clone_ref_fill'))=3";
         let ready: bool = db.query_row(CHECK, [], |r| r.get(0))?;
         if ready {
@@ -274,6 +274,7 @@ impl Index {
              CREATE TABLE IF NOT EXISTS legacy_retry(name TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS clone_ref_retry(root TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS bytes_retry(id TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS drop_retry(root TEXT PRIMARY KEY,next_ms INTEGER NOT NULL);
              INSERT OR IGNORE INTO meta VALUES('store_bytes','0');
              INSERT OR IGNORE INTO meta VALUES('bytes_fill','');
              INSERT OR IGNORE INTO meta VALUES('clone_ref_fill','');",

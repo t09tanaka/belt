@@ -16,7 +16,7 @@ pub use import_release::{abandoned_imports_read_only, ImportReleaseReport};
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
 #[cfg(test)]
-pub(in crate::source::retention) use received::PLANNED;
+pub(in crate::source::retention) use received::{set_budget, PLANNED};
 pub use received::{ReceivedPassInputs, ReceivedPassReport, SourceUse};
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
@@ -152,6 +152,15 @@ struct Claim {
     /// other claim is replayed by the page of expired runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     abandoned: bool,
+    /// The claim of a file larger than the in-lock proof may read (spec
+    /// 25.8 5b (d) 「1回の上限」): written under the exclusive lock before
+    /// any hash, with the membership of this root kept until completion
+    /// (so an unproven file keeps its root and the claim can be withdrawn,
+    /// [`Index::unclaim`]). Its content is hashed with the lock let go
+    /// ([`Index::hash_outside`]) and only the received pass drains it
+    /// ([`Index::drain_hashed`]); every other replay leaves it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
 }
 fn directory(file: &File, private: bool) -> Result<(u64, u64)> {
     let m = file.metadata()?;
@@ -325,10 +334,143 @@ impl Index {
             leaf,
             digest,
             abandoned: false,
+            root: None,
         };
         Ok((claim, verified))
     }
     fn drain_claim(&self, c: &mut Connection, claim: &Claim, budget: &mut u64) -> Result<()> {
+        // (a large claim is the received pass's: its hash is taken with the
+        // lock let go, never inside another page's budget)
+        ensure!(
+            claim.root.is_none(),
+            "large source claim waits for its pass"
+        );
+        self.drain(c, claim, Some(budget))
+    }
+    /// The size of `object`'s file through its checked ancestors, without
+    /// following a link; `None` when it cannot be looked at.
+    pub(super) fn leaf_size(&self, object: &str, path: &str) -> Option<u64> {
+        let (parent, name, _) = self.open_claim_parent(object, path).ok()?;
+        let st = rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+        u64::try_from(st.st_size).ok()
+    }
+    /// The large claim `claim` is withdrawn (its file was not its content,
+    /// or could not be read): the claim row goes and the publication is live
+    /// again; the membership it kept was never removed, so the file stays
+    /// with its root. `false` when the claim is no longer there.
+    fn unclaim(&self, c: &mut Connection, claim: &Claim) -> Result<bool> {
+        ensure!(claim.root.is_some(), "not a large source claim");
+        let tx = c.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM source_delete_claim WHERE object=?1 AND incarnation=?2 AND done=0",
+            params![claim.object, claim.incarnation],
+        )?;
+        if removed == 1 {
+            tx.execute("UPDATE publication SET state='live' WHERE object=?1 AND incarnation=?2 AND state='claimed'",params![claim.object,claim.incarnation])?;
+        }
+        tx.commit()?;
+        Ok(removed == 1)
+    }
+    /// Under the exclusive lock: claim the file of `object`, a member of
+    /// `root` no other root holds, without reading it (it is larger than the
+    /// section may hash). `None`: it is not a plain file of ours (kept).
+    fn claim_large(
+        &self,
+        c: &mut Connection,
+        root: &str,
+        object: &str,
+        path: &str,
+    ) -> Result<Option<Claim>> {
+        let Ok((parent, name, parents)) = self.open_claim_parent(object, path) else {
+            return Ok(None);
+        };
+        let Ok(fd) = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) else {
+            return Ok(None);
+        };
+        let file: File = fd.into();
+        let leaf = Identity::of(&file)?;
+        if !leaf.leaf() {
+            return Ok(None);
+        }
+        let incarnation = i64::try_from(self.publication(object)?.get())?;
+        ensure!(incarnation < i64::MAX, "source incarnation overflow");
+        let claim = Claim {
+            object: object.into(),
+            path: path.into(),
+            incarnation,
+            store: directory(&self.root, true)?,
+            parents,
+            leaf,
+            digest: String::new(),
+            abandoned: false,
+            root: Some(root.into()),
+        };
+        let tx = c.transaction()?;
+        let shared: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2) OR NOT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root=?2)",
+            params![object, root],
+            |r| r.get(0),
+        )?;
+        if shared {
+            return Ok(None);
+        }
+        tx.execute("INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,?2,?3,0)",params![object,claim.incarnation,serde_json::to_string(&claim)?])?;
+        let claimed = tx.execute("UPDATE publication SET state='claimed' WHERE object=?1 AND incarnation=?2 AND state='live'",params![object,claim.incarnation])?;
+        if claimed != 1 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        fault("after_large_claim")?;
+        Ok(Some(claim))
+    }
+    /// With no lock held: hash the file the large claim `claim` names,
+    /// opened through its checked ancestors and compared with the claimed
+    /// identity before and after the read. `Ok(None)`: the file is absent
+    /// (only this claim permits that, as in the replay). An error, or a
+    /// digest other than the object's name, withdraws the claim.
+    fn hash_outside(&self, claim: &Claim) -> Result<Option<String>> {
+        let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
+        ensure!(parents == claim.parents, "source deletion ancestor changed");
+        let opened = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        let file: File = match opened {
+            Ok(fd) => fd.into(),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            Identity::of(&file)? == claim.leaf,
+            "source deletion leaf changed"
+        );
+        let mut digest = Sha256::new();
+        let read = std::io::copy(&mut (&file).take(claim.leaf.size + 1), &mut digest)?;
+        ensure!(
+            read == claim.leaf.size && Identity::of(&file)? == claim.leaf,
+            "source changed during validation"
+        );
+        Ok(Some(format!("{:x}", digest.finalize())))
+    }
+    /// `budget`: the content is hashed again inside it; `None`: the large
+    /// claim's file was hashed outside the lock (the caller compared the
+    /// digest) and, under the exclusive lock again, only its identity and
+    /// ancestors are checked once more: the claim fenced every belt writer
+    /// meanwhile, and any other change shows in the identity.
+    fn drain(&self, c: &mut Connection, claim: &Claim, budget: Option<&mut u64>) -> Result<()> {
         ensure!(
             claim.incarnation > 0 && claim.incarnation < i64::MAX,
             "source incarnation overflow"
@@ -348,7 +490,9 @@ impl Index {
             current == Some(claim.incarnation),
             "stale source deletion incarnation"
         );
-        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
+        // (a large claim's own membership stays until completion)
+        let own = claim.root.as_deref().unwrap_or("");
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",params![claim.object,own],|r|r.get(0))?;
         ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
@@ -368,20 +512,22 @@ impl Index {
                     Identity::of(&file)? == claim.leaf && claim.leaf.leaf(),
                     "source deletion leaf changed"
                 );
-                ensure!(
-                    claim.leaf.size <= *budget,
-                    "source replay validation byte budget"
-                );
-                *budget -= claim.leaf.size;
-                let mut digest = Sha256::new();
-                let mut reader = (&file).take(claim.leaf.size + 1);
-                let bytes = std::io::copy(&mut reader, &mut digest)?;
-                ensure!(
-                    bytes == claim.leaf.size
-                        && format!("{:x}", digest.finalize()) == claim.digest
-                        && Identity::of(&file)? == claim.leaf,
-                    "source replay content changed"
-                );
+                if let Some(budget) = budget {
+                    ensure!(
+                        claim.leaf.size <= *budget,
+                        "source replay validation byte budget"
+                    );
+                    *budget -= claim.leaf.size;
+                    let mut digest = Sha256::new();
+                    let mut reader = (&file).take(claim.leaf.size + 1);
+                    let bytes = std::io::copy(&mut reader, &mut digest)?;
+                    ensure!(
+                        bytes == claim.leaf.size
+                            && format!("{:x}", digest.finalize()) == claim.digest
+                            && Identity::of(&file)? == claim.leaf,
+                        "source replay content changed"
+                    );
+                }
                 self.current()?;
                 let (_, _, current_parents) = self.open_claim_parent(&claim.object, &claim.path)?;
                 ensure!(
@@ -417,6 +563,12 @@ impl Index {
         ensure!(changed == 1, "source claim completion changed");
         // The file is gone: so is its object row, and its bytes leave the
         // total (spec 25.8 5b (c)). A later import inserts the row again.
+        if let Some(root) = &claim.root {
+            tx.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![root, claim.object],
+            )?;
+        }
         super::Index::forget_object(&tx, &claim.object, "1")?;
         // The completed claim row is deleted, not kept as `done=1`: the
         // generation lives on in `publication.incarnation`, which this same

@@ -155,26 +155,20 @@ impl SourceStore {
         self.retention.forget_absent_members(&root)
     }
 
-    /// One bounded pass over the abandoned tokens: the shared part under the
-    /// shared mutation lock, then the exclusive part only when every gate is
-    /// open. A store that is busy is left for the next pass.
+    /// The agent tick's bounded pass over the abandoned tokens: only the
+    /// shared part, under the shared mutation lock. The files no other root
+    /// holds are claimed by step 0 of the received pass (spec 25.8 5b (d)),
+    /// so the tick never takes the exclusive lock. A store that is busy is
+    /// left for the next pass.
     pub fn release_abandoned_imports(&self) -> Result<ImportReleaseReport> {
-        let mut report = match self.mutation_guard() {
-            Ok(_guard) => self.retention.release_shared_imports()?,
-            Err(e) if would_block(&e) => {
-                return Ok(ImportReleaseReport {
-                    stopped: true,
-                    ..Default::default()
-                })
-            }
-            Err(e) => return Err(e),
-        };
-        let pass = self.release_exclusive()?;
-        report.released += pass.released;
-        report.unlinked += pass.unlinked;
-        report.kept += pass.kept;
-        report.stopped |= pass.stopped;
-        Ok(report)
+        match self.mutation_guard() {
+            Ok(_guard) => self.retention.release_shared_imports(),
+            Err(e) if would_block(&e) => Ok(ImportReleaseReport {
+                stopped: true,
+                ..Default::default()
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     /// The exclusive part, only when every gate is open; nothing is waited
