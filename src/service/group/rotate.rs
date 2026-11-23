@@ -73,7 +73,7 @@ fn earlier() -> ApiError {
 }
 fn publish(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let parent = path.parent().ok_or_else(|| internal("missing parent"))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(internal)?;
+    let mut file = crate::platform::owned_temp::file_in(parent).map_err(internal)?;
     file.write_all(bytes).map_err(internal)?;
     file.as_file().sync_all().map_err(internal)?;
     file.persist_noclobber(path)
@@ -546,7 +546,7 @@ fn record_removals(
         }
     }
     let mut temporary =
-        tempfile::NamedTempFile::new_in(&spec.worker_state_dir).map_err(internal)?;
+        crate::platform::owned_temp::file_in(&spec.worker_state_dir).map_err(internal)?;
     serde_json::to_writer(&mut temporary, &removed).map_err(internal)?;
     temporary.as_file().sync_all().map_err(internal)?;
     temporary.persist(&path).map_err(|e| internal(e.error))?;

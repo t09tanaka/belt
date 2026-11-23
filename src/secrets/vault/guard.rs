@@ -47,6 +47,10 @@ fn orphan_tmp_target(name: &str) -> Option<&str> {
             .is_some_and(|run| RunId::parse(run).is_ok());
     known.then_some(published)
 }
+/// A temporary of the owned kind (spec 25.4 (a)): its name carries its owner.
+fn is_owned_tmp(name: &str) -> bool {
+    name.starts_with(crate::platform::owned_temp::FILE_PREFIX)
+}
 impl Drop for Lease {
     fn drop(&mut self) {
         let _ = self.lock.unlock();
@@ -251,7 +255,8 @@ impl Lease {
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
-            if orphan_tmp_target(name) == Some(MARKER)
+            if (orphan_tmp_target(name) == Some(MARKER)
+                || name.starts_with(crate::platform::owned_temp::FILE_PREFIX))
                 && rustix::fs::statat(&*self.root, name, AtFlags::SYMLINK_NOFOLLOW)
                     .is_ok_and(|s| (s.st_dev as u64, s.st_ino) == (marker.dev, marker.ino))
             {
@@ -351,7 +356,7 @@ impl Lease {
     }
     pub(crate) fn publish(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.current()?;
-        let tmp = format!(".{name}.{}.tmp", ulid::Ulid::new());
+        let tmp = crate::platform::owned_temp::new_file_name();
         let mut file: File = rustix::fs::openat(
             &*self.root,
             tmp.as_str(),
@@ -417,7 +422,7 @@ impl Lease {
         for entry in rustix::fs::Dir::read_from(&*self.root)? {
             let entry = entry?;
             if let Ok(name) = entry.file_name().to_str() {
-                if orphan_tmp_target(name).is_some() {
+                if orphan_tmp_target(name).is_some() || is_owned_tmp(name) {
                     names.push(name.to_owned());
                 }
             }
@@ -425,11 +430,18 @@ impl Lease {
         names.sort();
         let mut sweep = TmpSweep::default();
         for name in names {
-            let published = orphan_tmp_target(&name).context("Vault temporary name")?;
             let Ok(stat) = self.sweep_stat(&name) else {
                 sweep.retained += 1;
                 continue;
             };
+            // A name of the owned kind says nothing of its publication: it
+            // must prove its owner gone, and a second link is looked for by
+            // inode among the names a publication can have.
+            let owned = is_owned_tmp(&name);
+            if owned && !crate::platform::owned_temp::name_owner_is_gone(&name) {
+                sweep.retained += 1;
+                continue;
+            }
             let ours = stat.st_mode as u32 & 0o170000 == 0o100000
                 && stat.st_uid == euid
                 && stat.st_mode as u32 & 0o7777 == 0o600;
@@ -437,8 +449,9 @@ impl Lease {
                 && match stat.st_nlink as u64 {
                     1 => true,
                     // Only the publication this temporary was linked to.
-                    2 => rustix::fs::statat(&*self.root, published, AtFlags::SYMLINK_NOFOLLOW)
-                        .is_ok_and(|p| (p.st_dev, p.st_ino) == (stat.st_dev, stat.st_ino)),
+                    2 => {
+                        self.is_second_link_of_a_publication(&name, orphan_tmp_target(&name), &stat)
+                    }
                     _ => false,
                 };
             if !orphan {
@@ -458,6 +471,36 @@ impl Lease {
             self.root.sync_all()?;
         }
         Ok(sweep)
+    }
+    /// Whether `stat` (of the temporary `name`) is the same inode as a
+    /// publication: the named `published`, or, for a temporary whose name
+    /// does not say, any entry that is the marker or a run bundle.
+    fn is_second_link_of_a_publication(
+        &self,
+        name: &str,
+        published: Option<&str>,
+        stat: &rustix::fs::Stat,
+    ) -> bool {
+        let same = |other: &str| {
+            rustix::fs::statat(&*self.root, other, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|p| (p.st_dev, p.st_ino) == (stat.st_dev, stat.st_ino))
+        };
+        if let Some(published) = published {
+            return same(published);
+        }
+        let Ok(dir) = rustix::fs::Dir::read_from(&*self.root) else {
+            return false;
+        };
+        dir.flatten().any(|entry| {
+            entry.file_name().to_str().is_ok_and(|other| {
+                other != name
+                    && (other == MARKER
+                        || other
+                            .strip_suffix(".json")
+                            .is_some_and(|run| RunId::parse(run).is_ok()))
+                    && same(other)
+            })
+        })
     }
     fn sweep_stat(&self, name: &str) -> rustix::io::Result<rustix::fs::Stat> {
         #[cfg(test)]
@@ -828,6 +871,36 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["retention.lock".to_string(), bundle]);
+    }
+    #[test]
+    fn owned_names_are_swept_only_when_their_owner_is_proven_gone() {
+        use crate::platform::owned_temp::testing::{
+            dead_name, ended_process, live_name, name_in_another_place,
+        };
+        let (_tmp, v, r) = fixture();
+        let dead = v.dir.join(dead_name("cccccccccc01"));
+        private_file(&dead, b"dead");
+        let live = v.dir.join(live_name("cccccccccc02"));
+        private_file(&live, b"live");
+        let (pid, start) = ended_process();
+        let away = v
+            .dir
+            .join(name_in_another_place(pid, &start, "cccccccccc03"));
+        private_file(&away, b"elsewhere");
+        // Died after the link: the second name of the bundle, found by inode.
+        let twin = v.dir.join(dead_name("cccccccccc04"));
+        std::fs::hard_link(v.path(&r), &twin).unwrap();
+        let lease = v.lease(true).unwrap();
+        assert_eq!(
+            lease.sweep_orphan_tmp(32).unwrap(),
+            TmpSweep {
+                removed: 2,
+                retained: 2
+            }
+        );
+        drop(lease);
+        assert!(!dead.exists() && !twin.exists());
+        assert!(live.exists() && away.exists() && v.path(&r).exists());
     }
     #[test]
     fn orphan_sweep_retains_whatever_is_not_provably_a_dead_publication() {

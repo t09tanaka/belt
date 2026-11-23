@@ -443,6 +443,22 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if matches!(
+        cli.command,
+        Command::Init { .. }
+            | Command::Upgrade { .. }
+            | Command::UpgradeGuard { .. }
+            | Command::Daemon(_)
+            | Command::Group { .. }
+            | Command::GroupJoinHelper
+            | Command::GroupRotateHelper
+            | Command::Workers(_)
+            | Command::Worker(_)
+            | Command::WorkerService(_)
+            | Command::RegisterSystemWorker { .. }
+    ) {
+        crate::service::sweep_start_temporaries(&process_env());
+    }
     if let Command::Top { interval } = &cli.command {
         return crate::service::top::command(*interval, cli.json);
     }

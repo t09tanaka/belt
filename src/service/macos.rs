@@ -283,12 +283,40 @@ impl DirectoryFiles {
     }
 }
 impl DirectoryFiles {
+    /// `before_publish` may record the receipt, not the path of the staged
+    /// file: that is a temporary file, which any later start may remove once
+    /// this process is gone (spec 25.4 (a)).
     pub(crate) fn install_journaled(
         &mut self,
         plan: &Plan,
         before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
     ) -> Result<Receipt, InstallStartError> {
         self.install_journaled_with_sync(plan, before_publish, |path| File::open(path)?.sync_all())
+    }
+    /// The same, for a caller whose journal names the staged file so that a
+    /// later process finishes the publication (`init`): the file is a stage
+    /// ([`crate::platform::owned_temp::STAGE_PREFIX`]), which no sweep of
+    /// temporary files touches.
+    pub(crate) fn install_staged(
+        &mut self,
+        plan: &Plan,
+        before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
+    ) -> Result<Receipt, InstallStartError> {
+        self.install_prepared(
+            plan,
+            true,
+            File::sync_all,
+            |_, _| Ok(()),
+            |receipt, stage| {
+                File::open(
+                    stage
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("stage parent missing"))?,
+                )?
+                .sync_all()?;
+                before_publish(receipt, stage)
+            },
+        )
     }
     pub(crate) fn install_journaled_with_sync(
         &mut self,
@@ -298,6 +326,7 @@ impl DirectoryFiles {
     ) -> Result<Receipt, InstallStartError> {
         self.install_prepared(
             plan,
+            false,
             File::sync_all,
             |_, _| Ok(()),
             |receipt, stage| {
@@ -316,11 +345,12 @@ impl DirectoryFiles {
         sync: impl FnOnce(&File) -> io::Result<()>,
         rollback: impl FnOnce(&Self, &Receipt) -> anyhow::Result<()>,
     ) -> Result<Receipt, InstallStartError> {
-        self.install_prepared(plan, sync, rollback, |_, _| Ok(()))
+        self.install_prepared(plan, false, sync, rollback, |_, _| Ok(()))
     }
     fn install_prepared(
         &mut self,
         plan: &Plan,
+        journaled_stage: bool,
         sync: impl FnOnce(&File) -> io::Result<()>,
         rollback: impl FnOnce(&Self, &Receipt) -> anyhow::Result<()>,
         before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
@@ -329,9 +359,11 @@ impl DirectoryFiles {
         let (tmp, receipt) = (|| -> anyhow::Result<_> {
             let target = self.root.join(plan.filename());
             // Never claim or overwrite a pre-existing file, even if bytes match.
-            let mut tmp = tempfile::Builder::new()
-                .prefix(".init-")
-                .tempfile_in(&self.root)?;
+            let mut tmp = if journaled_stage {
+                crate::platform::owned_temp::stage_in(&self.root)?
+            } else {
+                crate::platform::owned_temp::file_in(&self.root)?
+            };
             tmp.as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
             tmp.write_all(plan.plist().as_bytes())?;

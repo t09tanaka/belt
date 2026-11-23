@@ -1204,6 +1204,17 @@ pub fn run(
     checks.extend(evaluate("parent", &local));
     checks.extend(direct_checks(env, &local.worker_scope));
     checks.extend(capture_checks(spec));
+    let leftover = super::leftover_temporaries(env);
+    if leftover > 0 {
+        checks.push(Check::new(
+            "parent",
+            "leftover_temporaries",
+            Level::Notice,
+            format!(
+                "{leftover} temporary file(s) named .belt-tmp.* are left in the configuration, state or service directories: their owner is not proven gone (another host, a running process, or a name belt cannot read); belt removes only the ones it can prove abandoned"
+            ),
+        ));
+    }
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
     // Every worker is looked at at the same time (up to a bound), each on its
     // own ssh processes; what is printed keeps the order of the registrations.

@@ -666,9 +666,9 @@ impl CoordinatorStore {
             );
             return Ok(());
         }
-        let stage = tempfile::Builder::new()
-            .prefix(".init-")
-            .tempfile_in(state_dir)?;
+        // A stage, not a temporary file: `publish` writes its name into the
+        // journal of `init`, and a later `init` finishes the publication.
+        let stage = crate::platform::owned_temp::stage_in(state_dir)?;
         let db = Db::open(stage.path(), DbKind::Coordinator, Access::ReadWrite)?;
         let cl = cluster.clone();
         let co = coordinator.clone();
@@ -694,6 +694,10 @@ impl CoordinatorStore {
             Ok(())
         })?;
         drop(db);
+        // The setup lock (and a journal SQLite may have left) of the stage
+        // is this process's alone: gone before the journal names the stage,
+        // so that the publication leaves nothing beside it.
+        crate::platform::owned_temp::remove_stage_sidecars(stage.path())?;
         stage.as_file().sync_all()?;
         // Retain the staged inode when publication/journal outcome is uncertain.
         let (_file, path) = stage.keep()?;

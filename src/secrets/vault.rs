@@ -159,11 +159,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| SecretError::Format("secret path has no directory".into()))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}.tmp", ulid::Ulid::new()));
+    let tmp = dir.join(crate::platform::owned_temp::new_file_name());
     let io = |e| SecretError::io(format!("secret file {}", path.display()), e);
     let mut f = OpenOptions::new()
         .write(true)
@@ -187,13 +183,14 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-/// Remove the temporary files (`.<name>.<ulid>.tmp`, regular files only) of
+/// Remove the temporary files of
 /// `dir` last written more than `max_age` ago: a crash between creating one
 /// and renaming it leaves a plaintext copy behind. Returns how many.
 pub(crate) fn sweep_stale_tmp(dir: &Path, max_age: Duration) -> Result<usize> {
     let io = |e| SecretError::io(format!("directory {}", dir.display()), e);
     let now = SystemTime::now();
-    let mut removed = 0;
+    // Names that prove their owner (spec 25.4 (a)), then the older kind by age.
+    let mut removed = crate::platform::owned_temp::sweep_files(dir).removed;
     for entry in fs::read_dir(dir).map_err(io)? {
         let entry = entry.map_err(io)?;
         let name = entry.file_name().to_string_lossy().into_owned();

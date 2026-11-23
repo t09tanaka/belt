@@ -57,7 +57,8 @@ pub fn write_input(path: &Path, spec: &Spec) -> anyhow::Result<ManagedInput> {
     )?;
     let bytes = serde_json::to_vec(spec)?;
     anyhow::ensure!(bytes.len() as u64 <= LIMIT, "bootstrap input too large");
-    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().expect("checked parent"))?;
+    let mut temporary =
+        crate::platform::owned_temp::file_in(path.parent().expect("checked parent"))?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
     match temporary.persist_noclobber(path) {
