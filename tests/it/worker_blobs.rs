@@ -3483,10 +3483,10 @@ fn the_start_removes_tokens_no_staging_directory_records() {
     let other = f.directory("other", 42);
     put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
     let record = f.incoming(&other.source).join("import-token");
-    std::fs::write(&record, "not a token").unwrap();
+    std::fs::create_dir(&record).unwrap();
     assert!(sink.forget_unowned().is_err());
     assert_eq!(index_rows(&f, "").0, p.blobs.len() as i64);
-    std::fs::remove_file(&record).unwrap();
+    std::fs::remove_dir(&record).unwrap();
     // (v) the agent's start: they go, and the source stays ready
     f.start();
     assert_eq!(index_rows(&f, "").0, 0);
@@ -3619,4 +3619,108 @@ fn a_record_left_after_the_publication_keeps_the_index_ref_of_the_source() {
     assert!(put_all(sink, &l, &p.source, Content, b).unwrap().complete);
     assert!(!dir.exists());
     assert_eq!(git(&clones[0], &["for-each-ref"]), refs);
+}
+
+fn stale(l: &BlobLimits) -> BlobLimits {
+    std::thread::sleep(Duration::from_millis(1100));
+    BlobLimits {
+        stale_ms: 1000,
+        ..l.clone()
+    }
+}
+
+#[test]
+fn a_token_that_cannot_be_released_keeps_its_directory_for_the_next_pass() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    cut_after_the_files(&f, sink, &l, &p);
+    let dir = f.incoming(&p.source);
+    assert!(dir.join("import-token").exists());
+    let l = stale(&l);
+    // the store is held exclusively: the token cannot be released
+    let lock = std::fs::File::open(f.state().join("sources/mutation.lock")).unwrap();
+    lock.lock().unwrap();
+    sink.drop_stale(&l);
+    assert!(dir.join("import-token").exists());
+    assert_eq!(index_rows(&f, "").0, 1);
+    assert_eq!(index_rows(&f, "").1, 1);
+    lock.unlock().unwrap();
+    sink.drop_stale(&l);
+    assert!(!dir.exists());
+    // released (a worker's store keeps what only the token held)
+    assert_eq!(index_rows(&f, "").1, 0);
+}
+
+#[test]
+fn the_stale_drop_only_tries_a_busy_clone_and_keeps_the_refs_it_counts_on() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    let clone = f.clones()[0].clone();
+    // a ref another source's bundle made, and its directory
+    let commit = git(
+        &clone,
+        &["for-each-ref", "--count=1", "--format=%(objectname)"],
+    );
+    let other = f.directory("other", 44);
+    let name = &format!("refs/local-ci/snapshots/{}", other.root.source_id);
+    git(&clone, &["update-ref", name, commit.trim()]);
+    put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
+    let dir = f.incoming(&other.source);
+    std::fs::write(
+        dir.join("made-refs"),
+        format!(
+            "{}\n{name} {} {}\n",
+            p.root.repository_id.as_deref().unwrap(),
+            other.root.source_id,
+            commit.trim()
+        ),
+    )
+    .unwrap();
+    let l = stale(&l);
+    // an import into the clone is going on
+    let lock = std::fs::File::open(format!("{}.import.lock", clone.display())).unwrap();
+    lock.lock().unwrap();
+    let start = std::time::Instant::now();
+    sink.drop_stale(&l);
+    assert!(start.elapsed() < Duration::from_millis(l.lock_wait_ms / 2));
+    assert!(dir.exists());
+    assert!(git(&clone, &["for-each-ref"]).contains(name));
+    lock.unlock().unwrap();
+    sink.drop_stale(&l);
+    assert!(!dir.exists());
+    assert!(!git(&clone, &["for-each-ref"]).contains(name));
+}
+
+#[test]
+fn a_record_that_names_no_token_owns_nothing_and_the_source_comes_again() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    cut_after_the_files(&f, sink, &l, &p);
+    // what a power loss can leave of the record
+    let record = f.incoming(&p.source).join("import-token");
+    std::fs::write(&record, "").unwrap();
+    // the start sweeps the token it was
+    assert!(sink.forget_unowned().unwrap().is_some());
+    assert_eq!(index_rows(&f, "").1, 0);
+    // and the source is taken again, with a new token
+    std::fs::write(&record, "garbage").unwrap();
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert!(!f.incoming(&p.source).exists());
+    // a stale directory with such a record goes
+    let other = f.directory("other", 45);
+    put_all(sink, &l, &other.source, Manifest, &other.manifests[0]).unwrap();
+    std::fs::write(f.incoming(&other.source).join("import-token"), "").unwrap();
+    sink.drop_stale(&stale(&l));
+    assert!(!f.incoming(&other.source).exists());
 }

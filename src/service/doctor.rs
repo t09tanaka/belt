@@ -160,12 +160,9 @@ pub struct AbandonedImports {
 }
 
 fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
-    // never makes a store
-    if !worker_state.join("sources").join("retention.db").is_file() {
-        return None;
-    }
-    let store = crate::source::SourceStore::open(worker_state).ok()?;
-    let (roots, members, bytes) = store.abandoned_imports().ok()?;
+    // read only, never makes a store
+    let (roots, members, bytes) =
+        crate::source::retention::abandoned_imports_read_only(worker_state).ok()??;
     Some(AbandonedImports {
         roots,
         members,

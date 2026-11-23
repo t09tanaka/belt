@@ -119,16 +119,24 @@ impl SourceStore {
     /// released now when the store is free, else by a later pass.
     pub fn release_import(&self, id: &str) -> Result<ImportReleaseReport> {
         ensure!(is_import_token_id(id), "not an import token id");
-        {
+        let root = format!("import:{id}");
+        let shared = {
             let _guard = self.mutation_guard()?;
             let mut c = self.retention.connect_for_import()?;
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             self.retention.abandon_import(&tx, id)?;
             tx.commit()?;
-            self.retention
-                .forget_absent_members(&format!("import:{id}"))?;
-        }
-        self.release_abandoned_imports()
+            self.retention.forget_absent_members(&root)?;
+            self.retention.release_shared_root(&root)?
+        };
+        // (the shared lock is let go first: the exclusive one is only tried)
+        let rest = self.release_exclusive()?;
+        Ok(ImportReleaseReport {
+            released: shared.released + rest.released,
+            unlinked: rest.unlinked,
+            kept: rest.kept,
+            stopped: rest.stopped,
+        })
     }
 
     /// One bounded pass over the abandoned tokens: the shared part under the
@@ -145,18 +153,7 @@ impl SourceStore {
             }
             Err(e) => return Err(e),
         };
-        if !self.retention.import_release_due()? {
-            return Ok(report);
-        }
-        let _guard = match self.retention.guard(true) {
-            Ok(g) => g,
-            Err(e) if would_block(&e) => {
-                report.stopped = true;
-                return Ok(report);
-            }
-            Err(e) => return Err(e),
-        };
-        let pass = self.retention.release_abandoned_imports()?;
+        let pass = self.release_exclusive()?;
         report.released += pass.released;
         report.unlinked += pass.unlinked;
         report.kept += pass.kept;
@@ -164,10 +161,23 @@ impl SourceStore {
         Ok(report)
     }
 
-    /// For `doctor`: abandoned token roots, their memberships, and the bytes
-    /// of the files only they hold.
-    pub fn abandoned_imports(&self) -> Result<(u64, u64, u64)> {
-        self.retention.abandoned_imports()
+    /// The exclusive part, only when every gate is open; nothing is waited
+    /// for.
+    fn release_exclusive(&self) -> Result<ImportReleaseReport> {
+        if !self.retention.import_release_due()? {
+            return Ok(ImportReleaseReport::default());
+        }
+        let _guard = match self.retention.guard(true) {
+            Ok(g) => g,
+            Err(e) if would_block(&e) => {
+                return Ok(ImportReleaseReport {
+                    stopped: true,
+                    ..Default::default()
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        self.retention.release_abandoned_imports()
     }
 
     /// At the worker's start, under `agent.lock` and before anything is
@@ -203,26 +213,21 @@ impl SourceStore {
                     }
                 }
                 tx.commit()?;
-                // members whose file never came go now (as `release_import`
-                // does), not when the gates open
+                // each abandoned root at once, as `release_import` does:
+                // members whose file never came, and the shared part
                 for token in abandoned {
-                    self.retention
-                        .forget_absent_members(&format!("import:{token}"))?;
+                    let root = format!("import:{token}");
+                    self.retention.forget_absent_members(&root)?;
+                    report.release.released += self.retention.release_shared_root(&root)?.released;
                 }
             }
         }
-        // (until a pass makes no progress, and at most one pass per token
-        // abandoned plus one: the old intake left a token for every blob)
-        for _ in 0..=report.abandoned {
-            let pass = self.release_abandoned_imports()?;
-            report.release.released += pass.released;
-            report.release.unlinked += pass.unlinked;
-            report.release.kept += pass.kept;
-            report.release.stopped = pass.stopped;
-            if pass.released == 0 && pass.unlinked == 0 {
-                break;
-            }
-        }
+        // then one exclusive pass (the agent's tick does the rest)
+        let pass = self.release_exclusive()?;
+        report.release.released += pass.released;
+        report.release.unlinked += pass.unlinked;
+        report.release.kept += pass.kept;
+        report.release.stopped = pass.stopped;
         Ok(report)
     }
 }
@@ -533,7 +538,10 @@ mod tests {
         assert_eq!(r.released, 1);
         drop(held);
         // the waiting roots and their files stay, counted for `doctor`
-        assert_eq!(store.abandoned_imports().unwrap(), (34, 1000 + 33, 0));
+        assert_eq!(
+            super::super::abandoned_imports_read_only(dir.path()).unwrap(),
+            Some((34, 1000 + 33, 0))
+        );
         assert_eq!(claims(&store), 0);
         assert!(store.has_blob(&want(&shared).hash));
     }
@@ -594,6 +602,49 @@ mod tests {
         assert_eq!((report.abandoned, report.release.released), (3, 3));
         assert_eq!(rows(&store), (1, 1, 1));
         assert!(store.has_blob(&want(&b).hash));
+    }
+
+    #[test]
+    fn the_tick_patrols_a_bounded_number_of_memberships_and_reaches_every_root() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        stuck_roots(&store, 1, 1000);
+        stuck_roots_more(&store);
+        // after all of them: a root whose one member another root holds
+        let b = [23u8; 9];
+        let token = store.begin_import().unwrap();
+        ingest(&store, &token, &b);
+        publish(&store, &b);
+        let c = store.retention.connect().unwrap();
+        c.execute(
+            "UPDATE root SET id='import:2',kind='abandoned' WHERE id=?1",
+            [format!("import:{}", SourceStore::import_token_id(&token))],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE member SET root='import:2' WHERE root LIKE 'import:01%'",
+            [],
+        )
+        .unwrap();
+        let mut ticks = 0;
+        while count(&store, "SELECT count(*) FROM root WHERE id='import:2'") == 1 {
+            ticks += 1;
+            assert!(ticks <= 16, "never reached");
+            let r = store.release_abandoned_imports().unwrap();
+            assert!(!r.stopped);
+            if ticks == 1 {
+                // stopped part-way through the first root, and resumes there
+                assert_eq!(
+                    count(
+                        &store,
+                        "SELECT count(*) FROM meta WHERE key='import_shared_object'"
+                    ),
+                    1
+                );
+            }
+        }
+        // each tick looked at a bounded part, never the whole store
+        assert!(ticks > 1);
     }
 
     #[test]

@@ -8,8 +8,8 @@ pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{inspect_corrupt_held, inspect_owners, CaptureOwner, CaptureVerdict};
 #[cfg(test)]
 pub use deletion::set_prune_fault;
-pub use deletion::ImportReleaseReport;
 pub(in crate::source) use deletion::Reserved;
+pub use deletion::{abandoned_imports_read_only, ImportReleaseReport};
 pub use deletion::{
     AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, Gate, PruneBudget, PruneInputs,
 };

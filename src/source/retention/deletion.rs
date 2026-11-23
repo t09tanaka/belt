@@ -10,7 +10,7 @@ mod import_release;
 mod prune;
 mod scratch;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
-pub use import_release::ImportReleaseReport;
+pub use import_release::{abandoned_imports_read_only, ImportReleaseReport};
 #[cfg(test)]
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};

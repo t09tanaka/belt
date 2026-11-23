@@ -648,13 +648,19 @@ impl Incoming {
     /// mutation lock. Should the token not be released or the clone be busy,
     /// everything stays for a later discard (the directory goes stale and
     /// the next tick tries again).
-    fn discard(&self, source: &str, limits: &BlobLimits) {
+    /// Only a request waits for the clone's import lock (`wait`); the
+    /// agent's tick and the stale drop under the lock over all sources only
+    /// try it.
+    fn discard(&self, source: &str, limits: &BlobLimits, wait: bool) {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(source);
         let dir = self.root.join(source);
         // The owner of the token ends: its rows go first (spec 25.8, 3).
+        // A record that names no token (cut by a crash, garbage) is no
+        // owner: the token it was is unrecorded, and the next start removes
+        // it (25.8, 4). One that cannot be read keeps everything.
         match recorded_token(&dir) {
             Ok(Some(id)) => {
                 if self.store.release_import(&id).is_err() {
@@ -662,6 +668,7 @@ impl Incoming {
                 }
             }
             Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
             Err(_) => return,
         }
         // Not published: the refs its bundle made go, but for those of
@@ -672,11 +679,13 @@ impl Incoming {
                 // Under the clone's import lock: another import may have
                 // found a ref of ours there and counted on it.
                 let busy = format!("the clone of {repository_id} is busy");
-                let Ok(_importing) = self
-                    .workspaces
-                    .import_lock(&repository_id)
-                    .and_then(|f| Self::wait_lock(f, limits, &busy))
-                else {
+                let Ok(_importing) = self.workspaces.import_lock(&repository_id).and_then(|f| {
+                    if wait {
+                        Self::wait_lock(f, limits, &busy)
+                    } else {
+                        f.try_lock().map(|()| f).map_err(|_| overloaded(&busy))
+                    }
+                }) else {
                     return;
                 };
                 Self::drop_refs(&repo, &made, |r| match r.source() {
@@ -713,7 +722,7 @@ impl Incoming {
     /// Nothing of a source that has no staged file stays.
     fn discard_if_empty(&self, source: &SourceId, limits: &BlobLimits) {
         if Self::holds_nothing(&self.dir(source)) {
-            self.discard(source.as_str(), limits);
+            self.discard(source.as_str(), limits, true);
         }
     }
 
@@ -829,12 +838,12 @@ impl Incoming {
                 continue;
             }
             if held.is_some_and(|s| lock_shard(&other) == lock_shard(s.as_str())) {
-                self.discard(&other, limits);
+                self.discard(&other, limits, false);
                 continue;
             }
             let f = self.lock_file(&lock_shard(&other).to_string())?;
             if f.try_lock().is_ok() {
-                self.discard(&other, limits);
+                self.discard(&other, limits, false);
             }
         }
         Ok(())
@@ -846,15 +855,26 @@ impl Incoming {
     /// the source's lock.
     fn import_token(&self, dir: &Path) -> Result<ImportToken, ApiError> {
         let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
-        if let Some(id) = recorded_token(dir).map_err(io_err)? {
+        // (a record that names no token is no owner: a new token replaces it)
+        let recorded = match recorded_token(dir) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => None,
+            other => other.map_err(io_err)?,
+        };
+        if let Some(id) = recorded {
             if let Some(token) = self.store.resume_import(&id).map_err(store_err)? {
                 return Ok(token);
             }
         }
         let token = self.store.begin_import().map_err(store_err)?;
+        // durable before any blob goes in with it: a record a power loss
+        // cut would name no token
         let tmp = dir.join(IMPORT_TOKEN_TMP);
-        fs::write(&tmp, SourceStore::import_token_id(&token)).map_err(io_err)?;
+        let mut f = File::create(&tmp).map_err(io_err)?;
+        f.write_all(SourceStore::import_token_id(&token).as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(io_err)?;
         fs::rename(&tmp, dir.join(IMPORT_TOKEN)).map_err(io_err)?;
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)?;
         Ok(token)
     }
 
@@ -1535,7 +1555,7 @@ impl Incoming {
             }
         }
         if let Some(why) = refused {
-            self.discard(source.as_str(), limits);
+            self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(format!("the source is refused: {why}")));
         }
@@ -1547,6 +1567,8 @@ impl Incoming {
         let mut objects = None;
         // (with what the bundle of this call put into the clone, if one did)
         let mut unpacked = None;
+        // the clone's import lock when no bundle of this call took it
+        let mut held = None;
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
             let repo = match Self::bundle_done(&dir)? {
                 Some(bundle) => {
@@ -1557,8 +1579,22 @@ impl Incoming {
                     repo
                 }
                 None => match self.objects(repository_id) {
-                    Some(repo) if self.commits_here(&repo, st, &carried)? => repo,
-                    _ => return Ok(false),
+                    Some(repo) => {
+                        // Held until the publication ends, as an unpack
+                        // holds it: a discard of another source of the
+                        // repository must not drop a ref this one counts on.
+                        let busy = format!("the clone of {repository_id} is busy");
+                        held = Some(Self::wait_lock(
+                            self.workspaces.import_lock(repository_id)?,
+                            limits,
+                            &busy,
+                        )?);
+                        if !self.commits_here(&repo, st, &carried)? {
+                            return Ok(false);
+                        }
+                        repo
+                    }
+                    None => return Ok(false),
                 },
             };
             objects = Some(repo);
@@ -1574,7 +1610,7 @@ impl Incoming {
                     .is_some_and(|m| m.execution_commit.is_some())
             });
         if homeless {
-            self.discard(source.as_str(), limits);
+            self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(
                 "the source is refused: it names a commit and no repository to hold it",
@@ -1646,7 +1682,10 @@ impl Incoming {
         }
         // published: the refs are the source's now
         remove_staged(&dir.join(MADE_REFS));
-        self.discard(source.as_str(), limits);
+        // (the clone's lock first: the discard takes it again)
+        drop(unpacked);
+        drop(held);
+        self.discard(source.as_str(), limits, true);
         Ok(true)
     }
 
@@ -1822,7 +1861,7 @@ impl BlobSink for Incoming {
         };
         if self.published(&root_id)? {
             // The source is whole: nothing more is taken for it.
-            self.discard(r.source_id.as_str(), limits);
+            self.discard(r.source_id.as_str(), limits, true);
             if r.kind == SourceBlobKind::Content && !self.store.has_blob(hex_of(&r.digest)) {
                 return Err(invalid("no manifest of the source names this blob"));
             }
@@ -1878,8 +1917,16 @@ impl BlobSink for Incoming {
         let mut owned = BTreeSet::new();
         if self.root.is_dir() {
             for source in self.staged_sources()? {
-                if let Some(id) = recorded_token(&self.root.join(source)).map_err(io_err)? {
-                    owned.insert(id);
+                // A record that names no token (cut, garbage) protects
+                // nothing: no publication can go on with it. One that
+                // cannot be read at all stops the sweep.
+                match recorded_token(&self.root.join(source)) {
+                    Ok(Some(id)) => {
+                        owned.insert(id);
+                    }
+                    Ok(None) => {}
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+                    Err(e) => return Err(io_err(e)),
                 }
             }
         }

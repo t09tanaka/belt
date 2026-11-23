@@ -25,8 +25,13 @@ pub struct ImportReleaseReport {
     pub stopped: bool,
 }
 
-/// Memberships one pass changes.
+/// Memberships one exclusive pass looks at.
 const MEMBERS: usize = 1000;
+
+/// Memberships one shared patrol looks at (one agent tick).
+const PATROL: usize = 256;
+const PATROL_ROOT: &str = "import_shared_after";
+const PATROL_OBJECT: &str = "import_shared_object";
 
 /// Where the exclusive pass resumes (a root id), so a root whose members
 /// cannot be proven does not stop the others.
@@ -73,61 +78,97 @@ impl Index {
     }
 
     /// The part of a pass that needs only the shared lock (the caller holds
-    /// it): memberships another root holds are detached, and abandoned token
-    /// roots left without members go with their rows. Only roots with such
-    /// work are visited, so roots that wait for the gates cost nothing and
-    /// never stop the pass; at most [`MEMBERS`] rows change.
+    /// it), for the one root `root`: memberships another root holds are
+    /// detached, a page of 32 per short IMMEDIATE transaction, and the root
+    /// goes with its rows when no member is left. Its cost is that root's
+    /// memberships (one publication's), not the store's.
+    pub(in crate::source::retention) fn release_shared_root(
+        &self,
+        root: &str,
+    ) -> Result<ImportReleaseReport> {
+        let mut report = ImportReleaseReport::default();
+        let mut c = self.connect_for_import()?;
+        let mut after = String::new();
+        loop {
+            let (finished, last) = shared_page(&mut c, root, &after, &mut report)?;
+            if finished {
+                return Ok(report);
+            }
+            after = last;
+        }
+    }
+
+    /// The shared part of the agent's pass: a patrol over the memberships
+    /// of the abandoned token roots, at most [`PATROL`] per call, resuming
+    /// where the last call stopped (`meta`, [`PATROL_ROOT`] and
+    /// [`PATROL_OBJECT`]) and wrapping around. However many roots wait for
+    /// the gates, a call costs the same.
     pub(in crate::source::retention) fn release_shared_imports(
         &self,
     ) -> Result<ImportReleaseReport> {
         let mut report = ImportReleaseReport::default();
         let mut c = self.connect_for_import()?;
-        let mut changed = 0usize;
-        let mut after = String::new();
-        loop {
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let roots: Vec<String> = {
-                let mut s = tx.prepare("SELECT r.id FROM root r WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND r.id>?1 AND (NOT EXISTS(SELECT 1 FROM member m WHERE m.root=r.id) OR EXISTS(SELECT 1 FROM member m JOIN member o ON o.object=m.object AND o.root<>m.root WHERE m.root=r.id)) ORDER BY r.id LIMIT 32")?;
-                let rows = s.query_map([&after], |r| r.get(0))?;
-                rows.collect::<std::result::Result<_, _>>()?
+        let get = |c: &Connection, key: &str| -> Result<Option<String>> {
+            Ok(
+                c.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+                    .optional()?,
+            )
+        };
+        let mut root_after = get(&c, PATROL_ROOT)?.unwrap_or_default();
+        // `Some`: part-way through `root_after`, after this member
+        let mut object_after = get(&c, PATROL_OBJECT)?;
+        let mut looked = 0usize;
+        let mut wrapped = false;
+        while looked < PATROL {
+            let root: Option<String> = match &object_after {
+                Some(_) => Some(root_after.clone()),
+                None => c
+                    .query_row(
+                        "SELECT id FROM root WHERE kind='abandoned' AND id LIKE 'import:%' AND id>?1 ORDER BY id LIMIT 1",
+                        [&root_after],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
             };
-            let Some(last) = roots.last() else {
-                tx.commit()?;
-                return Ok(report);
-            };
-            let last = last.clone();
-            let mut full = false;
-            for root in &roots {
-                let left = MEMBERS - changed;
-                let detached = tx.execute(
-                    "DELETE FROM member WHERE rowid IN (SELECT m.rowid FROM member m WHERE m.root=?1 AND EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>m.root) LIMIT ?2)",
-                    params![root, left as i64],
-                )?;
-                changed += detached;
-                if changed == MEMBERS {
-                    full = true;
+            let Some(root) = root else {
+                if wrapped || root_after.is_empty() {
                     break;
                 }
-                if tx.execute(
-                    "DELETE FROM root WHERE id=?1 AND kind='abandoned' AND NOT EXISTS(SELECT 1 FROM member WHERE root=?1)",
-                    [root],
-                )? == 1
-                {
-                    tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
-                    tx.execute(
-                        "DELETE FROM import_session WHERE token=?1 AND state='pending' AND source IS NULL AND run_id IS NULL",
-                        [root.trim_start_matches("import:")],
-                    )?;
-                    report.released += 1;
+                wrapped = true;
+                root_after.clear();
+                continue;
+            };
+            let mut after = object_after.take().unwrap_or_default();
+            loop {
+                let (finished, last) = shared_page(&mut c, &root, &after, &mut report)?;
+                looked += 32;
+                if finished {
+                    root_after = root.clone();
+                    object_after = None;
+                    break;
+                }
+                after = last;
+                if looked >= PATROL {
+                    root_after = root.clone();
+                    object_after = Some(after.clone());
+                    break;
                 }
             }
-            tx.commit()?;
-            if full {
-                report.stopped = true;
-                return Ok(report);
-            }
-            after = last;
         }
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![PATROL_ROOT, root_after],
+        )?;
+        match &object_after {
+            Some(o) => tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![PATROL_OBJECT, o],
+            )?,
+            None => tx.execute("DELETE FROM meta WHERE key=?1", [PATROL_OBJECT])?,
+        };
+        tx.commit()?;
+        Ok(report)
     }
 
     /// The part of a pass that claims files no other root holds, under the
@@ -250,28 +291,87 @@ impl Index {
         }
         Ok(report)
     }
+}
 
-    /// For `doctor`: the abandoned token roots, their memberships, and the
-    /// bytes of the files only they hold (no paths).
-    pub(in crate::source::retention) fn abandoned_imports(&self) -> Result<(u64, u64, u64)> {
-        let c = self.connect()?;
-        let (roots, members): (i64, i64) = c.query_row(
-            "SELECT (SELECT count(*) FROM root WHERE kind='abandoned' AND id LIKE 'import:%'), (SELECT count(*) FROM member m JOIN root r ON r.id=m.root WHERE r.kind='abandoned' AND r.id LIKE 'import:%')",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let mut bytes = 0u64;
-        let mut s = c.prepare("SELECT o.path FROM member m JOIN root r ON r.id=m.root JOIN object o ON o.id=m.object WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND NOT EXISTS(SELECT 1 FROM member b WHERE b.object=m.object AND b.root<>m.root)")?;
-        let paths = s.query_map([], |r| r.get::<_, String>(0))?;
-        for path in paths {
-            if let Ok(m) = std::fs::symlink_metadata(self.path.join(path?)) {
-                if m.is_file() {
-                    bytes += m.len();
-                }
-            }
-        }
-        Ok((roots as u64, members as u64, bytes))
+/// Paths `doctor` stats for [`abandoned_imports_read_only`], at most.
+const DOCTOR_PATHS: i64 = 10_000;
+
+/// For `doctor`: the abandoned token roots below `state_dir`, their
+/// memberships, and the bytes of the files only they hold (no paths; of at
+/// most [`DOCTOR_PATHS`] files). Read only; `None` when there is no index.
+pub fn abandoned_imports_read_only(state_dir: &std::path::Path) -> Result<Option<(u64, u64, u64)>> {
+    let sources = state_dir.join("sources");
+    let path = sources.join("retention.db");
+    if !path.is_file() {
+        return Ok(None);
     }
+    let c = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let (roots, members): (i64, i64) = c.query_row(
+        "SELECT (SELECT count(*) FROM root WHERE kind='abandoned' AND id LIKE 'import:%'), (SELECT count(*) FROM member m JOIN root r ON r.id=m.root WHERE r.kind='abandoned' AND r.id LIKE 'import:%')",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let paths: Vec<String> = {
+        let mut s = c.prepare("SELECT o.path FROM member m JOIN root r ON r.id=m.root JOIN object o ON o.id=m.object WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND NOT EXISTS(SELECT 1 FROM member b WHERE b.object=m.object AND b.root<>m.root) LIMIT ?1")?;
+        let rows = s.query_map([DOCTOR_PATHS], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    drop(c);
+    let bytes = paths
+        .iter()
+        .filter_map(|p| std::fs::symlink_metadata(sources.join(p)).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+    Ok(Some((roots as u64, members as u64, bytes)))
+}
+
+/// One page (32 memberships after `after`, by object) of the abandoned
+/// token root `root` in one IMMEDIATE transaction: the ones another root
+/// holds are detached; when the page is the last, the root goes if it has
+/// no member left. Returns whether the root is finished, and the last
+/// membership looked at.
+fn shared_page(
+    c: &mut Connection,
+    root: &str,
+    after: &str,
+    report: &mut ImportReleaseReport,
+) -> Result<(bool, String)> {
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let objects: Vec<(String, bool)> = {
+        let mut s = tx.prepare("SELECT m.object, EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>m.root) FROM member m WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT 32")?;
+        let rows = s.query_map(params![root, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for (object, shared) in &objects {
+        if *shared {
+            tx.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![root, object],
+            )?;
+        }
+    }
+    let finished = objects.len() < 32;
+    if finished
+        && tx.execute(
+            "DELETE FROM root WHERE id=?1 AND kind='abandoned' AND NOT EXISTS(SELECT 1 FROM member WHERE root=?1)",
+            [root],
+        )? == 1
+    {
+        tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
+        tx.execute(
+            "DELETE FROM import_session WHERE token=?1 AND state='pending' AND source IS NULL AND run_id IS NULL",
+            [root.trim_start_matches("import:")],
+        )?;
+        report.released += 1;
+    }
+    tx.commit()?;
+    let last = objects.last().map(|(o, _)| o.clone()).unwrap_or_default();
+    Ok((finished, last))
 }
 
 /// Remove the membership `object` of `root`, and the object's rows when no
