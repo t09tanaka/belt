@@ -157,7 +157,17 @@ bin="$NODENV_ROOT/versions/$version/bin"
         std::fs::write(host.join("hold"), "").unwrap();
         let first = RequestId::generate();
         assert_eq!(warm(&client, &spec, &first).await, SyncOutcome::Pending);
-        until("the first install to begin", || calls(&host, "20.0.0") == 1).await;
+        let end = Instant::now() + Duration::from_secs(20);
+        // Keep the warm-up wanted until the manager starts; `hold` prevents completion.
+        while calls(&host, "20.0.0") == 0 {
+            assert!(
+                Instant::now() < end,
+                "timed out waiting for the first install to begin"
+            );
+            assert_eq!(warm(&client, &spec, &first).await, SyncOutcome::Pending);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls(&host, "20.0.0"), 1);
         // Nobody asks again for longer than the idle time (one second).
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(installed(&spec).is_empty());

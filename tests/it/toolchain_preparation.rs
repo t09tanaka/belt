@@ -65,6 +65,7 @@ set -eu
 printf '%s\n' "$*" >> '{host}/calls'
 printf '%s\n' "$HOME" "$PATH" >> '{host}/environment'
 {mode}
+[ -d '{host}' ] || exit 0
 if [ -n "${{NODENV_ROOT:-}}" ]; then
   version="$1"; bin="$NODENV_ROOT/versions/$version/bin"; names=node
 elif [ -n "${{RUSTUP_HOME:-}}" ]; then
@@ -97,11 +98,11 @@ done
                 "wrong" => "# wrong probe is injected below".to_string(),
                 "long" => "/usr/bin/yes x | /usr/bin/head -c 9000; exit 0".to_string(),
                 "hang" => crate::fixture_process::script(&format!(
-                    "/bin/sleep 120 &\nprintf '%s\\n' \"$!\" > '{0}/child.pending'\n/bin/mv '{0}/child.pending' '{0}/child'\nwait",
+                    "while [ -d '{0}' ]; do /bin/sleep 0.05; done &\nprintf '%s\\n' \"$!\" > '{0}/child.pending'\n/bin/mv '{0}/child.pending' '{0}/child'\nwait",
                     host.display()
                 )),
                 "gate" => format!(
-                    "while [ ! -f '{}/release' ]; do /bin/sleep 0.05; done",
+                    "while [ ! -f '{0}/release' ] && [ -d '{0}' ]; do /bin/sleep 0.05; done",
                     host.display()
                 ),
                 _ => String::new(),

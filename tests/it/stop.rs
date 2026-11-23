@@ -23,6 +23,8 @@ fn times(grace: u64) -> StopTimes {
 struct Group {
     target: StopTarget,
     members: RecordedMembers,
+    // Keep the lifetime guard until the test releases the group.
+    _root: tempfile::TempDir,
 }
 
 /// The group has members that are the command's (and that is known).
@@ -37,17 +39,16 @@ fn stop(g: &Group, times: StopTimes) -> StopResult {
 /// A shell that leads its own group, ignores TERM when asked to, and has
 /// a background child in the same group.
 fn spawn_group(ignore_term: bool) -> (std::process::Child, Group) {
-    let ready = tempfile::NamedTempFile::new().unwrap();
-    let ready_path = ready.path().to_path_buf();
-    std::fs::remove_file(&ready_path).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
+    let ready_path = root.path().join("ready");
     let body = if ignore_term {
         &crate::fixture_process::script(
-            "trap '' TERM; sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
-         while :; do sleep 1; done",
+            "trap '' TERM; while [ -d \"${1%/*}\" ]; do sleep 0.05; done & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+         while [ -d \"${1%/*}\" ]; do sleep 0.05; done",
         )
     } else {
         &crate::fixture_process::script(
-            "sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait",
+            "while [ -d \"${1%/*}\" ]; do sleep 0.05; done & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait",
         )
     };
     let child = Command::new("sh")
@@ -88,7 +89,14 @@ fn spawn_group(ignore_term: bool) -> (std::process::Child, Group) {
         .expect("the member is readable")
         .to_string();
     let members = RecordedMembers(vec![(member, start)]);
-    (child, Group { target, members })
+    (
+        child,
+        Group {
+            target,
+            members,
+            _root: root,
+        },
+    )
 }
 
 #[test]
@@ -122,7 +130,7 @@ fn kill_follows_the_grace_for_a_group_that_ignores_term() {
 #[test]
 fn descendants_in_the_group_are_stopped_with_the_leader() {
     let (mut child, t) = spawn_group(false);
-    // Reap the leader first: the background `sleep` keeps the group alive.
+    // Reap the leader first: the background loop keeps the group alive.
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(alive(&t), "a member remains after the leader is gone");

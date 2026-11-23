@@ -306,12 +306,16 @@ impl Fx {
             .is_ok_and(|l| l.iter().any(|(_, _, ident)| ident.is_some()))
     }
 
-    /// A step that never ends: `bash <dir>/hang.sh`, whose command line
+    /// A step that stays until fixture cleanup: `bash <dir>/hang.sh`, whose command line
     /// names this fixture's directory, so that it is found (and killed by
     /// the fixture's cleanup) and never taken for another test's.
     fn hang(&self) -> String {
         let path = self.path("hang.sh");
-        std::fs::write(&path, "while :; do sleep 1; done\n").unwrap();
+        std::fs::write(
+            &path,
+            format!("while [ -f '{}' ]; do sleep 0.05; done\n", path.display()),
+        )
+        .unwrap();
         format!("exec bash {}", path.display())
     }
 
@@ -1407,7 +1411,7 @@ fn successful_execution_with_failed_template_publish_has_no_observation() {
     let f = fx();
     let started = f.path("observation-started");
     let release = f.path("observation-release");
-    let run = format!("touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; mkdir -p node_modules; echo ok > node_modules/x", started.display(), release.display());
+    let run = format!("touch '{}'; while [ ! -f '{}' ] && [ -d '{guard}' ]; do sleep 0.05; done; mkdir -p node_modules; echo ok > node_modules/x", started.display(), release.display(), guard = release.parent().unwrap().display());
     let p = f.payload(&spec(vec![step("i1", &run)]));
     let (a, wa) = f.consumer();
     assert_eq!(f.poll(&a, &p, &wa), SetupPoll::Pending);
