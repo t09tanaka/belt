@@ -753,3 +753,31 @@ fn the_rows_wait_until_the_inputs_are_gone() {
     assert_eq!(f.prune(), 1);
     f.nothing_left(&made);
 }
+
+/// Spec 25.13: the source index of an earlier binary gets the index the
+/// pruning deletes the import sessions of a run by, when it is opened.
+#[test]
+fn a_source_index_from_before_gets_the_index_of_import_sessions_by_run() {
+    let mut f = Fixture::new();
+    let db = f.state.join("sources/retention.db");
+    let indexed = || -> bool {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='import_session_run')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(indexed(), "a new index has it");
+    f.owner = None;
+    f.captured = None;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP INDEX import_session_run")
+        .unwrap();
+    assert!(!indexed());
+    f.start();
+    assert!(indexed(), "an index of an earlier binary gets it");
+}

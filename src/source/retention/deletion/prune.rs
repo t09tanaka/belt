@@ -34,6 +34,29 @@ pub struct PruneInputs {
     pub errors: Vec<String>,
 }
 
+impl Index {
+    /// The index the pruning finds the import sessions of a run by (spec
+    /// 25.5, 25.13). A new index has it from its first open; an index of
+    /// version 1 gets it on its next open. The version stays 1, as for the
+    /// owner table: nothing an older binary reads changed.
+    pub(in crate::source::retention) fn ensure_import_session_index(
+        &self,
+        db: &Connection,
+    ) -> Result<()> {
+        let present: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='import_session_run')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS import_session_run ON import_session(run_id);",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl SourceStore {
     /// The index connection of a deletion for the marked run `run`, under
     /// the source lock. `None` when the lock is busy.

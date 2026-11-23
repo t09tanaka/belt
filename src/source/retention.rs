@@ -155,7 +155,8 @@ impl Index {
         let mut db = self.connect().context("connect source index")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
-            return self.ensure_capture_owner_table(&mut db);
+            self.ensure_capture_owner_table(&mut db)?;
+            return self.ensure_import_session_index(&db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
