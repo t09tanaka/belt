@@ -22,7 +22,7 @@ impl Index {
             .context("check source root for foreground lock")?;
         // Retain this exact candidate inode throughout the wait. Reopening a
         // name after WouldBlock would accept a replaced permanent lock.
-        let file = open_permanent_file(&self.root, "mutation.lock")
+        let (file, created) = open_permanent_file(&self.root, "mutation.lock")
             .context("open foreground source mutation lock")?;
         let deadline = Instant::now() + timeout;
         #[cfg(test)]
@@ -38,10 +38,10 @@ impl Index {
                     // may retain the open description until its exec completes.
                     let locked = LockedFile(file);
                     self.check_foreground_lock(&locked.0)?;
-                    locked.0.sync_all().context("sync foreground source lock")?;
-                    self.root
-                        .sync_all()
-                        .context("sync foreground source parent")?;
+                    // Synced once, by the take that created the file (see `guard`).
+                    if created {
+                        self.sync_lock_created(&locked.0)?;
+                    }
                     return Ok(Guard {
                         _file: Arc::new(locked),
                         root: self.path.clone(),

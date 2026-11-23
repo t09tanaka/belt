@@ -92,7 +92,7 @@ impl Machine {
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
         let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
             .map_err(|e| internal("stored payload", e))?;
-        manifest_in(&self.store, &payload, Wait::Yes)
+        manifest_in(&self.store, &payload, Wait::Yes, None)
     }
 
     /// Prepare the setup steps of attempts once per worker (spec chapter 8):
@@ -229,6 +229,7 @@ fn manifest_in(
     store: &SourceStore,
     payload: &AttemptPayload,
     wait: Wait,
+    held: Option<&crate::source::retention::Guard>,
 ) -> Result<CiManifest, ApiError> {
     let missing = || {
         ApiError::new(
@@ -248,10 +249,13 @@ fn manifest_in(
         ),
         Wait::No => None,
     };
-    let m = store
-        .manifest(&source)
-        .map_err(|e| internal("source store", format!("{e:#}")))?
-        .ok_or_else(missing)?;
+    // Acceptance passes the shared lock it holds (no second take).
+    let m = match held {
+        Some(g) => store.manifest_under(g, &source),
+        None => store.manifest(&source),
+    }
+    .map_err(|e| internal("source store", format!("{e:#}")))?
+    .ok_or_else(missing)?;
     let want = payload.manifest_digest.as_str();
     if m.manifest_digest != want && format!("sha256:{}", m.manifest_digest) != want {
         return Err(ApiError::new(
@@ -280,7 +284,7 @@ struct BuilderWs {
 
 impl BuilderWorkspaces for BuilderWs {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
-        let m = manifest_in(&self.store, payload, Wait::Yes)?;
+        let m = manifest_in(&self.store, payload, Wait::Yes, None)?;
         // (the builder's thread is not joined by the attempt's release: it
         // pins the source for as long as it makes the workspace)
         let _pin = pin(&self.pins, &self.store, &m)?;
@@ -540,9 +544,10 @@ impl Host for Machine {
         &self,
         payload: &AttemptPayload,
         wait: bool,
+        held: Option<&crate::source::retention::Guard>,
     ) -> Result<Option<Vec<String>>, ApiError> {
         let wait = if wait { Wait::Yes } else { Wait::No };
-        match manifest_in(&self.store, payload, wait) {
+        match manifest_in(&self.store, payload, wait, held) {
             Ok(m) => Ok(Some(
                 m.secret_files.iter().map(|s| s.path.display()).collect(),
             )),
@@ -708,7 +713,7 @@ mod tests {
         // error at once (a source that is not here would be NotFound).
         let holder = step(&f.store, 600);
         let started = Instant::now();
-        let e = machine.secret_paths(&p, false).unwrap_err();
+        let e = machine.secret_paths(&p, false, None).unwrap_err();
         assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
         assert!(e.message.starts_with("source store"), "{e:?}");
         assert!(started.elapsed() < Duration::from_millis(500));
@@ -716,7 +721,7 @@ mod tests {
         // The accepted attempt's `prepare` reads on after the step.
         let holder = step(&f.store, 300);
         let started = Instant::now();
-        let paths = machine.secret_paths(&p, true).unwrap();
+        let paths = machine.secret_paths(&p, true, None).unwrap();
         assert_eq!(paths, Some(Vec::new()));
         assert!(started.elapsed() >= Duration::from_millis(250));
         holder.join().unwrap();

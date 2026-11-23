@@ -310,6 +310,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
             cli_jobs_error: None,
             linger: None,
             abandoned_imports: None,
+            source_lock_problem: None,
         },
     }});
     // No machine that runs this test is this platform.
