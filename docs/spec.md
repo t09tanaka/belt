@@ -1933,14 +1933,14 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 | lock | 開く経路 | 根拠 | 扱い |
 | - | - | - | - |
-| `reader-pins/<run>.lock` | resident（作成とGC）、どの版のCLIの `logs`・`outputs`（利用者がrun IDを打てば開ける） | (B)。`src/results/pin.rs` の `checked` が最初からinodeを照合し、readerは作らない | runと一緒に消す（段階2） |
-| `sources/runs/<run>.lock` | そのrunを取り込むprocessだけ（`SourceStore::lock_run`。run IDは取り込むprocessが作る） | (A)。runの行ができた後に、このlockを開く経路は無い。提出前は持ち主のprocessが生きていないことを示す（25.4） | runと一緒に消す（段階1・段階2） |
-| `supervisors/<attempt>.lock` | そのattemptのsupervisor、agent、task-traffic-controllerの台帳の照合（`src/config/traffic.rs`。台帳がattemptを名指す間） | (A)。条件は25.6に書く。`SupervisorLock::try_acquire` はfileを作るので (B) は使えない | attemptの行と一緒に消す（段階3） |
-| `toolchains/<identity>/install.lock` | そのrootへ導入するsetup builderと、workerの起動時のtrashの片付け | (A)。条件は25.7に書く | rootと一緒に消す（段階4） |
+| `reader-pins/<run>.lock` | resident（作成とGC）と、CLIの `logs`・`outputs`。pinを開く処理（`RunPin::ensure`・`shared`・`exclusive`）は、すべて親DBを開いた後の `CoordinatorStore` の中にある | (B)。`src/results/pin.rs` の `checked` が最初からinodeを照合し、readerは作らない。作る側（`result_gc_guard`）は、runの行があって印が無いときだけ作る（25.5） | runと一緒に消す（段階2） |
+| `sources/runs/<run>.lock` | そのrunを取り込むprocessだけ（`SourceStore::lock_run`。run IDは取り込むprocessが作る） | (A)。lockを作る前に持ち主の行（`capture_owner`）があり、runの行ができた後に、このlockを開く経路は無い。提出前は持ち主のprocessが生きていないことを示す（25.4） | runと一緒に消す（段階1・段階2） |
+| `supervisors/<attempt>.lock` | そのattemptのsupervisorの起動、agent（5か所）、別のscopeで動くsupervisorの照合（`config::traffic::foreign_supervisors`。`attempts/<attempt>/supervise.json` がある間）。一覧は25.6 | (A)。条件は25.6に書く。`SupervisorLock::try_acquire` はfileを作るので (B) は使えない | attemptのdirectoryと行の後に消す（段階3） |
+| `toolchains/<identity>/install.lock` | そのrootへ導入するsetup builder、builderが起動する導入のhelper process、workerの起動時のtrashの片付け | (A)。条件は25.7に書く | rootと一緒に消す（段階4） |
 | cloneのlock（`<clone>/.git` の中） | そのcloneのworkspaceを作る・消す処理 | 未確定（25.9） | 段階5が決まるまでunlinkしない |
-| `startup.lock`、`coordinator.lock`、`init.lock`、`transfer.lock`、`coordinator.db.init-lock`、`agent.lock`、`worker-service.lock`、`worker.db.init-lock`、`upgrade/upgrade.lock`、sourceの変更lock、`sources/secrets.lock`、Vaultのlock | どの版のどのcommandも開き得る | どちらも示せない | 固定。unlinkしない。個数は増えない |
+| 親: `startup.lock`、`coordinator.lock`、`init.lock`、`transfer.lock`、`coordinator.db.init-lock`、`upgrade/upgrade.lock`、sourceの変更lock（`sources/mutation.lock`）、`sources/secrets.lock`、Vaultのlock（`secrets/retention.lock`）。worker: `agent.lock`、`worker-owner.lock`、`worker-service.lock`、`worker.db.init-lock`、`group-rotation-key.lock`、`group-rotation-command.lock`、`incoming/locks/<0〜63>.lock` と `incoming/locks/all.lock`（受け取りのlock。source IDのhashを64で割った余りで割り振るので、65個で頭打ち）、sourceの変更lock、`ephemeral.lock`（一時workerのstateだけ。段階1） | どの版のどのcommandも開き得る | どちらも示せない | 固定。unlinkしない。個数は増えない |
 
-**(B) は、基準の文字どおりの読みより緩い。** 基準は「古い版のprocessがまだ開けるlock fileはunlinkしない」である。`reader-pins/<run>.lock` は、PATHに残った古いCLIが、利用者の打ったrun IDで開ける。この章は、「開けても、照合で必ず『無い』になり、fileを作らない」ことを、開けないことと同等として扱っている。この読みを採らない場合、readerのpinは固定のfileに分類され、runごとに1個が残り続ける（段階2の段8を行わない）。それを避けるには、pinをrunごとのfileでなくする設計（固定の個数のfileに、run IDのhashで割り振るなど）が別に要る。段階2のうち、この読みに依るのは段8だけである。
+**(B) と、古い版のCLI。** 基準は「古い版のprocessがまだ開けるlock fileはunlinkしない」である。`reader-pins/<run>.lock` を開く処理は、どれも親DBを開いた後にある。DBは、自分より新しいschemaの版を、読み取り専用でも開かない（`src/storage/policy.rs` の `CompatTable`。新しい版には触れない）。段階0と段階2のmigrationはschemaの版を上げるので、段階2が入った後にpinへ届くのは、段階2以降の版のprocessだけで、その全員が (B) の照合と、段階0の印の確認を行う。PATHに残ったそれより古いCLIは、DBを開けずに終わり、pinのpathに届かない。したがって、段8は基準の文字どおりの読みでも成り立つ。段階2より後の版で、pinを開く経路をDBを開く前に足してはならない。
 
 取得側にinodeの照合を足す段階は、その段階の「schema・wire」に書く。照合を足した版と同じ版では、そのlockを (B) を根拠にunlinkしない（次の版から）。
 
@@ -1949,8 +1949,8 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | 段階 | 内容 | 前提 | この文面のまま実装できるか |
 | - | - | - | - |
 | 0 | 既存の挙動の修正。入力の保持の終点の誤り、runの印 `pruning` と断り | なし | できる |
-| 1 | crashの受け皿と、持ち主が単純なもの。所有の証明つきの一時file、提出されなかった取り込み、`in-place/<run>.json`、一時workerの起動し直し | 段階0（印は使わないが、同じmigrationに入れてよい） | できる |
-| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる。ただし、段8（pinのunlink）は25.1の (B) の読みに依り、親のGit領域のrefを消す部分は、local-ciの関数の有無に依る（25.16） |
+| 1 | crashの受け皿と、持ち主が単純なもの。所有の証明つきの一時file、提出されなかった取り込み（行の無いrunへのcancelを含む）、`in-place/<run>.json`、一時workerの起動し直し | 段階0（印は使わないが、同じmigrationに入れてよい） | できる |
+| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる。ただし、親のGit領域のrefを消す部分は、local-ciの関数の有無に依る（25.16） |
 | 3 | workerの側の結果の写しと、重複防止の記録 | 段階2（`release_attempt` を送る時点が刈り取りにある）。wireの機能 `attempt_release_v1` | できる |
 | 4 | 古いbinaryと、toolchainのroot | なし（段階3と独立） | できる |
 | 5 | workerが受け取ったsourceとclone | 5a（workerの取り込みの持ち主）は独立。5bは未確定 | 5aはできる。5bはできない（25.9） |
@@ -1986,13 +1986,15 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 **規則。** 親DBの `run` に、刈り取り中の印（`pruning_at_ms`。NULLでなければ印あり）を足す。印は取り消さない。印を書くのは段階2の刈り取りだけで、段階0では誰も書かない。
 
 - **書き込みの断り。** 印のあるrunへの `retry`・enqueue・`create_task`・`create_attempt`・cancelは、`NOT_FOUND`（理由 `run_pruned`）で断る。印の確認は、それぞれが行やattemptを作るのと同じtransactionで行う。
+- **印の確認は、再送の受領より先。** cancelと `retry` は、同じ `request_id` の再送に、保存した答え（`control_request` の行）を返す。今の実装は、対象を解決する前にこの受領を引く（`src/storage/coordinator/control.rs` の `apply_cancel` の最初の文、`src/storage/coordinator/retry.rs` の3か所）。段階0で順序を入れ替え、対象のrunの印を先に確かめる。印があれば、受領の行が残っていても `NOT_FOUND`（`run_pruned`）と答える。受領の行は、刈り取りがrunと一緒に消す（25.5）ので、「刈り取りの途中は保存した答え、刈り取りの後は `NOT_FOUND`」と答えが変わる窓を作らない。
 - **読み手の断り。** 印のあるrunは、すべての読み手に `NOT_FOUND` と答える: `show`、`ls`（一覧に出さない）、`logs`、`outputs`、`top`、`ci status`（`--post` を含む）、GitHub statusの再投稿、residentの復旧と配置の走査。読み手は、印の確認と、答えに使うrunの行の読み取りを、**1つの読み取りtransaction**（同じsnapshot）で行う。複数の問い合わせで答えを組み立てる読み手（`show`、`ci status --post`）は、その全部を同じtransactionの中で行う。
+- **fileの読み手は、pinを取った後に確かめ直す。** `logs`・`outputs` は、共有pinを取った**後**に、1つの読み取りtransactionで、印が無いことと、対象がそのrunのものであることを確かめ直す。確かめ直しが通らなければ、pinを手放して `NOT_FOUND` と答え、fileを開かない。今の実装（`src/storage/coordinator.rs` の、pinを取る関数）は、pinの後に対象のrunだけを確かめ直している。ここに印を足す。pinを取る前の確認だけでは足りない: 確認とpinの間に印が書かれ、刈り取りが排他pinを取ってfileを消し、pinを手放した後に、読み手が共有pinを取れてしまう。
 
 **決定: 「印のあるrunは無い」とする。** 採らなかった案は「印から最後まで排他pinを持ち続ける」である。pinを持ち続ける案は、(1) passをまたいで、さらにresidentの再起動をまたいでdescriptorを持ち続けることはできず、再起動の直後に必ず窓が開く、(2) pinを取らない読み手（`show`・`ls`・`ci status`）には効かない、(3) fileの読み手が「無い」ではなく待ちか失敗になる。印はDBに永続し、読み手のsnapshotの中で確かめられるので、半分消えたrunを見る経路が無い。
 
-**安全の証明。** 刈り取りの各transaction（25.5）は印のあるrunの行だけを消す。読み手のsnapshotは、印の前のものならrunの全部の行を含み、印の後のものなら印を見て `NOT_FOUND` と答える。行の一部が欠けたrunを、印なしで見るsnapshotは存在しない。fileの読み手（`logs`・`outputs`）は、これに加えて共有pinを持ち、刈り取りは排他pinを取れたときだけfileを消す（25.5）ので、印の前に始まった読み取りは最後まで読める。
+**安全の証明。** 刈り取りの各transaction（25.5）は印のあるrunの行だけを消す。読み手のsnapshotは、印の前のものならrunの全部の行を含み、印の後のものなら印を見て `NOT_FOUND` と答える。行の一部が欠けたrunを、印なしで見るsnapshotは存在しない。fileの読み手（`logs`・`outputs`）は、これに加えて共有pinを持ち、刈り取りは排他pinを取れたときだけfileを消す（25.5）。読み手の順序は「共有pin → 印の確認 → fileを開く」、刈り取りの順序は「印 → 排他pin → fileを消す」である。読み手の確認が印より前のsnapshotなら、読み手は共有pinを既に持っているので、刈り取りは排他pinを取れず、読み手は最後まで読める。印より後のsnapshotなら、読み手は印を見てfileを開かない。どちらでもない順序は無い。再送の受領を印の後に引くので、印のあるrunについて、保存した答えが返る経路も無い。
 
-**受け入れ試験。** 印を直接書いたrunで: (i) `retry`・enqueue・`create_task`・`create_attempt`・cancelが `run_pruned` で断られ、行が増えない。(ii) `show`・`logs`・`outputs`・`ci status --post` が `NOT_FOUND` で、`ls` に出ず、GitHubへ何も投稿しない。(iii) taskの行を半分消した状態でも (ii) が同じ答えになる（`missing` と判定しない）。(iv) 印の無いrunは今までどおり。
+**受け入れ試験。** 印を直接書いたrunで: (i) `retry`・enqueue・`create_task`・`create_attempt`・cancelが `run_pruned` で断られ、行が増えない。(ii) `show`・`logs`・`outputs`・`ci status --post` が `NOT_FOUND` で、`ls` に出ず、GitHubへ何も投稿しない。(iii) taskの行を半分消した状態でも (ii) が同じ答えになる（`missing` と判定しない）。(iv) 印の無いrunは今までどおり。(v) cancelと `retry` を受理して受領の行を作った後に印を書き、同じ `request_id` で送り直すと、保存した答えではなく `run_pruned` が返る。(vi) `logs`・`outputs` が、最初の確認を通ってから共有pinを取るまでの間に、印を書いて排他pinでfileを消して手放す。読み手は `NOT_FOUND` と答え、消えたfileを開かない（確認とpinの間に止める点を差し込んで確かめる）。
 
 **schema。** 親DB: `run.pruning_at_ms INTEGER`。wireの変更は無い。
 
@@ -2005,7 +2007,8 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 **規則。** beltが作る一時のfile・directoryは、例外なく次のどちらかにする。
 
 - **directory**は、所有marker（`platform::owned_temp`。場所・pid・processの開始identity）を持つ。
-- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所>.<pid>.<開始identity>.<乱数>` とし、markerと同じ3つの事実を運ぶ。場所・pid・開始identityの定義は `owned_temp` と同じものを使う。
+- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所のhash>.<pid>.<開始identity>.<乱数>` とし、markerと同じ3つの事実を運ぶ。場所・pid・開始identityの定義は `owned_temp` と同じものを使う。
+- **場所は固定長のhashで運ぶ。** `owned_temp` の場所は、hostname・OSのboot・PID namespaceの3つで、hostnameだけで255 bytesになり得る。そのまま名前に入れると、file名の上限（`NAME_MAX`。255 bytes）を超える。名前に入れるのは、3つを区切りつきで並べたもののSHA-256の先頭16桁（hex）とする。pidは10進（10桁まで）、開始identityは10進（20桁まで）、乱数は英数字12字とする。名前は最長で `.belt-tmp.`（10）+ 16 + 1 + 10 + 1 + 20 + 1 + 12 = 71 bytesで、どのfilesystemの上限にも収まる。走査は、今の場所から同じhashを計算して比べる。hashが違えば「場所が違う」として触れない。directoryのmarkerは、fileの中身なので、今までどおり3つをそのまま持つ。
 - 作った時点でunlinkできるもの（匿名で足りるもの）は、名前を持たせない。
 
 走査は、その場所で同じ種類の処理を始めるとき（下の表）に、そのdirectoryの `readdir` 1回で行う。消すのは、名前かmarkerが解釈でき、場所が今と同じで、そのpidのprocessが居ないか開始identityが違うものだけである。自分のuidの所有で、link数が1（fileのとき）で、symlinkをたどらない。解釈できないもの、場所が違うものには触れず、`doctor` が件数を示す。processにsignalは送らない。
@@ -2016,6 +2019,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | 親・workerの `sources/tmp/` | `.recv.*`、`.manifest.*`、`commit-<sha>-*/` | そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動時） |
 | 親の `results/<attempt>/tmp/` | `*.part` | 回収の続き（既存）。attemptの結果を消すときに一緒に消える |
 | 親の `secrets/` | `.<名前>.<ulid>.tmp` | Vaultの排他lockの下の保持driver（既存の `sweep_orphan_tmp`。所有を証明できる名前に変える） |
+| 親の `sources/secrets/` | `.secrets.tmp-*`（local-ciが書く、平文のsecretの束の一時file。名前はlocal-ciが決めるので、この規則の名前にできない） | 保持driverが `sources/secrets.lock` を待たずに排他で取れたpass。この一時fileを書く取り込みは、必ずこのlockを持つ（`src/secrets/capture.rs`）ので、lockを取れた時点の残りは、書き手の居ない残骸である。workerの側は、起動時の既存の片付け（`sweep_store_copies`）が同じ規則で消す |
 | workerのstate直下 | `.s*/`（socketの準備）、`worker-socket.json` などの一時file、`removed-members.json` の一時file | workerの起動（`agent.lock` の下） |
 | workerの `clones/`・`workspaces/` | 展開と作成の作業用directory | workerの起動（既存の孤児の走査） |
 | workerの `setup/builders/<id>/`、`attempts/<attempt>/`、親の `results/<attempt>/` | builderの一時file、準備の観測の一時file、CIのartifactの受け渡しの作業用 | 持ち主のdirectoryと一緒に消える（既存）。持ち主のdirectoryの外（state直下）に書くものは、workerの起動 |
@@ -2034,25 +2038,71 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 ### (b) 提出されなかった取り込み
 
-**今の挙動。** 取り込みはCLIのprocessの中で、runの行ができる前に行われる（`src/service/submit.rs` → `service::input::capture`）。`sources/runs/<run>`、`sources/runs/<run>.lock`、pending root（`capture:<ulid>`）、Vaultの `secrets/<run>.json`、`in-place/<run>.json` ができる。enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（消すのは、提出が断られたときの `in-place/<run>.json` だけ）。secretの束が際限なく残る。
+**今の挙動。** 取り込みはCLIのprocessの中で、runの行ができる前に行われる（`src/service/submit.rs`・`src/service/ci_run.rs` → `service::input::capture` → `secrets::capture::capture_run` → `source::capture_for_run`）。順序は次のとおりである。
+
+1. `sources/secrets.lock` を取る（secret fileがあるとき）。
+2. `sources/runs/<run>.lock` を作って取る（`lock_run`）。
+3. pending root（`capture:<ulid>`）を作る。local-ciの取り込みが、objectとmanifestを書き、平文のsecretの束を `sources/secrets/<run>.json` に書く（途中は `.secrets.tmp-*`）。
+4. runのroot（`root` の行。`id = <run>`、`kind = 'run'`）を作り、pending rootのmemberを写す（`copy_root`）。
+5. `sources/runs/<run>` を書く（`bind_run`）。
+6. pending rootのmemberを外し、pending rootを消す（`handoff`。pageに分かれる）。
+7. 平文の束を親Vaultの `secrets/<run>.json` へ移す（`Vault::adopt`）。
+8. `in-place` のrunでは `in-place/<run>.json` を書く。
+9. enqueueを送る。
+
+enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（消すのは、提出が断られたときの `in-place/<run>.json` と、取り込みが失敗したときの平文の束だけ）。2と3の間で終わればlockだけが残り、6の後で終わればpending rootは無く、runのrootとそのmember・graphを名指して消すものが無い。親では、残った平文の束を片付ける処理が呼ばれていない（`sweep_store_copies` を呼ぶのはworkerだけである）。secretの束が際限なく残る。
+
+また、runの行が無いrunへのcancelを、今の実装は受理する（`control.rs` の `resolve` は、`Target::Run` を行の有無を見ずに通す）。取り込みの途中のCtrl-Cは、まだenqueueしていないrun IDへcancelを送り（`ci_run.rs`、`service/control.rs` の `cancel_and_stop`）、`run_cancel_intent`・`run_id` つきの `event`・`control_request` の行ができる。これは意図した挙動で（後から届くenqueueがcancelを引き継ぐ。`storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate`）、enqueueが届かなければ、この3つの行を消すものが無い。利用者が打ち間違えたrun IDへのcancelでも同じ行ができる。
 
 **規則。** 取り込みに持ち主を与える。
 
-- 取り込みを始めるprocessは、pending root（`capture:<ulid>`）を作るのと同じtransactionで、`sources/retention.db` の `capture_owner` に1行を書く: run ID、pending rootのID、場所、pid、processの開始identity。run IDは取り込みの前に決まっている（`RunId::generate`）。
-- **引き渡し。** residentは、enqueueがrunの行をcommitした後に、その行を消す。enqueueは、既存の規則どおりsourceのguardを取ってからDBを操作し、commitまで持ち続ける（第23章）。取り込みを持つrunでは、そのguardの下で `sources/runs/<run>` があることを確かめ、無ければ `NOT_FOUND`（理由 `capture_abandoned`）で断って何も作らない。
-- **断られたとき・失敗したとき。** 取り込んだprocessが、その場で下の「消すもの」を消す。
-- **放棄の判定。** 持ち主のprocessが生きている取り込みは、進行中であり、何があっても消さない。持ち主のprocessが居ない（場所が同じで、pidが居ないか開始identityが違う）取り込みは放棄されたものである。場所が違う行は判定できないので残し、`doctor` が示す。
-- **消す時点。** 親の保持driver（25.11）が、passごとに `capture_owner` の行を見る（行の数は、進行中と放棄された取り込みの数である）。放棄された行について、sourceの削除の所有（第23章のBと同じ排他）を取り、親DBにそのrunの行が無いことを確かめ直してから消す。行があれば、引き渡しは済んでいるので `capture_owner` の行だけを消す。
-- **消すもの。** Vaultの `secrets/<run>.json`（第23章のCの手順。claimを先に書く）、`in-place/<run>.json`、`sources/runs/<run>`、pending rootとそのmember、`sources/runs/<run>.lock`（最後に。25.1の (A)）、最後に `capture_owner` の行。
-- **pending rootのobject。** 今のBのpageは、期限の来たrunのrootを起点にするので、どのrunにも結び付かなかったpending rootのobjectを訪れない。rootの行だけを消すと、objectのfileが残る。したがって、Bのpageの起点に「放棄されたpending root」を足し、そのmemberのうち他のrootが持たないobjectを、Bの保護（claimを先に、所有するpathだけ、内容の検証、32件・64 MiB）のまま消す。rootの行は、memberが空になってから消す。
-- **持ち主の行を書かない版が作った取り込み。** 最初の公開版が持ち主の行を書くので、書かない公開版は無い。公開前の版のCLIが残した取り込み（runの行も `capture_owner` の行も無い `sources/runs/<run>`）は、進行中か放棄かを証明できないので消さず、`doctor` が件数を示す。
-- **期限。** 放棄された取り込みは、持ち主のprocessが終わってから、residentが動いていれば保持driverの次のpass（60秒以内）で、動いていなければ次のresidentの起動直後のpassで消える。
+- **持ち主の行が、最初の永続の書き込みである。** 取り込みを行う提出（`submit` と `ci run`）は、run IDを決めた直後、上の1より前に、`sources/retention.db` の `capture_owner` に1行を書く: run ID、状態（`capturing`）、pending rootのID（まだNULL）、場所、pid、processの開始identity。この行がcommitされるまで、lockもfileも作らない。pending rootのIDは、pending rootを作るのと同じtransactionで、この行に書く。
+- **計画の下書きは対象外。** 計画のための取り込み（`service/planning.rs` の `capture_into`）は、下書きのdirectory（`ci-plan-*/`）の中の、そのcommandだけのstoreへ書く。持ち主は下書きのdirectoryで、(a) の規則がdirectoryごと消す。`capture_owner` の行は書かない。
+- **引き渡し。** residentは、enqueueがrunの行をcommitした後に、その行を消す。enqueueは、既存の規則どおりsourceのguardを取ってからDBを操作し、commitまで持ち続ける（第23章）。取り込みを持つrunでは、そのguardの下で、`capture_owner` の行が `capturing` であることと、`sources/runs/<run>` があることを確かめ、どちらかが欠ければ `NOT_FOUND`（理由 `capture_abandoned`）で断って何も作らない。
+- **持ち主の行を消すのはresidentだけである。** 取り込んだprocessは、自分の失敗（取り込みの失敗、enqueueの拒否、Ctrl-C）で終わるとき、平文の束（`sources/secrets/<run>.json`）をその場で消し（既存）、行の状態を `given_up` に変えてから終わる。行は消さない。残りは、削除の所有を持つresidentが消す。CLIは、sourceの削除の所有（第23章のBの排他）と親DBを持たないので、objectと親DBの行を自分では消せない。
+- **放棄の判定。** 状態が `given_up` の取り込みと、持ち主のprocessが居ない（場所が同じで、pidが居ないか開始identityが違う）取り込みは、放棄されたものである。状態が `capturing` で持ち主のprocessが生きている取り込みは進行中で、何があっても消さない。場所が違う行は判定できないので残し、`doctor` が示す。
+- **消す時点。** residentが、次の3つの出来事で、そのrunの放棄の処理を行う。(1) enqueueを断ったとき（その要求を処理するその場）。(2) 行の無いrunへのcancelを、放棄を理由に断ったとき（下）。(3) 保持driverのpass（25.11）。passごとに `capture_owner` の行を全部見る（行の数は、進行中と放棄された取り込みの数である）。(3) はcrashと、要求を1つも送らずに終わったCLIの受け皿である。
+- **放棄の処理。** sourceの削除の所有を取り、親DBにそのrunの行が無いことを確かめ直してから、下の「消すもの」を消す。runの行があれば、引き渡しは済んでいるので `capture_owner` の行だけを消す。
+- **消すもの。** すべて、run IDと、行が持つpending rootのIDだけから名指せる。この順で消す。
+  1. 親DBの、そのrun IDの `run_cancel_intent`・`control_request`・`event` の行。1つのtransactionで、runの行が無いことを確かめ直して消す。
+  2. 親Vaultの `secrets/<run>.json`（第23章のCの手順。claimを先に書く）と、完了した `vault_delete_claim` の行。Vaultの一時fileは (a) の規則が消す。
+  3. 平文の束 `sources/secrets/<run>.json`。
+  4. `in-place/<run>.json`。
+  5. `sources/runs/<run>`。
+  6. runのroot（`id = <run>`、`kind = 'run'`）とpending root（行のID）の、memberとgraph。他のrootが持たないobjectとmanifestのfile（下）。memberが空になったrootの行。そのrunの `import_session`・`run_expiry` の行。
+  7. `sources/runs/<run>.lock`（25.1の (A)）。
+  8. 最後に `capture_owner` の行。
+- **放棄されたrootのobject。** 今のBのpageは、期限の来たrunのrootを起点にするので、行の無いrunのrootと、どのrunにも結び付かなかったpending rootを訪れない。rootの行だけを消すと、objectのfileが残る。したがって、Bのpageの起点に「放棄された取り込みのrunのrootとpending root」を足し、そのmemberのうち他のrootが持たないobjectとmanifestを、Bの保護（claimを先に、所有するpathだけ、内容の検証、32件・64 MiB）のまま消す。rootの行は、memberが空になってから消す。1 passで終わらなければ、`capture_owner` の行を残して次のpassが続ける。
+- **行の無いrunへのcancel。** residentは、runの行が無いrunへのcancelを、**そのrunの `capture_owner` の行が `capturing` で、場所が同じで、持ち主のprocessが生きているときだけ**受理する。それ以外（行が無い、`given_up`、持ち主が居ない、場所が違う）は `NOT_FOUND` で断り、`run_cancel_intent`・`event`・`control_request` のどれも書かない。行が放棄を示していれば、断ったその場で放棄の処理を行う。確認と書き込みは、enqueueと同じくsourceのguard（共有）の下で行い、親DBのtransactionの中でrunの行の有無を確かめ直す（行があれば、行のあるrunへの通常のcancelになる）。受理したcancelが書く `control_request` の行には、run IDを書く（下のschema）。
+- **持ち主の行を書かない版が作った取り込み。** 最初の公開版が持ち主の行を書くので、書かない公開版は無い。公開前の版のCLIが残した取り込み（runの行も `capture_owner` の行も無い `sources/runs/<run>`）は、進行中か放棄かを証明できないので消さず、`doctor` が件数を示す。公開前の版が残した、行の無いrunの `run_cancel_intent`・`control_request`・`event` は、段階1のmigrationが消す（migrationは `coordinator.lock` の下で動き、その時点で進行中の取り込みのcancelを消しても、失われるのは「まだ提出していないrunのcancelの予約」だけである。そのCLIは、段階1のresidentに `capture_abandoned` で断られる）。
+- **期限。** 放棄された取り込みは、residentが断った要求があればその場で、無ければ、residentが動いていれば保持driverの次のpass（60秒以内）で、動いていなければ次のresidentの起動直後のpassで消える。
 
-**安全の証明。** (1) 進行中の取り込みは、持ち主のprocessが生きている間は消されない。(2) 持ち主が終わった後に届くenqueue（CLIが送った直後に終わった場合）と削除は、sourceのguard（enqueueは共有、削除は排他）で直列になる。enqueueが先ならrunの行があり、削除は `capture_owner` の行だけを消す。削除が先ならenqueueは `sources/runs/<run>` が無いことを見て断る。(3) `sources/runs/<run>.lock` を開くのは、そのrunを取り込むprocessだけで（`lock_run` の呼び出しは取り込みの1か所）、そのprocessは居ない。run IDは使い回さない。(4) 起動時の走査は、`sources/runs/` と `in-place/` のentryを「行の無いrunのもの」として消すことをしない（25.11）。これらを消すのは、`capture_owner` の行を起点にしたこの規則と、刈り取りだけである。
+**挙動の変更。** (1) 行の無いrun IDへのcancelは、進行中の取り込みのものを除いて `NOT_FOUND` になる。今は受理して、`accepted = false`・`cancel_requested = true` の答えを返している。CLIの `cancel <run>` は、存在しないrun IDに `NOT_FOUND` を返す。(2) `storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate` は、進行中の `capture_owner` の行を前提に加えた形に変える（cancelの予約がenqueueと配置の門より先に効くことは変えない）。行の無いrunへのcancelを前提なしで受理することを確かめている試験（`service/resident/tests.rs` の、提出前の `cancel_and_stop` の試験を含む）は、前提を足すか、`NOT_FOUND` を期待する形に変える。(3) 取り込みの途中のCtrl-Cは今までどおり受理される（持ち主の行が最初に書かれているので）。持ち主の行を書く前のCtrl-Cは、何も作っていないので、cancelを送らずに終わる。
 
-**受け入れ試験。** (i) 取り込みの後、enqueueの前にCLIをSIGKILLすると、次のpassでVaultの束・run record・lock・pending root・in-placeのbindingが消える。(ii) 取り込み中（持ち主が生きている）にresidentを再起動しても何も消えず、続くenqueueが成功する。(iii) CLIがenqueueを送った直後に終わり、削除のpassと競っても、「runが受理されて全部残る」か「断られて全部消える」のどちらかになる。(iv) 提出が断られたとき、その場で全部消える。(v) 場所が違う行は消えず、`doctor` に出る。(vi) 放棄された取り込みのobjectのfileが、他のrootが持たなければ消え、持てば残る。(vii) 持ち主の行の無い `sources/runs/<run>` は消えず、`doctor` に出る。
+**安全の証明。** 取り込みの各時点でprocessが終わった場合に、残るものと、それを名指すものを挙げる。番号は「今の挙動」の順序で、0は持ち主の行の書き込みである。
 
-**schema。** `sources/retention.db`: `capture_owner(run_id PRIMARY KEY, root, place, pid, start)`。
+| 終わった時点 | 残っているもの | 名指すもの |
+| - | - | - |
+| 0より前 | 何も無い | 該当なし |
+| 0の後、2の前 | `capture_owner` の行 | 行そのもの |
+| 2の後、3の前 | 加えて `sources/runs/<run>.lock` | run ID |
+| 3の途中・後 | 加えてpending root、そのmember、objectとmanifestのfile、平文の束と `.secrets.tmp-*` | 行のpending rootのID（rootと同じtransactionで書く）、run ID。`.secrets.tmp-*` は (a) |
+| 4の後 | 加えてrunのrootとそのmember | run ID（`root.id`） |
+| 5の後 | 加えて `sources/runs/<run>` | run ID |
+| 6の途中 | pending rootのmemberの一部が外れている。外れたmemberは、先にrunのrootへ写してある（`handoff_page` は、写した後に外す） | run IDとpending rootのID。両方のrootを起点にする |
+| 6の後 | pending rootは無い。行のIDは、無いrootを指す（消す処理は「無い」を成功として進む） | run ID |
+| 7の途中・後 | 加えてVaultの `secrets/<run>.json`（途中ならVaultの一時fileか、平文の束） | run ID。一時fileは (a) |
+| 8の後 | 加えて `in-place/<run>.json` | run ID |
+| 9を送った後、residentのcommitの前 | 同上 | 下の (2) |
+| commitの後、行を消す前 | runの行と `capture_owner` の行 | 放棄の処理が、runの行を見て `capture_owner` の行だけを消す |
+
+どの時点でも、残っているものは、`capture_owner` の行（run IDとpending rootのID）から名指せる。行より先に作られるものは無い。
+
+(1) 進行中の取り込みは、状態が `capturing` で持ち主のprocessが生きている間は消されない。(2) 持ち主が終わった後に届くenqueue（CLIが送った直後に終わった場合）と放棄の処理は、sourceのguard（enqueueは共有、削除は排他）で直列になる。enqueueが先ならrunの行があり、放棄の処理は `capture_owner` の行だけを消す。放棄の処理が先ならenqueueは、行が無いことを見て断る。(3) 行の無いrunへのcancelと放棄の処理も、同じguardで直列になる。cancelが先なら、放棄の処理は消すものの1でその行を消す。放棄の処理が先なら、cancelは持ち主の行が無いことを見て断り、何も書かない。cancelを受理した後にenqueueが届けば、3つの行はrunのものになり、刈り取りが消す（25.5）。届かなければ、持ち主のprocessが終わるか `given_up` を書いた後に、放棄の処理が消す。したがって、行の無いrunのcancelの行で、消すものが決まっていないものは無い。(4) `sources/runs/<run>.lock` を開くのは、そのrunを取り込むprocessだけで（`lock_run` の呼び出しは取り込みの1か所）、lockより先に持ち主の行があり、そのprocessは居ないか、`given_up` を書いて取り込みを終えている。run IDは使い回さない。(5) 起動時の走査は、`sources/runs/` と `in-place/` のentryを「行の無いrunのもの」として消すことをしない（25.11）。これらを消すのは、`capture_owner` の行を起点にしたこの規則と、刈り取りだけである。
+
+**受け入れ試験。** (i) 上の表の各時点（0の後、2の後、3の途中、4の後、5の後、6の途中、6の後、7の後、8の後）でCLIをSIGKILLし、次のpassの後に、`sources/retention.db` のそのrunの行（`capture_owner`・`root`・`member`・`graph`・`import_session`）、他のrootが持たないobjectとmanifest、`sources/runs/<run>` とlock、平文の束、Vaultの束、in-placeのbindingが、どれも残らない（時点ごとに1つ。fileと行を列挙して確かめる）。(ii) 取り込み中（持ち主が生きている）にresidentを再起動しても何も消えず、続くenqueueが成功する。(iii) CLIがenqueueを送った直後に終わり、放棄の処理と競っても、「runが受理されて全部残る」か「断られて全部消える」のどちらかになる。(iv) 提出が断られたとき、断ったその場で全部消える（次のpassを待たない）。(v) 場所が違う行は消えず、`doctor` に出る。(vi) 放棄された取り込みのobjectのfileが、他のrootが持たなければ消え、持てば残る。(vii) 持ち主の行の無い `sources/runs/<run>` は消えず、`doctor` に出る。(viii) `capture_owner` の行が無いrun IDへのcancelが `NOT_FOUND` で、親DBの行が1つも増えない。(ix) 取り込み中のcancelは受理され、その後CLIをSIGKILLすると、次のpassで `run_cancel_intent`・`control_request`・`event` のそのrunの行が残らない。(x) 取り込み中のcancelの後にenqueueが届くと、今までどおりcancel済みのrunになる。(xi) cancelの受理と放棄の処理を競わせ、「受理されて、後の放棄の処理が行を消す」か「`NOT_FOUND` で何も書かれない」のどちらかになる。(xii) `given_up` を書いたCLIからのcancelは `NOT_FOUND` で、その場で放棄の処理が行われる。(xiii) 計画の下書きの取り込みが `capture_owner` の行を書かない。
+
+**schema。** `sources/retention.db`: `capture_owner(run_id PRIMARY KEY, state, root, place, pid, start)`。親DB: `control_request.run_id` と索引（cancelとretryの受理が対象のrunを書く。既存の行は、migrationが `target_json` から埋める）、索引 `event(run_id, seq)`、`event_no_delete` を外す（行の無いrunのeventを消すため。段階1でeventを消すのは放棄の処理だけである）。migrationは、runの行が無いrun IDの `run_cancel_intent`・`control_request`・`event` を消す。
 
 ### (c) `in-place/<run>.json`
 
@@ -2105,9 +2155,16 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 | 5 | runごとのfileと索引の行: `in-place/<run>.json`、`sources/runs/<run>`、`sources/retention.db` のそのrunの行（`run_expiry`、完了した `vault_delete_claim`、そのrunのrootとそのmember・graph、`import_session`、`capture_owner`）、最後に `sources/runs/<run>.lock` | 各削除は冪等。未完了のclaimが残るrunは、ここで止めて次のpassに回す |
 | 6 | 親DBの行を、下の順で消す。1 transactionは1,000行まで | 印のあるrunの残りの行を、同じ順で続ける |
 | 7 | 最後のtransaction（`run` の行を消すもの）のcommitの後、そのrunのattemptのうち、workerが受理していて、ACK済みでないものに `release_attempt` を送る（段階3が入っていれば。届かなくてよい。25.6）。送る相手の一覧（workerとattempt ID）は、段6でattemptの行を消すtransactionが、消す前に読んでメモリに持つ | 一覧は失われる。送らなかった分は、接続時の照合（25.6）が拾う |
-| 8 | `reader-pins/<run>.lock` をunlinkし、排他pinを手放す（25.1の (B) の読みに依る。採らない場合はこの段を行わず、pinは残る） | 行が無くpinだけが残る。起動時の走査が消す（25.11） |
+| 8 | `reader-pins/<run>.lock` をunlinkし、排他pinを手放す（25.1の (B)）。結果のGCのcursorがこのrunを指していれば、cursorを捨てる（下） | 行が無くpinだけが残る。起動時の走査が消す（25.11） |
 
 **passをまたぐpin。** 排他pinは、段3から同じpassの終わりまで持ち、passの終わりに手放す。passをまたいでは持たない。次のpassは取り直す。pinを持たない間も、印がすべての読み手を断る（25.3）ので、半分消えたrunは見えない。印の前に共有pinを取って読み始めたreaderは、排他pinを取れない間、刈り取りを段3で待たせる。
+
+**結果のGCが、消したpinを作り直さない。** 今の結果のGC（`src/results/retention.rs` の `page`）は、処理の途中のrunをcursor（`cursor.current`）に持ってpageをまたぎ、pageの最初に `result_gc_guard`（`src/storage/coordinator/retention.rs`）でpinを取る。`result_gc_guard` は、pinのfileを無条件に作って（`RunPin::ensure`）から排他で取る。したがって、cursorが指すrunを刈り取りが消すと、次のpageが、段8でunlinkしたpinを作り直し、行の無いrunのpinが残る。次の2つを規則とする。
+
+- `result_gc_guard` は、1つの読み取りtransactionで、そのrunの行があり、印が無いことを確かめたときだけ、pinを作って取る。行が無いか印があれば、pinに触れずに「このrunは無い」と答え、GCはそのrunのcursorを捨てて次のrunへ進む。確認とpinの作成の間に刈り取りが段8まで進むことは無い: どちらもresidentの保持driverの中で、重ならずに動く（25.11）。
+- 刈り取りは、段3でこのrunの結果を消すとき、結果のGCのcursorがこのrunを指していれば捨てる。段8でも確かめる。cursorはresidentのメモリにあり、再起動で空になる。
+
+pinを作るのは `result_gc_guard`（と、同じ `ensure` を呼ぶ、runを受理する経路）だけで、readerは作らない（`RunPin::shared` は、fileが無ければ「無い」と答える）。
 
 **段4の親のGit領域。** refは `refs/local-ci/snapshots/<source>` と `refs/local-ci/index/<source>` である。消すには、local-ciのライブラリの、sourceを名指してそのrefを消す関数を使う（beltはGit領域の中を自分で書き換えない）。その関数が採用する版に無い場合、この部分は実装できず、refは残る（25.16）。refを消したrepositoryには `git gc --prune=<14日前>` を、repositoryごとに24時間に1回まで行う。`--prune=now` は使わない: 取り込みをするCLIは、refを付ける前のobjectをこのrepositoryに書き、それを知らせるlockを持たないので、猶予なしのpruneは進行中の取り込みのobjectを消す。14日はGitの既定の猶予と同じ値で、利用者のGitの設定に依らないように明示する。したがって、消したsourceのGit objectは、refを消してから最長で14日と24時間残る。
 
@@ -2125,9 +2182,9 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 1つのtransactionの中でもこの順を守る。途中のtransactionで止まっても、残っている行は常に「親の行がある子」だけなので、外部キーは満たされる。
 
-**`control_request`。** `run_id` の列と索引を足す。cancelとretryの受理が、対象のrunを書く。既存の行は、migrationが `target_json` から埋める。採らなかった案は「答えを返した時点で消す」である: この行の読み手は、同じ `request_id` の再送（答えを失ったCLIのやり直し）で、再送がもう来ないことを証明できる出来事が無い。runの行が無ければ再送にも `NOT_FOUND` と答えるので、runと一緒に消せば足りる。
+**`control_request`。** `run_id` の列と索引は段階1が足している（25.4の (b)）。採らなかった案は「答えを返した時点で消す」である: この行の読み手は、同じ `request_id` の再送（答えを失ったCLIのやり直し）で、再送がもう来ないことを証明できる出来事が無い。runと一緒に消せば足りる: 印のあるrunへの再送は、受領を引く前に印で断られ（25.3）、runの行が無くなった後の再送は、cancelなら「行の無いrunへのcancel」として `NOT_FOUND` になり（25.4の (b)）、`retry` は対象のrunが無いので `NOT_FOUND` になる。どちらも受領の行を必要としない。
 
-**外すtrigger。** `event_no_delete`、`retire_tombstone_no_delete` を外す。identityの記録を消す版では `worker_identity_tombstone_no_delete` も外す（下）。消すのは、この章の刈り取りと保持driverだけである。
+**外すtrigger。** `retire_tombstone_no_delete` を外す（`event_no_delete` は段階1が外している）。identityの記録を消す版では `worker_identity_tombstone_no_delete` も外す（下）。消すのは、この章の刈り取りと保持driver、放棄された取り込みの処理だけである。
 
 **workflow artifact。** あるattemptがuploadしたworkflow artifactは、そのattempt自身の保持期間ではなく、**runが終わってから** `retention_days` 日まで残す（後のJobとそのretryがdownloadするため）。今の実装（`claim_result_page` と `workflow_run_end`）が既にそうしている。刈り取りの段3は、runが終わって保持期間が過ぎた後なので、これと矛盾しない。25.10の「結果」の行は、この例外を含めて書く。
 
@@ -2139,7 +2196,8 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 | 参照 | 答え |
 | - | - |
-| 利用者の `show`・`logs`・`outputs`・`retry`・`cancel` | `NOT_FOUND`。メッセージで、終了から `retention_days` 日でrunを消すことを伝える |
+| 利用者の `show`・`logs`・`outputs`・`retry`・`cancel` | `NOT_FOUND`。メッセージで、終了から `retention_days` 日でrunを消すことを伝える。cancelも何も書かない（刈り取ったrunには `capture_owner` の行が無いので、25.4の (b) の規則で断られる。`run_cancel_intent`・`event`・`control_request` の行はできない） |
+| 同じ `request_id` で送り直したcancel・`retry` | 刈り取りの途中（印がある間）は `run_pruned`、後は `NOT_FOUND`。保存した答えは返さない（25.3） |
 | workerに残る、親DBに行の無いattempt | 親は、自分の行があるattemptについてだけworkerへ尋ねる（追跡は行から始まる）ので、行の無いattemptの答えを受け取る経路は無い。workerの答え（`inspect` の件数、eventなど）に行の無いattemptが現れても、親は行を作らず、leaseも更新せず、そのworkerの他のattemptの処理を止めない。workerの側は、段階3の照合（25.6）が消す。段階3が入るまでは、workerが従来どおり `ack_wait` の7日で結果を消し、行は残る |
 | 遅れて届いた古いsubmitの写し | workerの記録が断る（今は消さないtombstoneとattemptの行、段階3からは重複防止の記録） |
 | 古い版のreaderが開いた、消されたpin | inodeの照合で「無い」になる（25.1の (B)） |
@@ -2161,11 +2219,11 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 - 段4の入力: 読み手は配送・workspaceの準備・retryで、どれも印か「終わっている」で居ない。削除はBの保護（排他、claimを先に、所有するpathだけ、内容の検証）をそのまま使う。
 - 段5のlock: `sources/runs/<run>.lock` は25.1の (A)。
 - 段6の行: 読み手は印で断られている。他のメンバーはこのDBを読まない。
-- 段8のpin: 25.1の (B)。
+- 段8のpin: 25.1の (B)。pinを開けるのは、親DBを開けた版のprocessだけで、その全員がinodeを照合する。readerは作らない。作る側（`result_gc_guard`）は、行があって印が無いときだけ作り、刈り取りと同じdriverの中で重ならずに動く。受理の経路がpinを作るのは、新しいrun IDについてだけである。したがって、unlinkの後に同じpathへfileを作るものは無い。
 
-**受け入れ試験。** (i) 条件を満たしたrunが、表の8段を経て、25.10の「親のstate directory」のrunごとの行をすべて残さない（fileとDBの行を列挙して確かめる）。(ii) 各段の直後でresidentを止め、再起動後のpassが続きを行い、同じ結果になる（段ごとに1つ）。(iii) 外部キーを有効にしたまま、1 transaction 1,000行で、3,000行を超えるrunを消せる。(iv) `run_id` がNULLでattemptを持つeventが残らない。(v) readerが共有pinを持つ間、段3が進まず、readerは最後まで読める。(vi) 刈り取りの途中のどの時点でも、`show`・`ls`・`ci status --post` が `NOT_FOUND` か何も出さない。(vii) 同じsourceを別のrunが参照していれば、manifest・object・bundle・refが残る。(viii) workflow artifactが、producerのattemptの保持期間を過ぎても、runが終わって保持期間が過ぎるまで残る。(ix) workerだけのhostで `removed-members.json` が残り、外したメンバーを断り続ける。(x) retire済みのattemptを持つrunが刈り取られる。(xi) `git gc` が `--prune=now` を使わない。(xii) 刈り取った後、workerがそのrunのattemptをまだ持っている状態で接続しても、親に行ができず、同じworkerの他のattemptの追跡と回収が進む。
+**受け入れ試験。** (i) 条件を満たしたrunが、表の8段を経て、25.10の「親のstate directory」のrunごとの行をすべて残さない（fileとDBの行を列挙して確かめる）。(ii) 各段の直後でresidentを止め、再起動後のpassが続きを行い、同じ結果になる（段ごとに1つ）。(iii) 外部キーを有効にしたまま、1 transaction 1,000行で、3,000行を超えるrunを消せる。(iv) `run_id` がNULLでattemptを持つeventが残らない。(v) readerが共有pinを持つ間、段3が進まず、readerは最後まで読める。(vi) 刈り取りの途中のどの時点でも、`show`・`ls`・`ci status --post` が `NOT_FOUND` か何も出さない。(vii) 同じsourceを別のrunが参照していれば、manifest・object・bundle・refが残る。(viii) workflow artifactが、producerのattemptの保持期間を過ぎても、runが終わって保持期間が過ぎるまで残る。(ix) workerだけのhostで `removed-members.json` が残り、外したメンバーを断り続ける。(x) retire済みのattemptを持つrunが刈り取られる。(xi) `git gc` が `--prune=now` を使わない。(xii) 刈り取った後、workerがそのrunのattemptをまだ持っている状態で接続しても、親に行ができず、同じworkerの他のattemptの追跡と回収が進む。(xiii) 結果のGCのcursorが指すrunを刈り取り、その後の結果のGCのpageを何回動かしても、`reader-pins/<run>.lock` ができない。(xiv) 刈り取ったrunへのcancelと、同じ `request_id` の再送が `NOT_FOUND` で、親DBの行が増えない。(xv) 段階2より前のschemaの版のCLIの `logs`・`outputs` が、DBを開けずに終わり、`reader-pins/` に何も作らない。
 
-**schema。** 親DB: `event_no_delete`・`retire_tombstone_no_delete` を外す。`event(run_id, seq)`、`event(seq) WHERE run_id IS NULL AND attempt_id IS NULL`、`run(source_id)`、`run(secret_bundle_id)` の索引。`control_request.run_id` と索引。`ci_test_timing` に最後に書いた時刻と索引。`sources/retention.db`: `import_session(run_id)` の索引。wireの変更は無い。
+**schema。** 親DB: `retire_tombstone_no_delete` を外す。`event(seq) WHERE run_id IS NULL AND attempt_id IS NULL`、`run(source_id)`、`run(secret_bundle_id)` の索引。`ci_test_timing` に最後に書いた時刻と索引。（`event_no_delete` を外すこと、`event(run_id, seq)`、`control_request.run_id` は段階1。）schemaの版を上げる。`sources/retention.db`: `import_session(run_id)` の索引。wireの変更は無い。
 
 ## 25.6 段階3: workerの側の結果の写しと、重複防止の記録
 
@@ -2187,16 +2245,20 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 | 回収の閉じ方 | 送るもの | 時点 |
 | - | - | - |
 | 成功（`complete`・`required_missing`） | `ack_collected`（既存） | 検証と永続化の後（第13章） |
-| 打ち切り（`gave_up`） | 回収を閉じた時点では何も送らない | 第13章の「打ち切った回収ではACKを送らず、開き直せる」を保つ。workerは `ack_wait` の間、resultを持つ |
-| retireの確認、workerが受理しなかったattempt | 何も送らない | 親が自分でterminationを確定したもの |
-| 上の3つのうち、ACK済みでないattempt | `release_attempt` | runの刈り取りの段7（25.5）。開き直しができなくなる時点である |
+| 打ち切り（`gave_up`） | `release_attempt` | 回収を閉じたtransactionのcommitの直後。打ち切った回収のworkerの写しを、もう一度読む処理が無い（下） |
+| retireの確認、workerが受理しなかったattempt | 閉じた時点では何も送らない | 親が自分でterminationを確定したもの。受理しなかったattemptは、workerに行が無い。retireを確認したattemptは、刈り取りの段7で送る（確認の時点で送れるかは未決。25.16） |
+| 上のうち、ACKも解放も済んでいないattempt | `release_attempt` | runの刈り取りの段7（25.5）と、接続時の照合（下） |
 | 親DBに行の無いattempt | `release_attempt` | 接続時の照合（下） |
 
-**決定: 打ち切りの時点では送らない。** 採らなかった案は「回収を閉じたら、閉じ方に依らずACKを送る」である。これは、(1) 今のworkerがdigestの一致を必須にしていて、digestを持たない打ち切りの親のACKを断り続ける、(2) 照合を外すと第13章の4の検出が無くなる、(3) 打ち切りの直後にworkerが消すと、第13章の開き直しができなくなる。開き直しの保存処理（`reopen_collection`）は実装にあるが、それを呼ぶ経路はまだ無い。経路を足すときも、この規則のままで成り立つ。
+**決定: 打ち切った回収は、打ち切った時点で解放する。** workerの写しを残すのは、それをもう一度読むものが在る間だけである。打ち切った回収を読み直す処理は、開き直しの保存処理（`reopen_collection`。`src/storage/coordinator/collect.rs`）だけで、それを呼ぶ経路は製品に無い（定義だけがある）。読み手が無いので、打ち切りの時点で `release_attempt` を送り、workerはその場で写しを消す。開き直す経路を後から足す変更は、その経路が、workerに写しを残す上限つきの期間（いつまで、何bytesまで、何が消すか）を自分で定める。それまで、打ち切った回収は開き直せない（開き直しても、workerは `NOT_FOUND` と答え、回収は再び打ち切られる。今も `ack_wait` を過ぎれば同じである）。
 
-**接続時の照合。** 親は、workerとの接続を確立するたびに1回、そのworkerに残る自分のattemptのうち、terminalで、ACKも `release_attempt` も受けていないものを、新しい読み取り操作 `list_unreleased` で列挙する。要求は `after`（attempt ID）と `limit`（500まで）を持ち、答えはattempt IDの昇順の1 pageと、続きがあるかである。workerは主キー `(coordinator_id, attempt_id)` で引く。親は、各IDについて自分のDBを主キーで引き、行があれば何もしない（通常の回収が扱う）。**行が無ければ `release_attempt` を送る。**
+`ack_collected` は送らない（採らなかった案「回収を閉じたら、閉じ方に依らずACKを送る」）。打ち切った親はdigestを持たず、今のworkerはdigestの一致を必須にしている。照合を外すと、第13章の4の検出（digestを照合した読み取りの後に保存されたresultを断る）が無くなる。`release_attempt` は別の操作なので、成功した回収のこの検出は変わらない。打ち切った回収では、親は後から保存されたresultを読まないので、検出する相手が無い。resultを持たないterminalのattemptへの `release_attempt` を、supervisorのlockを取れたときだけ受理する規則（上）は残す。
 
-行が無いことは、「この親はそのattemptをもう送らない」の証明である: 親は、submitを送る前に必ずattemptの行を作り、行を消すのは刈り取りだけで、attempt IDは使い回さない。試用のrollbackは行を戻すが、試用中のcoordinatorは刈り取りも `release_attempt` も行わない（25.1の8）。
+**`ack_wait` の7日。** 段階3の後、7日が効くのは、親がACKも `release_attempt` も送れなかったattemptだけである: 親が7日のあいだ接続しなかったもの、親がまだ回収を閉じていないもの（待ち続けている回収、`observation` がunknownのもの）、retireを確認したもの。成功した回収と打ち切った回収の写しは、閉じた時点で消える。
+
+**接続時の照合。** 親は、workerとの接続を確立するたびに1回、そのworkerに残る自分のattemptのうち、terminalで、ACKも `release_attempt` も受けていないものを、新しい読み取り操作 `list_unreleased` で列挙する。要求は `after`（attempt ID）と `limit`（500まで）を持ち、答えはattempt IDの昇順の1 pageと、続きがあるかである。workerは主キー `(coordinator_id, attempt_id)` で引く。親は、各IDについて自分のDBを主キーで引く。**行が無ければ `release_attempt` を送る。行があり、回収が `gave_up` で閉じていれば、`release_attempt` を送る**（打ち切りの時点で送った解放が届かなかった分を拾う。親は、解放が受理されたことを記録しない。workerが列挙しなくなることが、受理の記録である）。それ以外の行があれば何もしない（通常の回収が扱う）。
+
+行が無いことは、「この親はそのattemptをもう送らない」の証明である: 親は、submitを送る前に必ずattemptの行を作り、行を消すのは刈り取りだけで、attempt IDは使い回さない。回収が閉じていることは、attemptがterminalであることを含むので、同じ証明になる（下の (c)）。試用のrollbackは行を戻すが、試用中のcoordinatorは刈り取りも `release_attempt` も行わない（25.1の8）。
 
 `list_attempts` は使わない（該当が500件を超えると `INVALID_INPUT` を返し、page送りが無いので、溜まった後は列挙できない）。
 
@@ -2205,39 +2267,82 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 | 時点 | 消すもの | 証明 |
 | - | - | - |
 | attemptがterminalになった | workspace（fast-worktreeの削除とportoolの解放。22.5）、置いたsecret fileとその索引、`ci/` のscratch、`tmp/`（既存） | terminalの記録と、supervisorのlockを取れたこと |
-| `ack_collected` か `release_attempt` を受理した | `attempts/<attempt>/`（result・log・artifact）と、`worker_attempt` の行、その子（`command_launch`・`lease`・`log_spool`・`blob_ref`）、そのattemptのevent。同じtransactionで、**解放済み**の重複防止の記録を1行書く（既に未解放の記録になっていれば、解放済みに変える）。待たずにその場で消す | 親がもう読まないと述べたこと。回収の後にworkerの写しを読む処理は無い |
-| 同じ時点の後 | `supervisors/<attempt>.lock` | 下 |
-| ACKも `release_attempt` も来ないままterminalから7日（`ack_wait`） | 上と同じもの。同じtransactionで、**未解放**の重複防止の記録を1行書く | 回収に来る親が7日居なかったこと（既存）。行の残りの読み手は遅れたsubmitの照合と `get_attempt` だけで、記録が答える |
+| `ack_collected` か `release_attempt` を受理した | `worker_attempt` の行、その子（`command_launch`・`lease`・`log_spool`・`blob_ref`）、そのattemptのevent、受理したattemptのtombstone。同じtransactionで、**解放済み**の重複防止の記録を1行書き（既に未解放の記録になっていれば、解放済みに変える）、attempt IDを `dropped_attempt` に書く。commitの直後に、`attempts/<attempt>/`（result・log・artifact・`supervise.json`）を消し、次に `supervisors/<attempt>.lock` を消し（下）、最後に `dropped_attempt` の行を消す。待たずにその場で行う | 親がもう読まないと述べたこと。回収の後にworkerの写しを読む処理は無い |
+| ACKも `release_attempt` も来ないままterminalから7日（`ack_wait`） | 上と同じもの。同じtransactionで、**未解放**の重複防止の記録を1行書く。対象は行で選ぶ（directoryが既に無い、段階3より前の行も含む） | 回収に来る親が7日居なかったこと（既存）。行の残りの読み手は遅れたsubmitの照合と `get_attempt` だけで、記録が答える |
 
 ACKの後に7日残していた規則はやめる。回収が済んだ結果を読むのは親の写しだけである。
 
-**`supervisors/<attempt>.lock` を消す条件（25.1の (A)）。** 開く経路は3つで、すべてが閉じていることを確かめる。(1) そのattemptのsupervisor: agentがlockを取れたので居ない。attemptはterminalで、IDは使い回さないので、後から起動するsupervisorは無い。(2) agent: 行を消した後は、このlockを引く理由が無い。確かめるだけの呼び出し（ACK、`workers stop` の集計、復旧）は、worker DBのterminalでないattemptについてだけlockを開くように改める。(3) task-traffic-controllerの台帳の照合（`src/config/traffic.rs`）: 台帳にそのattemptを名指すentryが無いことを確かめる。entryが残っていれば、lockは消さずに次のtickに回す。agentは、lockを取ったままunlinkしてから手放す。
+**消す順序と、途中で落ちたとき。** 順序は「行（と記録、`dropped_attempt`）のcommit → `attempts/<attempt>/` → `supervisors/<attempt>.lock` → `dropped_attempt` の行」である。`dropped_attempt` は既存の表で、起動時の既存の片付け（`remove_dropped_attempts`）が、残っている行のattemptについて同じ順序の続きを行う。したがって、どこで落ちても、directoryとlockは次の起動で消える。
 
-`SupervisorLock::try_acquire` は、確かめるだけの呼び出しでもfileを作る。段階3で、作る取得（supervisorの起動: `src/supervisor/process.rs`）と、作らない取得（それ以外: `src/worker/agent.rs` の4か所、`src/config/traffic.rs`）に分ける。作らない取得は、fileが無ければ「supervisorは居ない」と答える。setup builderのlock（`src/setup/builder.rs`）は別のdirectoryで、builderと一緒に消えるので変えない。
+**`supervisors/<attempt>.lock` を消す条件（25.1の (A)）。** このpathを開く処理は、次のものがすべてである。
+
+| 開く処理 | 場所 | 開く条件 | unlinkの後に開かない理由 |
+| - | - | - | - |
+| supervisorの起動（fileを作る） | `src/supervisor/process.rs` | agentがそのattemptのsupervisorを起動したとき | attemptの行が無い。attempt IDは使い回さない。agentがlockを取れたので、起動済みのsupervisorも居ない |
+| agentの `drive` | `src/worker/agent.rs` | terminalでないattemptを進めるとき | 行が無い |
+| agentの `settling`（`workers stop` の集計） | 同上 | terminalでないattemptを数えるとき | 同上。今は `supervisors/` の全部を見ているので、worker DBのterminalでないattemptだけを見るように改める |
+| agentの `ack`（resultの無いattemptのACK・解放） | 同上 | 行のあるattemptの要求を処理するとき | 行が無ければ、lockを開く前に記録が答える |
+| agentの `remove_dropped_attempts` | 同上 | `dropped_attempt` に行があるとき | unlinkを行うのがこの処理である。lockを取ったままunlinkしてから手放す |
+| agentの `settle`（復旧） | 同上 | 起動時に、terminalでないattemptについて | 行が無い |
+| 別のscopeで動くsupervisorの照合 `config::traffic::foreign_supervisors` | `src/config/traffic.rs` | `attempts/*/supervise.json` と `setup/builders/*/spec.json` を読み、scopeが違うものについてlockを取る。台帳は読まない | `attempts/<attempt>/` を、unlinkより先に消してある。`supervise.json` が無ければ、そのattemptのlockを開かない |
+
+最後の行の照合を呼ぶのは、`config::traffic::hold` で、呼び出し元は3つある: workerの起動（`src/service/worker.rs`。`agent.lock` を取った後）、residentの起動（`src/service/resident.rs`。**`agent.lock` を取る前**。`agent.lock` は、その後のagentの開始の中で取る）、`ResolvedConfig::worker_runtime`（`src/config/runtime.rs`。両方の起動から呼ばれる）。したがって、この照合は `agent.lock` で守られているとは言えず、動いているagentの削除と同時に走り得る。次の2つを規則とする。
+
+- **directoryが先、lockが後。** 上の順序のとおり、`attempts/<attempt>/` を消してからlockをunlinkする。照合が `supervise.json` を読めるのは、unlinkより前だけである。
+- **照合は、fileを作らずに取る。** `SupervisorLock::try_acquire` は、確かめるだけの呼び出しでもfileを作る。段階3で、作る取得（supervisorの起動だけ）と、作らない取得（agentの5か所と `foreign_supervisors`）に分ける。作らない取得は、fileが無ければ「supervisorは居ない」と答える。これで、`supervise.json` を読んだ直後にdirectoryとlockが消えても、照合はlockを作り直さない。setup builderのlock（`src/setup/builder.rs`。builderのdirectoryの中）は、builderと一緒に消えるので変えない。
+
+段階3より前の版の `hold` は、作る取得のままである。その版のresidentかworkerが、段階3のagentの削除と同時に起動の途中にあり、`supervise.json` を読んだ後・directoryが消えた後にlockを取ると、空のlock fileが1個できる。害は無い（そのattemptのsupervisorは二度と起動されず、fileの有無を「supervisorが居る」と読む処理は無い）。残ったfileは、次のagentの起動時の走査（25.11）が、行が無いことを見て消す。
 
 **全走査をやめる。** 「まだ動いているsupervisorの数」は、`supervisors/` を読まず、worker DBのterminalでないattemptのlockだけを直接のpathで調べる。
 
 ### (c) 重複防止の記録
 
-第11章の「古いsubmitを新規実行する状態に戻さない」ために、消したattemptごとに小さい記録だけを残す: `coordinator_id`、`attempt_id`、`payload_hash`、`coordinator_epoch`、終わり方の種類、解放済みかどうか、時刻（1件約200 bytes）。cancel・retireのtombstoneのうち、attemptを受理していたもの（`delivered = 1`）は、この記録に置き換える。submitの「新規かどうか」の判定（`src/worker/agent.rs` の `fresh`）は、attemptの行、tombstone、この記録のどれも無いことにする。
+第11章の「古いsubmitを新規実行する状態に戻さない」ために、消したattemptごとに小さい記録だけを残す: `coordinator_id`、`attempt_id`、`payload_hash`、`coordinator_epoch`、終わり方の種類、解放済みかどうか、時刻（1件約200 bytes）。cancel・retireのtombstoneのうち、attemptを受理していたもの（`delivered = 1`）は、この記録に置き換える。submitの「新規かどうか」の判定（`src/worker/agent.rs` の `fresh`）は、attemptの行、tombstone、この記録のどれも無いことにする。**この判定と、attemptの行の挿入は、worker DBの1つの書き込みtransactionで行う。** 今の実装は、判定をprocessの中のlock（`submitting`）の下で行い、挿入はその後の別のtransaction（`submit_within`）で行う。解放の受理（行を消して記録を書く）と、記録の削除は、それぞれ1つの書き込みtransactionなので、判定と挿入を同じtransactionに入れれば、SQLiteの書き込みの直列化だけで「判定の後、挿入の前に記録が消える」ことが無くなる。
 
 - **読み手**: 遅れて届いたsubmitの写し（同じ `attempt_id` を、`RETIRED` または既存の終わり方で答える）と、親の `get_attempt`（終わり方の語だけを答える。resultは「期限切れ」）。
-- **解放済みの記録を消す時点**: その解放（ACKか `release_attempt`）を受けた時点で開いていた、そのメンバーの接続が、すべて閉じたとき。
+- **解放済みの記録を消す時点**: その解放（ACKか `release_attempt`）より前に、そのメンバーの接続から読まれ得たsubmitが、すべて処理を終えたとき（下の「解放済みの記録を消してよい条件」）。通常は、解放の受理から数ミリ秒の後である。接続が閉じるのを待たない。
 - **未解放の記録**（`ack_wait` を過ぎたattemptのもの）: 親が `release_attempt` を送るまで消さない。親はそのattemptを未確定として持っている可能性があり、送り直し得る。`release_attempt` を受けたら解放済みに変え、上の規則で消える。`list_unreleased` は、terminalで未解放のattemptの行と、未解放の記録の両方を列挙する。
-- **上限**: メンバーごとに10,000件（解放済みと未解放の合計。約2 MB。届かなかったtombstoneの上限と同じ値）。上限に達したメンバーからの新しいsubmitは、`OVERLOADED`（`overloaded_reason.reason = "attempt_records"`）で断る。他のメンバーのsubmitには影響しない。この答えを受けた親は、そのworkerについて照合（`list_unreleased`）を行い、そのworkerへの接続を閉じてつなぎ直す。これで、行の無いattemptの記録が解放され、解放済みの記録が消える条件が成り立つ。それでも上限のままなら、残りは、親がまだ行を持つattempt（刈り取り前のrunのもの）の未解放の記録であり、そのrunが刈り取られるまで断りが続く（親の保持期間の中の、そのworkerで回収できなかったattemptが10,000件を超えた状態である）。上限は、1本の接続を長く保ったまま多数のattemptを流す親と、回収しない親が、記録を際限なく増やさないための歯止めである。
+- **上限**: メンバーごとに10,000件（解放済みと未解放の合計。約2 MB。届かなかったtombstoneの上限と同じ値）。上限に達したメンバーからの新しいsubmitは、`OVERLOADED`（`overloaded_reason.reason = "attempt_records"`）で断る。他のメンバーのsubmitには影響しない。この答えを受けた親は、そのworkerについて照合（`list_unreleased`）を行う。
+- **上限が受け持つもの。** 解放済みの記録は、下の条件で、解放の直後に消える。同時に在る解放済みの記録は、「処理の途中のsubmitが在る間に受理した解放の数」で、submitの処理は1件が1つのtransactionと検査だけであり、同時に動く要求はagent全体で64（`MAX_CONCURRENT_REQUESTS`）なので、通常は0か数件である。1本の接続を長く保つ親でも、記録は溜まらない。したがって、上限に届くのは未解放の記録だけで、それは「このメンバーが、7日のあいだACKも解放も送らず、今も行を持っているattempt」（回収を閉じていないもの、unknownのもの、retireを確認したもの）が10,000件を超えた状態である。この数を実装から導く上限は無い（worker 1台が7日に終えるattemptの数は、利用者の使い方で決まる）ので、歯止めとして10,000件を置く。値は、届かなかったtombstoneの上限に合わせた。断りは日常の経路ではなく、回収しない親の異常の表示である。
 - **戻らないメンバー**: `belt group forget`（下）を実行しないまま居なくなったメンバーの記録は、上限（10,000件、約2 MB）までで止まり、それ以上は増えない（新しいsubmitが来ない）。消すのは `belt group forget` である。メンバーの数は利用者の操作で決まる。
 
-**「接続が閉じた」が証明になる理由。** submitの写しが存在し得る場所は、親のprocessと、接続の中だけである。
+**解放済みの記録を消してよい条件。** workerは、接続から要求を順に取り出し、取り出した要求を、別々の処理として同時に動かす（`src/worker/serve.rs`。取り出しは接続ごとに順番、処理はagent全体で64まで同時で、終わる順は取り出した順と限らない。接続が終わっても、取り出し済みの要求の処理は最後まで動く）。したがって、「接続が閉じた」は「その接続から読んだsubmitの処理が終わった」を意味しない。条件は、接続ではなく、要求の処理で書く。
+
+workerは、接続ごとに、取り出したsubmitへ通し番号を付け、処理の途中のsubmitの番号の集合をメモリに持つ。接続が**済んだ**とは、その接続からもう何も取り出さず（接続が終わり、取り出しの口を捨てた）、取り出したsubmitの処理がすべて終わったことである。
+
+接続Cで受けた解放（Cがそれまでに取り出したsubmitの数をrとする）の記録は、次の2つが成り立った時点で消す。
+
+1. Cで、解放より前に取り出したsubmit（番号がr以下）の処理が、すべて終わった。
+2. 解放を受けた時点で開いていた、同じメンバーの他の接続が、すべて済んだ。
+
+確かめるのは、submitの処理が1つ終わったときと、接続が1つ済んだときである（その出来事が条件を満たした記録だけを、主キーで消す）。この表は永続しない。agentが再起動した時点で、接続も処理の途中の要求も無いので、起動時に、接続を受け付ける前に、解放済みの記録を全部消す（1 transaction 1,000行まで）。
+
+**これが証明になる理由。** submitの写しが存在し得る場所は、親のprocessと、接続の中と、workerが取り出して処理している途中だけである。
 
 - 親は、submitを、その時点でそのworkerに付いている接続にだけ書く（`Coordinator` は、送る直前に、尋ねた接続が今も付いているものと同じかを確かめる）。接続が切れた呼び出しは答えなしで終わり、別の接続へ自動では送り直されない。
 - 親は、attemptのterminalを記録した後、そのattemptのsubmitを送らない。ACKと `release_attempt` は、terminalの記録か行の不在の後にだけ送る。**規則として**: 親は、あるattemptのsubmitの呼び出しが答えを待っている間、そのattemptのACK・`release_attempt` を送らない。
-- したがって、workerが解放を受けた時点より後に、そのattemptのsubmitが新しく書かれることは無い。その時点で既に書かれていた写しは、その時点で開いていたそのメンバーの接続のどれかの中にある（親が見限った接続で、workerがまだ読み終えていないものを含む）。それらがすべて閉じれば、写しは残っていない。
-- 新しい接続は、親の新しい `hello` から始まる。SSHの中継は、切れた接続のbytesを別の接続へ送り直さない（今の中継に、つなぎ直して送り直す処理は無い。**規則として**、足さない）。
-- submitを書くのは、residentの `Coordinator` だけである。同じメンバーの名義で接続する他のprocess（`doctor`・`workers`・`group` の確認の接続）はsubmitを書かない。workerは、それらの接続も同じメンバーの接続として数える（記録を消すのが遅れるだけで、早くはならない）。親が再起動するとepochが進み、古いepochの写しは `STALE_EPOCH` で断られる。
+- したがって、親が解放を書いた時点で、そのattemptのsubmitの呼び出しは、どれも終わっている。終わり方は2つである。答えを受け取った（workerは処理を終えている）。接続が切れて答えなしで終わった（写しは、親が既に見限った接続の中に残り得る）。
+- **解放と同じ接続Cの中の写し。** submit・`ack_collected`・`release_attempt` は、どれも同じ種類（control）の要求で、1本の接続の中では、親が書いた順にworkerが取り出す（`src/protocol/` の送る側と受ける側のqueueは、種類ごとに先入れ先出しである。**規則として**、`release_attempt` はcontrolの種類とし、この順序を保つ）。親は解放の後に同じattemptのsubmitを書かないので、Cの中の写しは、解放より前に取り出されている（番号がr以下）。条件1は、その処理が終わるのを待つ。処理は、記録を見て、実行せずに答える。
+- **他の接続の中の写し。** 親が見限った接続である。親は自分の側を閉じているので、workerは残りを読み終えると接続の終わりを見る。条件2は、その接続から取り出したsubmitの処理が終わるのを待つ。同じメンバーの名義で接続する他のprocess（`doctor`・`workers`・`group` の確認の接続）はsubmitを書かないが、workerはそれを知らないので、同じく数える（記録を消すのが遅れるだけで、早くはならない）。これらは1回の問い合わせで閉じる接続である。
+- 新しい接続は、親の新しい `hello` から始まる。SSHの中継は、切れた接続のbytesを別の接続へ送り直さない（今の中継に、つなぎ直して送り直す処理は無い。**規則として**、足さない）。解放より後に開いた接続に、解放より前のsubmitの写しは入らない。
+- submitを書くのは、residentの `Coordinator` だけである。親が再起動するとepochが進み、古いepochの写しは `STALE_EPOCH` で断られる。
+- 記録が在る間に処理されたsubmitは、判定と挿入が1つのtransactionなので、必ず記録を見る。記録を消すtransactionは、上の2つの条件が成り立った後にだけ始まる。その後に同じattemptのsubmitを取り出す接続は無い。
 
-workerは、メンバーごとに、開いている接続の通し番号をメモリに持つ。解放を受けたとき、記録に「今開いている接続の最大の番号」を付け、その番号以下の接続がすべて閉じたら記録を消す。この表は永続しない。agentが再起動した時点で、すべての接続は閉じているので、起動時に解放済みの記録を全部消す（1 transaction 1,000行まで）。
+**残る遅れ。** 条件2は、解放の時点で、同じメンバーの長く開いたままの接続がもう1本ある場合に、その接続が終わるまで待つ。residentがworker 1台へ持つ接続は1本で（`src/config/runtime.rs` の `attach_worker_link`）、他は1回の問い合わせで閉じるので、通常は起きない。起きた場合、記録は上限までで止まり、その接続が終わった時点でまとめて消える。
 
-時間だけで消す規則は採らない（接続の中に残った写しが届かないことを、時間では証明できない）。メンバーのepochの前進も、解放済みの記録を消す条件には使わない（接続の規則で足りる）。届かなかったattemptのtombstone（24.4）は、従来どおりepochの前進で消す。
+時間だけで消す規則は採らない（接続の中に残った写しが届かないことを、時間では証明できない）。メンバーのepochの前進も、解放済みの記録を消す条件には使わない（上の規則で足りる）。届かなかったattemptのtombstone（24.4）は、従来どおりepochの前進で消す。
+
+### (c2) 段階3より前に作られた行
+
+**今の挙動。** 段階3より前のworkerは、`ack_collected` を受理しても `worker_attempt` の行を消さない（`acked_at_ms` を書くだけ）。directoryは7日後に消える。段階3の規則は「ACKの受理の時点で消す」なので、既に受理した行にはその出来事が二度と来ない。`list_unreleased` はACK済みの行を列挙しないので、照合も拾わない。何もしなければ、段階3より前にACKされた行は永久に残る。
+
+**規則。** 段階3のagentは、起動時に、接続を受け付ける前に、`acked_at_ms` を持つterminalの行を、(b) の「ACKを受理した」と同じ手順で消す（行と子とevent、受理したattemptのtombstone、`dropped_attempt` 経由のdirectoryとlock）。1 transaction 1,000行までで、起動時に終わらなかった残りは、tickが同じ手順で続ける。**重複防止の記録は書かない。**
+
+- **記録が要らない理由。** その行は、親が送った `ack_collected` をworkerが受理したものである。親は、ACKを送る前にattemptのterminalを記録しており、terminalの後はsubmitを送らない。起動時には接続が無く、処理の途中の要求も無いので、「解放済みの記録を消してよい条件」は最初から成り立っている（書いても、その場で消える記録である）。tickが続きを行う時点では接続が在るが、その接続は起動の後に開いたもので、ACKより前のsubmitの写しを含まない。
+- **ACKの答えを失った親。** 親がACKの受理を記録していない場合、親はACKを送り直し、行を消したworkerは `NOT_FOUND` と答え、親は回収を閉じる（第13章の5。既存の規則）。
+- **試用中は行わない。** この削除は、試用中（24.8）は行わない（25.1の8。rollbackはworker DBを戻すが、消したdirectoryは戻せない）。schemaの変更（表を足し、triggerを外す）だけを試用の中で行い、削除はcommitの後の最初の起動かtickから始める。
+- **ACKされていない、段階3より前の行。** terminalから7日を過ぎた行は、directoryが既に無くても行が残っている。(b) の `ack_wait` の規則は行で選ぶので、最初のtickが、行を消して未解放の記録に変える。7日以内の行は、通常の規則（ACK、`release_attempt`、`ack_wait`）で消える。
+- **受理したattemptのtombstone（`delivered = 1`）。** 段階3より前は、行と一緒に残っている。行を消す処理が、同じtransactionで消す（上のとおり、記録に置き換える必要が無い）。行の無い、受理したattemptのtombstoneは、段階3より前の版では作られない。
 
 ### (d) メンバーを忘れる
 
@@ -2258,11 +2363,11 @@ workerは、メンバーごとに、開いている接続の通し番号をメ�
 
 attemptに属さないworkerのevent（起動、identity、GCの記録）は、`retention_days` 日で、`seq` の小さい順に、1 tickで1,000行まで消す。読み手は親の `watch_events` と診断である。attemptのeventは、(b) でattemptと一緒に消す。
 
-**安全の証明（段階3の全体）。** 結果の写しを読むのは、submitしたメンバーの回収だけで、そのメンバーが「もう読まない」と述べた後に消す。attemptの行を読むのは、そのメンバーの `get_attempt`・`get_result`・`watch_events` と、遅れたsubmitの照合で、前の3つは解放の後には来ず、最後のものは重複防止の記録が答える。記録を消した後に同じattemptのsubmitが届く経路は、(c) と (d) で閉じている。
+**安全の証明（段階3の全体）。** 結果の写しを読むのは、submitしたメンバーの回収だけで、そのメンバーが「もう読まない」と述べた後に消す（成功した回収はACK、打ち切った回収は閉じた時点の解放、刈り取ったrunは行の不在）。attemptの行を読むのは、そのメンバーの `get_attempt`・`get_result`・`watch_events` と、遅れたsubmitの照合で、前の3つは解放の後には来ず、最後のものは重複防止の記録が答える。記録を消した後に同じattemptのsubmitが届く経路は、(c) と (d) で閉じている。
 
-**受け入れ試験。** (i) `ack_collected` の受理の直後に、attemptのdirectory・行・子の行・eventが無く、記録が1行ある。(ii) `ack_collected` のdigestの不一致と、読み取りの後のresultの保存は、今までどおり断られる。(iii) 打ち切った回収のattemptは、runの刈り取りまでworkerに残り、刈り取りで `release_attempt` が届いて消える。(iv) 刈り取りのときにworkerが不在でも、次の接続の照合で消える。親DBに行のあるattemptには `release_attempt` を送らない。(v) 600件を超える未解放のattemptを、`list_unreleased` がpageで列挙できる。(vi) 解放の後、同じ接続で届いた同じattemptのsubmitの写しは実行されない。接続をすべて閉じた後に記録が消える。(vii) 別の接続に残した写し（解放の時点で開いていた接続）が、解放の後に読まれても実行されない。(viii) agentの再起動で、解放済みの記録が消え、未解放の記録は残る。`ack_wait` を過ぎたattemptは、行が無く未解放の記録があり、遅れたsubmitが実行されず、`release_attempt` で消える。(ix) 10,000件で `attempt_records` の断りが出て、他のメンバーは断られず、親がつなぎ直すと受理に戻る。(x) `belt group forget` の後、同じ `coordinator_id` の接続が `member_forgotten` で断られ、送り直されたsubmitが実行されない。terminalでないattemptがあれば命令が断られる。(xi) `workers forget <worker>` の挙動が変わらない。(xii) 機能を合意していない相手には `release_attempt` も `list_unreleased` も送らず、今の挙動になる。(xiii) lockを確かめるだけの呼び出しが、消したlock fileを作り直さない。台帳がattemptを名指す間はlockが残る。
+**受け入れ試験。** (i) `ack_collected` の受理の直後に、attemptのdirectory・行・子の行・eventが無く、記録が1行ある。(ii) `ack_collected` のdigestの不一致と、読み取りの後のresultの保存は、今までどおり断られる。(iii) 回収を打ち切った直後に `release_attempt` が届き、workerのdirectory・行が消える。届かなかった場合（workerが不在）、次の接続の照合が、行があって `gave_up` で閉じた回収として拾い、消える。(iv) 刈り取りのときにworkerが不在でも、次の接続の照合で消える。親DBに行があり、回収が閉じていないattemptには `release_attempt` を送らない。(v) 600件を超える未解放のattemptを、`list_unreleased` がpageで列挙できる。(vi) 解放より前に取り出されて処理を待っているsubmitの写し（処理を止める点を差し込む）は、解放の受理の後に処理されても実行されず、その処理が終わった時点で記録が消える。接続は開いたままである。(vii) 別の接続に残した写し（解放の時点で開いていた接続）が、解放の後に読まれても実行されず、その接続が済むまで記録が残る。接続が終わっても、取り出し済みのsubmitの処理が終わるまで記録が残る。(viii) agentの再起動で、解放済みの記録が消え、未解放の記録は残る。`ack_wait` を過ぎたattemptは、行が無く未解放の記録があり、遅れたsubmitが実行されず、`release_attempt` で消える。(ix) 1本の接続を保ったまま、10,000件を超えるattemptを順に実行・回収しても、解放済みの記録が溜まらず、`attempt_records` の断りが出ない。未解放の記録が10,000件に達したときだけ断りが出て、他のメンバーは断られない。(xiv) submitの判定と挿入の間に解放と記録の削除を差し込めない（判定と挿入が1つのtransactionである）。(xv) 段階3より前にACKされた行を持つworker DBで起動すると、接続を受け付ける前に、その行・directory・lockが消え、記録は増えない。1,000行を超える分はtickが続ける。試用中は消えない。段階3より前の、7日を過ぎたACKの無い行は、最初のtickで未解放の記録に変わる。(xvi) 親が、同じattemptのsubmitの答えを待っている間、ACKも `release_attempt` も送らない。(x) `belt group forget` の後、同じ `coordinator_id` の接続が `member_forgotten` で断られ、送り直されたsubmitが実行されない。terminalでないattemptがあれば命令が断られる。(xi) `workers forget <worker>` の挙動が変わらない。(xii) 機能を合意していない相手には `release_attempt` も `list_unreleased` も送らず、今の挙動になる。(xiii) lockを確かめるだけの呼び出し（agentの5か所と `foreign_supervisors`）が、消したlock fileを作り直さない。`attempts/<attempt>/` がlockより先に消える。directoryを消した直後・lockを消した直後に落ちても、次の起動が `dropped_attempt` から続きを行う。residentの起動の `hold` を、agentの削除と競わせても、lock fileが残らない。
 
-**schema・wire。** worker DB: 重複防止の記録の表、`refused_member`、`event_no_delete`（worker DB）と `tombstone_no_delete` を外す。wire: 機能 `attempt_release_v1`、操作 `release_attempt`・`list_unreleased`、`overloaded_reason.reason = "attempt_records"`、断る理由 `member_forgotten`。CLI: `belt group forget <member>`。親: submitとACK・`release_attempt` の間の排他、接続時の照合。
+**schema・wire。** worker DB: 重複防止の記録の表、`refused_member`、`event_no_delete`（worker DB）と `tombstone_no_delete` を外す。submitの判定と挿入を1つのtransactionにする。段階3より前の行の変換（(c2)）。wire: 機能 `attempt_release_v1`、操作 `release_attempt`・`list_unreleased`、`overloaded_reason.reason = "attempt_records"`、断る理由 `member_forgotten`。CLI: `belt group forget <member>`。親: submitとACK・`release_attempt` の間の排他、接続時の照合。
 
 ## 25.7 段階4: 古いbinaryと、toolchainのroot
 
@@ -2307,15 +2412,20 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 - **削除。** 1つのtransactionで、参照が無いことと下の条件を確かめ、状態を `evicting` にする（これがclaimである）。その後、`install.lock` を取り、22.2の手順（`toolchains` の中のtrashへrenameしてから消す）で消し、最後に行を消す。`evicting` の行は、起動時に続きを行う。
 - **対象。** 参照が無く、14日使われなかったroot。合計が20 GiBを超えたら、参照の無いものを、最後に使った時刻の古い順に消す（数値はsetup templateと同じ。読み手はどちらも「次の実行を速くするcache」）。
 - **template。** rootの上で作ったtemplateは、そのrootを参照する。rootを消すためにtemplateを消すことはしない。templateが自分の規則（20 GiB、14日、run scopeは1時間、copy中とpinの保護）で消えた後に、rootが対象になる。
-- **古い版のbuilder。** 参照を記録しない版のbuilderが動いている間は、どのrootも消さない: `setup/builders/` に、参照の表に無いbuilderのdirectoryがあり、そのlockを取れなければ、削除のpassを丸ごと見送る。
+- **古い版のbuilder。** 参照を記録しない版のbuilderが動いている間は、どのrootも消さない: `setup/builders/` に、参照の表に無いbuilderのdirectoryがあり、そのlockを取れないか、そのbuilderが起動したhelperが残っていれば（下）、削除のpassを丸ごと見送る。
+- **段階4より前に導入されたroot。** 段階4より前のrootには、表の行が無い。行が無いままでは、削除の対象にならず（永久に残る）、bindは「行が無いのでrootは無い」として、receiptのある既存のdirectoryへ導入をやり直す。したがって、段階4のmigrationの後の最初の起動で、agentが `agent.lock` の下で、`toolchains/` を1回だけ読み、`receipt.json` のあるdirectoryごとに `live` の行を作る（最後に使った時刻は、その起動の時刻。bytesは、削除のpassが初めて必要としたときに測る）。`receipt.json` の無いdirectory（導入の途中で止まったもの）には行を作らない。それは、次にそのrootへ導入するbuilderが、`install.lock` の下で片付ける（既存）。行を作り終えるまで、bindと削除を始めない。
 
-**`install.lock`（25.1の (A)）。** 開く経路は2つである。(1) そのrootへ導入するsetup builder（導入の入口 `adapters::install_admitted` を呼ぶのは `src/setup/builder.rs` と `src/setup/builder/probe.rs` だけで、CLIは呼ばない）。(2) workerの起動時のtrashの片付け（`adapters::sweep_trash`。agentが `agent.lock` の下で行う）。削除の時点で、参照の表にbuilderが無く、古い版のbuilderも居ない（上）。削除を行うのは今のagentで、(2) と同時には動かない。したがって、開くprocessは残っていない。lockはrootと一緒に消える。
+**`install.lock`（25.1の (A)）。** 開く経路は3つである。(1) そのrootへ導入するsetup builder（導入の入口 `adapters::install_admitted` を呼ぶ `src/setup/builder.rs` と `src/setup/builder/probe.rs`）。(2) builderが起動する導入のhelper process（`src/toolchain/preparation.rs` の `helper_main`。builderがnodeとして起動し（`src/setup/builder.rs`）、helperが `install_admitted` を呼ぶ。CLIは呼ばない）。(3) workerの起動時のtrashの片付け（`adapters::sweep_trash`。agentが `agent.lock` の下で行う）。
+
+helperは、builderの子として、自分のprocess groupとsessionの先頭で起動される（`preparation.rs` の照合が、`pgid` と `sid` がhelperのpidに等しいことを求めている）。builderがSIGKILLで終わると、builderのlockは空くが、helperは残り得る。したがって、「builderのlockを取れた」は、helperが居ないことの証明にならない。**builderの参照を外してよいのは、builderのlockを取れ、かつ、そのbuilderが起動したhelperのprocess groupにprocessが残っていないときである。** helperのpidと開始identityは、builderのdirectoryの起動の記録から読む。groupが残っていれば、参照は残し、次のtickで確かめ直す。この確認は新しい要求である（今のbuilderの片付けが、helperのgroupの終了まで確かめているかは、コードから確認できていない。段階4の実装が確かめ、無ければ足す）。
+
+削除の時点で、参照の表にbuilderが無く（したがって、そのhelperのgroupも無い）、古い版のbuilderとそのhelperも居ない（上）。削除を行うのは今のagentで、(3) と同時には動かない。したがって、開くprocessは残っていない。lockはrootと一緒に消える。
 
 **安全の証明。** rootを読む・書くのは、bindしたattempt、builder、ウォームアップ、templateの適用である。どれも参照を持つ。参照を足すtransactionと、claimを書くtransactionは、同じDBの書き込みとして直列になるので、「参照なしを確かめてからrenameするまでの間にbindされる」ことは無い: bindが先なら参照があり、claimが先ならbindは `evicting` を見る。
 
-**受け入れ試験。** (i) 既存のrootをbindするattemptと削除を競わせ、「bindが成功してrootが残る」か「bindが導入へ進む」のどちらかになる（PATHの先が消えた状態で実行されない）。(ii) terminalでないattempt、動いているbuilder、進行中のウォームアップ、残っているtemplateが参照するrootは消えない。(iii) `evicting` の途中で落ちても、起動時に続きが行われる。(iv) 古い版のbuilderのdirectoryとlockがある間、削除が見送られる。(v) 14日と20 GiBの両方の条件。
+**受け入れ試験。** (i) 既存のrootをbindするattemptと削除を競わせ、「bindが成功してrootが残る」か「bindが導入へ進む」のどちらかになる（PATHの先が消えた状態で実行されない）。(ii) terminalでないattempt、動いているbuilder、進行中のウォームアップ、残っているtemplateが参照するrootは消えない。(iii) `evicting` の途中で落ちても、起動時に続きが行われる。(iv) 古い版のbuilderのdirectoryとlockがある間、削除が見送られる。(v) 14日と20 GiBの両方の条件。(vi) builderをSIGKILLし、helperが生きている間、builderの参照が残り、rootが消えない。helperのgroupが無くなった後のtickで参照が外れる。(vii) 段階4より前に導入したroot（表に行が無く、`receipt.json` がある）が、最初の起動で `live` の行を得て、bindが導入をやり直さず、14日使われなければ消える。`receipt.json` の無いdirectoryには行ができない。
 
-**schema・wire。** worker DB: rootの表と参照の表。wireの変更は無い。
+**schema・wire。** worker DB: rootの表と参照の表。最初の起動での、既存のrootの行の作成。wireの変更は無い。
 
 ## 25.8 段階5: workerが受け取ったsourceとclone
 
