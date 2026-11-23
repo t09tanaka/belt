@@ -40,7 +40,7 @@ serde_json = "1"
 sha2 = "0.10"
 # The ledger is shared with the CLI of the same user: stay on the minor
 # whose ledger format this library reads and writes.
-task-traffic-controller = "~0.10.6"
+task-traffic-controller = "~0.11.0"
 tempfile = "3"
 tar = { version = "0.4", default-features = false }
 thiserror = "2"
