@@ -4,7 +4,25 @@ Run CI and development commands on one machine or share work with other members 
 
 Status: in development. The specification (Japanese) is in [docs/spec.md](docs/spec.md), with progress and remaining acceptance work in [docs/plan.md](docs/plan.md).
 
-Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
+## What you get on one machine
+
+You do not need a LAN to use belt. A single `belt` install gives one machine all of the following:
+
+- **Run your CI locally.** `belt ci` plans and runs your repository's GitHub Actions workflows on your machine. It can post the result as a GitHub commit status.
+- **No overload from parallel work.** Builds and tests wait for a share of the machine's CPU and memory, so several at once take turns.
+- **Fast, isolated worktrees.** Each run gets its own Git worktree with dependencies ready in seconds.
+- **No port collisions.** Each worktree gets its own ports and local resources, such as the Compose project name and database, so dev servers and integration tests in parallel worktrees do not collide.
+
+Each feature also exists as a standalone tool. belt links all four, so you do not need to install them:
+
+| Feature | Standalone tool |
+|---|---|
+| Local CI | [local-ci](https://github.com/t09tanaka/local-ci) |
+| Resource admission | [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) |
+| Fast worktrees | [fast-worktree](https://github.com/t09tanaka/fast-worktree) |
+| Per-worktree ports | [portool](https://github.com/t09tanaka/portool) |
+
+Workspace hooks and commands can call `fast-worktree` and `portool` directly. `belt workers diff` shows the version of each linked tool. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
 
 ## Install
 
