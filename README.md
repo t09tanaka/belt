@@ -678,6 +678,44 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
 `source::capture_directory` does the same for a directory that is not a
 repository.
 
+### Staged publication (opt-in)
+
+`capture_source` and `capture_directory` write each object into the store while
+they read, before they know the input held still: an attempt that turns out
+unstable leaves its objects there, and a caller killed after the call returns
+cannot tell which objects the capture made. A caller that has to account for
+every file uses `capture_source_staged` / `capture_directory_staged` with a
+`Staging { scratch_dir, before_install }` instead. They return a
+`StagedSnapshot { snapshot, installed, reused }`. The defaults are unchanged.
+
+- Every new file of the store (objects, the secret bundle that goes to the
+  store, manifests, and the temporary files that otherwise go under the
+  store's `tmp/`) is written under `scratch_dir`, which must exist and be on
+  the store's file system (otherwise the capture is refused before anything
+  is written). Reads during the capture look there first, then in the store.
+  The files of an attempt that turned out unstable are removed before the next
+  attempt. Submodules carry the same staging.
+- When the capture is stable and the manifest sealed, `before_install` is
+  called once with every file about to enter the store (`Intent`: its kind,
+  hash and size or source id and digest, staged path, destination). An error
+  installs nothing, removes the staged files and is returned.
+- Each file is then installed by a hard link that never replaces. A destination
+  that exists is read in full and compared (an object by its hash, a manifest
+  by its digest, a secret bundle by content) and reused; different content is
+  an error and the destination is left as it is. The destination directories
+  are fsynced, so a returned capture is durable. Objects go first and
+  manifests last.
+- `StagedSnapshot::installed` are the destinations this capture created,
+  `reused` the ones that were there already: those are not the caller's to
+  remove. Objects are always staged, so that a hit is known by content and an
+  object cannot disappear between a check and the manifest.
+- Local-ci removes the files it staged and leaves `scratch_dir` itself to the
+  caller. Temporary files of a killed process stay in it.
+- Out of scope: the private Git repository under `git/<key>.git` (objects and
+  refs) is written as before, as is a secret bundle at the path of
+  `CaptureOptions::secret_bundle` (written before `before_install`, removed if
+  the capture fails).
+
 ### Secret files
 
 `CaptureOptions::secret_files` (the `[source] secret_files` globs of

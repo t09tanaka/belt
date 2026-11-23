@@ -5,10 +5,11 @@
 
 mod common;
 use local_ci::source::{
-    capture_directory, capture_source, export_objects, export_with_basis, import_objects,
-    import_objects_for, materialize_secrets, materialize_source, publishable, remove_imported_refs,
-    seal_manifest, secret_digest, CaptureOptions, ObjectStore, RelPath, SecretBundle, SecretSpec,
-    SourceError, SourceInfo, SourceKind, SourceManifest, Stage, SubmoduleRef,
+    capture_directory, capture_directory_staged, capture_source, capture_source_staged,
+    export_objects, export_with_basis, import_objects, import_objects_for, materialize_secrets,
+    materialize_source, publishable, remove_imported_refs, seal_manifest, secret_digest,
+    CaptureOptions, ObjectStore, RelPath, SecretBundle, SecretSpec, SourceError, SourceInfo,
+    SourceKind, SourceManifest, Stage, SubmoduleRef,
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
@@ -4798,4 +4799,328 @@ fn a_bundle_whose_refs_git_cannot_list_is_an_error_and_is_not_published() {
     let written = log.lines().filter(|l| l.contains("bundle create")).count();
     assert_eq!(written, 1, "{log}");
     assert!(names_in(&f.home.join("sources/bundles")).is_empty());
+}
+
+// ---- staged publication (opt-in) -------------------------------------------
+
+mod staged {
+    use super::*;
+    use local_ci::source::{Intent, IntentKind, Staging};
+    use std::sync::Mutex;
+
+    /// Every file under `dir`, by path relative to it.
+    fn files_under(dir: &Path) -> Vec<String> {
+        let mut out = vec![];
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    out.push(p.strip_prefix(dir).unwrap().display().to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// What the store holds as content (not its private Git repository, not
+    /// `tmp/`).
+    fn store_files(store: &Path) -> Vec<String> {
+        ["objects", "manifests", "secrets"]
+            .iter()
+            .flat_map(|d| {
+                files_under(&store.join(d))
+                    .into_iter()
+                    .map(move |f| format!("{d}/{f}"))
+            })
+            .collect()
+    }
+
+    fn sha(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    }
+
+    type Seen = Arc<Mutex<Vec<Vec<Intent>>>>;
+
+    fn staging(
+        f: &Fixture,
+        before: impl Fn(&[Intent]) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> (Staging, PathBuf, Seen) {
+        let scratch = f.home.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let seen: Seen = Arc::default();
+        let s2 = seen.clone();
+        let st = Staging {
+            scratch_dir: scratch.clone(),
+            before_install: Arc::new(move |i| {
+                s2.lock().unwrap().push(i.to_vec());
+                before(i)
+            }),
+        };
+        (st, scratch, seen)
+    }
+
+    fn passthrough(f: &Fixture) -> (Staging, PathBuf, Seen) {
+        staging(f, |_| Ok(()))
+    }
+
+    fn store_dir(f: &Fixture) -> PathBuf {
+        f.home.join("sources")
+    }
+
+    fn unstable_once(file: PathBuf) -> Option<local_ci::source::Hook> {
+        hook(move |s| {
+            if s == Stage::AfterRead(1) {
+                std::fs::write(&file, "changed while it was read\n").unwrap();
+            }
+            Ok(())
+        })
+    }
+
+    /// Today's behaviour of the default entry point, kept as it is: the
+    /// objects of an attempt that turned out unstable stay in the store.
+    #[test]
+    fn the_default_path_leaves_the_objects_of_an_unstable_attempt_in_the_store() {
+        let f = fixture();
+        dirty(&f);
+        let mut o = opts();
+        o.hook = unstable_once(f.dir.join("unstaged.txt"));
+        capture_source(&f.ctx(), &f.dir, &o).unwrap();
+        // "u1\n" was read by attempt 1 and is in no manifest
+        assert!(store_dir(&f)
+            .join("objects")
+            .join(&sha(b"u1\n")[..2])
+            .join(sha(b"u1\n"))
+            .exists());
+    }
+
+    #[test]
+    fn an_unstable_attempt_leaves_nothing_in_the_store_when_staged() {
+        let f = fixture();
+        dirty(&f);
+        let mut o = opts();
+        o.hook = unstable_once(f.dir.join("unstaged.txt"));
+        let (st, scratch, seen) = passthrough(&f);
+        let r = capture_source_staged(&f.ctx(), &f.dir, &o, &st).unwrap();
+        let stale = sha(b"u1\n");
+        // not offered for install, not in the store
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "before_install is called once");
+        assert!(!calls[0]
+            .iter()
+            .any(|i| matches!(&i.kind, IntentKind::Object { hash, .. } if *hash == stale)));
+        assert!(!store_dir(&f)
+            .join("objects")
+            .join(&stale[..2])
+            .join(&stale)
+            .exists());
+        // what the manifest names is all there
+        for e in &r.snapshot.manifest.object_manifest.entries {
+            assert!(
+                ObjectStore::open(store_dir(&f)).unwrap().has(&e.hash),
+                "{}",
+                e.path.display()
+            );
+        }
+        assert!(
+            files_under(&scratch).is_empty(),
+            "{:?}",
+            files_under(&scratch)
+        );
+    }
+
+    #[test]
+    fn a_failing_before_install_installs_nothing_and_clears_the_scratch() {
+        let f = fixture();
+        dirty(&f);
+        let store = store_dir(&f);
+        let scratch_seen = Arc::new(Mutex::new((vec![], vec![])));
+        let s2 = scratch_seen.clone();
+        let (st, scratch, _) = {
+            let scratch = f.home.join("scratch");
+            let sc = scratch.clone();
+            let store = store.clone();
+            staging(&f, move |_| {
+                // here a kill would leave only the scratch files
+                *s2.lock().unwrap() = (store_files(&store), files_under(&sc));
+                anyhow::bail!("stop before the install")
+            })
+        };
+        let err = capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).unwrap_err();
+        assert!(format!("{err:#}").contains("stop before the install"));
+        let (in_store, in_scratch) = scratch_seen.lock().unwrap().clone();
+        assert!(in_store.is_empty(), "{in_store:?}");
+        assert!(!in_scratch.is_empty());
+        assert!(store_files(&store).is_empty(), "{:?}", store_files(&store));
+        assert!(
+            files_under(&scratch).is_empty(),
+            "{:?}",
+            files_under(&scratch)
+        );
+    }
+
+    #[test]
+    fn a_capture_that_stops_at_any_point_leaves_files_only_in_the_scratch() {
+        for point in [Stage::AfterRead(1), Stage::BeforePublish] {
+            let f = fixture();
+            dirty(&f);
+            let store = store_dir(&f);
+            let (st, scratch, seen) = passthrough(&f);
+            let (store2, sc2) = (store.clone(), scratch.clone());
+            let mut o = opts();
+            o.hook = hook(move |s| {
+                if s == point {
+                    // killed here: the store has nothing of this capture
+                    assert!(
+                        store_files(&store2).is_empty(),
+                        "{:?}",
+                        store_files(&store2)
+                    );
+                    assert!(
+                        !files_under(&sc2).is_empty(),
+                        "{point:?}: nothing staged yet"
+                    );
+                    anyhow::bail!("killed");
+                }
+                Ok(())
+            });
+            let err = capture_source_staged(&f.ctx(), &f.dir, &o, &st).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("killed") || format!("{err:#}").contains("SOURCE_BUSY"),
+                "{err:#}"
+            );
+            assert!(store_files(&store).is_empty());
+            assert!(files_under(&scratch).is_empty());
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{point:?}: before_install ran"
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_with_the_same_content_is_reused_and_one_with_other_content_is_an_error() {
+        let f = fixture();
+        dirty(&f);
+        let c = f.ctx();
+        let (st, scratch, seen) = passthrough(&f);
+        let first = capture_source_staged(&c, &f.dir, &opts(), &st).unwrap();
+        assert!(first.reused.is_empty());
+        let mut want: Vec<PathBuf> = seen.lock().unwrap()[0]
+            .iter()
+            .map(|i| i.destination.clone())
+            .collect();
+        want.sort();
+        let mut got = first.installed.clone();
+        got.sort();
+        assert_eq!(got, want);
+        assert!(got.iter().all(|p| p.is_file()));
+
+        // the same capture again: everything is there, nothing is created
+        let again = capture_source_staged(&c, &f.dir, &opts(), &st).unwrap();
+        assert!(again.installed.is_empty(), "{:?}", again.installed);
+        let mut reused = again.reused.clone();
+        reused.sort();
+        assert_eq!(reused, want);
+        assert!(files_under(&scratch).is_empty());
+
+        // an object whose content is not its name is not believed or replaced
+        let obj = want
+            .iter()
+            .find(|p| p.to_string_lossy().contains("/objects/"))
+            .unwrap()
+            .clone();
+        std::fs::write(&obj, "not what the name says").unwrap();
+        let err = capture_source_staged(&c, &f.dir, &opts(), &st).unwrap_err();
+        assert!(format!("{err:#}").contains("was not replaced"), "{err:#}");
+        assert_eq!(std::fs::read(&obj).unwrap(), b"not what the name says");
+        assert!(files_under(&scratch).is_empty());
+    }
+
+    #[test]
+    fn reads_during_capture_find_the_staged_objects() {
+        // an LFS pointer is read back (resolve_lfs) and so is .gitattributes
+        let (f, oid, _payload) = lfs_fixture(false, true);
+        let c = f.ctx();
+        let (st, _, _) = passthrough(&f);
+        let staged = capture_source_staged(&c, &f.dir, &opts(), &st).unwrap();
+        assert_eq!(staged.snapshot.manifest.lfs.len(), 1);
+        assert_eq!(staged.snapshot.manifest.lfs[0].oid, oid);
+        // the same source as the default path makes of it
+        let mut o2 = opts();
+        o2.store = Some(f.home.join("other-store"));
+        let plain = capture_source(&c, &f.dir, &o2).unwrap();
+        assert_eq!(staged.snapshot.manifest.source_id, plain.manifest.source_id);
+        assert_eq!(staged.snapshot.manifest.canonical, plain.manifest.canonical);
+    }
+
+    #[test]
+    fn submodule_manifests_are_staged_and_installed_with_the_parent() {
+        let f = with_submodule();
+        std::fs::write(f.dir.join("vendor/lib/lib.txt"), "dirty lib\n").unwrap();
+        let (st, scratch, seen) = passthrough(&f);
+        let r = capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).unwrap();
+        let manifests: Vec<String> = seen.lock().unwrap()[0]
+            .iter()
+            .filter_map(|i| match &i.kind {
+                IntentKind::Manifest { source_id, .. } => Some(source_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let sub = r.snapshot.manifest.submodules[0].source_id.clone().unwrap();
+        assert_eq!(manifests.len(), 2, "{manifests:?}");
+        assert_eq!(manifests.last().unwrap(), &r.snapshot.manifest.source_id);
+        assert!(manifests.contains(&sub));
+        let store = ObjectStore::open(store_dir(&f)).unwrap();
+        assert!(store.load_manifest(&sub).unwrap().is_some());
+        assert!(files_under(&scratch).is_empty());
+    }
+
+    #[test]
+    fn a_directory_capture_stages_the_secret_bundle_too() {
+        let f = fixture();
+        let dir = f.home.join("plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=1\n").unwrap();
+        let mut o = opts();
+        o.secret_files = vec![spec(".env", true)];
+        o.secret_key = KEY.to_vec();
+        let (st, scratch, seen) = passthrough(&f);
+        let r = capture_directory_staged(&f.ctx(), &dir, &o, &st).unwrap();
+        let calls = seen.lock().unwrap();
+        assert!(calls[0]
+            .iter()
+            .any(|i| matches!(&i.kind, IntentKind::SecretBundle { .. })));
+        let bundle = r.snapshot.secrets.clone().unwrap();
+        assert!(bundle.is_file());
+        assert_eq!(bundle.parent().unwrap(), store_dir(&f).join("secrets"));
+        assert!(files_under(&scratch).is_empty());
+        // and the default path's capture of it is the same source
+        let mut o2 = o.clone();
+        o2.store = Some(f.home.join("other-store"));
+        let plain = capture_directory(&f.ctx(), &dir, &o2).unwrap();
+        assert_eq!(plain.manifest.source_id, r.snapshot.manifest.source_id);
+    }
+
+    #[test]
+    fn a_missing_scratch_directory_is_refused_before_anything_is_written() {
+        let f = fixture();
+        let st = Staging {
+            scratch_dir: f.home.join("no-such-scratch"),
+            before_install: Arc::new(|_| Ok(())),
+        };
+        assert!(capture_source_staged(&f.ctx(), &f.dir, &opts(), &st).is_err());
+        assert!(store_files(&store_dir(&f)).is_empty());
+    }
 }

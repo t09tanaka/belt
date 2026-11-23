@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add opt-in staged publication of a capture for the library (minor: 0.19.0 when released). `source::capture_source_staged` and `capture_directory_staged` take a `Staging { scratch_dir, before_install }`, write every new file of the source store (objects, manifests, secret bundle, temporary files) under `scratch_dir` on the store's file system, and install them only after the capture is stable: `before_install` sees the full list once, and each file is installed by a link that never replaces; an existing destination is verified in full and reused, different content is an error. `StagedSnapshot` says which destinations were installed and which reused. An unstable attempt leaves nothing in the store. The existing entry points and `CaptureOptions` are unchanged; the private Git repository under `git/` is not staged.
+
 ## [0.18.5] - 2026-11-23
 
 - Record in each build cache entry what made its key. Beside the marker, an entry now holds `.local-ci-inputs.json` with the SHA-256 of each part of the key (schema, toolchain, OS, job, each lock, each build-affecting variable by name, each config file, the matrix), never the values, which can hold secrets. When a run saves an entry that an earlier run could have reused, two such files show which input made the keys differ. The file is for reading only: listing, pruning and restoring ignore it, an entry without it is as good, and it is not copied into `target/`. The key itself is unchanged.

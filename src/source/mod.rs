@@ -19,11 +19,15 @@ mod capture;
 mod gate;
 mod materialize;
 mod secret;
+mod staging;
 mod store;
 mod transfer;
 
 pub(crate) use capture::check_digest as check_manifest_digest;
-pub use capture::{capture_directory, capture_source, seal_manifest};
+pub use capture::{
+    capture_directory, capture_directory_staged, capture_source, capture_source_staged,
+    seal_manifest,
+};
 pub use gate::{publishable, SourceInfo};
 pub(crate) use materialize::check_materialization_graph;
 pub use materialize::{
@@ -31,6 +35,7 @@ pub use materialize::{
     materialize_source, verify_materialized_except, verify_materialized_from,
 };
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
+pub use staging::{BeforeInstall, Intent, IntentKind, StagedSnapshot, Staging};
 pub use store::{ObjectStore, RelPath};
 pub use transfer::{
     export_from, export_objects, export_with_basis, import_objects, import_objects_for,

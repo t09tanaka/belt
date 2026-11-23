@@ -2,6 +2,7 @@
 //! still while it was read.
 
 use super::secret::{self, SecretBundle};
+use super::staging::{StagedSnapshot, Stager, Staging};
 use super::store::{sha256_hex, write_atomic, ObjectStore, RelPath};
 use super::*;
 use crate::context::ExecContext;
@@ -1390,7 +1391,7 @@ fn write_blobs(
         .spawn()
         .context("failed to run git fast-import")?;
     let mut si = child.stdin.take().unwrap();
-    let paths: Vec<PathBuf> = hashes.iter().map(|h| store.object_path(h)).collect();
+    let paths: Vec<PathBuf> = hashes.iter().map(|h| store.locate(h)).collect();
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         for (i, p) in paths.iter().enumerate() {
             let size = std::fs::metadata(p)?.len();
@@ -1635,7 +1636,7 @@ impl AttrTree {
         let had = std::fs::symlink_metadata(&attributes).is_ok();
         // a copy and not a link: a filter runs in this directory, and what
         // it does to a file here must not reach the store
-        if std::fs::copy(store.object_path(hash), &target).is_err() {
+        if std::fs::copy(store.locate(hash), &target).is_err() {
             return false;
         }
         if !had && std::fs::symlink_metadata(&attributes).is_ok() {
@@ -2408,6 +2409,77 @@ pub fn capture_source(
     capture_worktree(ctx, repo_dir, opts, &store_of(ctx, opts)?).map(|c| c.snap)
 }
 
+/// Settle a staged capture: install what it staged (after the caller's
+/// `before_install`), or, when anything failed, remove it all.
+fn settle_staged(
+    stager: &Arc<Stager>,
+    store: &ObjectStore,
+    staging: &Staging,
+    opts: &CaptureOptions,
+    res: Result<SourceSnapshot>,
+) -> Result<StagedSnapshot> {
+    let out = res.and_then(|snapshot| {
+        let (installed, reused) = stager
+            .install(store, &*staging.before_install)
+            .inspect_err(|_| {
+                // a bundle at the caller's path was written before; the
+                // capture failed, so nothing of it stays
+                if let (Some(p), Some(_)) = (&opts.secret_bundle, &snapshot.secrets) {
+                    let _ = std::fs::remove_file(p);
+                }
+            })?;
+        Ok(StagedSnapshot {
+            snapshot,
+            installed,
+            reused,
+        })
+    });
+    if out.is_err() {
+        stager.reset_to(0);
+    }
+    out
+}
+
+fn staged_store(
+    ctx: &ExecContext,
+    opts: &CaptureOptions,
+    staging: &Staging,
+) -> Result<(ObjectStore, Arc<Stager>)> {
+    let plain = store_of(ctx, opts)?;
+    let stager = Stager::new(staging, &plain)?;
+    Ok((plain.with_staging(stager.clone()), stager))
+}
+
+/// [`capture_source`] with the new files of the store staged under
+/// `staging.scratch_dir` and installed at the end (see [`Staging`]). Git
+/// objects and refs of the private repository under `git/` are written as
+/// before.
+pub fn capture_source_staged(
+    ctx: &ExecContext,
+    repo_dir: &Path,
+    opts: &CaptureOptions,
+    staging: &Staging,
+) -> Result<StagedSnapshot> {
+    check_secret_opts(opts)?;
+    let (store, stager) = staged_store(ctx, opts, staging)?;
+    let res = capture_worktree(ctx, repo_dir, opts, &store).map(|c| c.snap);
+    settle_staged(&stager, &store, staging, opts, res)
+}
+
+/// [`capture_directory`] with the new files of the store staged (see
+/// [`Staging`]).
+pub fn capture_directory_staged(
+    ctx: &ExecContext,
+    dir: &Path,
+    opts: &CaptureOptions,
+    staging: &Staging,
+) -> Result<StagedSnapshot> {
+    check_secret_opts(opts)?;
+    let (store, stager) = staged_store(ctx, opts, staging)?;
+    let res = capture_directory_in(ctx, dir, opts, &store);
+    settle_staged(&stager, &store, staging, opts, res)
+}
+
 /// The directories of a capture and what they looked like when it read them:
 /// the repository itself, then every submodule below it.
 type Seen = Vec<(PathBuf, Meta, Facts)>;
@@ -2440,6 +2512,7 @@ fn capture_worktree(
     let mut last = String::new();
     let attempts = opts.max_attempts.max(1);
     for attempt in 1..=attempts {
+        let mark = store.stage_mark();
         match one_pass(ctx, &root, &facts, opts, &o, store, attempt) {
             Ok(p) => {
                 let mut seen = vec![(root.clone(), p.sel.meta.clone(), facts.clone())];
@@ -2453,7 +2526,11 @@ fn capture_worktree(
                 });
             }
             Err(e) => match e.downcast_ref::<Unstable>() {
-                Some(u) => last = u.0.clone(),
+                Some(u) => {
+                    // a staged attempt leaves nothing for the next one
+                    store.stage_reset(mark);
+                    last = u.0.clone()
+                }
                 None => return Err(e),
             },
         }
@@ -2749,11 +2826,7 @@ fn publish(
                 bundle.save_new(path)?;
                 path.clone()
             }
-            None => {
-                let path = store.secrets_path(&m.source_id);
-                bundle.save(&path)?;
-                path
-            }
+            None => store.save_secrets(&m.source_id, &bundle)?,
         })
     };
     let published = opts
@@ -2776,19 +2849,29 @@ pub fn capture_directory(
     opts: &CaptureOptions,
 ) -> Result<SourceSnapshot> {
     check_secret_opts(opts)?;
+    capture_directory_in(ctx, dir, opts, &store_of(ctx, opts)?)
+}
+
+fn capture_directory_in(
+    ctx: &ExecContext,
+    dir: &Path,
+    opts: &CaptureOptions,
+    store: &ObjectStore,
+) -> Result<SourceSnapshot> {
+    let _ = ctx;
     if opts.secret_root.is_some() && !opts.secret_files.is_empty() {
         bail!("secret_root is for the capture of a repository; a directory capture takes its secret files from the directory itself");
     }
-    let store = store_of(ctx, opts)?;
     let root = std::fs::canonicalize(dir)?;
     let o = build_opts(opts)?;
     let mut warnings = vec![];
     let attempts = opts.max_attempts.max(1);
     let mut last = String::new();
     for attempt in 1..=attempts {
+        let mark = store.stage_mark();
         let attempt_res = (|| -> Result<(Meta, Read, Vec<LfsRef>)> {
             let meta = select_directory(&root, &o, &mut warnings)?;
-            let read = read_all(&store, &root, &root, &meta, &BTreeSet::new())?;
+            let read = read_all(store, &root, &root, &meta, &BTreeSet::new())?;
             opts.call(Stage::AfterRead(attempt))?;
             let mut again_warnings = vec![];
             let again = select_directory(&root, &o, &mut again_warnings)?;
@@ -2826,7 +2909,7 @@ pub fn capture_directory(
                     canonical: CanonicalConfig::default(),
                     secret_files,
                 });
-                let secrets = publish(&store, opts, &m, bundle_files)?;
+                let secrets = publish(store, opts, &m, bundle_files)?;
                 warnings.sort();
                 warnings.dedup();
                 return Ok(SourceSnapshot {
@@ -2836,7 +2919,10 @@ pub fn capture_directory(
                 });
             }
             Err(e) => match e.downcast_ref::<Unstable>() {
-                Some(u) => last = u.0.clone(),
+                Some(u) => {
+                    store.stage_reset(mark);
+                    last = u.0.clone()
+                }
                 None => return Err(e),
             },
         }
