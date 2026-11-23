@@ -794,11 +794,22 @@ async fn init_into_an_ephemeral_workers_state_writes_nothing() {
         found.sort();
         found
     }
-    for worker_installed in [false, true] {
+    // The marker, or what a creation killed before its marker leaves.
+    let states: [&[&str]; 3] = [
+        &["ephemeral.json"],
+        &["ephemeral.lock"],
+        &["ephemeral.lock", "ephemeral.json.part"],
+    ];
+    for (worker_installed, names) in [false, true]
+        .into_iter()
+        .flat_map(|installed| states.map(|names| (installed, names)))
+    {
         let (root, context) = fixture();
         let paths = Paths::resolve(&context.env).unwrap();
         private_dir(&paths.worker).unwrap();
-        fs::write(paths.worker.join("ephemeral.json"), "{}").unwrap();
+        for name in names {
+            fs::write(paths.worker.join(name), "{}").unwrap();
+        }
         if worker_installed {
             private_dir(&paths.config).unwrap();
             let journal = super::super::worker_service::Paths::journal_path(&context.env).unwrap();
@@ -814,13 +825,13 @@ async fn init_into_an_ephemeral_workers_state_writes_nothing() {
             super::super::worker::ephemeral::refuse_marked(&paths.worker)
                 .unwrap_err()
                 .to_string(),
-            "installed: {worker_installed}"
+            "installed: {worker_installed} {names:?}"
         );
         assert!(error.contains("belongs to an ephemeral worker"), "{error}");
         assert_eq!(
             listing(root.path()),
             before,
-            "installed: {worker_installed}"
+            "installed: {worker_installed} {names:?}"
         );
         assert!(!paths.journal.exists());
     }

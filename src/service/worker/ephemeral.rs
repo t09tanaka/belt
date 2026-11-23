@@ -689,6 +689,18 @@ fn create_state(
     filesystem_of: impl Fn(&File) -> plan::Filesystem,
     at: &dyn Fn(Step),
 ) -> anyhow::Result<(Created, File)> {
+    create_state_with(path, marker, filesystem_of, at, &File::try_lock_shared)
+}
+
+/// `create_state` with the shared lock taken by `lock_shared`, so that a
+/// test can make it fail.
+fn create_state_with(
+    path: &Path,
+    marker: &MarkerFile,
+    filesystem_of: impl Fn(&File) -> plan::Filesystem,
+    at: &dyn Fn(Step),
+    lock_shared: &dyn Fn(&File) -> Result<(), TryLockError>,
+) -> anyhow::Result<(Created, File)> {
     std::fs::DirBuilder::new().mode(0o700).create(path)?;
     let meta = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(meta.is_dir(), "worker state is not a directory");
@@ -709,6 +721,13 @@ fn create_state(
                 path.display()
             )
         };
+        // Another party may have removed the fresh directory and made its own
+        // at the same path before this call looked at it: only an empty
+        // directory is this call's to fill.
+        if !names_in(dir)?.is_empty() {
+            made.stepped_back = true;
+            return Err(stepping_back());
+        }
         let lock = match private_at(dir, LOCK, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL) {
             Ok(lock) => lock,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -717,16 +736,18 @@ fn create_state(
             }
             Err(e) => return Err(e.into()),
         };
-        made.names.push(LOCK);
         at(Step::Made);
-        match lock.try_lock_shared() {
+        match lock_shared(&lock) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 made.stepped_back = true;
                 return Err(stepping_back());
             }
+            // Not held: unlinking the name would not provably unlink this
+            // call's own file, so it stays for the next start to remove.
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
+        made.names.push(LOCK);
         let lock = made.lock.insert(lock);
         at(Step::Locked);
         let mut marker = marker.clone();
@@ -986,12 +1007,18 @@ fn start(args: &Args) -> anyhow::Result<()> {
 
 /// A resident worker never takes over an ephemeral worker's state, its
 /// identity or its attempts (spec 25.4 (d)). Anything but a clear "no marker"
-/// counts as marked.
+/// counts as marked, and so does what a creation that was killed leaves.
 pub(super) fn marked(state: &Path) -> bool {
-    !matches!(
-        std::fs::symlink_metadata(state.join(MARKER)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-    )
+    // An unfinished creation counts: a resident never makes these names, and
+    // writing into it would leave a state no ephemeral start may clear.
+    std::iter::once(MARKER)
+        .chain(plan::UNFINISHED_NAMES)
+        .any(|name| {
+            !matches!(
+                std::fs::symlink_metadata(state.join(name)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 /// The refusal of everything that would run, install or start a persistent

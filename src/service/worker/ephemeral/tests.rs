@@ -329,13 +329,21 @@ fn a_new_start_never_writes_into_a_directory_that_already_exists() {
 }
 
 #[test]
-fn only_a_state_with_the_marker_is_marked() {
+fn only_a_state_with_the_marker_or_an_unfinished_creation_is_marked() {
     let fx = Fx::new();
     assert!(!marked(&fx.state()));
     let state = fx.left_behind();
     assert!(marked(&state));
     std::fs::remove_file(state.join(MARKER)).unwrap();
+    // What a creation killed before its marker leaves marks it too.
+    assert!(marked(&state));
+    std::fs::remove_file(state.join(LOCK)).unwrap();
     assert!(!marked(&state));
+    for name in plan::UNFINISHED_NAMES {
+        private(&state.join(name), b"");
+        assert!(marked(&state), "{name}");
+        std::fs::remove_file(state.join(name)).unwrap();
+    }
     // A marker that cannot be read still marks the state.
     std::os::unix::fs::symlink("nowhere", state.join(MARKER)).unwrap();
     assert!(marked(&state));
@@ -552,6 +560,46 @@ fn links_inside_a_state_are_removed_and_never_followed() {
     reclaim(&state, false, local, &nowhere).unwrap();
     assert!(!state.exists());
     assert_eq!(tree(&victim), before);
+}
+
+/// A directory that another party made at the same path (after removing the
+/// empty one this call made) is not empty by the time it is filled: the call
+/// steps back and touches nothing.
+#[test]
+fn a_creation_steps_back_from_a_directory_that_is_not_empty() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let result = create_state(&state, &marker(), local, &|step| {
+        if step == Step::Directory {
+            private(&state.join("theirs"), b"x");
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(tree(&state), [(state.join("theirs"), 1)]);
+}
+
+/// A lock that cannot be taken for another reason than being held: the call
+/// never held the file, so it leaves the name alone (the next start removes
+/// it) and does not unlink one it cannot prove is its own.
+#[test]
+fn a_creation_whose_lock_fails_does_not_unlink_the_lock_file() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let result = create_state_with(
+        &state,
+        &marker(),
+        local,
+        &|step| {
+            if step == Step::Made {
+                // Replaced by another party's file before the call fails.
+                std::fs::remove_file(state.join(LOCK)).unwrap();
+                private(&state.join(LOCK), b"theirs");
+            }
+        },
+        &|_| Err(TryLockError::Error(std::io::Error::other("injected"))),
+    );
+    assert!(result.is_err());
+    assert_eq!(tree(&state), [(state.join(LOCK), 6)]);
 }
 
 /// A creation that fails takes back the names it made, and only those: a
