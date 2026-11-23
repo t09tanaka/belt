@@ -191,6 +191,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &captured.manifest.ci_source_id);
     let mut worker = f.spawn();
     f.ready(&mut worker).await;
     let (mut bridge, connected) = f.bridge().await;
