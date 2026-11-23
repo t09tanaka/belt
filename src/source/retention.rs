@@ -387,6 +387,13 @@ impl Index {
         tx.commit()?;
         Ok(changed == 1)
     }
+    pub(crate) fn registered_elsewhere(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM member m JOIN root r ON r.id=m.root WHERE m.object='m:'||?1 AND r.source IS NOT NULL)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
     pub(crate) fn received_row(&self, id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND source=?1)",

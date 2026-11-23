@@ -29,8 +29,12 @@ impl SourcePins {
     /// when the source is not in the store.
     pub fn pin(&self, store: &SourceStore, source: &str) -> Result<Pin> {
         let held = store.mutation_guard_waiting()?;
+        // (the `receive:` row, or the manifest file: a source an
+        // attempt names may be in the store by another root, as the parent's
+        // local worker and a captured source are; the deleting pass only
+        // considers `receive:` roots, so this is the same proof for it)
         ensure!(
-            store.received(&held, source)?,
+            store.received(&held, source)? || store.manifest_file_present(source),
             "source {source} is not in this worker's store"
         );
         *self.lock().entry(source.to_string()).or_insert(0) += 1;
@@ -75,8 +79,6 @@ mod tests {
         let id = "a".repeat(64);
         assert!(pins.pin(&store, &id).is_err());
         assert!(!pins.pinned(&id));
-        // (a legacy manifest file counts as present while the legacy
-        // registration is pending)
         let path = store.object_store().unwrap().manifest_path(&id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{}").unwrap();

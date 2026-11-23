@@ -751,6 +751,12 @@ impl SourceStore {
         if self.retention.received_row(id)? {
             return Ok(true);
         }
+        // A source a finished registration of another root holds (a
+        // capture, a run's source in a store shared with a parent): its
+        // `m:` membership belongs to a root whose source is set.
+        if self.retention.registered_elsewhere(id)? {
+            return Ok(true);
+        }
         if !self.retention.legacy_registration_pending()?
             || self.retention.has_object(&format!("m:{id}"))?
         {
@@ -769,6 +775,13 @@ impl SourceStore {
     /// meanwhile) or when the store holds a parent's root. Returns
     /// `(registered, abandoned)`, or `None` when it did not run.
     pub fn settle_empty_receive_roots(&self) -> Result<Option<(u32, u32)>> {
+        // (looked at first without the lock: with nothing to settle, or in a
+        // store with a parent's root, whose owner may hold its shared lock
+        // for long, the start does not wait at all)
+        if self.retention.holds_parent_roots()? || self.retention.empty_receive_roots(1)?.is_empty()
+        {
+            return Ok(None);
+        }
         let Some(_exclusive) = self
             .retention
             .guard_exclusive_waiting(std::time::Duration::from_secs(120))?
@@ -830,6 +843,10 @@ impl SourceStore {
             None => true,
         });
         (blobs && children).then_some(m)
+    }
+    /// Whether the manifest file of `id` is there (no index looked at).
+    pub fn manifest_file_present(&self, id: &str) -> bool {
+        std::fs::symlink_metadata(self.inner.manifest_path(id)).is_ok_and(|m| m.is_file())
     }
     fn publish_checked(&self, m: &CiManifest) -> Result<()> {
         self.publish_checked_root(m, &format!("receive:{}", m.source_id))
