@@ -986,6 +986,7 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 
 - **起動**: 利用者がノートブックから `belt worker --ephemeral` を起動する。LaunchAgentやsystemdへ登録せず、親からの導入・更新（`workers add --install`、`upgrade`）の対象にもしない。バイナリの配置は利用者が行う。
 - **接続**: 親は、利用者が用意したトンネルを指すSSH接続（ユーザー設定の `ephemeral = true` のworker）でつなぐ。独自の未認証ポートを開けない原則（第3章）は一時workerでも変えない。
+- **起動し直し**: killや電源断でstate（`~/.belt`）が残った場合、次の `belt worker --ephemeral` が、誰も使っていないことを証明できたときだけ自分で消して、新しいidentityで起動する。証明できなければ、何も消さず、何にもsignalを送らずに1で終わり、成り立たなかった条件を示す。常駐の `belt worker` は、一時workerのstate（`ephemeral.json` があるもの）では起動を断る。規則と証明は25.4の (d) に書く。
 - **グループ**: 起動時にグループのIDと鍵を受け取るので、鍵を持つどのメンバーも使える。identityの退役と `workers forget` は、それを行ったメンバーの記録の中だけで働く（24.3）。鍵が更新されたら、新しい鍵で起動し直す。
 - **identity**: 起動ごとに新しいworker identityを発行する。以前のidentityの再接続として扱わない。親は最後に見たidentityを記録する。同じ名前で別のidentityが接続を試みた場合、利用者が旧identityを `workers forget` するまで新しい接続を拒否する。以前の起動のattemptを新しい起動へ送らない。
 - **到達不能**: 一時workerへ配置したattemptは、接続が切れてもunknownのまま保持する。時間の経過や推測で別workerへ再投入しない（第11章・第12章）。
@@ -2116,7 +2117,7 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 
 ### (d) 一時workerの起動し直し
 
-**今の挙動。** 一時worker（第15章）のstate（`~/.belt`）は、liveなattemptが無い状態で正常に終わったときだけ消える。SIGKILLや電源断で残ると、次の `belt worker --ephemeral` は起動を断り、人が消すまで使えない。
+**この規則より前の挙動。** 一時worker（第15章）のstate（`~/.belt`）は、liveなattemptが無い状態で正常に終わったときだけ消えた。SIGKILLや電源断で残ると、次の `belt worker --ephemeral` は起動を断り、人が消すまで使えなかった。下の規則は実装済みである（受け入れ試験の (vi)・(vii) はS26のDocker環境で確かめる）。
 
 **規則。** 残ったstateを、次の一時workerが自分で安全に片付ける。
 
@@ -2548,7 +2549,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | FrozenPlan | `ci-plans/<digest>` | CI task | 名指すattemptが無くなって `retention_days` 日 | 同じ | 既存 | 名指すattemptが無いこと |
 | toolのlink | `tool-bin/<digest>/` | hookとcommand | 消さない | 指す先のbinaryと一緒 | 4 | 25.7の (a) |
 | 更新の試用 | `upgrade/`、`<config>/bin/<digest>/worker.db.saved` | rollback | 試用の間 | 同じ | 既存 | commitの記録 |
-| 一時workerのmarkerとlock | `ephemeral.json`、`ephemeral.lock` | 次の一時workerの起動 | 無い | stateと一緒 | 1 | 25.4の (d) |
+| 一時workerのmarkerとlock | `ephemeral.json`、`ephemeral.lock` | 次の一時workerの起動 | 一時workerがstateを作るときに最初に書き、lockを共有で持って子のprocessへ継承させる。stateと一緒に消える（正常終了、または次の一時workerの起動） | stateと一緒 | 1 | 25.4の (d) |
 | 外したメンバー（workerだけのhost） | `removed-members.json` | 接続の拒否 | 1個。coordinator DBが無いhostでは正 | 同じ | 既存 | 利用者の操作 |
 | 固定のfile | `worker.json`、`boot_id`（起動の記録）、`control.json`、`upgrade-hold.json`、`traffic-hold.json`、`worker-service.json`、`worker-binding.json` とその更新の予定、`worker-socket.json`、`upgrade-trial*.json`、`agent.sock`、グループ鍵と次の鍵 | 起動、接続 | 各1個。上書きする。鍵の一時fileは600秒で消す | 同じ | 既存 | 各操作の規則 |
 | 受け取りのlock | `incoming/locks/<0〜63>.lock`、`incoming/locks/all.lock` | sourceの受け取り | 65個で頭打ち（source IDのhashで割り振る） | unlinkしない | 既存 | 該当なし |
@@ -2652,7 +2653,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | （記述は無い。実装は、行の無いrun IDへのcancelを受理して記録する） | なし | 1 | 進行中の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（25.4の (b)） |
 | 第15章 | 退役したidentityはtombstoneを永続保持する | 未決 | 25.16 |
 | 第15章 | バイナリはversion別directoryへ配置する | 4 | 名指すものの無い版を消す |
-| 第15章（記述は無い。実装は、stateが残っていると一時workerの起動を断る） | なし | 1 | 25.4の (d) |
+| 第15章 | 残ったstateは、次の一時workerが、使われていないことを証明できたときだけ消して起動する（「起動し直し」。段階1で書き足した。それより前は記述が無く、実装はstateが残っていると起動を断っていた） | 1（実装済み） | 25.4の (d) |
 | 第23章 | reader-pinsのinodeはparent stateとともに保持し、unlinkしない | 2 | runの刈り取りの最後にunlinkする |
 | 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
 | 第23章 | Git・bundleの片付けは後続の作業 | 2 | 25.5の段4 |

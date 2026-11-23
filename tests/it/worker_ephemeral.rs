@@ -148,6 +148,26 @@ impl Fx {
             .unwrap();
         assert!(status.success());
     }
+    /// Every entry of the state with its content, so "unchanged" also means
+    /// "nothing was created".
+    fn listing(&self) -> Vec<(String, Vec<u8>)> {
+        let mut found: Vec<_> = std::fs::read_dir(self.state())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+    fn marker(&self) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(self.state().join("ephemeral.json")).unwrap())
+            .unwrap()
+    }
     /// Nothing a resident worker would leave: no service file, no journal.
     fn assert_nothing_installed(&self) {
         assert!(!self.home().join("Library").exists());
@@ -183,19 +203,41 @@ async fn it_runs_under_a_fresh_identity_installs_nothing_and_cleans_up() {
 #[tokio::test]
 async fn it_refuses_existing_state_and_a_resident_worker_and_changes_nothing() {
     let fx = Fx::new();
-    // State left by an earlier run, or by a persistent worker.
+    let fx = &fx;
+    // State left by a persistent worker, or by anything that is not an
+    // ephemeral worker: it carries no ephemeral.json (spec 25.4 (d), (iii)).
     std::fs::create_dir(fx.state()).unwrap();
     std::fs::write(fx.state().join("marker"), "x").unwrap();
-    let out = tokio::time::timeout(T, fx.command(&[]).spawn().unwrap().wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("starts clean"));
-    assert_eq!(
-        std::fs::read_to_string(fx.state().join("marker")).unwrap(),
-        "x"
-    );
+    let refused = |why: &'static str| async move {
+        let before = fx.listing();
+        let out = tokio::time::timeout(T, fx.command(&[]).spawn().unwrap().wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(why), "{stderr}");
+        assert_eq!(fx.listing(), before, "a refusal changed the state");
+        assert_eq!(
+            std::fs::read_to_string(fx.state().join("marker")).unwrap(),
+            "x"
+        );
+    };
+    // As anyone could have made it (open to others), then private.
+    refused("is kept").await;
+    std::fs::set_permissions(fx.state(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    refused("starts clean").await;
+    refused("no ephemeral.json").await;
+    // A marker of another kind, and one that does not parse.
+    let marker = fx.state().join("ephemeral.json");
+    let write = |text: &str| {
+        std::fs::write(&marker, text).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write(r#"{"schema":1,"kind":"resident_worker"}"#);
+    refused("not of the ephemeral worker kind").await;
+    write("not json");
+    refused("cannot be read").await;
     std::fs::remove_dir_all(fx.state()).unwrap();
     // A resident worker's journal: the role must not exist beside it.
     let config = fx.home().join(".config/belt");
@@ -208,6 +250,113 @@ async fn it_refuses_existing_state_and_a_resident_worker_and_changes_nothing() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("persistent worker is installed"));
     assert!(!fx.state().exists());
+}
+
+/// Spec 25.4 (d), (i) without a command: a worker that was killed leaves its
+/// state behind; the next start proves that nothing uses it, clears it and
+/// runs under a new identity.
+#[tokio::test]
+async fn a_killed_worker_leaves_state_that_the_next_start_clears_by_itself() {
+    let fx = Fx::new();
+    let (mut child, pid, start) = fx.spawn();
+    fx.ready(&mut child).await;
+    let (_, first) = fx.hello().await;
+    let marker = fx.marker();
+    assert_eq!(marker["kind"], "ephemeral_worker");
+    assert_eq!(marker["pid"], pid);
+    assert_eq!(marker["start"], start.as_str());
+    assert_eq!(marker["boot"], belt::platform::boot_id().unwrap().as_str());
+    assert_eq!(
+        first,
+        format!(
+            "{}.{}",
+            marker["boot"].as_str().unwrap(),
+            marker["instance"].as_str().unwrap()
+        )
+    );
+    super::common::kill_recorded(pid, &start);
+    let status = tokio::time::timeout(T, child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    // Killed: nothing was cleaned up.
+    assert!(fx.state().join("ephemeral.json").exists());
+    assert!(fx.state().join("ephemeral.lock").exists());
+    std::fs::write(fx.state().join("left-over"), "old").unwrap();
+
+    let (mut child, pid, start) = fx.spawn();
+    fx.ready(&mut child).await;
+    assert!(!fx.state().join("left-over").exists());
+    let (worker, second) = fx.hello().await;
+    assert_eq!(worker, "colab");
+    assert_ne!(first, second, "a restart must not look like the same start");
+    assert_eq!(fx.marker()["pid"], pid);
+    assert_ne!(fx.marker()["instance"], marker["instance"]);
+    fx.assert_nothing_installed();
+    fx.stop(child, pid, start).await;
+    assert!(!fx.state().exists());
+}
+
+/// Spec 25.4 (d), (v): a persistent worker never takes over a state that an
+/// ephemeral worker made, and touches nothing in it.
+#[tokio::test]
+async fn a_persistent_worker_refuses_an_ephemeral_state_and_changes_nothing() {
+    let fx = Fx::new();
+    std::fs::create_dir(fx.state()).unwrap();
+    std::fs::set_permissions(fx.state(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = fx.state().join("ephemeral.json");
+    std::fs::write(&marker, r#"{"schema":1,"kind":"ephemeral_worker"}"#).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let spec = belt::service::worker::WorkerSpec {
+        schema: 1,
+        expected_cluster: fx.cluster.clone(),
+        worker_id: belt::ids::WorkerId::parse("colab").unwrap(),
+        state_dir: fx.state(),
+        cluster_key_path: fx.home().join("key"),
+        executable: BIN.into(),
+        env: std::collections::BTreeMap::from([
+            ("HOME".into(), fx.home().display().to_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]),
+        config: "schema_version=1\n".into(),
+    };
+    let input = fx.home().join("worker.json");
+    std::fs::write(&input, serde_json::to_vec(&spec).unwrap()).unwrap();
+    std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let run = || async {
+        let out = tokio::time::timeout(
+            T,
+            tokio::process::Command::new(BIN)
+                .args(["worker", "--input"])
+                .arg(&input)
+                .env("HOME", fx.home())
+                .env_remove("XDG_CONFIG_HOME")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+                .wait_with_output(),
+        )
+        .await
+        .expect("the worker must refuse, not serve");
+        let out = out.unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let before = fx.listing();
+    let (code, stderr) = run().await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("belongs to an ephemeral worker"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("belt worker --ephemeral"), "{stderr}");
+    assert_eq!(fx.listing(), before, "the refusal changed the state");
 }
 
 #[test]

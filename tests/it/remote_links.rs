@@ -200,7 +200,12 @@ async fn submit_requiring(
         let release =
             belt::protocol::ssh::quote(&root.join(format!("release-{name}")).display().to_string());
         let fixture = belt::protocol::ssh::quote(&root.display().to_string());
-        format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
+        // The command's own pid, for a test that follows the process itself.
+        let pid =
+            belt::protocol::ssh::quote(&root.join(format!("pid-{name}")).display().to_string());
+        format!(
+            "echo $$ > {pid} && while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done"
+        )
     } else {
         crate::fixture_process::script(&format!("sleep {delay}"))
     };
@@ -785,6 +790,218 @@ HOME="$home" exec {} worker --stdio
         std::fs::read_to_string(root.join("count-ephemeral")).unwrap(),
         "once\n"
     );
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    owner.wait().await;
+}
+
+/// Spec 25.4 (d), acceptance (i) and (ii), across the real daemon, the real
+/// ephemeral worker, its supervisor and a real command. The worker is killed
+/// while the command runs. The next start is refused for as long as the
+/// command lives (it inherited `ephemeral.lock`), removes nothing and signals
+/// nothing; once the command and its supervisor are gone, the next start
+/// clears the state by itself and runs under a new identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_ephemeral_worker_is_cleared_by_the_next_start_only_after_its_command_ended() {
+    let fixture = crate::test_tmp::tempdir().unwrap();
+    let root = fixture.path();
+    let state = root.join("parent");
+    let home = root.join("ephemeral");
+    let bin = root.join("bin");
+    let config = root.join("config/belt");
+    for dir in [root, &state, &root.join("local"), &home, &bin, &config] {
+        private(dir);
+    }
+    let key = root.join("key");
+    belt::secrets::key::init(&key).unwrap();
+    let cluster = CoordinatorStore::open(&state, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let worker = WorkerId::parse("colab").unwrap();
+    write_private(&config.join("config.toml"), format!(
+        "schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\nmax_active_task=1\n[scheduler]\nprefetch_per_worker=0\n[[workers]]\nid='colab'\nssh='{}'\nephemeral=true\n",
+        home.display()
+    ).as_bytes());
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" = 3 ] || exit 91
+home=$2
+[ "$3" = "'belt' 'worker' '--stdio'" ] || exit 91
+[ ! -e "$home/offline" ] || exit 92
+echo $$ > "$home/bridge.pid"
+HOME="$home" exec {} worker --stdio
+"#,
+            belt::protocol::ssh::quote(BIN)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(home.join("offline"), "").unwrap();
+    let start_worker = || {
+        let mut command = tokio::process::Command::new(BIN);
+        command
+            .args(["worker", "--ephemeral", "--cluster"])
+            .arg(cluster.to_string())
+            .args(["--name", worker.as_str(), "--key-file"])
+            .arg(&key)
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env("PATH", "/bin:/usr/bin")
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        command
+    };
+    let worker_state = home.join(".belt");
+    let marker = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(worker_state.join("ephemeral.json")).unwrap())
+            .unwrap()
+    };
+    let agent = Owned::new(start_worker().spawn().unwrap());
+    let (owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
+    let blocker = submit(&client, &state, &spec.env, &key, root, "blocker", u32::MAX).await;
+    wait_for("local slot occupied", || {
+        root.join("count-blocker").exists()
+    })
+    .await;
+    std::fs::remove_file(home.join("offline")).unwrap();
+    let task = submit(
+        &client,
+        &state,
+        &spec.env,
+        &key,
+        root,
+        "ephemeral",
+        u32::MAX,
+    )
+    .await;
+    wait_for("ephemeral command started", || {
+        root.join("pid-ephemeral").exists()
+    })
+    .await;
+    assert_eq!(attempt(&state, &task).unwrap().worker_id, worker);
+    // The command and the supervisor that started it.
+    let command_pid: u32 = std::fs::read_to_string(root.join("pid-ephemeral"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let command_start = super::common::identity_of(command_pid).unwrap();
+    let supervisor_pid = belt::platform::read_process(command_pid).ppid.unwrap();
+    assert!(supervisor_pid > 1 && supervisor_pid != agent.pid);
+    let supervisor_start = super::common::identity_of(supervisor_pid).unwrap();
+    let first = marker();
+    assert_eq!(first["kind"], "ephemeral_worker");
+    assert_eq!(first["pid"], agent.pid);
+
+    // The tunnel goes away and stays away, then the worker is killed.
+    std::fs::write(home.join("offline"), "").unwrap();
+    let (pid, start) = bridge(&home, owner.pid).unwrap();
+    super::common::kill_recorded(pid, &start);
+    wait_for("unknown attempt", || {
+        attempt(&state, &task).is_some_and(|a| a.observation == Observation::Unknown)
+    })
+    .await;
+    super::common::kill_recorded(agent.pid, &agent.start);
+    agent.wait().await;
+
+    // (ii) The command still runs: the next start is refused.
+    std::fs::write(worker_state.join("left-over"), "old").unwrap();
+    let directory = std::fs::metadata(&worker_state).unwrap();
+    let marker_bytes = std::fs::read(worker_state.join("ephemeral.json")).unwrap();
+    let refused = tokio::time::timeout(
+        T,
+        start_worker()
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+            .wait_with_output(),
+    )
+    .await
+    .expect("the second start must be refused, not serve")
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("ephemeral.lock is held"), "{stderr}");
+    assert!(
+        stderr.contains(first["instance"].as_str().unwrap()),
+        "{stderr}"
+    );
+    // Nothing was removed or replaced.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let now = std::fs::metadata(&worker_state).unwrap();
+        assert_eq!((now.dev(), now.ino()), (directory.dev(), directory.ino()));
+    }
+    assert_eq!(
+        std::fs::read(worker_state.join("ephemeral.json")).unwrap(),
+        marker_bytes
+    );
+    assert_eq!(
+        std::fs::read_to_string(worker_state.join("left-over")).unwrap(),
+        "old"
+    );
+    assert!(worker_state.join("worker.db").exists());
+    // Nothing was signalled: the command (which no signal handler protects)
+    // and its supervisor are the same processes, and the command still waits.
+    assert_eq!(
+        super::common::identity_of(command_pid).as_deref(),
+        Some(command_start.as_str())
+    );
+    assert_eq!(
+        super::common::identity_of(supervisor_pid).as_deref(),
+        Some(supervisor_start.as_str())
+    );
+    assert!(!root.join("release-ephemeral").exists());
+
+    // (i) The command ends by itself, and the supervisor after it.
+    std::fs::write(root.join("release-ephemeral"), "").unwrap();
+    wait_for("command and supervisor gone", || {
+        super::common::identity_of(command_pid).as_deref() != Some(command_start.as_str())
+            && super::common::identity_of(supervisor_pid).as_deref()
+                != Some(supervisor_start.as_str())
+    })
+    .await;
+    let mut again = Owned::new(start_worker().spawn().unwrap());
+    wait_for("second start serving", || {
+        let exited = again.child.as_mut().unwrap().try_wait().unwrap();
+        assert!(exited.is_none(), "the second start exited {exited:?}");
+        std::os::unix::net::UnixStream::connect(worker_state.join("agent.sock")).is_ok()
+    })
+    .await;
+    let second = marker();
+    assert_eq!(second["pid"], again.pid);
+    assert_ne!(second["instance"], first["instance"]);
+    assert!(!worker_state.join("left-over").exists());
+    assert_eq!(
+        belt::storage::WorkerStore::open_read_only(&worker_state)
+            .unwrap()
+            .list_nonterminal()
+            .unwrap()
+            .len(),
+        0,
+        "the new state must not carry the earlier start's attempt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("count-ephemeral")).unwrap(),
+        "once\n"
+    );
+    again.stop().await;
+    assert!(!worker_state.exists());
+    std::fs::write(root.join("release-blocker"), "").unwrap();
+    wait_for("blocker finished", || {
+        attempt(&state, &blocker).is_some_and(|a| a.termination.is_some())
+    })
+    .await;
     assert!(matches!(
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
