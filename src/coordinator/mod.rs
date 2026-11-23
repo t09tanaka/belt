@@ -37,9 +37,9 @@ mod link;
 pub(crate) mod member_contact;
 pub mod policy;
 mod prefetch;
-pub(crate) mod release;
 mod preparation;
 mod preparation_identity;
+pub(crate) mod release;
 mod workflow_artifact;
 
 pub use input_gate::{PlacementInputs, ReadyInput};

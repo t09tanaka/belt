@@ -54,7 +54,10 @@ impl Coordinator {
             .with_submits(self.submits_in_flight());
         // Spec 25.6 (a): the workers attached since the last pass list what
         // they hold of this parent that nobody releases any more.
-        self.reconcile_unreleased().await?;
+        self.reconcile_unreleased(
+            tokio::time::Instant::now() + Duration::from_millis(cfg.budget_ms / 4),
+        )
+        .await?;
         let mut attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             // Use every attached worker before rotating/truncating the page.

@@ -18,8 +18,6 @@ pub use coordinator::query;
 mod db;
 #[cfg(test)]
 mod group_tests;
-#[cfg(test)]
-mod release_tests;
 mod lock;
 #[cfg(test)]
 mod paging_tests;
@@ -28,6 +26,8 @@ pub mod policy;
 mod prune_tests;
 #[cfg(test)]
 mod pruning_tests;
+#[cfg(test)]
+mod release_tests;
 #[cfg(test)]
 mod retry_dependents_tests;
 mod schema;
@@ -52,9 +52,10 @@ pub use db::Db;
 pub use lock::ProcessLock;
 pub(crate) use worker::MembershipImage;
 pub use worker::{
-    AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
-    MemberPin, NewAcceptance, ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
-    MAX_UNDELIVERED_TOMBSTONES, DedupRecord, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNRELEASED_PAGE, RELEASE_BATCH,
+    AcceptedAttempt, CancelOutcome, DedupRecord, KeyGeneration, LaunchClaim, LeaseOutcome,
+    LogPosition, MemberPin, NewAcceptance, ProcessIdentity, Released, SubmitOutcome, WorkerStore,
+    DEFAULT_ACK_WAIT_MS, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNDELIVERED_TOMBSTONES,
+    MAX_UNRELEASED_PAGE, RELEASE_BATCH,
 };
 
 use crate::error::ErrorCode;

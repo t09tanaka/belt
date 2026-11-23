@@ -37,8 +37,8 @@ const ATTEMPT: &str = "worker_attempt";
 
 mod release;
 pub use release::{
-    DedupRecord, Leave, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
-    MAX_UNRELEASED_PAGE, RELEASE_BATCH,
+    DedupRecord, Leave, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNRELEASED_PAGE,
+    RELEASE_BATCH,
 };
 
 /// How long a worker waits for `ack_collected` after an attempt ended before
@@ -797,6 +797,9 @@ impl WorkerStore {
             new.coordinator_epoch,
             move |tx, o| {
                 let aid = new.attempt_id.to_string();
+                // Spec 25.6 (d): a member forgotten while its connection
+                // stayed open gets nothing accepted either.
+                release::not_refused(tx, o)?;
                 let existing = load(tx, o, &aid)?;
                 let tombstoned = tx
                     .query_row(

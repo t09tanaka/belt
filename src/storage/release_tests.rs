@@ -83,17 +83,29 @@ fn walk(m: &WorkerStore, a: &AttemptId, at: u64) {
 }
 
 fn count(t: &T, sql: &'static str) -> i64 {
-    t.own.db.call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?)).unwrap()
+    t.own
+        .db
+        .call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+        .unwrap()
 }
 
 #[test]
 fn an_acknowledgement_with_the_feature_deletes_the_attempt_and_leaves_a_released_record() {
     let t = store();
     let (a, new) = ended(&t, 10);
-    assert!(t.m.ack_and_release(&a, CoordinatorEpoch(1), 20, false).unwrap());
+    assert!(t
+        .m
+        .ack_and_release(&a, CoordinatorEpoch(1), 20, false)
+        .unwrap());
     assert!(t.m.get(&a).unwrap().is_none());
     assert!(t.m.events_of_attempt(&a, 10).unwrap().is_empty());
-    for table in ["command_launch", "lease", "log_spool", "blob_ref", "tombstone"] {
+    for table in [
+        "command_launch",
+        "lease",
+        "log_spool",
+        "blob_ref",
+        "tombstone",
+    ] {
         let n: i64 = t
             .own
             .db
@@ -124,11 +136,10 @@ fn a_release_deletes_a_terminal_attempt_refuses_a_live_one_and_releases_a_record
     let t = store();
     let live = AttemptId::generate();
     t.m.submit(acceptance(&live, 'b'), 1).unwrap();
-    let e = t
-        .m
-        .release_attempt(&live, CoordinatorEpoch(1), 2)
-        .err()
-        .unwrap();
+    let e =
+        t.m.release_attempt(&live, CoordinatorEpoch(1), 2)
+            .err()
+            .unwrap();
     assert_eq!(e.code(), ErrorCode::Overloaded, "{e:?}");
     assert!(t.m.get(&live).unwrap().is_some());
     let (a, _) = ended(&t, 1);
@@ -144,7 +155,10 @@ fn a_release_deletes_a_terminal_attempt_refuses_a_live_one_and_releases_a_record
     t.own
         .forget_released(vec![(t.member.clone(), a.clone())])
         .unwrap();
-    let e = t.m.release_attempt(&a, CoordinatorEpoch(1), 5).err().unwrap();
+    let e =
+        t.m.release_attempt(&a, CoordinatorEpoch(1), 5)
+            .err()
+            .unwrap();
     assert_eq!(e.code(), ErrorCode::NotFound);
     // Another member's release does not reach it.
     let (b, _) = ended(&t, 1);
@@ -171,18 +185,25 @@ fn the_ack_wait_turns_rows_into_unreleased_records_that_only_a_release_frees() {
     let rec = t.m.attempt_record(&old).unwrap().unwrap();
     assert!(!rec.released);
     // A late submit is refused; the record stays until released.
-    assert_eq!(t.m.submit(new, 1_100).err().unwrap().code(), ErrorCode::Retired);
+    assert_eq!(
+        t.m.submit(new, 1_100).err().unwrap().code(),
+        ErrorCode::Retired
+    );
     assert_eq!(t.own.purge_released_records(1_000).unwrap(), 0);
     let mut both = vec![old.clone(), young.clone()];
     both.sort();
     assert_eq!(t.m.list_unreleased(None, 500).unwrap(), (both, false));
     assert_eq!(
-        t.m.release_attempt(&old, CoordinatorEpoch(1), 1_200).unwrap(),
+        t.m.release_attempt(&old, CoordinatorEpoch(1), 1_200)
+            .unwrap(),
         Released::Record
     );
     assert_eq!(t.own.purge_released_records(1_000).unwrap(), 1);
     assert!(t.m.attempt_record(&old).unwrap().is_none());
-    assert_eq!(t.m.list_unreleased(None, 500).unwrap(), (vec![young], false));
+    assert_eq!(
+        t.m.list_unreleased(None, 500).unwrap(),
+        (vec![young], false)
+    );
 }
 
 #[test]
@@ -233,7 +254,10 @@ fn a_member_at_its_bound_of_records_is_refused_a_new_attempt_and_no_one_else() {
         .unwrap();
     let a = AttemptId::generate();
     let e = t.m.submit(acceptance(&a, 'c'), 1).err().unwrap();
-    assert!(matches!(e, StorageError::AttemptRecords(n) if n == full), "{e:?}");
+    assert!(
+        matches!(e, StorageError::AttemptRecords(n) if n == full),
+        "{e:?}"
+    );
     assert!(t.m.get(&a).unwrap().is_none());
     let other = t.own.for_member(&CoordinatorId::generate());
     other.submit(acceptance(&a, 'c'), 1).unwrap();

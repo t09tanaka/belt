@@ -70,22 +70,32 @@ pub fn judge_unreleased(row: bool, verdict: Option<Verdict>) -> Unreleased {
 /// answer is accepted as it comes: a worker that has nothing of the attempt
 /// any more (`NOT_FOUND`) has what the release asks for, and one that does
 /// not answer lists it again at the next connection.
-pub async fn release_over(link: &dyn WorkerLink, submits: &InFlight, attempts: &[AttemptId]) {
+pub async fn release_over(
+    link: &dyn WorkerLink,
+    submits: &InFlight,
+    attempts: &[AttemptId],
+) -> bool {
     if !link.attempt_release_negotiated() {
-        return;
+        return true;
     }
     for attempt in attempts {
         if submits.contains(attempt) {
             continue;
         }
-        let _ = link
+        let answer = link
             .call(Request::ReleaseAttempt(ReleaseAttemptRequest {
                 schema_version: SchemaVersion::CURRENT,
                 request_id: RequestId::generate(),
                 attempt_id: attempt.clone(),
             }))
             .await;
+        // A worker that does not answer is not asked the rest now: what is
+        // left is listed again at the next reconciliation.
+        if matches!(answer, Err(crate::coordinator::LinkError::Unconfirmed)) {
+            return false;
+        }
     }
+    true
 }
 
 impl Coordinator {
@@ -106,7 +116,9 @@ impl Coordinator {
     /// 7). One that is not attached lists them at its next connection.
     pub async fn release_on(&self, worker: &WorkerId, attempts: &[AttemptId]) {
         if let Some(link) = self.link_of(worker) {
-            release_over(link.as_ref(), &self.submits, attempts).await;
+            if !release_over(link.as_ref(), &self.submits, attempts).await {
+                self.reconcile_due(worker);
+            }
         }
     }
 
@@ -124,7 +136,7 @@ impl Coordinator {
     /// and neither acknowledged nor released, and release what has no row
     /// here or whose collection gave up. A worker that does not answer, or
     /// has more than [`PAGES`] pages, stays due.
-    pub(crate) async fn reconcile_unreleased(&self) -> Result<()> {
+    pub(crate) async fn reconcile_unreleased(&self, deadline: tokio::time::Instant) -> Result<()> {
         let due: Vec<WorkerId> = std::mem::take(
             &mut *self
                 .unreleased_due
@@ -141,7 +153,11 @@ impl Coordinator {
             if !link.attempt_release_negotiated() {
                 continue;
             }
-            if !self.reconcile_one(link.as_ref()).await? {
+            let link = super::link::Budgeted {
+                inner: link,
+                deadline,
+            };
+            if !self.reconcile_one(&link).await? {
                 self.reconcile_due(&worker);
             }
         }
@@ -181,7 +197,9 @@ impl Coordinator {
                     Ok(out)
                 })
                 .await?;
-            release_over(link, &self.submits, &judged).await;
+            if !release_over(link, &self.submits, &judged).await {
+                return Ok(false);
+            }
             if !page.more {
                 return Ok(true);
             }
@@ -209,7 +227,11 @@ mod tests {
             judge_unreleased(true, Some(Verdict::GaveUp)),
             Unreleased::Release
         );
-        for v in [None, Some(Verdict::Complete), Some(Verdict::RequiredMissing)] {
+        for v in [
+            None,
+            Some(Verdict::Complete),
+            Some(Verdict::RequiredMissing),
+        ] {
             assert_eq!(judge_unreleased(true, v), Unreleased::Keep, "{v:?}");
         }
     }

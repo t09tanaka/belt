@@ -755,7 +755,7 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - `STALE_EPOCH` を受け取った親は、新しい親に交代したものとして、以後は配置も制御も行わない。
 - 配置を記録した未ACKの需要は、workerの受理を記録したときのほか、attemptがterminalになったとき、retireが確認されたときにも解消する。
 
-retire・重複排除の最小記録のうち、親の記録（`retire_tombstone`）は、runの刈り取り（25.5）でそのattemptの行と一緒に消す。workerの記録はclusterの寿命中保持する（attemptが届かなかったtombstoneだけは、24.4の規則で消してよい）。（workerの記録は、第25章の段階3で、重複防止の記録の規則に変える。）大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
+retire・重複排除の最小記録のうち、親の記録（`retire_tombstone`）は、runの刈り取り（25.5）でそのattemptの行と一緒に消す。workerの記録は、attemptを消した後は重複防止の記録が受け持ち、25.6の (c) の規則で消す（attemptが届かなかったtombstoneは、24.4の規則で消してよい）。大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
 
 # 12. lease、停止、再接続、再起動
 
@@ -906,7 +906,7 @@ artifactの記録（`get_result` の `artifacts` の1件）は、name、相対pa
 4. すべてが検証され永続保存された後に、記録した `result_digest` で `ack_collected` を送る。送る直前に、記録したものがdiskにあることを確かめ直す: `result.json` を記録から書き直し、各logと各artifactを読んで記録した長さとdigestに照合し、ファイルとその上の各directoryをfsyncする（新しく作ったdirectoryとファイルは、作った時点でも親directoryをfsyncする）。記録と合わないものは記録を取り消して回収し直し、それが済むまでACKを送らない。workerが別のresultを持っていれば（resultなしで確定したattemptに後からresultが保存された場合）`CONFLICT` で断るので、親はresultを読み直し、digestが違えば1から回収し直す。workerは、digestを照合した読み取りの後にresultが保存された場合も、ACKの記録と同じtransactionで断る。
 5. workerがACKを受理した記録と、attemptの `collected` を、同じtransactionで確定する。応答を失ったACKは送り直す（workerは同じACKを何度でも受理する）。送り直したACKにworkerが `NOT_FOUND`・`RETIRED` で答えた場合（解放して削除した後）は、親にすべてが揃っているので回収を閉じる。resultを持たないattemptへのACKは、workerがそのattemptのsupervisorのlockを取れたときだけ記録する（supervisorが生きている間は後からresultが保存されうるので `OVERLOADED` で断り、親は待つ）。resultなしでACKされたattemptへのresultの保存は、workerが失敗として断る。
 
-回収の失敗に数えるのは、問い合わせ直しても変わらないものだけである: 全bytesを受け取ったobjectのdigest・sizeの不一致、問い合わせと合わない・自己矛盾した応答（使えない名前を含む）、workerの `NOT_FOUND`・`RETIRED`（workerはACKを待つ期限 `ack_wait_ms` を過ぎたresultだけを削除する）。これが、間に検証済みの前進（artifactの公開）を挟まずに3回続いたら回収を打ち切り、`COLLECTION_FAILED` を確定する。それ以外（接続の切断、`OVERLOADED`、worker内部の失敗 `INTERNAL`、未知のerror code、親自身のdiskやDBの失敗）は数えず、間隔を延ばしながら（既定1秒から倍々、最大64秒。切断は待たない）何度でも待つ。前の親が残した `.part`（末尾が壊れているかもしれない）がdigestに合わないときは、失敗に数えずに捨てて最初から取り直す。1つのattemptの失敗は、同じworkerの他のattemptの回収を止めない。打ち切った回収ではACKを送らず、途中のファイル（`tmp/`）を消す。打ち切った回収は開き直せる（resultの読み直しから。親に残っているファイルは検証し直す）。（開き直しの保存処理は実装にあるが、それを呼ぶ経路はまだ無い。第25章の段階3は、打ち切りの時点でACKは送らず、別の操作 `release_attempt` を送り、workerはその場で写しを消す。段階3の後は、打ち切った回収を開き直しても `NOT_FOUND` で再び打ち切られる。開き直す経路を足す変更が、workerに写しを残す上限つきの期間を定める。25.6。）workerが未ACKのresultを保持するのは `ack_wait_ms` の間なので、それを過ぎて開き直した回収は `NOT_FOUND` で再び打ち切られる。
+回収の失敗に数えるのは、問い合わせ直しても変わらないものだけである: 全bytesを受け取ったobjectのdigest・sizeの不一致、問い合わせと合わない・自己矛盾した応答（使えない名前を含む）、workerの `NOT_FOUND`・`RETIRED`（workerはACKを待つ期限 `ack_wait_ms` を過ぎたresultだけを削除する）。これが、間に検証済みの前進（artifactの公開）を挟まずに3回続いたら回収を打ち切り、`COLLECTION_FAILED` を確定する。それ以外（接続の切断、`OVERLOADED`、worker内部の失敗 `INTERNAL`、未知のerror code、親自身のdiskやDBの失敗）は数えず、間隔を延ばしながら（既定1秒から倍々、最大64秒。切断は待たない）何度でも待つ。前の親が残した `.part`（末尾が壊れているかもしれない）がdigestに合わないときは、失敗に数えずに捨てて最初から取り直す。1つのattemptの失敗は、同じworkerの他のattemptの回収を止めない。打ち切った回収ではACKを送らず、途中のファイル（`tmp/`）を消す。打ち切った回収は開き直せる（resultの読み直しから。親に残っているファイルは検証し直す）。（開き直しの保存処理は実装にあるが、それを呼ぶ経路は無い。打ち切りの時点でACKは送らず、別の操作 `release_attempt` を送り、workerはその場で写しを消す。打ち切った回収を開き直しても `NOT_FOUND` で再び打ち切られる。開き直す経路を足す変更が、workerに写しを残す上限つきの期間を定める。25.6。）workerが未ACKのresultを保持するのは `ack_wait_ms` の間なので、それを過ぎて開き直した回収は `NOT_FOUND` で再び打ち切られる。
 
 **必須artifactと任意artifactの判定**: 親が `required` で宣言したartifactがresultの `artifacts` に無い場合（`artifacts_not_stored` の `missing`・`refused`、またはどちらの一覧にも無い）、そのattemptは `collected` にならず、taskは成功にならない（commandが成功していても「必須artifactの欠落」）。resultは変わらないので、`missing` も `refused` も取り直さない。存在するartifactとlogは回収し、ACKも送る（workerに残す理由が無い）。`optional` の欠落はtaskの結果を変えない。親がterminationを確定したattempt（workerが受理していない、またはretireを親が確定した）は、workerに問い合わせずに回収を閉じる。
 
@@ -929,7 +929,7 @@ matrixのoutputは既定で元のmatrix順に集約し、完了到着順によ�
 
 中間artifactはupload step時点でimmutableに固定し、親で検証・永続保存したreceiptを公開してからstepを完了する。download側はこのreceiptを待つ。最終run回収とは別の処理とし、後段がUnit terminalまでartifactを待つdeadlockを作らない。同名artifactのconflictもworkflow単位で判定し、別workflowが同名のartifactをuploadしてもconflictにならない（local-ci 0.8.0以降の実装と同じ）。別workflowのartifactはdownloadできない。同名artifactは同じworkflow内では既定でconflict、明示overwriteは新しいartifact versionとして記録する。matrixにはvariantを含む名前または明示reducerを必要とする。
 
-`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は、runの刈り取り（25.5）でrunと一緒に消す。runは、終わってから `retention_days` 日で、行・結果・入力ごと親から消え、その後の `show`・`logs`・`outputs`・`retry`・`cancel` は `NOT_FOUND` になる。（workerの側の写しの保持は、第25章の段階3で変える。）
+`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は、runの刈り取り（25.5）でrunと一緒に消す。runは、終わってから `retention_days` 日で、行・結果・入力ごと親から消え、その後の `show`・`logs`・`outputs`・`retry`・`cancel` は `NOT_FOUND` になる。workerの側の写しは、ACKか `release_attempt` の受理でその場で消える（25.6）。
 
 secret bundleの内容はartifact・outputs・ログspoolのいずれにも含めない（第22章）。
 
@@ -1843,7 +1843,7 @@ belt group                                # グループのID、鍵の世代、�
 - **epoch**: `coordinator_epoch` は投げたメンバーごとの世代である。workerは `coordinator_id` ごとに最大のepochを持ち、`STALE_EPOCH` の判定、lease key（`coordinator_epoch`・`lease_seq`）、helloの答えの `coordinator_epoch` には、そのメンバーのものだけを使う。あるメンバーのepochが進んでも、他のメンバーの要求は古くならない。「何も行っていない」ことを表す断り（`OVERLOADED`、`INVALID_INPUT`、taskにliveなattemptがあることによる `CONFLICT`）は、その要求が運んだ新しいepochも記録せず、epochが進んだときのtombstoneの消去も行わない。attemptについての答え（`RETIRED`、payloadの不一致、`LEASE_NOT_RENEWABLE` など）は、従来どおり新しいepochを記録する。
 - **所有と見える範囲**: attemptは、それをsubmitしたメンバー（`coordinator_id`）のものである。workerは、attempt・retireのtombstone・leaseを `(coordinator_id, attempt_id)` で、taskごとのliveなattemptの一意性を `(coordinator_id, task_id)` で持つ。したがって、別のメンバーが同じ `attempt_id` や `task_id` を使っても別の行になり、互いに `RETIRED` や `CONFLICT` を起こさず、相手の状態も返らない。`get_attempt`・`list_attempts`・`renew_lease`・`cancel_attempt`・`retire_attempt`・`watch_events`・`read_log`・`get_result`・`ack_collected`・`blob_get`・`secret_bundle_put` は、接続したメンバーの分だけを対象にする（他のメンバーのattemptは `NOT_FOUND`）。
 - **`attempt_id` は1つのworkerで1メンバーの分だけ**: worker上のattemptのdirectory、supervisor、task-traffic-controllerのcommand IDは、`attempt_id` だけで名前を付ける。そのため、1つのworkerが同じ `attempt_id` のattemptを持てるのは、同時に1つのメンバーの分だけである。別のメンバーのattemptが持っている `attempt_id` へのsubmitは、tombstoneを含めて何も保存せずに、`OVERLOADED` と `overloaded_reason.reason = "attempt_id_in_use"` で断る（相手のattemptの状態は答えに含めない）。断られた側は、taskを失敗にせず、新しい `attempt_id` で配置し直す（`in-place` のtaskは同じattemptを後で送り直す。第11章）。tombstone・lease・epochはこの制限を受けず、同じ `attempt_id` へのcancelやretireは、送ったメンバー自身のtombstoneになるだけで、相手のattemptには触れない。`attempt_id` は乱数で作るので、正直なメンバーの間でこの衝突は実際には起きない。
-- **届かなかったattemptのtombstone**: retireやcancelが先に届き、attemptが届かなかったtombstoneは、そのメンバーの `coordinator_epoch` が記録時より進んだら消してよい（古いepochの遅れたsubmitは `STALE_EPOCH` で断られる）。メンバーごとに1万件を上限とし、超える依頼は `OVERLOADED` で断る。受理したattemptのtombstoneは従来どおり消さない。（第25章の段階3で、重複防止の記録に置き換える。）
+- **届かなかったattemptのtombstone**: retireやcancelが先に届き、attemptが届かなかったtombstoneは、そのメンバーの `coordinator_epoch` が記録時より進んだら消してよい（古いepochの遅れたsubmitは `STALE_EPOCH` で断られる）。メンバーごとに1万件を上限とし、超える依頼は `OVERLOADED` で断る。受理したattemptのtombstoneは、attemptと一緒に消え、重複防止の記録が置き換わる（25.6）。
 - **drainとstop**: `workers drain`・`resume` はメンバー全体に働く（どのメンバーからの新しいsubmitも止める）。状態はworkerの側に永続化し、どのメンバーからでも `resume` できる。更新のための保留（24.8）はdrainとは別の状態で、`resume` では解けない。`workers stop` はそのマシンのresident（両方の役割）を止めるので、相手が他のメンバーの仕事を持つか、自分で投げた非terminalのrunを持つとき（`inspect` の答えで分かる）は、理由を示して断る。`--all-submitters` を明示したときだけ進める。`stop --cancel-running` も同じ条件で `--all-submitters` を要する。
 
 ## 24.5 投げたメンバーをまたぐ予測と見積
@@ -1964,8 +1964,8 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | - | - | - | - |
 | 0 | 既存の挙動の修正。入力の保持の終点の誤り、runの印 `pruning` と断り | なし | できる |
 | 1 | crashの受け皿と、持ち主が単純なもの。所有の証明つきの一時file、提出されなかった取り込み（行の無いrunへのcancelを含む）、`in-place/<run>.json`、一時workerの起動し直し | 段階0（印は使わないが、同じmigrationに入れてよい） | できる |
-| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる（入れてある）。段7（`release_attempt` の送信）は段階3と一緒に入れる。親のGit領域のrefを消す部分は、local-ciに関数が無いので入れていない（25.16） |
-| 3 | workerの側の結果の写しと、重複防止の記録 | 段階2（`release_attempt` を送る時点が刈り取りにある）。wireの機能 `attempt_release_v1` | できる |
+| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる（入れてある）。段7（`release_attempt` の送信）は段階3で入れた。親のGit領域のrefを消す部分は、local-ciに関数が無いので入れていない（25.16） |
+| 3 | workerの側の結果の写しと、重複防止の記録 | 段階2（`release_attempt` を送る時点が刈り取りにある）。wireの機能 `attempt_release_v1` | できる（入れてある） |
 | 4 | 古いbinaryと、toolchainのroot | なし（段階3と独立） | できる |
 | 5 | workerが受け取ったsourceとclone | 5a（workerの取り込みの持ち主）は独立。5bは未確定 | 5aはできる。5bはできない（25.9） |
 
@@ -2185,7 +2185,7 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 
 **刈り取り**は、投げたメンバーが1つのrunを自分のディスクから完全に消す処理である。
 
-**今の挙動（段階2を入れた後）。** 親は、下の8段のうち、段7（`release_attempt` の送信。段階3と一緒に入れる）と、段4の親のGit領域のrefの削除（local-ciに関数が無い。25.16）を除いて、この節のとおりに消す。段階2より前は、runの行とevent、`reader-pins/<run>.lock`、`sources/runs/<run>` とそのlock、`sources/retention.db` の行、通常のrunの `in-place/<run>.json` を消さなかった。結果・入力・Vaultは、刈り取りより前に、それぞれの保持driverが消している（第23章）。刈り取りは、その残りを消す。
+**今の挙動（段階3を入れた後）。** 親は、下の8段のうち、段4の親のGit領域のrefの削除（local-ciに関数が無い。25.16）を除いて、この節のとおりに消す。段階2より前は、runの行とevent、`reader-pins/<run>.lock`、`sources/runs/<run>` とそのlock、`sources/retention.db` の行、通常のrunの `in-place/<run>.json` を消さなかった。結果・入力・Vaultは、刈り取りより前に、それぞれの保持driverが消している（第23章）。刈り取りは、その残りを消す。
 
 **条件。** runが終わっていて（25.3の述語）、終点から `retention_days`（既定7日）が過ぎていること。`observation` がunknownのattemptを持つrunは、述語の3で条件を満たさない。時計がHoldの間、試用中は行わない。時計は、結果のGCの時計（親DBの `result_gc_clock`）である。
 
@@ -2280,7 +2280,7 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 
 ## 25.6 段階3: workerの側の結果の写しと、重複防止の記録
 
-**今の挙動。** workerは、`ack_collected` を受理した後も7日、ACKが来ないときはterminalから7日（`ack_wait`）で、resultとattemptのdirectoryを消す。`worker_attempt` の行、event、受理したattemptのtombstoneは消さない（triggerが禁じている）。`supervisors/<attempt>.lock` は消さず、agentが全部を走査する。親が `ack_collected` を送るのは、回収が成功したときだけである。`list_attempts` を親は呼んでいない。
+**今の挙動（段階3を入れた後）。** この節の規則のとおりである。機能 `attempt_release_v1` を合意した接続では、workerは `ack_collected` か `release_attempt` を受理した時点で、attemptの行・子・event・tombstoneを消し、重複防止の記録を書き、directoryとlockを消す（`src/storage/worker/release.rs`、`src/worker/agent.rs`）。合意していない接続（段階3より前の親）の `ack_collected` は、今までどおり `acked_at_ms` を書くだけで、その行は次のagentの起動で (c2) の手順で消える。段階3より前は、workerは `ack_collected` を受理した後も7日、ACKが来ないときはterminalから7日（`ack_wait`）で、resultとattemptのdirectoryを消し、`worker_attempt` の行、event、受理したattemptのtombstoneは消さなかった（triggerが禁じていた）。
 
 ### (a) ACKと放棄
 
@@ -2420,7 +2420,7 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 
 **安全の証明（段階3の全体）。** 結果の写しを読むのは、submitしたメンバーの回収だけで、そのメンバーが「もう読まない」と述べた後に消す（成功した回収はACK、打ち切った回収は閉じた時点の解放、刈り取ったrunは行の不在）。attemptの行を読むのは、そのメンバーの `get_attempt`・`get_result`・`watch_events` と、遅れたsubmitの照合で、前の3つは解放の後には来ず、最後のものは重複防止の記録が答える。記録を消した後に同じattemptのsubmitが届く経路は、(c) と (d) で閉じている。
 
-**受け入れ試験。** (i) `ack_collected` の受理の直後に、attemptのdirectory・行・子の行・eventが無く、記録が1行ある。(ii) `ack_collected` のdigestの不一致と、読み取りの後のresultの保存は、今までどおり断られる。(iii) 回収を打ち切った直後に `release_attempt` が届き、workerのdirectory・行が消える。届かなかった場合（workerが不在）、次の接続の照合が、行があって `gave_up` で閉じた回収として拾い、消える。(iv) 刈り取りのときにworkerが不在でも、次の接続の照合で消える。親DBに行があり、回収が閉じていないattemptには `release_attempt` を送らない。(v) 600件を超える未解放のattemptを、`list_unreleased` がpageで列挙できる。(vi) 解放より前に取り出されて処理を待っているsubmitの写し（処理を止める点を差し込む）は、解放の受理の後に処理されても実行されず、その処理が終わった時点で記録が消える。接続は開いたままである。(vii) 別の接続に残した写し（解放の時点で開いていた接続）が、解放の後に読まれても実行されず、その接続が済むまで記録が残る。接続が終わっても、取り出し済みのsubmitの処理が終わるまで記録が残る。(viii) agentの再起動で、解放済みの記録が消え、未解放の記録は残る。`ack_wait` を過ぎたattemptは、行が無く未解放の記録があり、遅れたsubmitが実行されず、`release_attempt` で消える。(ix) 1本の接続を保ったまま、10,000件を超えるattemptを順に実行・回収しても、解放済みの記録が溜まらず、`attempt_records` の断りが出ない。未解放の記録が10,000件に達したときだけ断りが出て、他のメンバーは断られない。(x) `belt group forget` の後、同じ `coordinator_id` の接続が `member_forgotten` で断られ、送り直されたsubmitが実行されない。terminalでないattemptがあれば命令が断られる。(xi) `workers forget <worker>` の挙動が変わらない。(xii) 機能を合意していない相手には `release_attempt` も `list_unreleased` も送らず、今の挙動になる。(xiii) lockを確かめるだけの呼び出し（agentの5か所と `foreign_supervisors`）が、消したlock fileを作り直さない。`attempts/<attempt>/` がlockより先に消える。directoryを消した直後・lockを消した直後に落ちても、次の起動が `dropped_attempt` から続きを行う。residentの起動の `hold` を、agentの削除と競わせても、lock fileが残らない。(xiv) submitの判定と挿入の間に解放と記録の削除を差し込めない（判定と挿入が1つのtransactionである）。(xv) 段階3より前にACKされた行を持つworker DBで起動すると、接続を受け付ける前に、その行・directory・lockが消え、記録は増えない。1,000行を超える分はtickが続ける。試用中は消えない。段階3より前の、7日を過ぎたACKの無い行は、最初のtickで未解放の記録に変わる。(xvi) 親が、同じattemptのsubmitの答えを待っている間、ACKも `release_attempt` も送らない。
+**受け入れ試験。** (i) `ack_collected` の受理の直後に、attemptのdirectory・行・子の行・eventが無く、記録が1行書かれている（処理の途中のsubmitが無ければ、その記録は同じ受理の中で消える）。(ii) `ack_collected` のdigestの不一致と、読み取りの後のresultの保存は、今までどおり断られる。(iii) 回収を打ち切った直後に `release_attempt` が届き、workerのdirectory・行が消える。届かなかった場合（workerが不在）、次の接続の照合が、行があって `gave_up` で閉じた回収として拾い、消える。(iv) 刈り取りのときにworkerが不在でも、次の接続の照合で消える。親DBに行があり、回収が閉じていないattemptには `release_attempt` を送らない。(v) 600件を超える未解放のattemptを、`list_unreleased` がpageで列挙できる。(vi) 解放より前に取り出されて処理を待っているsubmitの写し（処理を止める点を差し込む）は、解放の受理の後に処理されても実行されず、その処理が終わった時点で記録が消える。接続は開いたままである。(vii) 別の接続に残した写し（解放の時点で開いていた接続）が、解放の後に読まれても実行されず、その接続が済むまで記録が残る。接続が終わっても、取り出し済みのsubmitの処理が終わるまで記録が残る。(viii) agentの再起動で、解放済みの記録が消え、未解放の記録は残る。`ack_wait` を過ぎたattemptは、行が無く未解放の記録があり、遅れたsubmitが実行されず、`release_attempt` で消える。(ix) 1本の接続を保ったまま、10,000件を超えるattemptを順に実行・回収しても、解放済みの記録が溜まらず、`attempt_records` の断りが出ない。未解放の記録が10,000件に達したときだけ断りが出て、他のメンバーは断られない。(x) `belt group forget` の後、同じ `coordinator_id` の接続が `member_forgotten` で断られ、送り直されたsubmitが実行されない。terminalでないattemptがあれば命令が断られる。(xi) `workers forget <worker>` の挙動が変わらない。(xii) 機能を合意していない相手には `release_attempt` も `list_unreleased` も送らず、今の挙動になる。(xiii) lockを確かめるだけの呼び出し（agentの5か所と `foreign_supervisors`）が、消したlock fileを作り直さない。`attempts/<attempt>/` がlockより先に消える。directoryを消した直後・lockを消した直後に落ちても、次の起動が `dropped_attempt` から続きを行う。residentの起動の `hold` を、agentの削除と競わせても、lock fileが残らない。(xiv) submitの判定と挿入の間に解放と記録の削除を差し込めない（判定と挿入が1つのtransactionである）。(xv) 段階3より前にACKされた行を持つworker DBで起動すると、接続を受け付ける前に、その行・directory・lockが消え、記録は増えない。1,000行を超える分はtickが続ける。試用中は消えない。段階3より前の、7日を過ぎたACKの無い行は、最初のtickで未解放の記録に変わる。(xvi) 親が、同じattemptのsubmitの答えを待っている間、ACKも `release_attempt` も送らない。
 
 **schema・wire。** worker DB: 重複防止の記録の表、`refused_member`、`event_no_delete`（worker DB）と `tombstone_no_delete` を外す。submitの判定と挿入を1つのtransactionにする。段階3より前の行の変換（(c2)）。wire: 機能 `attempt_release_v1`、操作 `release_attempt`・`list_unreleased`、`overloaded_reason.reason = "attempt_records"`、断る理由 `member_forgotten`。CLI: `belt group forget <member>`。親: submitとACK・`release_attempt` の間の排他、接続時の照合。
 
@@ -2575,16 +2575,16 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
-| attemptの行と子（`command_launch`・`lease`・`log_spool`・`blob_ref`）、attemptのevent | `worker.db` | 親の照会、復旧 | 消さない | ACKか `release_attempt` の受理で消す（成功した回収はACK、打ち切った回収は閉じた時点の解放）。どちらも来なければterminalから7日。段階3より前にACKされた行は、段階3の起動時に消す | 3 | 25.6 |
-| 重複防止の記録 | `worker.db` | 遅れたsubmit、親の照会 | 表が無い（attemptの行とtombstoneが残っている） | 解放済みは、解放より前に読まれ得たsubmitの処理が終わった時点で消す（通常は数ミリ秒）。未解放は `release_attempt` まで。合計でメンバーごとに10,000件（約2 MB）を歯止めにする | 3 | 25.6の (c) |
+| attemptの行と子（`command_launch`・`lease`・`log_spool`・`blob_ref`）、attemptのevent | `worker.db` | 親の照会、復旧 | 規則のとおり（段階3で入れた） | ACKか `release_attempt` の受理で消す（成功した回収はACK、打ち切った回収は閉じた時点の解放）。どちらも来なければterminalから7日。段階3より前にACKされた行は、段階3の起動時に消す | 3 | 25.6 |
+| 重複防止の記録 | `worker.db` | 遅れたsubmit、親の照会 | 規則のとおり（段階3で入れた） | 解放済みは、解放より前に読まれ得たsubmitの処理が終わった時点で消す（通常は数ミリ秒）。未解放は `release_attempt` まで。合計でメンバーごとに10,000件（約2 MB）を歯止めにする | 3 | 25.6の (c) |
 | tombstone | `worker.db` の `tombstone` | 遅れたsubmit | 届かなかったものは、メンバーごとに10,000件、epochの前進で消す。受理したものは消さない | 受理したものは重複防止の記録に置き換える | 既存、3 | 24.4、25.6 |
-| 忘れたメンバー | `worker.db` の `refused_member` | 接続の拒否 | 表が無い | 命令ごとに1行。1,024行まで。消さない | 3 | 利用者の操作 |
-| メンバーごとの記録 | `worker.db` の `member_epoch`・`group_member`・`retired_identity` | 接続の検査 | メンバーごとに1行ずつ。消さない | `belt group forget` で消す | 3 | 利用者の操作 |
-| workerのevent（attemptに属さないもの） | `worker.db` | 親の `watch_events`、診断 | 消さない | `retention_days` 日 | 3 | 時刻 |
+| 忘れたメンバー | `worker.db` の `refused_member` | 接続の拒否 | 規則のとおり（段階3で入れた） | 命令ごとに1行。1,024行まで。消さない | 3 | 利用者の操作 |
+| メンバーごとの記録 | `worker.db` の `member_epoch`・`group_member`・`retired_identity` | 接続の検査 | 規則のとおり（段階3で入れた） | `belt group forget` で消す | 3 | 利用者の操作 |
+| workerのevent（attemptに属さないもの） | `worker.db` | 親の `watch_events`、診断 | 規則のとおり（段階3で入れた） | `retention_days` 日 | 3 | 時刻 |
 | 捨てたattemptの一覧 | `worker.db` の `dropped_attempt` | agentの片付け | directoryを消した直後に消す | 同じ | 既存 | directoryが無いこと |
-| attemptのdirectory | `attempts/<attempt>/`（`supervise.json`・`execution-binding.json`・`cleanup-pending`・`ci/` を含む） | supervisor、回収、別のscopeのsupervisorの照合 | terminalか、ACKから7日。ACKが無ければterminalから7日。中の `ci/exchange/.belt-xchg.*/`（artifactのstepの作業用）は、killで残ったものを、同じattemptの次のartifactのstepの開始が、markerで所有を証明できたものだけ消す（25.4の (a)） | ACKか `release_attempt` の受理でその場（行のcommitの直後、lockより先）。無ければterminalから7日 | 3 | 25.6 |
+| attemptのdirectory | `attempts/<attempt>/`（`supervise.json`・`execution-binding.json`・`cleanup-pending`・`ci/` を含む） | supervisor、回収、別のscopeのsupervisorの照合 | 規則のとおり（段階3で入れた） | ACKか `release_attempt` の受理でその場（行のcommitの直後、lockより先）。無ければterminalから7日 | 3 | 25.6 |
 | workspace | `workspaces/<attempt>` | attemptのcommand | terminalで消す。32個まで | 同じ | 既存 | terminalと、supervisorのlock |
-| supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 消さない。全部を走査する | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
+| supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 規則のとおり（段階3で入れた） | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
 | secretの配置 | workspaceの中、`secret-index/<attempt>.json`、`.secrets.tmp-*`、`secrets/` | attemptのcommand | terminalで消す | 同じ | 既存 | terminal |
 | 受け取ったsource | `sources/manifests/`、`sources/objects/` | `blob_verify`、workspaceの準備 | 消さない | 未確定（25.9） | 5b | なし |
 | workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | `import_session`・`root(kind='pending')`・`member` が、受け取ったblobごとに増える | 公開か放棄で消す | 5a | 25.8 |
@@ -2695,10 +2695,10 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | - | - | - | - |
 | 第6章 | 受理されたrunのprivate bindingは、親stateの削除まで保持する（放棄された取り込みのbindingは、段階1で消すようにしてある） | 2（入れてある） | runの刈り取りで消す |
 | 第6章 | 内容をprivateなobject storeへ取り込み、安定したらmanifestをatomicに公開する（やり直した回のobjectは、storeに残った） | 1（入れてある） | 内容は取り込みごとのscratch directoryへ書き、安定した後にだけ、索引へ予約を書いてからstoreへ入れる（25.4の (b)） |
-| 第11章 | retire・重複排除の最小記録はclusterの寿命中保持する | 2（親。入れてある）、3（worker） | 親の記録はrunと一緒に、workerの記録は25.6の (c) で消す |
+| 第11章 | retire・重複排除の最小記録はclusterの寿命中保持する | 2（親。入れてある）、3（worker。入れてある） | 親の記録はrunと一緒に、workerの記録は25.6の (c) で消す |
 | 第11章 | `list_attempts` は500件を超えると `INVALID_INPUT` | 変えない | 照合には `list_unreleased` を使う |
 | 第13章 | 入力、ログ、結果の既定保持はterminal後7日。回収の判定の記録は消さない | 2（入れてある）、3 | 回収の記録はrunと一緒に消す。workerの写しは解放の受理で消す |
-| 第13章 | 打ち切った回収ではACKを送らず、開き直せる | 3 | ACKは送らない。打ち切りの時点で `release_attempt` を送り、workerはその場で写しを消す。開き直しはできなくなる（開き直す経路は製品に無い。足す変更が、写しを残す期間を定める。25.6） |
+| 第13章 | 打ち切った回収ではACKを送らず、開き直せる | 3（入れてある） | ACKは送らない。打ち切りの時点で `release_attempt` を送り、workerはその場で写しを消す。開き直しはできなくなる（開き直す経路は製品に無い。足す変更が、写しを残す期間を定める。25.6） |
 | 第13章 | resultなしで確定したattemptに後からresultが保存された場合の検出（`ack_collected` の `CONFLICT`、digestを照合した読み取りの後の保存の拒否） | 変えない | 成功した回収のACKは変わらない。`release_attempt` はdigestを運ばないが、resultを持たないattemptへは、supervisorのlockを取れたときだけ受理する |
 | （他の章に記述は無い。段階1より前の実装は、行の無いrun IDへのcancelを受理して記録した） | なし | 1（入れてある） | 持ち主の行が `capturing` の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（持ち主の行を読めなかったときは、送り直しを求める答え。25.4の (b)） |
 | 第15章 | 退役したidentityはtombstoneを永続保持する | 未決 | 25.16 |

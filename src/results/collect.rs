@@ -352,7 +352,10 @@ impl Collector {
         }
     }
 
-    pub(crate) fn with_submits(mut self, submits: Arc<crate::coordinator::release::InFlight>) -> Self {
+    pub(crate) fn with_submits(
+        mut self,
+        submits: Arc<crate::coordinator::release::InFlight>,
+    ) -> Self {
         self.submits = submits;
         self
     }
@@ -614,7 +617,7 @@ impl Collector {
                     // collection that gave up; it is released right after
                     // the commit. Lost on the way, the next connection's
                     // reconciliation sends it again.
-                    crate::coordinator::release::release_over(
+                    let _ = crate::coordinator::release::release_over(
                         link,
                         &self.submits,
                         std::slice::from_ref(&a),

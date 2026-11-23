@@ -225,9 +225,8 @@ pub(crate) fn forget(
             format!("{member} is still on this machine's list; remove it first"),
         ));
     }
-    let store = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id).map_err(|e| {
-        ApiError::new(e.code(), e.to_string())
-    })?;
+    let store = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id)
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
     let attempts = store
         .forget_member(member, crate::platform::wall_ms())
         .map_err(|e| ApiError::new(e.code(), e.to_string()))?;

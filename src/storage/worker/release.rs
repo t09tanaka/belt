@@ -78,7 +78,16 @@ pub(crate) fn drop_attempt(
             "SELECT run_id, task_id, generation, payload_hash, coordinator_epoch, termination_json
              FROM worker_attempt WHERE coordinator_id = ?1 AND attempt_id = ?2",
             [owner, aid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()?;
     let Some((run, task, generation, hash, epoch, termination)) = row else {
@@ -91,7 +100,14 @@ pub(crate) fn drop_attempt(
         let rows = s.query_map([owner, aid], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for table in ["command_launch", "lease", "log_spool", "blob_ref", "tombstone", "event"] {
+    for table in [
+        "command_launch",
+        "lease",
+        "log_spool",
+        "blob_ref",
+        "tombstone",
+        "event",
+    ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE coordinator_id = ?1 AND attempt_id = ?2"),
             [owner, aid],
@@ -159,6 +175,24 @@ pub(crate) fn record_room(conn: &Connection, owner: &str) -> Result<()> {
     let n = to_u64(n)?;
     if n >= MAX_ATTEMPT_RECORDS {
         return Err(StorageError::AttemptRecords(n));
+    }
+    Ok(())
+}
+
+/// Refuse every submit of a member `belt group forget` removed here.
+pub(crate) fn not_refused(conn: &Connection, owner: &str) -> Result<()> {
+    let refused = conn
+        .query_row(
+            "SELECT 1 FROM refused_member WHERE coordinator_id = ?1",
+            [owner],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if refused {
+        return Err(StorageError::Invalid(
+            "this worker forgot this member (belt group forget)".into(),
+        ));
     }
     Ok(())
 }

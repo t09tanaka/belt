@@ -219,7 +219,10 @@ mod tests {
         let at = r.take(c, false);
         let _ = late;
         let other = r.released(&m, &b, Some(at));
-        assert!(other.is_empty(), "the late connection was open at this release");
+        assert!(
+            other.is_empty(),
+            "the late connection was open at this release"
+        );
         assert_eq!(r.close(late), vec![(m, b)]);
     }
 
@@ -232,8 +235,10 @@ mod tests {
         assert!(r.handled(s).is_empty());
         let at = r.take(c, false);
         assert_eq!(r.released(&m, &a, Some(at)), vec![(m.clone(), a.clone())]);
+        // A release that came over no connection waits for every open one.
         let (_, b) = ids();
-        assert_eq!(r.released(&m, &b, None), vec![(m, b)]);
+        assert!(r.released(&m, &b, None).is_empty());
+        assert_eq!(r.close(c), vec![(m, b)]);
     }
 
     #[test]

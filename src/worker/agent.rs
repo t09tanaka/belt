@@ -274,6 +274,9 @@ pub struct Agent {
     /// When this agent started (wall clock): the rows acknowledged before it
     /// are an older version's (spec 25.6 (c2)).
     started_ms: u64,
+    /// This agent accepted an acknowledgement of a parent without
+    /// `attempt_release_v1`: the tick no longer continues (c2).
+    old_acks: AtomicBool,
     ticking: AtomicBool,
     /// Warm-ups in progress or just answered, by `sync_id`.
     warmups: Mutex<BTreeMap<String, warmup::Warmup>>,
@@ -671,7 +674,8 @@ impl Agent {
             let dropped = remove_dropped_attempts(&cfg.attempts_root(), &store).map_err(api)?;
             for (attempt, error) in &dropped.failed {
                 let payload = json!({ "attempt": attempt, "error": error });
-                let _ = store.append_event(None, None, "agent_dropped_attempt_kept", &payload, now());
+                let _ =
+                    store.append_event(None, None, "agent_dropped_attempt_kept", &payload, now());
             }
         }
         let max_prepares = cfg.max_concurrent_prepares.max(1);
@@ -716,6 +720,7 @@ impl Agent {
             submitting: Mutex::default(),
             releases: super::release::Releases::default(),
             started_ms,
+            old_acks: AtomicBool::new(false),
             ticking: AtomicBool::new(false),
             warmups: Mutex::default(),
             cleanup_scan: Mutex::new(None),
@@ -2241,14 +2246,40 @@ impl Agent {
         let batch = crate::storage::RELEASE_BATCH;
         let at = now();
         let mut ids = Vec::new();
-        match self.store.expire_unreleased(at, self.cfg.ack_wait_ms, batch) {
+        match self
+            .store
+            .expire_unreleased(at, self.cfg.ack_wait_ms, batch)
+        {
             Ok(v) => ids.extend(v),
-            Err(e) => self.note_global("agent_release_failed", "ack_wait", json!({ "error": e.to_string() })),
+            Err(e) => self.note_global(
+                "agent_release_failed",
+                "ack_wait",
+                json!({ "error": e.to_string() }),
+            ),
         }
-        match self.store.drop_acked_before(self.started_ms, batch) {
+        // Not after this agent accepted an acknowledgement of a parent
+        // without the feature: its row stays until the next start, whatever
+        // the wall clock does (spec 25.6 (c2)).
+        let acked = if self.old_acks.load(Ordering::SeqCst) {
+            Ok(Vec::new())
+        } else {
+            self.store.drop_acked_before(self.started_ms, batch)
+        };
+        match acked {
             Ok(v) => ids.extend(v),
-            Err(e) => self.note_global("agent_release_failed", "acked", json!({ "error": e.to_string() })),
+            Err(e) => self.note_global(
+                "agent_release_failed",
+                "acked",
+                json!({ "error": e.to_string() }),
+            ),
         }
+        // What a release could not finish (a lock a supervisor still held
+        // while it exited) is tried again, a few at a time.
+        if let Ok(left) = self.store.dropped_attempts(DROPPED_PER_TICK) {
+            ids.extend(left);
+        }
+        ids.sort();
+        ids.dedup();
         for id in ids {
             self.remove_dropped(&id);
         }
@@ -2256,13 +2287,25 @@ impl Agent {
             .store
             .prune_unowned_events(at.saturating_sub(self.cfg.retention_ms), batch)
         {
-            self.note_global("agent_release_failed", "events", json!({ "error": e.to_string() }));
+            self.note_global(
+                "agent_release_failed",
+                "events",
+                json!({ "error": e.to_string() }),
+            );
         }
     }
 
     /// The directory and the lock of an attempt whose row just went, at
     /// once; what fails stays in `dropped_attempt` for the next start.
     fn remove_dropped(&self, id: &str) {
+        // The teardown of a terminal attempt (workspace, placed secrets,
+        // scratch) may not have run yet when its member released it: it
+        // runs first, under the attempt's shard, as `clean_ended` would.
+        if let Ok(a) = AttemptId::parse(id) {
+            if a.as_str() == id {
+                self.clean(&a);
+            }
+        }
         let mut report = DroppedReport::default();
         let done = remove_dropped_attempt(&self.cfg.attempts_root(), &self.store, id, &mut report);
         for (attempt, error) in &report.failed {
@@ -2273,13 +2316,22 @@ impl Agent {
             );
         }
         if let Err(e) = done {
-            self.note_global("agent_dropped_attempt_kept", id, json!({ "attempt": id, "error": e.to_string() }));
+            self.note_global(
+                "agent_dropped_attempt_kept",
+                id,
+                json!({ "attempt": id, "error": e.to_string() }),
+            );
         }
     }
 
     /// A release of `attempt` by `member` was committed: its directory and
     /// lock go now, and its record once no submit can be behind it.
-    fn released(&self, member: &CoordinatorId, attempt: &AttemptId, at: Option<super::release::Taken>) {
+    fn released(
+        &self,
+        member: &CoordinatorId,
+        attempt: &AttemptId,
+        at: Option<super::release::Taken>,
+    ) {
         self.remove_dropped(attempt.as_str());
         let ripe = self.releases.released(member, attempt, at);
         self.forget_ripe(ripe);
@@ -2288,7 +2340,11 @@ impl Agent {
     fn forget_ripe(&self, ripe: super::release::Ripe) {
         if let Err(e) = self.store.forget_released(ripe) {
             // Kept: the next start deletes every released record.
-            self.note_global("agent_release_failed", "records", json!({ "error": e.to_string() }));
+            self.note_global(
+                "agent_release_failed",
+                "records",
+                json!({ "error": e.to_string() }),
+            );
         }
     }
 
@@ -2678,11 +2734,13 @@ impl Agent {
                 let (attempts, more) = store
                     .list_unreleased(r.after.as_ref(), r.limit)
                     .map_err(api)?;
-                Ok(Response::ListUnreleased(crate::wire::ListUnreleasedResponse {
-                    schema_version: SchemaVersion::CURRENT,
-                    attempts,
-                    more,
-                }))
+                Ok(Response::ListUnreleased(
+                    crate::wire::ListUnreleasedResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        attempts,
+                        more,
+                    },
+                ))
             }
             Request::ListAttempts(r) => self.list(store, r).map(Response::ListAttempts),
             Request::WorkflowArtifact(r) => {
@@ -3329,6 +3387,7 @@ impl Agent {
             drop(_no_supervisor);
             self.released(&session.coordinator_id, &r.attempt_id, link.taken);
         } else {
+            self.old_acks.store(true, Ordering::SeqCst);
             store
                 .ack_collected_as_read(&r.attempt_id, session.coordinator_epoch, now(), has_result)
                 .map_err(api)?;
@@ -3388,7 +3447,8 @@ impl Agent {
         Ok(AttemptStatus {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: rec.attempt_id,
-            run_id: RunId::parse(&rec.run_id).map_err(|e| corrupt("record run id", e.to_string()))?,
+            run_id: RunId::parse(&rec.run_id)
+                .map_err(|e| corrupt("record run id", e.to_string()))?,
             task_id: TaskId::parse(&rec.task_id)
                 .map_err(|e| corrupt("record task id", e.to_string()))?,
             generation: Generation(rec.generation),
@@ -3661,6 +3721,9 @@ impl Agent {
 
 /// The most dropped attempts one start clears; more wait for the next start.
 const DROPPED_PER_START: u32 = 10_000;
+
+/// Leftover dropped attempts one tick tries again.
+const DROPPED_PER_TICK: u32 = 32;
 
 /// Batches of rows an older version acknowledged that the start deletes
 /// before it accepts a connection; the tick goes on with the rest.

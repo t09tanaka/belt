@@ -33,6 +33,7 @@ use tokio::sync::Semaphore;
 const T: Duration = Duration::from_secs(20);
 
 mod group_membership;
+mod release;
 
 /// The machine, reduced to plain directories, with a record of every call.
 struct DirHost {
@@ -1508,7 +1509,7 @@ async fn a_command_s_own_timeout_overrides_the_default_of_the_attempt() {
 // ------------------------------------------------- results, events, GC
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nothing_is_collected_as_garbage_before_ack_collected() {
+async fn nothing_is_collected_before_ack_collected_and_the_acknowledged_attempt_goes_at_once() {
     let f = fx();
     let mut cfg = f.cfg("boot-a");
     // Keep nothing longer than necessary: only the missing ACK protects.
@@ -1561,24 +1562,33 @@ async fn nothing_is_collected_as_garbage_before_ack_collected() {
     assert!(agent.gc().unwrap().removed.is_empty());
     assert!(stored());
 
-    for _ in 0..2 {
-        let Response::AckCollected(r) = call(&c, ack(result.result_digest.clone())).await.unwrap()
-        else {
-            panic!()
-        };
-        assert!(r.released);
-    }
-    assert!(f.rec(&a).acked_at_ms.is_some());
-    let report = agent.gc().unwrap();
-    assert_eq!(report.removed.len(), 1);
+    let spec: AttemptPayload = serde_json::from_value(f.rec(&a).spec).unwrap();
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    let Response::AckCollected(r) = call(&c, ack(result.result_digest.clone())).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(r.released);
+    // Spec 25.6 (i): with attempt_release_v1 the acknowledged attempt goes
+    // at once: its directory, its row, its children and its events; a
+    // record answers for it.
     assert!(!logs.exists());
-    // The attempt's record and tombstone-level facts stay: a resend is still
-    // the same attempt, never a new run.
-    assert!(
-        submit(&c, &a, &serde_json::from_value(f.rec(&a).spec).unwrap())
-            .await
-            .duplicate
-    );
+    assert!(!f.state().join("attempts").join(a.as_str()).exists());
+    assert!(!f
+        .state()
+        .join("supervisors")
+        .join(format!("{a}.lock"))
+        .exists());
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(f.store().events_of_attempt(&a, 10).unwrap().is_empty());
+    // The acknowledgement sent again finds nothing (the parent closes on it).
+    let e = call(&c, ack(result.result_digest.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    // No submit was in flight: the released record went at once.
+    assert_eq!(agent.releases_waiting(), 0);
+    let _ = spec;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
