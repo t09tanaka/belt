@@ -3358,11 +3358,17 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     // not there before.
     let attempt_dirs = || -> Vec<String> {
         std::fs::read_dir(spec.worker_state_dir.join("attempts"))
-            .map(|d| d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect())
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let view = |known: &[String]| {
-        let fresh: Vec<String> = attempt_dirs().into_iter().filter(|d| !known.contains(d)).collect();
+        let fresh: Vec<String> = attempt_dirs()
+            .into_iter()
+            .filter(|d| !known.contains(d))
+            .collect();
         assert_eq!(fresh.len(), 1, "{fresh:?}");
         let attempt = belt::ids::AttemptId::parse(&fresh[0]).unwrap();
         let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
@@ -3378,9 +3384,20 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     start_resident(&spec).await;
     let known_before = attempt_dirs();
     let child = tokio::process::Command::new(&spec.executable)
-        .args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c",&script])
+        .args([
+            "--json",
+            "exec",
+            "--profile",
+            "node22",
+            "--requires",
+            "node",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
         .env_clear()
-        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v)))
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
         .envs(&spec.env)
         .current_dir(&input)
         .stdout(std::process::Stdio::piped())
@@ -3390,11 +3407,14 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     held("the first attempt");
     let first_dir = view(&known_before);
     std::fs::write(&gate, "").unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await.unwrap_or_else(|elapsed| {
-        diagnose_coordinator(&spec);
-        diagnose_worker(&spec);
-        panic!("named-profile exec did not finish: {elapsed}");
-    }).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .unwrap_or_else(|elapsed| {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("named-profile exec did not finish: {elapsed}");
+        })
+        .unwrap();
     if output.status.code() != Some(23) {
         diagnose_worker(&spec);
     }

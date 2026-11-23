@@ -39,6 +39,13 @@ fn unreleased_req() -> Request {
     })
 }
 
+/// The dedup record of the member the fixture's parent is.
+fn recorded(f: &Fx, a: &AttemptId) -> Option<belt::storage::DedupRecord> {
+    let (_, member) = f.store().members().unwrap().remove(0);
+    let member = belt::ids::CoordinatorId::parse(&member).unwrap();
+    f.store().for_member(&member).attempt_record(a).unwrap()
+}
+
 fn lock_of(f: &Fx, a: &AttemptId) -> PathBuf {
     f.state().join("supervisors").join(format!("{a}.lock"))
 }
@@ -223,5 +230,113 @@ async fn past_the_ack_wait_a_restart_keeps_the_unreleased_record_until_a_release
         panic!()
     };
     assert!(page.attempts.is_empty());
+    agent.shutdown();
+}
+
+// (vii) A connection of the member that was open at the release still reads
+// a copy of the submit after it: the late submit does not run, and the
+// record stays until that connection is done, however the release came.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_open_at_the_release_keeps_the_record_until_it_is_done() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let marker = f.path("ran-again");
+    submit(&c, &a, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+
+    // A second connection of the same member; no permit is free on it, so
+    // the late submit it takes waits before it is handled.
+    let permits = Arc::new(Semaphore::new(0));
+    let (x, y) = duplex_pair(64 * 1024);
+    tokio::spawn(serve_connection(
+        agent.clone(),
+        y,
+        f.cluster.clone(),
+        permits.clone(),
+    ));
+    let d = Arc::new(connect(x, client_cfg(&f.cluster)).await.unwrap().client);
+    let late = payload(&format!("touch {}", marker.display()));
+    let waiting = tokio::spawn({
+        let d = d.clone();
+        let request = submit_req(&a, &late);
+        async move { call(&d, request).await }
+    });
+
+    call(&c, release_req(&a)).await.unwrap();
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(
+        recorded(&f, &a).is_some(),
+        "the other connection may still read a copy"
+    );
+    permits.add_permits(1);
+    let _ = waiting.await.unwrap();
+    assert!(!marker.exists(), "a late submit ran");
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(recorded(&f, &a).is_some(), "the connection is still open");
+    drop(d);
+    wait_for("the record goes with the connection", || {
+        recorded(&f, &a).is_none()
+    });
+    assert!(!marker.exists());
+    agent.shutdown();
+}
+
+// (xiii) The checks of the agent do not make the lock of a released attempt
+// again, in a tick or at the next start, and the directory is gone with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_never_makes_the_lock_of_a_released_attempt_again() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    call(&c, release_req(&a)).await.unwrap();
+    for _ in 0..3 {
+        agent.tick();
+    }
+    assert!(!lock_of(&f, &a).exists());
+    assert!(!f.state().join("attempts").join(a.as_str()).exists());
+    agent.shutdown();
+
+    let agent = f.start("boot-b");
+    agent.tick();
+    assert!(!lock_of(&f, &a).exists());
+    assert!(!f.state().join("attempts").join(a.as_str()).exists());
+    agent.shutdown();
+}
+
+// (xv) A start on trial deletes nothing the older version acknowledged (a
+// rollback restores the database, not the directories); the next start that
+// is not on trial does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_on_trial_keeps_the_rows_an_older_version_acknowledged() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let old = connect_old(&f, &agent).await;
+    let b = AttemptId::generate();
+    submit(&old, &b, &payload("echo y")).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&b).is_empty());
+    let digest = digest_of(&old, &b).await;
+    call(&old, ack_req(&b, digest)).await.unwrap();
+    agent.shutdown();
+
+    belt::worker::control::begin_trial(&f.state()).unwrap();
+    let agent = f.start("boot-b");
+    agent.tick();
+    assert!(f.store().get(&b).unwrap().is_some());
+    assert!(f.state().join("attempts").join(b.as_str()).exists());
+    agent.shutdown();
+
+    belt::worker::control::end_trial(&f.state()).unwrap();
+    let agent = f.start("boot-c");
+    assert!(f.store().get(&b).unwrap().is_none());
+    assert!(!f.state().join("attempts").join(b.as_str()).exists());
+    assert!(recorded(&f, &b).is_none());
     agent.shutdown();
 }
