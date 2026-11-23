@@ -280,7 +280,7 @@ fn a_new_state_starts_with_the_marker_and_holds_an_inheritable_shared_lock() {
 }
 
 #[test]
-fn a_start_that_meets_a_clearing_in_progress_gives_up() {
+fn a_new_start_never_writes_into_a_directory_that_already_exists() {
     let fx = Fx::new();
     let state = fx.state();
     std::fs::DirBuilder::new()
