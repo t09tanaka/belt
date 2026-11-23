@@ -655,6 +655,8 @@ async fn resident_measured_fixture(metrics_fail: bool) {
     let sources = SourceStore::open(&state).unwrap();
     let vault = belt::secrets::vault::Vault::open(&state).unwrap();
     let key = belt::secrets::key::load(&root.path().join("key")).unwrap();
+    // A submitting command owns its capture before it makes it (spec 25.4 (b)).
+    sources.own_capture(&run).unwrap();
     let captured = belt::secrets::capture::capture_run(
         &env,
         &sources,
