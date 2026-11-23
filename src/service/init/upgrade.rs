@@ -546,7 +546,12 @@ pub fn begin<L: Launcher>(
         })();
         if let Err(e) = checked {
             // Spec 25.7 (a): a copy the version check refused goes at once.
-            crate::service::old_binaries::remove_refused(&paths.config, &to, created);
+            crate::service::old_binaries::remove_refused(
+                &places_of(&paths),
+                &to,
+                created,
+                crate::service::old_binaries::Holds::Init,
+            );
             return Err(e);
         }
         ensure!(!interrupted(), "interrupted; nothing was switched");
@@ -834,21 +839,24 @@ pub(crate) fn guard_definition_known(config: &Path) -> bool {
     !journal || watch(config).is_ok()
 }
 
-/// Remove the versions nothing names any more (spec 25.7 (a)), after the
-/// commit removed the guard.
-fn sweep_old_versions<L: Launcher>(paths: &Paths, launcher: &mut L) {
-    let places = crate::service::old_binaries::Places {
+fn places_of(paths: &Paths) -> crate::service::old_binaries::Places {
+    crate::service::old_binaries::Places {
         config: paths.config.clone(),
         worker_state: paths.worker.clone(),
         parent_state: Some(paths.state.clone()),
         services: vec![paths.services.clone()],
-    };
+    }
+}
+
+/// Remove the versions nothing names any more (spec 25.7 (a)), after the
+/// commit removed the guard.
+fn sweep_old_versions<L: Launcher>(paths: &Paths, launcher: &mut L) {
+    let places = places_of(paths);
     let config = paths.config.clone();
     let _ = crate::service::old_binaries::sweep(
         &places,
         &mut || guard_present(&config, launcher),
         false,
-        std::time::SystemTime::now(),
     );
 }
 

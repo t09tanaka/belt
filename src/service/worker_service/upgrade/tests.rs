@@ -162,7 +162,7 @@ impl Host {
     }
     /// Once the parent has committed, the host serves `digest`: journal, link,
     /// input and service agree, the journal is at rest in its first shape,
-    /// and no version binary changed.
+    /// and no version binary changed (the previous one may have been removed).
     fn assert_serving(&self, digest: &str) {
         let paths = self.paths();
         self.commit(digest).unwrap();
@@ -180,10 +180,12 @@ impl Host {
         let receipt = journal.receipt.expect("a service file is registered");
         let plist = fs::read_to_string(receipt.path()).unwrap();
         assert!(plist.contains(paths.executable(digest).to_str().unwrap()));
-        assert_eq!(
-            fs::read(paths.executable(&self.old)).unwrap(),
-            b"old version"
-        );
+        // The previous version is gone once the commit has looked (spec
+        // 25.7 (a)), or, when it is still there or is the one served, intact.
+        match fs::read(paths.executable(&self.old)) {
+            Ok(bytes) => assert_eq!(bytes, b"old version"),
+            Err(_) => assert_ne!(digest, self.old, "the served version is there"),
+        }
         assert_eq!(
             status.bridge_binary.as_deref(),
             paths.bridge_binary().to_str()
@@ -235,11 +237,11 @@ fn upgrade_places_the_version_stops_the_old_service_and_starts_the_new_one() {
     assert!(status.draining && !status.cancel_running);
     let paths = h.paths();
     assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
-    // The previous version keeps the exact input it ran with.
-    assert_eq!(
-        fs::read(version_input(&paths, &h.old)).unwrap(),
-        h.input_at_install
-    );
+    // The previous version keeps the exact input it ran with (until the
+    // commit removes the version, spec 25.7 (a)).
+    if let Ok(input) = fs::read(version_input(&paths, &h.old)) {
+        assert_eq!(input, h.input_at_install);
+    }
 }
 
 #[test]

@@ -10,11 +10,9 @@
 //! too: nothing is removed on a guess. The commands that place a version
 //! (`init`, `worker-service install` and `upgrade`) hold `init.lock` or
 //! `worker-service.lock` from before the directory is made until a journal
-//! names it; the pass takes both without waiting. `init` creates
-//! `init.lock` and takes it before it places a version, but a pass that
-//! found no `init.lock` (and does not create one: a host where `init` never
-//! ran keeps none) cannot keep a first `init` from creating it after the
-//! look; so a directory younger than [`GRACE`] is kept besides.
+//! names it; the pass takes both without waiting (creating them: the same
+//! file `init` takes, so a first `init` cannot slip in after the look) and
+//! holds both from before it reads the journals until it has removed.
 //!
 //! A `tool-bin/<id>/` goes with its version: when each of its links points
 //! at `<config>/bin/<digest>/belt` and that directory is gone. Anything else
@@ -26,12 +24,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use super::worker_service::upgrade::is_digest;
 
-/// A version directory this young may be one a command is placing now.
-pub(crate) const GRACE: Duration = Duration::from_secs(600);
 /// Version directories removed in one pass at most (spec 25.11: bounded).
 pub(crate) const PER_PASS: usize = 8;
 /// A journal or service definition larger than this is not belt's.
@@ -101,9 +96,8 @@ pub(crate) fn sweep(
     places: &Places,
     guard: &mut dyn FnMut() -> anyhow::Result<bool>,
     switch_held: bool,
-    now: SystemTime,
 ) -> Outcome {
-    match pass(places, guard, switch_held, now) {
+    match pass(places, guard, switch_held) {
         Ok(outcome) => outcome,
         Err(held) => Outcome {
             held: Some(held),
@@ -116,21 +110,27 @@ fn pass(
     places: &Places,
     guard: &mut dyn FnMut() -> anyhow::Result<bool>,
     switch_held: bool,
-    now: SystemTime,
 ) -> Result<Outcome, Held> {
+    // No configuration directory: nothing was ever placed, and the pass makes
+    // no file on a host where `init` never ran.
+    if !places.config.is_dir() {
+        return Ok(Outcome::default());
+    }
+    // Held to the end, taken before anything is read: nothing places a
+    // version while the pass looks (every command that places one holds one
+    // of the two from before it makes the directory until a journal names it).
+    let _init = try_lock(&places.config.join("init.lock"))?;
+    let _switch = if switch_held {
+        None
+    } else {
+        Some(try_lock(&places.config.join("worker-service.lock"))?)
+    };
     if on_trial(places)? {
         return Err(Held::Trial);
     }
     if guard().map_err(|_| Held::Unreadable)? {
         return Err(Held::Guard);
     }
-    // Held to the end: nothing places a version while the pass looks.
-    let _init = try_lock(&places.config.join("init.lock"), false)?;
-    let _switch = if switch_held {
-        None
-    } else {
-        try_lock(&places.config.join("worker-service.lock"), true)?
-    };
     if builders_present(&places.worker_state)? {
         return Err(Held::Builder);
     }
@@ -151,12 +151,7 @@ fn pass(
         let Ok(meta) = fs::symlink_metadata(&dir) else {
             continue;
         };
-        let young = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_none_or(|age| age < GRACE);
-        if !meta.is_dir() || meta.uid() != euid() || young {
+        if !meta.is_dir() || meta.uid() != euid() {
             continue;
         }
         if fs::remove_dir_all(&dir).is_ok() {
@@ -190,26 +185,24 @@ fn on_trial(places: &Places) -> Result<bool, Held> {
     Ok(markers.iter().any(|m| present(m)))
 }
 
-/// The lock at `path`, taken without waiting. `None` when there is no such
-/// file and `create` is off (nothing that would take it has made it).
-fn try_lock(path: &Path, create: bool) -> Result<Option<File>, Held> {
+/// The lock at `path` (made when it is not there), taken without waiting.
+fn try_lock(path: &Path) -> Result<File, Held> {
     use std::os::fd::AsRawFd;
     let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .create(create)
+        .create(true)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => return Ok(None),
         Err(_) => return Err(Held::Unreadable),
     };
     // SAFETY: `file` is an open descriptor owned here.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        Ok(Some(file))
+        Ok(file)
     } else {
         Err(Held::Placing)
     }
@@ -405,29 +398,42 @@ pub(crate) fn sweep_at_start(env: &BTreeMap<String, String>) {
         &places,
         &mut || super::init::upgrade::guard_present(&config, &mut launcher),
         false,
-        SystemTime::now(),
     );
+}
+
+/// The lock the caller of [`remove_refused`] holds already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holds {
+    /// `init.lock` (an `init` or the resident's upgrade).
+    Init,
+    /// `worker-service.lock` (`worker-service install` or `upgrade`).
+    Switch,
 }
 
 /// Spec 25.7 (a): a copy a command placed for a version and then refused at
 /// the version check goes at once (when it made the directory: `created`),
-/// unless a link of `bin/` points at it.
-pub(crate) fn remove_refused(config: &Path, digest: &str, created: bool) {
+/// unless a link of `bin/` points at it, a journal or definition names it
+/// (the other command may have reused it), or the other command's lock is
+/// held (it may be placing the same version).
+pub(crate) fn remove_refused(places: &Places, digest: &str, created: bool, holds: Holds) {
     if !created || !is_digest(digest) {
         return;
     }
-    let bin = config.join("bin");
+    let other = match holds {
+        Holds::Init => "worker-service.lock",
+        Holds::Switch => "init.lock",
+    };
+    let Ok(_other) = try_lock(&places.config.join(other)) else {
+        return;
+    };
     // A link that is not there points at nothing; one that cannot be read
-    // may point here.
-    let linked = ["current", "resident"]
-        .iter()
-        .any(|l| match fs::read_link(bin.join(l)) {
-            Ok(t) => t.to_string_lossy().contains(digest),
-            Err(e) => e.kind() != io::ErrorKind::NotFound,
-        });
-    let dir = bin.join(digest);
+    // may point here (`Named::read` fails then, and nothing is removed).
+    let Ok(named) = Named::read(places) else {
+        return;
+    };
+    let dir = places.bin().join(digest);
     let ours = fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && m.uid() == euid());
-    if !linked && ours {
+    if !named.names(digest) && ours {
         let _ = fs::remove_dir_all(&dir);
     }
 }

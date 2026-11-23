@@ -247,6 +247,12 @@ struct Flight {
     /// The last reference went: no new consumer joins, and the builder is
     /// cancelled.
     stop: bool,
+    /// The identity of the root a tool install made, once it has (the
+    /// consumers waiting here are bound to it, spec 25.7 (b)).
+    root: Option<String>,
+    /// The builder's references are let go: no new consumer joins (one that
+    /// came later is bound by its own next poll).
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -327,6 +333,9 @@ pub struct Setups {
     last_roots_pass: AtomicU64,
     /// A pass over the roots is running.
     roots_passing: std::sync::atomic::AtomicBool,
+    /// Since when (monotonic ms) the worker DB could not be opened, for a
+    /// tool preparation that waits for it.
+    roots_unopened_since: Mutex<Option<u64>>,
 }
 
 impl Setups {
@@ -355,6 +364,7 @@ impl Setups {
             roots_opening: Mutex::new(()),
             last_roots_pass: AtomicU64::new(0),
             roots_passing: std::sync::atomic::AtomicBool::new(false),
+            roots_unopened_since: Mutex::new(None),
         };
         s.recover();
         // What a clear renamed aside and did not get to remove. An installer
@@ -562,8 +572,12 @@ impl Setups {
         // Spec 25.7 (b): without the worker DB no root is bound or installed
         // into; the next poll asks again.
         if self.db().is_none() {
-            return Ok(ToolPreparationPoll::Pending);
+            return Ok(match self.database_wait(platform::monotonic_ms()) {
+                Some(why) => ToolPreparationPoll::Failed(PreparationFailure(why)),
+                None => ToolPreparationPoll::Pending,
+            });
         }
+        *lock(&self.roots_unopened_since) = None;
         self.poll_tool_checked(attempt, request, &plan, |receipt| match receipt {
             // Spec 25.7 (b): the root is bound before it is used. Without
             // the worker DB nothing is used; the next poll asks again.
@@ -728,6 +742,8 @@ impl Setups {
                 refs: BTreeSet::from([consumer.clone()]),
                 end: None,
                 stop: false,
+                root: None,
+                closed: false,
                 kind: BuilderKind::ToolInstall,
             },
         );
@@ -750,7 +766,7 @@ impl Setups {
             return false;
         };
         let f = inner.flights.get_mut(&id).expect("listed builder exists");
-        if !f.stop {
+        if !f.stop && !f.closed {
             policy::join(&mut f.refs, consumer);
             inner
                 .consumers
@@ -860,7 +876,7 @@ impl Setups {
             Err(_) => {}
         }
         if !lock(&self.leftover).contains(attempt) && remove_tree(&dir).is_ok() {
-            self.release_builder_roots(id);
+            self.release_tool_roots(id);
         }
         result
     }
@@ -986,6 +1002,8 @@ impl Setups {
                                 end: None,
                                 kind: BuilderKind::WorkspaceSetup,
                                 stop: false,
+                                root: None,
+                                closed: false,
                             },
                         );
                         inner.by_key.insert(key.clone(), id.clone());
@@ -2213,6 +2231,8 @@ mod tool_validation_tests {
                 refs: BTreeSet::from([consumer_key]),
                 end: None,
                 stop: false,
+                root: None,
+                closed: false,
                 kind,
             },
         );
@@ -2252,6 +2272,8 @@ mod tool_validation_tests {
                         refs: BTreeSet::from([consumer_key]),
                         end: Some(BuilderResult::Tool(Ok(Box::new(receipt)))),
                         stop: false,
+                        root: None,
+                        closed: false,
                         kind: BuilderKind::ToolInstall,
                     },
                 );

@@ -508,3 +508,104 @@ fn a_pass_that_keeps_stopping_is_told_by_doctor() {
     s.roots_pass(now);
     assert!(doctor_notices(&f.state, now).is_empty());
 }
+
+fn flight_of(refs: &[&str]) -> Flight {
+    Flight {
+        key: "tool:k".into(),
+        attempt_id: AttemptId::generate(),
+        refs: refs.iter().map(|r| r.to_string()).collect(),
+        end: None,
+        kind: BuilderKind::ToolInstall,
+        stop: false,
+        root: None,
+        closed: false,
+    }
+}
+
+fn holders(f: &Fixture, identity: &str) -> Vec<String> {
+    let db = f.db();
+    let mut stmt = db
+        .prepare("SELECT holder FROM toolchain_ref WHERE identity = ?1 ORDER BY holder")
+        .unwrap();
+    stmt.query_map([identity], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Review L-a: a consumer that joins between the hand-off and the end of the
+/// builder is bound before the builder's reference goes, and none joins
+/// after that.
+#[test]
+fn a_consumer_joining_after_the_hand_off_is_bound_before_the_builders_reference_goes() {
+    let f = Fixture::new();
+    f.root(A);
+    let s = f.open();
+    let id = BuilderId::generate();
+    let (first, late, later) = ("att-1/tool:k", "att-2/tool:k", "att-3/tool:k");
+    {
+        let mut inner = lock(&s.inner);
+        inner.flights.insert(id.clone(), flight_of(&[first]));
+        inner.by_key.insert("tool:k".into(), id.clone());
+        for c in [first, late, later] {
+            inner.consumers.insert(c.into(), Consumer::default());
+        }
+    }
+    s.hold_root_for_install(&id, &plan_of(&s, A)).unwrap();
+    s.hand_off_root(&id, &plan_of(&s, A));
+    assert_eq!(
+        holders(&f, A),
+        vec!["att-1".to_string(), id.as_str().into()]
+    );
+    // Joins after the hand-off, before the builder's reference goes.
+    assert!(Setups::join_tool(&mut lock(&s.inner), "tool:k", late));
+    s.release_tool_roots(&id);
+    assert_eq!(holders(&f, A), vec!["att-1".to_string(), "att-2".into()]);
+    // The builder's references are gone: nobody else joins this flight.
+    assert!(Setups::join_tool(&mut lock(&s.inner), "tool:k", later));
+    assert!(!lock(&s.inner).flights[&id].refs.contains(later));
+}
+
+/// Review L-c: while the worker DB cannot be opened a tool preparation waits,
+/// and after the builders' deadline it fails naming the DB; `doctor` says the
+/// DB cannot be opened.
+#[test]
+fn a_tool_preparation_fails_when_the_database_never_opens() {
+    let f = Fixture::new();
+    f.root(A);
+    std::fs::write(f.state.join("worker.db"), b"not a database").unwrap();
+    let cfg = SetupConfig::new(
+        f.state.clone(),
+        crate::ids::WorkerId::parse("w-roots").unwrap(),
+        "/bin/sh".into(),
+    );
+    let deadline = cfg.deadline_ms;
+    let s = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+    assert!(s.db().is_none());
+    assert_eq!(s.database_wait(1_000), None, "waiting");
+    assert_eq!(s.database_wait(1_000 + deadline - 1), None, "still waiting");
+    let why = s.database_wait(1_000 + deadline).expect("failed");
+    assert!(why.contains("worker.db"), "{why}");
+    let notices = doctor_notices(&f.state, platform::wall_ms());
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("worker database"), "{notices:?}");
+    assert!(!notices[0].contains(f.state.to_str().unwrap()), "no paths");
+}
+
+/// Review L-d: a hand-off that cannot be written is counted for `doctor`, and
+/// the count goes with the next one that is written.
+#[test]
+fn a_failed_hand_off_is_counted_and_cleared_by_the_next_that_works() {
+    let f = Fixture::new();
+    f.root(A);
+    let s = f.open();
+    let db = s.db().unwrap();
+    s.count_failed_hand_off(db, A);
+    s.count_failed_hand_off(db, A);
+    let notices = doctor_notices(&f.state, platform::wall_ms());
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("2 hand-off"), "{notices:?}");
+    db.toolchain_bind_all(A, vec!["att-1".into()], platform::wall_ms())
+        .unwrap();
+    assert!(doctor_notices(&f.state, platform::wall_ms()).is_empty());
+}

@@ -192,7 +192,14 @@ pub fn upgrade<L: Launcher>(
     hook(Step::Compat)?;
     if let Err(e) = compatible(&paths, &journal) {
         // Spec 25.7 (a): a copy the version check refused goes at once.
-        crate::service::old_binaries::remove_refused(&paths.config, &digest, created);
+        if let Ok(places) = crate::service::old_binaries::Places::of(env, launcher.backend()) {
+            crate::service::old_binaries::remove_refused(
+                &places,
+                &digest,
+                created,
+                crate::service::old_binaries::Holds::Switch,
+            );
+        }
         return Err(e);
     }
     switch_to(&paths, journal, &digest, launcher, options, hook)
@@ -596,7 +603,6 @@ pub fn commit<L: Launcher>(
                 &places,
                 &mut || crate::service::init::upgrade::guard_present(&config, &mut launcher),
                 true,
-                std::time::SystemTime::now(),
             );
         }
         Err(e) => eprintln!("belt: the old versions were not looked at: {e:#}"),

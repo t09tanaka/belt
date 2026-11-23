@@ -158,15 +158,34 @@ impl Setups {
     /// it installed before the builder's own reference goes: no pass can
     /// take the root between the install and their next poll. Under
     /// `inner`, so a consumer released at the same time either is not bound
-    /// here or has its reference let go by its release afterwards.
+    /// here or has its reference let go by its release afterwards. The root
+    /// is kept in the flight: [`Self::release_tool_roots`] binds the ones
+    /// that joined since.
     pub(super) fn hand_off_root(&self, id: &BuilderId, root: &Path) {
         let (Some(db), Some(identity)) = (self.db(), root.file_name().and_then(|n| n.to_str()))
         else {
             return;
         };
-        let inner = lock(&self.inner);
+        let failed = {
+            let mut inner = lock(&self.inner);
+            let Some(flight) = inner.flights.get_mut(id) else {
+                return;
+            };
+            flight.root = Some(identity.to_string());
+            Self::bind_waiting(&inner, db, id, identity)
+        };
+        if failed {
+            self.count_failed_hand_off(db, identity);
+        }
+    }
+
+    /// Bind the consumers waiting at `id` to `identity`; `true` when the
+    /// write failed. Called with `inner` held (the caller passes its guard's
+    /// content): the write is one short transaction, and the consumers
+    /// cannot change while it runs.
+    fn bind_waiting(inner: &Inner, db: &WorkerStore, id: &BuilderId, identity: &str) -> bool {
         let Some(flight) = inner.flights.get(id) else {
-            return;
+            return false;
         };
         let consumers: Vec<String> = flight
             .refs
@@ -174,9 +193,62 @@ impl Setups {
             .filter(|c| inner.consumers.contains_key(*c))
             .filter_map(|c| c.rsplit_once("/tool:").map(|(a, _)| a.to_string()))
             .collect();
-        if !consumers.is_empty() {
-            let _ = db.toolchain_bind_all(identity, consumers, platform::wall_ms());
+        !consumers.is_empty()
+            && db
+                .toolchain_bind_all(identity, consumers, platform::wall_ms())
+                .is_err()
+    }
+
+    /// A hand-off that could not be written (the database stayed busy): the
+    /// consumers are bound by their own next poll, so nothing is lost but the
+    /// guarantee that no pass runs in between. Said once on stderr and
+    /// counted for `doctor` (best effort: the count is in the same database).
+    fn count_failed_hand_off(&self, db: &WorkerStore, identity: &str) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "belt: the waiting consumers were not bound to the toolchain root {identity} (the worker database is busy); each binds at its next poll"
+        );
+        let _ = db.toolchain_count_hand_off_failure();
+    }
+
+    /// The tool builder `id` has removed its directory: its references go.
+    /// First, in the one `inner` section, the consumers that joined since the
+    /// hand-off are bound and no more join (a later one is bound by its own
+    /// poll); the builder's reference goes after, so no consumer waits on
+    /// this builder without holding the root. When that bind cannot be
+    /// written, the builder's reference stays (the next pass lets it go, as
+    /// it does for any builder whose directory is gone).
+    pub(super) fn release_tool_roots(&self, id: &BuilderId) {
+        let Some(db) = self.db() else {
+            return;
+        };
+        let bound = {
+            let mut inner = lock(&self.inner);
+            let root = inner.flights.get_mut(id).and_then(|flight| {
+                flight.closed = true;
+                flight.root.clone()
+            });
+            match root {
+                Some(identity) if Self::bind_waiting(&inner, db, id, &identity) => Err(identity),
+                _ => Ok(()),
+            }
+        };
+        match bound {
+            Ok(()) => self.release_builder_roots(id),
+            Err(identity) => self.count_failed_hand_off(db, &identity),
         }
+    }
+
+    /// A tool preparation that finds the worker DB closed waits (the next
+    /// poll asks again), for [`SetupConfig::deadline_ms`] (the bound every
+    /// builder has, 30 minutes by default); then it fails with the reason
+    /// named, instead of staying pending without a word. `now_ms` is monotonic.
+    pub(super) fn database_wait(&self, now_ms: u64) -> Option<String> {
+        let mut since = lock(&self.roots_unopened_since);
+        let begun = *since.get_or_insert(now_ms);
+        (now_ms.saturating_sub(begun) >= self.cfg.deadline_ms).then(|| {
+            "the worker database (worker.db) cannot be opened (another worker, permissions, or a newer schema); see belt doctor".to_string()
+        })
     }
 
     /// A tool builder references the root it installs into before its helper
@@ -419,7 +491,12 @@ pub(crate) fn doctor_notices(state_dir: &Path, now_ms: u64) -> Vec<String> {
     }
     let Ok(status) = WorkerStore::open_read_only(state_dir).and_then(|db| db.toolchain_status())
     else {
-        return Vec::new();
+        // The worker reads the same file: while it cannot, no root is bound,
+        // installed into or removed, and a tool preparation fails after its
+        // deadline.
+        return vec![
+            "the worker database (worker.db) cannot be opened (another worker, permissions, or a newer schema); tool installs and the cleaning of toolchain roots wait for it".to_string(),
+        ];
     };
     let mut out = Vec::new();
     if let Some((reason, since)) = status.held {
@@ -435,6 +512,12 @@ pub(crate) fn doctor_notices(state_dir: &Path, now_ms: u64) -> Vec<String> {
         out.push(format!(
             "{} removal(s) of a toolchain root failed (another device, an unsafe directory or a refused rename); the root was kept and is tried again later",
             status.evict_failures
+        ));
+    }
+    if status.hand_off_failures > 0 {
+        out.push(format!(
+            "{} hand-off(s) of a toolchain root to the consumers waiting for its install could not be written (the worker database was busy); each consumer binds at its next poll",
+            status.hand_off_failures
         ));
     }
     out

@@ -18,6 +18,9 @@ const HELD: &str = "toolchain_roots_held";
 /// How many removals failed in a way the next pass does not cure by waiting
 /// (the root went back to `live`), for `doctor`.
 const EVICT_FAILURES: &str = "toolchain_evict_failures";
+/// How many hand-offs of a root to the waiting consumers could not be
+/// written (cleared by the next one that is), for `doctor`.
+const HAND_OFF_FAILURES: &str = "toolchain_hand_off_failures";
 
 /// What `doctor` says of the passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,6 +28,7 @@ pub struct RootsStatus {
     /// The reason the passes stop, and since when.
     pub held: Option<(String, u64)>,
     pub evict_failures: u64,
+    pub hand_off_failures: u64,
 }
 
 /// What a bind found.
@@ -131,6 +135,23 @@ impl WorkerStore {
             for consumer in &consumers {
                 bind_in(tx, &identity, consumer, now_ms)?;
             }
+            // Writing works again: the count of failed hand-offs goes.
+            tx.execute(
+                "DELETE FROM schema_meta WHERE key = ?1",
+                [HAND_OFF_FAILURES],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A hand-off to the waiting consumers could not be written.
+    pub fn toolchain_count_hand_off_failure(&self) -> Result<()> {
+        self.db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO schema_meta (key, value) VALUES (?1, '1')
+                 ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                [HAND_OFF_FAILURES],
+            )?;
             Ok(())
         })
     }
@@ -390,9 +411,13 @@ impl WorkerStore {
             let evict_failures = get(EVICT_FAILURES)?
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            let hand_off_failures = get(HAND_OFF_FAILURES)?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             Ok(RootsStatus {
                 held,
                 evict_failures,
+                hand_off_failures,
             })
         })
     }

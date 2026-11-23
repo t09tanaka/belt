@@ -1,6 +1,7 @@
 use super::*;
 use crate::ids::{CoordinatorId, WorkerId};
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::time::{Duration, SystemTime};
 
 const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -58,7 +59,7 @@ impl Fixture {
             .unwrap();
     }
     fn sweep(&self) -> Outcome {
-        sweep(&self.places, &mut || Ok(false), false, SystemTime::now())
+        sweep(&self.places, &mut || Ok(false), false)
     }
     /// Swept, and the old version is still there with its tool link.
     fn assert_kept(&self) -> Outcome {
@@ -173,13 +174,12 @@ fn nothing_goes_while_an_upgrade_is_on_trial() {
 #[test]
 fn nothing_goes_while_the_guard_is_there() {
     let f = Fixture::new();
-    let outcome = sweep(&f.places, &mut || Ok(true), false, SystemTime::now());
+    let outcome = sweep(&f.places, &mut || Ok(true), false);
     assert_eq!(outcome.held, Some(Held::Guard));
     let outcome = sweep(
         &f.places,
         &mut || Err(anyhow::anyhow!("journal unreadable")),
         false,
-        SystemTime::now(),
     );
     assert_eq!(outcome.held, Some(Held::Unreadable));
     assert!(f.version(OLD).exists());
@@ -225,25 +225,72 @@ fn a_live_attempt_keeps_every_version() {
 fn nothing_goes_while_a_version_is_being_placed() {
     let f = Fixture::new();
     for name in ["init.lock", "worker-service.lock"] {
-        let lock = try_lock(&f.places.config.join(name), true)
-            .unwrap()
-            .unwrap();
+        let lock = try_lock(&f.places.config.join(name)).unwrap();
         assert_eq!(f.assert_kept().held, Some(Held::Placing));
         drop(lock);
     }
     f.assert_removed();
 }
 
-/// A version directory placed moments ago may be one a first `init` is
-/// placing before `init.lock` exists: it is kept.
+/// The pass makes `init.lock` and takes it (a first `init` that comes after
+/// the look finds it held, or finds a pass over), and makes nothing on a
+/// host that has no configuration directory.
 #[test]
-fn a_version_placed_moments_ago_is_kept() {
+fn the_pass_takes_init_lock_even_when_none_was_there() {
     let f = Fixture::new();
-    File::open(f.version(OLD))
-        .unwrap()
-        .set_modified(SystemTime::now())
-        .unwrap();
-    assert_eq!(f.assert_kept().held, None);
+    let lock = f.places.config.join("init.lock");
+    assert!(!lock.exists());
+    f.assert_removed();
+    assert!(lock.exists());
+    let bare = Places {
+        config: f.places.config.join("none"),
+        ..f.places.clone()
+    };
+    let outcome = sweep(&bare, &mut || Ok(false), false);
+    assert_eq!(outcome, Outcome::default());
+    assert!(!bare.config.exists());
+}
+
+/// A first `init` reuses a version directory placed long ago (the placer
+/// keeps its mtime) and names it in `init.json`, all under `init.lock`, which
+/// it makes if it is not there. Whatever the order against the pass, a
+/// journal never names a removed directory.
+#[test]
+fn a_first_init_that_reuses_an_old_version_is_never_left_naming_a_removed_directory() {
+    for _ in 0..30 {
+        let f = Fixture::new();
+        let config = f.places.config.clone();
+        let old = f.version(OLD);
+        let placer = std::thread::spawn(move || {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(config.join("init.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            // The directory is checked and reused under the lock.
+            let reused = old.join("belt").exists();
+            if reused {
+                fs::write(
+                    config.join("init.json"),
+                    format!("{{\"binary_hash\":\"{OLD}\"}}"),
+                )
+                .unwrap();
+            }
+            reused
+        });
+        let mut reused = false;
+        while !placer.is_finished() {
+            f.sweep();
+        }
+        reused |= placer.join().unwrap();
+        f.sweep();
+        if reused {
+            assert!(f.version(OLD).join("belt").exists());
+        }
+    }
 }
 
 /// A journal that cannot be read may name the version: nothing goes.
@@ -356,24 +403,44 @@ fn a_pass_concurrent_with_a_placement_never_removes_the_placed_version() {
         f.sweep();
     }
     placer.join().unwrap();
-    // The last placement is named; the others were placed moments ago.
+    // The last placement is named.
     let last = format!("{:064x}", 39u64 + 0xabc);
     assert!(f.version(&last).join("belt").exists());
 }
 
 /// Spec 25.7 (a): a copy refused at the version check goes at once when the
-/// command made it, unless a link of `bin/` points at it.
+/// command made it, unless a link of `bin/` points at it, a journal names it
+/// (the other command reused it) or the other command's lock is held.
 #[test]
-fn a_refused_copy_goes_at_once_unless_linked() {
+fn a_refused_copy_goes_at_once_unless_linked_named_or_being_placed() {
     let f = Fixture::new();
-    remove_refused(&f.places.config, OLD, false);
+    let p = &f.places;
+    remove_refused(p, OLD, false, Holds::Init);
     assert!(f.version(OLD).exists(), "not made by the command");
-    symlink(OLD, f.places.bin().join("resident")).unwrap();
-    remove_refused(&f.places.config, OLD, true);
+    symlink(OLD, p.bin().join("resident")).unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
     assert!(f.version(OLD).exists(), "linked");
-    fs::remove_file(f.places.bin().join("resident")).unwrap();
-    remove_refused(&f.places.config, OLD, true);
+    fs::remove_file(p.bin().join("resident")).unwrap();
+    // The other command's journal names it.
+    fs::write(
+        p.config.join("worker-service.json"),
+        format!("{{\"binary_sha256\":\"{OLD}\"}}"),
+    )
+    .unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
+    assert!(
+        f.version(OLD).exists(),
+        "named by the other command's journal"
+    );
+    fs::remove_file(p.config.join("worker-service.json")).unwrap();
+    // The other command holds its lock: an init upgrade must not remove.
+    let other = try_lock(&p.config.join("worker-service.lock")).unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
+    assert!(f.version(OLD).exists(), "the other lock is held");
+    // The lock the caller holds is its own, not the other's.
+    remove_refused(p, OLD, true, Holds::Switch);
     assert!(!f.version(OLD).exists());
-    remove_refused(&f.places.config, NEW, true);
+    drop(other);
+    remove_refused(p, NEW, true, Holds::Init);
     assert!(f.version(NEW).exists(), "bin/current points at it");
 }
