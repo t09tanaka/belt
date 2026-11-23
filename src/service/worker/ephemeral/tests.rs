@@ -1020,6 +1020,7 @@ fn a_filesystem_mounted_inside_the_state_is_never_entered_or_removed() {
     // The rest of the data went: worker.db and the workspace's own file.
     assert_eq!(tree(&state), kept);
     assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
+    std::fs::remove_file(state.join("single/mount")).unwrap();
     // What a directory is on is asked of the descriptor that was opened,
     // too: a filesystem mounted between the look and the open is seen.
     let looks = std::cell::Cell::new(0);
