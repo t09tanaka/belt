@@ -2406,6 +2406,17 @@ impl Agent {
                 backoff.insert(id, (pass + delay, delay));
             }
         }
+        // An entry another path took out of the list (a release, a forget)
+        // leaves the map too, so it holds only what is still waiting.
+        {
+            let mut backoff = lock(&self.dropped_backoff);
+            if !backoff.is_empty() {
+                if let Ok(all) = self.store.dropped_attempts_after("", u32::MAX) {
+                    let listed: std::collections::HashSet<String> = all.into_iter().collect();
+                    backoff.retain(|id, _| listed.contains(id));
+                }
+            }
+        }
         // Events of no attempt go by uptime too (spec 25.6 (e)): those older
         // than the newest hourly mark `retention` of uptime old.
         let pruned = match uptime {
@@ -2480,7 +2491,7 @@ impl Agent {
             stored.as_ref(),
             self.cfg.boot_id.as_str(),
             platform::monotonic_ms(),
-        );
+        )?;
         if write || flush {
             let marked = mark.is_none_or(|m| u.uptime_ms >= m.saturating_add(UPTIME_MARK_MS));
             if self.store.store_uptime(&u, marked).is_ok() {

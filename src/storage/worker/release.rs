@@ -617,19 +617,31 @@ pub struct Uptime {
 /// Stored at most once a minute of uptime (and at a new boot, at shutdown).
 pub const UPTIME_WRITE_MS: u64 = 60_000;
 
+/// The most one step adds: a stop of the agent or a sleep of the machine
+/// between two samples counts at most this long (spec 25.6 (b)).
+pub const UPTIME_STEP_MAX_MS: u64 = 2 * UPTIME_WRITE_MS;
+
 /// The uptime now, from the stored sample, and whether to store the new
-/// one. The same boot adds the monotonic time since the sample; a new boot
-/// (or no sample) adds nothing, so downtime never counts and what was not
-/// stored before a reboot (under a minute) only delays. The wall clock is
-/// not an input.
-pub fn uptime_step(stored: Option<&Uptime>, boot: &str, mono: u64) -> (Uptime, bool) {
-    match stored {
+/// one. The same boot adds the monotonic time since the sample, at most
+/// [`UPTIME_STEP_MAX_MS`]: the clock runs through an agent stop and a sleep,
+/// which are not uptime. A step is made from the last *stored* sample, so
+/// ticks between writes accumulate in full; a capped step is over a minute,
+/// so it is always stored and the next one starts from its reading. A new
+/// boot (or no sample) adds nothing, so downtime never counts and what was
+/// not stored before a reboot (under a minute) only delays. The wall clock
+/// is not an input. `None` when the clock failed (`u64::MAX`): no step.
+pub fn uptime_step(stored: Option<&Uptime>, boot: &str, mono: u64) -> Option<(Uptime, bool)> {
+    if mono == u64::MAX {
+        return None;
+    }
+    Some(match stored {
         Some(s) if s.boot == boot => {
             let elapsed = mono.saturating_sub(s.mono);
+            let counted = elapsed.min(UPTIME_STEP_MAX_MS);
             let u = Uptime {
                 boot: boot.to_string(),
                 mono: s.mono.max(mono),
-                uptime_ms: s.uptime_ms.saturating_add(elapsed),
+                uptime_ms: s.uptime_ms.saturating_add(counted),
             };
             (u, elapsed >= UPTIME_WRITE_MS)
         }
@@ -641,7 +653,7 @@ pub fn uptime_step(stored: Option<&Uptime>, boot: &str, mono: u64) -> (Uptime, b
             },
             true,
         ),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -660,7 +672,8 @@ mod uptime_tests {
             let origin = day * 7;
             let mut last = None;
             for minute in 0..=(12 * 60) {
-                let (u, write) = uptime_step(stored.as_ref(), &boot, origin + minute * 60_000);
+                let (u, write) =
+                    uptime_step(stored.as_ref(), &boot, origin + minute * 60_000).unwrap();
                 if write {
                     stored = Some(u.clone());
                 }
@@ -673,16 +686,40 @@ mod uptime_tests {
 
     #[test]
     fn a_tick_within_the_minute_is_not_stored() {
-        let (s, w) = uptime_step(None, "b", 10);
+        let (s, w) = uptime_step(None, "b", 10).unwrap();
         assert!(w);
         assert_eq!(s.uptime_ms, 0);
-        let (u, w) = uptime_step(Some(&s), "b", 59_000);
+        let (u, w) = uptime_step(Some(&s), "b", 59_000).unwrap();
         assert!(!w);
         assert_eq!(u.uptime_ms, 58_990);
-        assert!(uptime_step(Some(&s), "b", 60_010).1);
+        assert!(uptime_step(Some(&s), "b", 60_010).unwrap().1);
         // A new boot carries the uptime and adds nothing.
-        let (r, w) = uptime_step(Some(&u), "c", 5);
+        let (r, w) = uptime_step(Some(&u), "c", 5).unwrap();
         assert!(w);
         assert_eq!(r.uptime_ms, 58_990);
+    }
+
+    #[test]
+    fn a_stop_or_a_sleep_adds_at_most_two_minutes() {
+        let hour = 3_600_000;
+        let (s, _) = uptime_step(None, "b", 1_000).unwrap();
+        // One step over the 7-day wait plus an hour: capped, and stored.
+        let (u, write) = uptime_step(Some(&s), "b", 1_000 + 7 * 24 * hour + hour).unwrap();
+        assert_eq!(u.uptime_ms, UPTIME_STEP_MAX_MS);
+        assert!(write);
+        // The next ticks start from the capped step's reading and add in full.
+        let (v, write) = uptime_step(Some(&u), "b", u.mono + 30_000).unwrap();
+        assert_eq!(v.uptime_ms, UPTIME_STEP_MAX_MS + 30_000);
+        assert!(!write);
+        // A gap of exactly the cap is counted in full.
+        let (w, _) = uptime_step(Some(&u), "b", u.mono + UPTIME_STEP_MAX_MS).unwrap();
+        assert_eq!(w.uptime_ms, 2 * UPTIME_STEP_MAX_MS);
+    }
+
+    #[test]
+    fn a_failed_clock_makes_no_step() {
+        let (s, _) = uptime_step(None, "b", 1_000).unwrap();
+        assert!(uptime_step(Some(&s), "b", u64::MAX).is_none());
+        assert!(uptime_step(None, "b", u64::MAX).is_none());
     }
 }

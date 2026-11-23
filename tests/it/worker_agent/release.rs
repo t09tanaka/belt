@@ -633,3 +633,40 @@ async fn the_backoff_of_a_failing_dropped_entry_never_passes_64_passes() {
     assert!(!entry.exists(), "not tried again at pass 191");
     agent.shutdown();
 }
+
+// An entry that left the list (a release, a forget) takes its backoff with
+// it: the same id listed again is tried at its first pass, not held back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_backoff_of_an_entry_that_left_the_list_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let agent = f.start("boot-a");
+    let root = f.state().join("attempts");
+    let stuck = AttemptId::generate();
+    let sealed = root.join(stuck.as_str()).join("sealed");
+    std::fs::create_dir_all(&sealed).unwrap();
+    std::fs::write(sealed.join("f"), b"").unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [stuck.as_str()])
+        .unwrap();
+    let entry = root.join(stuck.as_str());
+    let mut pass = 0u32;
+    let mut run_to = |until: u32| {
+        while pass < until {
+            agent.supervise();
+            pass += 1;
+        }
+    };
+    // Failed at passes 0, 1 and 3: the next try would be pass 7.
+    run_to(4);
+    db.execute("DELETE FROM dropped_attempt", []).unwrap();
+    run_to(5);
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [stuck.as_str()])
+        .unwrap();
+    run_to(6);
+    assert!(!entry.exists(), "held back by a backoff that was kept");
+    drop(db);
+    agent.shutdown();
+}

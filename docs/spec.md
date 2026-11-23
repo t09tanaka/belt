@@ -2352,7 +2352,7 @@ unlinkを行うのは、`dropped_attempt` の続きを行う処理（`remove_dro
 
 **解放の後片付けが失敗したとき。** 解放の受理の後のworkspaceの片付け（fast-worktreeの削除、置いたsecret fileの消去）が失敗し、`cleanup-pending` か `workspace.json` が残ったら、attemptのdirectoryと `dropped_attempt` の行を残す。tickが32件ずつやり直し（`DROPPED_PER_TICK`）、片付けが済んでから、directory・lock・`dropped_attempt` の行を消す。
 
-**ack_waitの時計。** `ack_wait` の判定と、attemptを持たないeventの期間（(e)）は、壁時計を読まず、workerの稼働時間（`uptime`。worker DBの `uptime` 表）で行う。稼働時間は、同じbootの間だけmonotonicの経過で進み、別のbootへ持ち越し、止まっていた間は数えない。書くのは稼働時間で1分に1回と、bootが変わったとき・agentが止まるときだけで、再起動で失うのは高々1分（削除が遅れるだけ）である。agentは、terminalの行を初めて見たときの稼働時間を行に書き（`terminal_uptime_ms`。`terminal_at_ms` は表示用に残す）、そこから稼働時間で `ack_wait` が経った行を消す。したがって、どの行も稼働時間で `ack_wait` が経つ前には消えず、経てば消え、壁時計の段差（1970年への巻き戻しを含む）は何も変えない。(e) は、1時間の稼働ごとにその時点の最新のeventの番号を印として残し（`uptime_mark`）、`retention` だけ稼働時間の古い最新の印より前の、attemptを持たないeventを消す（印の分、最大1時間遅れる）。agentの結果のGCは、`ack_wait` を壁時計で判定せず（上の規則に任せる）、試用中は行わない。
+**ack_waitの時計。** `ack_wait` の判定と、attemptを持たないeventの期間（(e)）は、壁時計を読まず、workerの稼働時間（`uptime`。worker DBの `uptime` 表）で行う。稼働時間は、同じbootの間だけmonotonicの経過で進み、別のbootへ持ち越し、止まっていた間は数えない。monotonicの時計はagentの停止や機械のスリープの間も進むので、前回書いた値からの経過は1回に最大2分（書く間隔の2倍）までしか足さない（agentの停止とスリープは数えない。1回の空きにつき最大2分、削除が遅れる側に倒す）。時計が読めないとき（失敗）は足さず、書かない。書くのは稼働時間で1分に1回と、bootが変わったとき・agentが止まるときだけで、再起動で失うのは高々1分（削除が遅れるだけ）である。agentは、terminalの行を初めて見たときの稼働時間を行に書き（`terminal_uptime_ms`。`terminal_at_ms` は表示用に残す）、そこから稼働時間で `ack_wait` が経った行を消す。したがって、どの行も稼働時間で `ack_wait` が経つ前には消えず、経てば消え、壁時計の段差（1970年への巻き戻しを含む）は何も変えない。(e) は、1時間の稼働ごとにその時点の最新のeventの番号を印として残し（`uptime_mark`）、`retention` だけ稼働時間の古い最新の印より前の、attemptを持たないeventを消す（印の分、最大1時間遅れる）。agentの結果のGCは、`ack_wait` を壁時計で判定せず（上の規則に任せる）、試用中は行わない。
 
 ### (c) 重複防止の記録
 

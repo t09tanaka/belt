@@ -1208,3 +1208,25 @@ fn a_worker_switch_is_on_trial_from_the_copy_until_it_is_undone_or_committed() {
     h.rollback(&mut |_| Ok(())).unwrap();
     assert!(!crate::worker::control::in_trial(&state));
 }
+
+#[test]
+fn a_switch_that_stopped_before_it_was_recorded_leaves_no_trial_marker() {
+    // Stopped at Record: the copy began a trial, the journal has no switch.
+    let h = Host::new();
+    h.database();
+    let state = h.paths().state;
+    h.upgrade(&mut failing(Step::Record)).unwrap_err();
+    assert!(crate::worker::control::in_trial(&state));
+    assert!(read_journal(&h.paths()).unwrap().unwrap().switch.is_none());
+    h.rollback(&mut |_| Ok(())).unwrap();
+    assert!(!crate::worker::control::in_trial(&state));
+
+    // Same, and the old version is simply committed.
+    let h = Host::new();
+    h.database();
+    let state = h.paths().state;
+    h.upgrade(&mut failing(Step::Record)).unwrap_err();
+    assert!(crate::worker::control::in_trial(&state));
+    h.commit(&h.old).unwrap();
+    assert!(!crate::worker::control::in_trial(&state));
+}

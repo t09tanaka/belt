@@ -311,14 +311,14 @@ fn restore_database(paths: &Paths, digest: &str) -> anyhow::Result<()> {
         !absent(&saved)?,
         "the worker database saved for version {digest} is gone, so that version cannot be restored; run upgrade again to finish the switch"
     );
+    let _forget =
+        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     if !absent(&database)? {
         checkpoint(&database)?;
     }
     // A log of the replaced database must never be replayed into this one.
     remove_if_present(&paths.state.join("worker.db-wal"))?;
     remove_if_present(&paths.state.join("worker.db-shm"))?;
-    let _forget =
-        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     copy_private(&saved, &database)
 }
 
@@ -564,6 +564,10 @@ fn switch_to<L: Launcher>(
         remove_if_present(&saved_database(paths, to))?;
         journal.switch = None;
         save_journal(paths, &journal)?;
+    }
+    // The marker follows the journal: with no switch recorded (also one that
+    // stopped before it was recorded) nothing is on trial.
+    if journal.switch.is_none() {
         crate::worker::control::end_trial(&paths.state)?;
     }
     status_with(paths, &journal, &plan, &receipt, &mut launcher, ready)
@@ -595,8 +599,10 @@ pub fn commit<L: Launcher>(
         // refuses to roll back instead of starting on a missing database.
         remove_if_present(&saved_database(&paths, &switch.from))?;
         save_journal(&paths, &journal)?;
-        crate::worker::control::end_trial(&paths.state)?;
     }
+    // Also when no switch is recorded: a marker left by a switch that stopped
+    // before it was recorded must not outlive the commit.
+    crate::worker::control::end_trial(&paths.state)?;
     if journal.drained_by_upgrade {
         // The marker first: a crash in between leaves the ownership recorded
         // and the next commit finishes, never a drain nobody owns.
