@@ -1419,4 +1419,36 @@ mod tests {
             ErrorCode::NotFound
         );
     }
+
+    /// Spec 25.3 (b). `logs` of a run that is being pruned, or of a task or
+    /// an attempt of it, is refused before any log file is opened.
+    #[test]
+    fn logs_of_a_run_that_is_being_pruned_are_not_found() {
+        let f = Fixture::new();
+        f.append(LogStream::Stdout, b"kept until the run is pruned", true);
+        let open = |target: Target, attempt: Option<AttemptId>| {
+            Observer::new(
+                Reader::Offline(Arc::new(
+                    CoordinatorStore::open_read_only(f.dir.path()).unwrap(),
+                )),
+                f.dir.path().join("results"),
+                target,
+                attempt,
+            )
+        };
+        assert!(open(Target::Run(f.run.clone()), None).is_ok());
+        f.db.mark_pruning_for_test(&f.run);
+        for (target, attempt) in [
+            (Target::Run(f.run.clone()), None),
+            (Target::Task(f.task.clone()), None),
+            (Target::Task(f.task.clone()), Some(f.attempt.clone())),
+        ] {
+            let error = open(target, attempt).err().unwrap();
+            assert_eq!(error.code, ErrorCode::NotFound);
+            assert!(
+                error.message.contains(crate::storage::RUN_PRUNED),
+                "{error:?}"
+            );
+        }
+    }
 }

@@ -521,6 +521,7 @@ impl CoordinatorStore {
         );
         let declared = declared.to_vec();
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
             let core = common::read_core(tx, ATTEMPT, &a)?;
             if !core.state.is_terminal() {
                 return Err(StorageError::IllegalState {
@@ -580,6 +581,7 @@ impl CoordinatorStore {
             logs.to_string(),
         );
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
             let n = tx.execute(
                 "UPDATE collection SET logs_json = ?1, updated_at_ms = ?2
                  WHERE attempt_id = ?3 AND result_digest = ?4 AND closed_at_ms IS NULL",
@@ -601,6 +603,7 @@ impl CoordinatorStore {
         let (receipt, file) = (receipt.clone(), file.clone());
         self.db.write(move |tx| {
             let a = receipt.attempt_id.to_string();
+            super::refuse_pruned_attempt(tx, &a)?;
             add_ref(tx, &a, &file, at_ms)?;
             Self::record_artifact_in(tx, &receipt, at_ms)?;
             clear_strikes(tx, &a)
@@ -621,6 +624,7 @@ impl CoordinatorStore {
     ) -> Result<bool> {
         let (a, names) = (attempt_id.to_string(), artifacts.to_vec());
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
             let row = ensure_row(tx, &a, at_ms)?;
             if row.closed_at_ms.is_some() {
                 return Ok(false);
@@ -669,6 +673,7 @@ impl CoordinatorStore {
     pub fn reopen_collection(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<bool> {
         let a = attempt_id.to_string();
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
             let Some(row) = load_row(tx, &a)? else {
                 return Ok(false);
             };
@@ -706,6 +711,7 @@ impl CoordinatorStore {
     pub fn strike_collection(&self, attempt_id: &AttemptId, why: &str, at_ms: u64) -> Result<u32> {
         let (a, why) = (attempt_id.to_string(), why.to_string());
         self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
             let row = ensure_row(tx, &a, at_ms)?;
             if row.closed_at_ms.is_some() {
                 return Ok(row.strikes);
@@ -749,8 +755,10 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<bool> {
         let (a, digest) = (attempt_id.to_string(), result_digest.cloned());
-        self.db
-            .write(move |tx| close_collection_in(tx, &a, digest.as_ref(), verdict, acked, at_ms))
+        self.db.write(move |tx| {
+            super::refuse_pruned_attempt(tx, &a)?;
+            close_collection_in(tx, &a, digest.as_ref(), verdict, acked, at_ms)
+        })
     }
 
     /// Where the run stands: each task by its current attempt (the one that

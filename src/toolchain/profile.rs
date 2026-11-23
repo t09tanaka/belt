@@ -956,48 +956,7 @@ fn bounded_probe_in(
         .map_err(|_| ProbeMiss::Failed)?;
     let pid = child.id();
     // Every failure after spawn still passes through owned group cleanup/reap.
-    let output = (|| {
-        let mut out = child.stdout.take().ok_or(ProbeMiss::Failed)?;
-        let mut err = child.stderr.take().ok_or(ProbeMiss::Failed)?;
-        for fd in [out.as_raw_fd(), err.as_raw_fd()] {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(ProbeMiss::Failed);
-            }
-        }
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let started = Instant::now();
-        loop {
-            if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
-                return Err(ProbeMiss::Failed);
-            }
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let observed = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid,
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if observed != 0 {
-                return Err(ProbeMiss::Failed);
-            }
-            if started.elapsed() >= deadline {
-                return Err(ProbeMiss::TimedOut);
-            }
-            if unsafe { info.si_pid() } == pid as i32 {
-                if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr)
-                {
-                    return Err(ProbeMiss::Failed);
-                }
-                return Ok(if stdout.is_empty() { stderr } else { stdout });
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    })();
+    let output = probe_output(&mut child, deadline);
     // Our unreaped Child owns pid, so this group number cannot be recycled.
     if let Ok(group) = i32::try_from(pid) {
         crate::platform::signal_process_group(group, libc::SIGKILL);
@@ -1009,6 +968,49 @@ fn bounded_probe_in(
         return Err(ProbeMiss::Failed);
     }
     String::from_utf8(output).map_err(|_| ProbeMiss::Failed)
+}
+/// Observe exit before the deadline: the parent may resume late after the
+/// child has already finished. The caller retains group cleanup and reaping.
+fn probe_output(child: &mut std::process::Child, deadline: Duration) -> Result<Vec<u8>, ProbeMiss> {
+    let pid = child.id();
+    let mut out = child.stdout.take().ok_or(ProbeMiss::Failed)?;
+    let mut err = child.stderr.take().ok_or(ProbeMiss::Failed)?;
+    for fd in [out.as_raw_fd(), err.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(ProbeMiss::Failed);
+        }
+    }
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let started = Instant::now();
+    loop {
+        if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
+            return Err(ProbeMiss::Failed);
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if observed != 0 {
+            return Err(ProbeMiss::Failed);
+        }
+        if unsafe { info.si_pid() } == pid as i32 {
+            if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
+                return Err(ProbeMiss::Failed);
+            }
+            return Ok(if stdout.is_empty() { stderr } else { stdout });
+        }
+        if started.elapsed() >= deadline {
+            return Err(ProbeMiss::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 fn read_available(input: &mut impl Read, output: &mut Vec<u8>) -> bool {
     loop {
@@ -1060,6 +1062,33 @@ mod tests {
         ]
         .into()
     }
+    #[test]
+    fn an_exited_probe_returns_output_after_the_deadline() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf 'probe answer\\n'"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Wait for exit without reaping, so the probe observes a real exited
+        // child deterministically, with no scheduling delay or sleep assumed.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let output = probe_output(&mut child, Duration::ZERO);
+        let status = child.wait().unwrap();
+        assert_eq!(observed, 0);
+        assert!(status.success());
+        assert_eq!(output, Ok(b"probe answer\n".to_vec()));
+    }
+
     /// Every way a probe ends removes its directory: an answer, a failing
     /// tool, a tool that cannot be started, too much output, and a timeout
     /// whose descendant keeps the directory as its working directory.

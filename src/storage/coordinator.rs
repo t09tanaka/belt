@@ -243,6 +243,100 @@ fn not_found(what: impl Into<String>) -> StorageError {
     StorageError::NotFound { what: what.into() }
 }
 
+/// Why a run that carries the mark `run.pruning_at_ms` is refused (spec
+/// 25.3 (b)). The mark is never cleared and the rows of the run are deleted
+/// only after it, so a run that carries it does not exist for any reader or
+/// writer: the answer is `NOT_FOUND`, and this reason is in its message.
+pub(crate) const RUN_PRUNED: &str = "run_pruned";
+
+fn run_pruned(run: &str) -> StorageError {
+    not_found(format!("run {run} ({RUN_PRUNED})"))
+}
+
+/// Whether `run` carries the mark. `known` is false for a file from before
+/// the column, which has no marked run. A run without a row has no mark.
+fn run_marked(c: &Connection, run: &str, known: bool) -> Result<bool> {
+    if !known {
+        return Ok(false);
+    }
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND pruning_at_ms IS NOT NULL)",
+        [run],
+        |r| r.get(0),
+    )?)
+}
+
+/// Refuse to write to a marked run. For the transaction that makes the row:
+/// the check and the row are one commit. Only a writable store calls this,
+/// and its file has the column.
+fn refuse_pruned(c: &Connection, run: &str) -> Result<()> {
+    if run_marked(c, run, true)? {
+        return Err(run_pruned(run));
+    }
+    Ok(())
+}
+
+/// [`refuse_pruned`] for the run of `task`. A task without a row is left to
+/// the caller, which answers for it as before.
+fn refuse_pruned_task(c: &Connection, task: &str) -> Result<()> {
+    let run: Option<String> = c
+        .query_row(
+            "SELECT r.run_id FROM task t JOIN run r USING(run_id) WHERE t.task_id=?1 AND r.pruning_at_ms IS NOT NULL",
+            [task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match run {
+        Some(run) => Err(run_pruned(&run)),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_pruned`] for the run of `attempt`: a writer that is given only
+/// an attempt (its collection, its logs, its artifacts, an event that names
+/// no run) finds the run through the task. An attempt without a row is left
+/// to the caller.
+fn refuse_pruned_attempt(c: &Connection, attempt: &str) -> Result<()> {
+    let run: Option<String> = c
+        .query_row(
+            "SELECT r.run_id FROM attempt a JOIN task t USING(task_id) JOIN run r USING(run_id)
+             WHERE a.attempt_id=?1 AND r.pruning_at_ms IS NOT NULL",
+            [attempt],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match run {
+        Some(run) => Err(run_pruned(&run)),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_pruned`] for the run of the matrix group `group`. A group
+/// without a row is left to the caller.
+fn refuse_pruned_group(c: &Connection, group: &str) -> Result<()> {
+    let run: Option<String> = c
+        .query_row(
+            "SELECT r.run_id FROM matrix_group g JOIN run r USING(run_id)
+             WHERE g.group_id=?1 AND r.pruning_at_ms IS NOT NULL",
+            [group],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match run {
+        Some(run) => Err(run_pruned(&run)),
+        None => Ok(()),
+    }
+}
+
+/// The condition of a run row `alias` that carries no mark, for a scan.
+fn unmarked(alias: &str, known: bool) -> String {
+    if known {
+        format!("{alias}.pruning_at_ms IS NULL")
+    } else {
+        "1".into()
+    }
+}
+
 /// A global matrix permit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permit {
@@ -291,6 +385,9 @@ pub struct CoordinatorStore {
     /// False for a file from before the third step opened read-only: it has
     /// no `collection` table (no collection of it was ever begun).
     collections: bool,
+    /// False for a file from before `run.pruning_at_ms` opened read-only:
+    /// no run of it carries the mark.
+    pruning: bool,
     state_dir: std::path::PathBuf,
     _lock: Option<ProcessLock>,
 }
@@ -326,12 +423,31 @@ impl CoordinatorStore {
     }
     /// Resolve immutable target identity, lock one run, then validate fresh metadata.
     /// Export/read commands must retain this pin for their whole invocation.
+    ///
+    /// The order is "shared pin, then the mark, then the files" (spec 25.3
+    /// (b)): the pruning of a run writes the mark, then takes the pin
+    /// exclusively, then deletes. A check before the pin alone would let the
+    /// mark, the deletion and the release all fall between it and the pin.
+    /// So the target is read again once the pin is held, the mark with it in
+    /// one snapshot, and a reader that is refused there drops the pin and
+    /// opens no file.
     pub fn result_read_pin(
         &self,
         target: &crate::service::completion::Target,
         attempt: Option<&AttemptId>,
     ) -> Result<crate::results::pin::RunPin> {
+        self.result_read_pin_after(target, attempt, || ())
+    }
+    /// [`Self::result_read_pin`]; `between` runs after the first check of
+    /// the target and before the pin is taken (a test stops a reader there).
+    pub(crate) fn result_read_pin_after(
+        &self,
+        target: &crate::service::completion::Target,
+        attempt: Option<&AttemptId>,
+        between: impl FnOnce(),
+    ) -> Result<crate::results::pin::RunPin> {
         let run = self.result_target_run(target, attempt)?;
+        between();
         let pin =
             crate::results::pin::RunPin::shared(&self.state_dir, &run).map_err(
                 |error| {
@@ -346,6 +462,7 @@ impl CoordinatorStore {
             }
                 },
             )?;
+        // A refusal returns here, which drops the pin.
         if self.result_target_run(target, attempt)? != run {
             return Err(StorageError::Invalid(
                 "result target changed while acquiring pin".into(),
@@ -353,48 +470,182 @@ impl CoordinatorStore {
         }
         Ok(pin)
     }
+    /// The run of a target that exists and carries no mark, read in one
+    /// snapshot.
     fn result_target_run(
         &self,
         target: &crate::service::completion::Target,
         attempt: Option<&AttemptId>,
     ) -> Result<RunId> {
         use crate::service::completion::Target;
-        match target {
-            Target::Run(run) if attempt.is_none() => self
-                .query_run(run.clone())?
-                .map(|_| run.clone())
-                .ok_or_else(|| not_found("run")),
-            Target::Task(task) => {
-                let row = self
-                    .query_task(task.clone())?
-                    .ok_or_else(|| not_found("task"))?;
-                if let Some(a) = attempt {
-                    if self.get_attempt(a)?.is_none_or(|a| a.task_id != *task) {
-                        return Err(not_found("attempt of selected task"));
+        let pruning = self.pruning;
+        let (target, attempt) = (target.clone(), attempt.map(ToString::to_string));
+        self.db.call(move |c| {
+            let c = &c.unchecked_transaction()?;
+            let run = match (&target, &attempt) {
+                (Target::Run(run), None) => {
+                    let known: bool = c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+                        [run.as_str()],
+                        |r| r.get(0),
+                    )?;
+                    if !known {
+                        return Err(not_found("run"));
                     }
+                    run.to_string()
                 }
-                Ok(row.run_id)
+                (Target::Task(task), attempt) => {
+                    let run: Option<String> = c
+                        .query_row(
+                            "SELECT run_id FROM task WHERE task_id=?1",
+                            [task.as_str()],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let run = run.ok_or_else(|| not_found("task"))?;
+                    if let Some(attempt) = attempt {
+                        let owned: bool = c.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM attempt WHERE attempt_id=?1 AND task_id=?2)",
+                            params![attempt, task.as_str()],
+                            |r| r.get(0),
+                        )?;
+                        if !owned {
+                            return Err(not_found("attempt of selected task"));
+                        }
+                    }
+                    run
+                }
+                _ => return Err(StorageError::Invalid("attempt requires task".into())),
+            };
+            if run_marked(c, &run, pruning)? {
+                return Err(run_pruned(&run));
             }
-            _ => Err(StorageError::Invalid("attempt requires task".into())),
-        }
+            id("run_id", RunId::parse(&run))
+        })
     }
+    /// The shared pin of the run of `attempt`, to write its results under.
+    /// This makes the pin file, so it is taken only for an attempt whose
+    /// task and run have their rows and whose run carries no mark, read in
+    /// one snapshot (spec 25.5): the pin of a run that is being pruned is
+    /// never made again.
+    ///
+    /// The check before the pin is not enough alone (spec 25.3, 25.5):
+    /// between it and the pin the pruning can mark the run, delete its
+    /// results and rows and unlink its pin file, and this function would
+    /// make the file again and write results nothing deletes. So the same
+    /// check is made again with the pin held. A writer that is refused
+    /// there lets go of the pin and unlinks the pin file, when it gets the
+    /// pin exclusively (otherwise the scan at start removes it). It cannot
+    /// tell a file it made from one that was there, so it unlinks either:
+    /// a run that is marked but not pruned to its end yet can lose its pin
+    /// file here, and the pruning must take a missing pin file for "no
+    /// reader".
     pub(crate) fn result_writer_pin(
         &self,
         attempt: &AttemptId,
     ) -> Result<crate::results::pin::RunPin> {
+        self.result_writer_pin_after(attempt, || ())
+    }
+    /// [`Self::result_writer_pin`]; `between` runs after the first check of
+    /// the attempt and before the pin file is made (a test stops a writer
+    /// there).
+    pub(crate) fn result_writer_pin_after(
+        &self,
+        attempt: &AttemptId,
+        between: impl FnOnce(),
+    ) -> Result<crate::results::pin::RunPin> {
+        use crate::results::pin::RunPin;
         if self._lock.is_none() {
             return Err(StorageError::Invalid("read-only owner".into()));
         }
-        let task = self
-            .get_attempt(attempt)?
-            .ok_or_else(|| not_found("attempt"))?
-            .task_id;
-        let run = self
-            .query_task(task)?
-            .ok_or_else(|| not_found("task"))?
-            .run_id;
-        crate::results::pin::RunPin::ensure(&self.state_dir, &run)?;
-        Ok(crate::results::pin::RunPin::shared(&self.state_dir, &run)?)
+        let run = self.result_writer_run(attempt)?;
+        between();
+        RunPin::ensure(&self.state_dir, &run)?;
+        let pin = RunPin::shared(&self.state_dir, &run)?;
+        match self.result_writer_run(attempt) {
+            Ok(again) if again == run => Ok(pin),
+            answer => {
+                drop(pin);
+                if let Ok(alone) = RunPin::exclusive(&self.state_dir, &run) {
+                    let path = self.state_dir.join(format!("reader-pins/{run}.lock"));
+                    match std::fs::remove_file(path) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(StorageError::Io(e))
+                        }
+                        _ => {}
+                    }
+                    drop(alone);
+                }
+                Err(answer
+                    .err()
+                    .unwrap_or_else(|| not_found("attempt, its task or its run")))
+            }
+        }
+    }
+    /// The run of an attempt that has its row, as its task and its run have,
+    /// and whose run carries no mark: one snapshot.
+    fn result_writer_run(&self, attempt: &AttemptId) -> Result<RunId> {
+        let attempt = attempt.to_string();
+        self.db.call(move |c| {
+            let row: Option<(String, bool)> = c
+                .query_row(
+                    "SELECT r.run_id, r.pruning_at_ms IS NOT NULL FROM attempt a
+                     JOIN task t USING(task_id) JOIN run r USING(run_id) WHERE a.attempt_id=?1",
+                    [&attempt],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                None => Err(not_found("attempt, its task or its run")),
+                Some((run, true)) => Err(run_pruned(&run)),
+                Some((run, false)) => id("run_id", RunId::parse(&run)),
+            }
+        })
+    }
+    /// Whether `run` carries the mark of a pruned run. A reader that builds
+    /// its answer from several reads asks this before the first of them and
+    /// [`Self::run_is_whole`] after the last: the mark is never cleared and
+    /// the rows of a run are deleted only after it, so a run that has its
+    /// row and no mark after the last read had all its rows at every read
+    /// before.
+    pub fn run_is_pruned(&self, run: &RunId) -> Result<bool> {
+        let (run, pruning) = (run.to_string(), self.pruning);
+        self.db.call(move |c| run_marked(c, &run, pruning))
+    }
+    /// Refuse a read of a task whose run carries the mark. A task without a
+    /// row is left to the caller.
+    pub(crate) fn refuse_pruned_task_read(&self, task: &TaskId) -> Result<()> {
+        if !self.pruning {
+            return Ok(());
+        }
+        let task = task.to_string();
+        self.db.call(move |c| refuse_pruned_task(c, &task))
+    }
+    /// Whether `run` has its row and carries no mark, in one snapshot. This
+    /// is what a reader asks after its last read: a run whose pruning ran to
+    /// its end meanwhile has no row, and no mark to see either.
+    pub fn run_is_whole(&self, run: &RunId) -> Result<bool> {
+        let run = run.to_string();
+        let unmarked = unmarked("run", self.pruning);
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND {unmarked})"),
+                [run],
+                |r| r.get(0),
+            )?)
+        })
+    }
+    /// [`Self::run_is_whole`] for the run of `task`, which has its row too.
+    pub(crate) fn task_is_whole(&self, task: &TaskId) -> Result<bool> {
+        let task = task.to_string();
+        let unmarked = unmarked("r", self.pruning);
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM task t JOIN run r USING(run_id) WHERE t.task_id=?1 AND {unmarked})"),
+                [task],
+                |r| r.get(0),
+            )?)
+        })
     }
     /// Prepare a private, fully initialized metadata database without claiming an epoch.
     /// The publish callback journals the staged inode before its no-replace rename.
@@ -524,6 +775,7 @@ impl CoordinatorStore {
             task_cancel: true,
             retry_boundaries: true,
             collections: true,
+            pruning: true,
             state_dir: state_dir.to_path_buf(),
             _lock: Some(lock),
         })
@@ -574,6 +826,13 @@ impl CoordinatorStore {
                 |r| r.get(0),
             )?)
         })?;
+        let pruning = db.call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*)>0 FROM pragma_table_info('run') WHERE name='pruning_at_ms'",
+                [],
+                |r| r.get(0),
+            )?)
+        })?;
         Ok(Self {
             db,
             cluster_id,
@@ -582,6 +841,7 @@ impl CoordinatorStore {
             task_cancel,
             retry_boundaries: db_has_retry,
             collections,
+            pruning,
             state_dir: state_dir.to_path_buf(),
             _lock: None,
         })
@@ -757,6 +1017,7 @@ impl CoordinatorStore {
             .map_err(|error| StorageError::Invalid(format!("{error:#}")))?;
         let (task, run, spec) = (task_id.to_string(), run_id.to_string(), spec.to_string());
         self.db.write(move |tx| {
+            refuse_pruned(tx, &run)?;
             tx.execute(
                 "INSERT INTO task (task_id, run_id, spec_json, created_at_ms)
                  VALUES (?1,?2,?3,?4)",
@@ -784,6 +1045,7 @@ impl CoordinatorStore {
                 })
                 .optional()?
                 .ok_or_else(|| not_found(format!("task {task}")))?;
+            refuse_pruned(tx, &run)?;
             mutation
                 .ensure_run_available(
                     &RunId::parse(&run).map_err(|e| StorageError::Invalid(e.to_string()))?,
@@ -964,6 +1226,7 @@ impl CoordinatorStore {
         let (aid, reason) = (attempt_id.to_string(), reason.to_string());
         let note = note.map(|(kind, payload)| (kind.to_string(), payload.clone()));
         self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, &aid)?;
             let worker: String = tx
                 .query_row(
                     "SELECT worker_id FROM attempt WHERE attempt_id = ?1",
@@ -1035,6 +1298,7 @@ impl CoordinatorStore {
         let a = attempt_id.map(ToString::to_string);
         let demand = demand.to_string();
         self.db.write(move |tx| {
+            refuse_pruned_task(tx, &task)?;
             tx.execute(
                 "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
                  VALUES (?1,?2,?3,?4,?5)",
@@ -1113,6 +1377,7 @@ impl CoordinatorStore {
     ) -> Result<()> {
         let (g, r) = (group_id.to_string(), run_id.to_string());
         self.db.write(move |tx| {
+            refuse_pruned(tx, &r)?;
             tx.execute(
                 "INSERT INTO matrix_group (group_id, run_id, max_parallel, created_at_ms)
                  VALUES (?1,?2,?3,?4)",
@@ -1135,7 +1400,10 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<Option<Permit>> {
         let (g, p) = (group_id.to_string(), permit_id.clone());
-        self.db.write(move |tx| reserve_permit(tx, &g, &p, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_group(tx, &g)?;
+            reserve_permit(tx, &g, &p, at_ms)
+        })
     }
 
     /// Give the permit back. Refused while its attempt is neither terminal nor
@@ -1196,6 +1464,15 @@ impl CoordinatorStore {
         );
         let (kind, payload) = (kind.to_string(), payload.clone());
         self.db.write(move |tx| {
+            // An event that names only an attempt belongs to the run of that
+            // attempt (spec 25.3 (b)): written while the run is pruned, it
+            // would be a row the pruning has already passed.
+            if let Some(run) = &r {
+                refuse_pruned(tx, run)?;
+            }
+            if let Some(attempt) = &a {
+                refuse_pruned_attempt(tx, attempt)?;
+            }
             common::append_event(tx, r.as_deref(), a.as_deref(), &kind, &payload, at_ms)
         })
     }
@@ -1232,6 +1509,10 @@ impl CoordinatorStore {
         );
         let wanted = wanted.to_vec();
         self.db.write(move |tx| {
+            if let Some(run) = &r {
+                refuse_pruned(tx, run)?;
+            }
+            refuse_pruned_attempt(tx, &a)?;
             common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
         })
     }
@@ -1260,8 +1541,10 @@ impl CoordinatorStore {
     /// same receipt again is a no-op, a different one is a conflict.
     pub fn record_artifact(&self, r: &ArtifactReceipt, at_ms: u64) -> Result<()> {
         let r = r.clone();
-        self.db
-            .write(move |tx| Self::record_artifact_in(tx, &r, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, r.attempt_id.as_str())?;
+            Self::record_artifact_in(tx, &r, at_ms)
+        })
     }
 
     /// [`Self::record_artifact`] in the transaction of the caller.
@@ -1388,7 +1671,10 @@ impl CoordinatorStore {
 
     pub fn add_blob_ref(&self, r: &NewBlobRef, at_ms: u64) -> Result<()> {
         let r = r.clone();
-        self.db.write(move |tx| common::add_blob_ref(tx, &r, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, &r.attempt_id)?;
+            common::add_blob_ref(tx, &r, at_ms)
+        })
     }
 
     /// Mark a reference as in use (a cache entry another job reads).

@@ -134,9 +134,13 @@ pub fn stored(
 ) -> Result<crate::ci::summary::PlanSummary, ApiError> {
     let store = super::bootstrap::read_only_store(spec)
         .map_err(|_| failure("coordinator state is unavailable"))?;
-    let rows = store
-        .ci_run_tasks(run)
-        .map_err(|_| failure("cannot read the stored run"))?;
+    let rows = store.ci_run_tasks(run).map_err(|e| match e {
+        // A run that is being pruned (spec 25.3 (b)).
+        crate::storage::StorageError::NotFound { .. } => {
+            ApiError::new(ErrorCode::NotFound, e.to_string())
+        }
+        _ => failure("cannot read the stored run"),
+    })?;
     let digest = crate::ci::discovery::active_plan(&rows)
         .or_else(|| {
             rows.iter()
