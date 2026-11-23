@@ -335,6 +335,44 @@ impl WorkerStore {
         })
     }
 
+    /// The wall time the ack wait may judge by now (chapter 23's Hold
+    /// rule, as the result collection's clock): `None` while the clock is
+    /// held (first sample, a new boot, a step of the wall clock), in which
+    /// case nothing expires. The state is kept in the worker database.
+    pub fn release_clock_cutoff(
+        &self,
+        boot: &str,
+        wall: u64,
+        mono: u64,
+        retention: u64,
+    ) -> Result<Option<u64>> {
+        use crate::results::clock_policy::{step, ClockState};
+        let boot = boot.to_string();
+        self.db.write(move |tx| {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT state_json FROM release_clock WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let previous = previous
+                .as_deref()
+                .map(|s| from_json::<ClockState>("release clock", s))
+                .transpose()?;
+            let next = step(previous.as_ref(), Some(&boot), wall, mono, retention);
+            if let Some(state) = next.state {
+                tx.execute(
+                    "INSERT INTO release_clock VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
+                    [serde_json::to_string(&state)
+                        .map_err(|e| StorageError::Invalid(e.to_string()))?],
+                )?;
+            }
+            Ok(next.cutoff)
+        })
+    }
+
     /// The ack wait (spec 25.6 (b)): up to `batch` terminal attempts that
     /// ended at least `ack_wait_ms` ago and got neither `ack_collected` nor
     /// `release_attempt` are deleted, each leaving an unreleased record.

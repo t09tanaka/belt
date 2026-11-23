@@ -402,6 +402,15 @@ fn owner_in(conn: &Connection, scope: &Option<String>, attempt_id: Option<&str>)
     Ok(found.unwrap_or_else(unowned))
 }
 
+/// Whether `attempt_id` has a `worker_attempt` row (of any member).
+fn attempt_row_exists(conn: &Connection, attempt_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM worker_attempt WHERE attempt_id = ?1)",
+        [attempt_id],
+        |r| r.get(0),
+    )?)
+}
+
 impl WorkerStore {
     /// Open (creating or migrating) `worker.db` in `state_dir`. Safe to call
     /// from the agent and from supervisors at the same time.
@@ -1809,6 +1818,14 @@ impl WorkerStore {
         let (kind, payload) = (kind.to_string(), payload.clone());
         let scope = self.scope.clone();
         self.db.write(move |tx| {
+            // Spec 25.6 (e): an attempt's events go with its row. One
+            // written after the row went (a late cleanup note, a supervisor
+            // after the release) would have no deletion, so it is dropped.
+            if let Some(a) = a.as_deref() {
+                if !attempt_row_exists(tx, a)? {
+                    return Ok(0);
+                }
+            }
             let o = owner_in(tx, &scope, a.as_deref())?;
             common::append_event_owned(
                 tx,
@@ -1868,6 +1885,10 @@ impl WorkerStore {
         let wanted = wanted.to_vec();
         let o = self.scope.clone();
         self.db.write(move |tx| {
+            // As in [`Self::append_event`]: no row, no events.
+            if !attempt_row_exists(tx, &a)? {
+                return Ok(0);
+            }
             let o = owner_in(tx, &o, Some(&a))?;
             common::append_events_unseen_owned(
                 tx,

@@ -222,9 +222,16 @@ async fn past_the_ack_wait_a_restart_keeps_the_unreleased_record_until_a_release
     };
     assert_eq!(page.attempts, vec![a.clone()], "the restart kept it");
     let late = payload(&format!("touch {}", marker.display()));
-    let _ = call(&c, submit_req(&a, &late)).await;
+    let first = call(&c, submit_req(&a, &late)).await.unwrap_err().code;
     assert!(f.store().get(&a).unwrap().is_none());
     assert!(!marker.exists(), "a late submit ran");
+    // A late copy is answered by its record, not by the checks of a new
+    // acceptance: RETIRED even while the worker drains.
+    belt::worker::control::write(&f.state(), belt::worker::control::Control::draining()).unwrap();
+    let e = call(&c, submit_req(&a, &late)).await.unwrap_err();
+    assert_eq!(e.code, first, "{e:?}");
+    assert_ne!(e.code, ErrorCode::Overloaded);
+    belt::worker::control::write(&f.state(), belt::worker::control::Control::default()).unwrap();
     call(&c, release_req(&a)).await.unwrap();
     let Response::ListUnreleased(page) = call(&c, unreleased_req()).await.unwrap() else {
         panic!()
@@ -338,5 +345,34 @@ async fn a_start_on_trial_keeps_the_rows_an_older_version_acknowledged() {
     assert!(f.store().get(&b).unwrap().is_none());
     assert!(!f.state().join("attempts").join(b.as_str()).exists());
     assert!(recorded(&f, &b).is_none());
+    agent.shutdown();
+}
+
+// A release whose teardown failed (a busy workspace) keeps the directory and
+// the `dropped_attempt` entry; a later tick finishes it. No event of the
+// attempt is written after its row went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_whose_cleanup_failed_is_finished_by_a_later_tick() {
+    let f = fx();
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    call(&c, release_req(&a)).await.unwrap();
+    let dir = f.state().join("attempts").join(a.as_str());
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(dir.join("cleanup-pending").exists(), "the teardown is kept");
+    assert_eq!(f.store().dropped_attempts(10).unwrap(), vec![a.to_string()]);
+    agent.tick();
+    assert!(dir.exists());
+    assert!(f.store().events_of_attempt(&a, 10).unwrap().is_empty());
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    agent.tick();
+    assert!(!dir.exists());
+    assert!(!lock_of(&f, &a).exists());
+    assert!(f.store().dropped_attempts(10).unwrap().is_empty());
     agent.shutdown();
 }

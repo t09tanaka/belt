@@ -271,6 +271,9 @@ pub struct Agent {
     /// The released dedup records and the submits that may be behind them
     /// (spec 25.6 (c)).
     releases: super::release::Releases,
+    /// Released records a submit's handling let go of where no database
+    /// write may run (a drop on the async runtime): forgotten by the tick.
+    ripe_later: Mutex<super::release::Ripe>,
     /// When this agent started (wall clock): the rows acknowledged before it
     /// are an older version's (spec 25.6 (c2)).
     started_ms: u64,
@@ -608,6 +611,18 @@ impl Agent {
                     // After the workspaces: what the rebuild of the database
                     // dropped has no row that would clean its directory up.
                     let dropped = remove_dropped_attempts(&cfg.attempts_root(), s).map_err(api)?;
+                    // Then the lock files no attempt owns any more (spec
+                    // 25.6 (b), 25.11): an older `hold` made one again.
+                    if let Err(e) = sweep_supervisor_locks(&cfg.state_dir, s) {
+                        let payload = json!({ "error": e.to_string() });
+                        let _ = s.append_event(
+                            None,
+                            None,
+                            "agent_supervisor_locks_kept",
+                            &payload,
+                            now(),
+                        );
+                    }
                     for (attempt, error) in &dropped.failed {
                         let payload = json!({ "attempt": attempt, "error": error });
                         let _ = s.append_event(
@@ -719,6 +734,7 @@ impl Agent {
             noted: Mutex::default(),
             submitting: Mutex::default(),
             releases: super::release::Releases::default(),
+            ripe_later: Mutex::default(),
             started_ms,
             old_acks: AtomicBool::new(false),
             ticking: AtomicBool::new(false),
@@ -2168,6 +2184,7 @@ impl Agent {
         // the key is refreshed here too: links proven with a discarded key
         // must close on an init host as well. Its own in-process link is
         // served by `serve_local_connection` and stays open.
+        self.forget_ripe_later();
         self.apply_rekey();
         self.refresh_group_key();
         // The init resident runs this pass and not `tick`: a warm-up nobody
@@ -2221,6 +2238,7 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
+        self.forget_ripe_later();
         self.apply_rekey();
         self.refresh_group_key();
         self.apply_control();
@@ -2246,10 +2264,23 @@ impl Agent {
         let batch = crate::storage::RELEASE_BATCH;
         let at = now();
         let mut ids = Vec::new();
-        match self
-            .store
-            .expire_unreleased(at, self.cfg.ack_wait_ms, batch)
-        {
+        // The ack wait judges by the wall clock only through chapter 23's
+        // Hold rule: a step of the clock deletes nothing until a full wait
+        // has passed on the monotonic clock.
+        let cutoff = self.store.release_clock_cutoff(
+            self.cfg.boot_id.as_str(),
+            at,
+            platform::monotonic_ms(),
+            self.cfg.ack_wait_ms,
+        );
+        let expired = match cutoff {
+            Ok(Some(cut)) => self
+                .store
+                .expire_unreleased(cut, self.cfg.ack_wait_ms, batch),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        };
+        match expired {
             Ok(v) => ids.extend(v),
             Err(e) => self.note_global(
                 "agent_release_failed",
@@ -2304,6 +2335,18 @@ impl Agent {
         if let Ok(a) = AttemptId::parse(id) {
             if a.as_str() == id {
                 self.clean(&a);
+                // A teardown that failed (a busy workspace, a secret that
+                // could not be erased) left its evidence in the directory:
+                // keep the directory and the `dropped_attempt` entry, so a
+                // later tick (`DROPPED_PER_TICK`) tries the teardown again.
+                if self.teardown_left(&a) {
+                    self.note_global(
+                        "agent_dropped_attempt_kept",
+                        id,
+                        json!({ "attempt": id, "error": "its cleanup is not finished" }),
+                    );
+                    return;
+                }
             }
         }
         let mut report = DroppedReport::default();
@@ -2322,6 +2365,13 @@ impl Agent {
                 json!({ "attempt": id, "error": e.to_string() }),
             );
         }
+    }
+
+    /// Whether the teardown of `attempt` left something to do again: its
+    /// `cleanup-pending` mark or its workspace record.
+    fn teardown_left(&self, attempt: &AttemptId) -> bool {
+        self.attempt_dir(attempt).join("cleanup-pending").exists()
+            || self.workspace_path(attempt).exists()
     }
 
     /// A release of `attempt` by `member` was committed: its directory and
@@ -2362,6 +2412,22 @@ impl Agent {
     pub(crate) fn submit_handled(&self, taken: super::release::Taken) {
         let ripe = self.releases.handled(taken);
         self.forget_ripe(ripe);
+    }
+
+    fn forget_ripe_later(&self) {
+        let later = std::mem::take(&mut *lock(&self.ripe_later));
+        if !later.is_empty() {
+            self.forget_ripe(later);
+        }
+    }
+
+    /// [`Self::submit_handled`] without the database write: the records it
+    /// lets go of are forgotten by the next tick.
+    pub(crate) fn submit_handled_later(&self, taken: super::release::Taken) {
+        let ripe = self.releases.handled(taken);
+        if !ripe.is_empty() {
+            lock(&self.ripe_later).extend(ripe);
+        }
     }
 
     /// Connection `conn` takes nothing more.
@@ -2917,8 +2983,12 @@ impl Agent {
         // A resend of an accepted attempt is answered with what is there
         // (spec 11, idempotency): its payload was checked when it was
         // accepted, and it adds no load. The store still compares the hash.
+        // A late copy of a deleted attempt is answered by its dedup record
+        // (RETIRED, in the store's step below), never by the checks of a
+        // new acceptance (spec 25.6 (c)).
         let fresh = store.get(&r.attempt_id).map_err(api)?.is_none()
-            && store.tombstone(&r.attempt_id).map_err(api)?.is_none();
+            && store.tombstone(&r.attempt_id).map_err(api)?.is_none()
+            && store.attempt_record(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
             super::ci_task::check_accepted(&self.cfg.state_dir, &r.payload)?;
@@ -3764,6 +3834,55 @@ pub fn remove_dropped_attempts(
     Ok(report)
 }
 
+/// The most entries of `supervisors/` one start looks at (spec 25.11: one
+/// `readdir`, each entry one primary-key lookup); more wait for the next.
+const SUPERVISOR_LOCKS_PER_START: usize = 10_000;
+
+/// Remove the lock files in `supervisors/` whose attempt has no row and no
+/// directory (spec 25.6 (b)): what a version whose `hold` still created the
+/// file left after the attempt went. Each is taken without creating it and
+/// unlinked while held; one a live supervisor holds, a name that is not a
+/// canonical `<attempt>.lock`, anything but a plain file with one link, or
+/// an attempt still listed in `dropped_attempt` (its own removal goes on)
+/// is kept. Returns how many files went.
+pub(crate) fn sweep_supervisor_locks(
+    state_dir: &Path,
+    store: &WorkerStore,
+) -> Result<u32, StorageError> {
+    use std::os::unix::fs::MetadataExt;
+    let rd = match fs::read_dir(state_dir.join("supervisors")) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(StorageError::Io(e)),
+    };
+    let dropped: std::collections::BTreeSet<String> = store
+        .dropped_attempts(DROPPED_PER_START)?
+        .into_iter()
+        .collect();
+    let mut removed = 0;
+    for ent in rd.take(SUPERVISOR_LOCKS_PER_START).flatten() {
+        let name = ent.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".lock")) else {
+            continue;
+        };
+        let Some(attempt) = AttemptId::parse(id).ok().filter(|a| a.as_str() == id) else {
+            continue;
+        };
+        let plain = fs::symlink_metadata(ent.path()).is_ok_and(|m| m.is_file() && m.nlink() == 1);
+        if !plain
+            || dropped.contains(id)
+            || store.attempt_id_held(id)?
+            || fs::symlink_metadata(state_dir.join("attempts").join(id)).is_ok()
+        {
+            continue;
+        }
+        if let Ok(true) = SupervisorLock::remove(state_dir, &attempt) {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// [`remove_dropped_attempts`] for one entry, right after the transaction
 /// that deleted the attempt (it does not wait for the next start).
 pub(crate) fn remove_dropped_attempt(
@@ -3838,18 +3957,9 @@ pub(crate) fn interrupt_offline(
         store.expire_lease(&rec.attempt_id, now()).map_err(api)?;
         // A living supervisor observes the lease. Otherwise hold its lock
         // while settling an unstarted attempt or recovering a recorded launch.
-        let Some(_owner) = SupervisorLock::try_acquire_existing(state, &rec.attempt_id)
-            .map_err(|e| internal("supervisor lock", e))?
-        else {
+        let Unended::Held(_owner) = hold_unended(state, store, &rec.attempt_id)? else {
             continue;
         };
-        if store
-            .get(&rec.attempt_id)
-            .map_err(api)?
-            .is_none_or(|r| r.termination.is_some())
-        {
-            continue;
-        }
         if store.launches(&rec.attempt_id).map_err(api)?.is_empty() {
             crate::supervisor::run::finalize(store, &rec.attempt_id, termination(None, None))
                 .map_err(|e| internal("settling old identity", e))?;
@@ -3938,6 +4048,52 @@ fn how_termination(how: Settle) -> Termination {
     }
 }
 
+/// What [`hold_unended`] found.
+#[derive(Debug)]
+enum Unended {
+    /// A live supervisor holds the lock: it owns the attempt.
+    Alive,
+    /// The row is gone or terminal: nothing to settle (the lock file, which
+    /// this call may have created, was unlinked while held).
+    Ended,
+    /// The lock, held until dropped, of an attempt that is not terminal.
+    Held(SupervisorLock),
+}
+
+/// Take the supervisor lock of an attempt the caller saw as not terminal,
+/// for a recovery that settles it (spec 25.6 (b)). The lock is taken
+/// *creating* its file, as the supervisor's start does: a supervisor that
+/// was spawned but has not taken its lock yet then finds it held and gives
+/// up, instead of starting the command under a result being fixed. A row
+/// that is not terminal is never deleted, so this cannot make a lock file
+/// again after its deletion; if the row turns out gone or terminal once the
+/// lock is held, the file is unlinked while held.
+fn hold_unended(
+    state: &Path,
+    store: &WorkerStore,
+    attempt: &AttemptId,
+) -> Result<Unended, ApiError> {
+    let Some(held) =
+        SupervisorLock::try_acquire(state, attempt).map_err(|e| internal("supervisor lock", e))?
+    else {
+        return Ok(Unended::Alive);
+    };
+    let ended = store
+        .get(attempt)
+        .map_err(api)?
+        .is_none_or(|r| r.termination.is_some());
+    if !ended {
+        return Ok(Unended::Held(held));
+    }
+    match fs::remove_file(crate::supervisor::lock::lock_path(state, attempt)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(internal("supervisor lock", e)),
+    }
+    drop(held);
+    Ok(Unended::Ended)
+}
+
 /// Fix the result of an attempt whose command was never started, holding the
 /// supervisor lock so no supervisor can be starting it meanwhile. `false`
 /// when a supervisor lives (it owns the attempt) or a launch appeared.
@@ -3951,9 +4107,7 @@ fn settle(
     how: Settle,
     lost: bool,
 ) -> Result<bool, ApiError> {
-    let lock = SupervisorLock::try_acquire_existing(&cfg.state_dir, attempt)
-        .map_err(|e| internal("supervisor lock", e))?;
-    let Some(_lock) = lock else {
+    let Unended::Held(_lock) = hold_unended(&cfg.state_dir, store, attempt)? else {
         return Ok(false);
     };
     if !lost && !store.launches(attempt).map_err(api)?.is_empty() {
@@ -4007,5 +4161,104 @@ mod rekey_deadline_tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert!(error.message.contains("still stopping old attempts"));
         assert!(error.message.contains("rerun send-key"));
+    }
+}
+
+#[cfg(test)]
+mod settle_lock_tests {
+    use super::*;
+    use crate::storage::NewAcceptance;
+    use crate::supervisor::lock::lock_path;
+
+    fn accepted(store: &WorkerStore) -> AttemptId {
+        let a = AttemptId::generate();
+        let hash = format!("sha256:{}", "a".repeat(64));
+        store
+            .for_member(&CoordinatorId::generate())
+            .submit(
+                NewAcceptance {
+                    attempt_id: a.clone(),
+                    run_id: RunId::generate(),
+                    task_id: TaskId::generate(),
+                    generation: Generation(1),
+                    payload_hash: PayloadHash::parse(&hash).unwrap(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    spec: json!({"cmd": "true"}),
+                },
+                1,
+            )
+            .unwrap();
+        a
+    }
+
+    /// M1: a supervisor spawned before an agent restart, that has not taken
+    /// its lock yet (no lock file), is kept out while recovery settles the
+    /// attempt: the recovery's lock creates the file, so the supervisor's
+    /// own `try_acquire` finds it held.
+    #[test]
+    fn a_settle_keeps_out_a_supervisor_that_has_not_locked_yet() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = WorkerStore::open(dir.path(), &WorkerId::parse("w").unwrap()).unwrap();
+        let a = accepted(&store);
+        assert!(!lock_path(dir.path(), &a).exists());
+        let Unended::Held(held) = hold_unended(dir.path(), &store, &a).unwrap() else {
+            panic!("a free lock of a live attempt is held");
+        };
+        assert!(SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .is_none());
+        drop(held);
+        // A supervisor that holds it keeps the recovery out.
+        let sup = SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            hold_unended(dir.path(), &store, &a).unwrap(),
+            Unended::Alive
+        ));
+        drop(sup);
+    }
+
+    /// L1: the start removes a lock file no attempt owns; it keeps one of
+    /// an attempt with a row, one whose directory is still there, one a
+    /// supervisor holds and a name that is not a lock of an attempt.
+    #[test]
+    fn the_start_removes_only_the_lock_files_of_attempts_that_went() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = WorkerStore::open(dir.path(), &WorkerId::parse("w").unwrap()).unwrap();
+        let gone = AttemptId::generate();
+        let live = accepted(&store);
+        let with_dir = AttemptId::generate();
+        let held_id = AttemptId::generate();
+        for a in [&gone, &live, &with_dir, &held_id] {
+            drop(SupervisorLock::try_acquire(dir.path(), a).unwrap().unwrap());
+        }
+        fs::create_dir_all(dir.path().join("attempts").join(with_dir.as_str())).unwrap();
+        let other = dir.path().join("supervisors").join("notes.txt");
+        fs::write(&other, b"").unwrap();
+        let held = SupervisorLock::try_acquire_existing(dir.path(), &held_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sweep_supervisor_locks(dir.path(), &store).unwrap(), 1);
+        assert!(!lock_path(dir.path(), &gone).exists());
+        for a in [&live, &with_dir, &held_id] {
+            assert!(lock_path(dir.path(), a).exists(), "{a}");
+        }
+        assert!(other.exists());
+        drop(held);
+    }
+
+    /// No row (or a terminal one): nothing to settle, and no lock file is
+    /// left behind by the look.
+    #[test]
+    fn a_settle_of_a_gone_attempt_leaves_no_lock_file() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = WorkerStore::open(dir.path(), &WorkerId::parse("w").unwrap()).unwrap();
+        let gone = AttemptId::generate();
+        assert!(matches!(
+            hold_unended(dir.path(), &store, &gone).unwrap(),
+            Unended::Ended
+        ));
+        assert!(!lock_path(dir.path(), &gone).exists());
     }
 }

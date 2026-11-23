@@ -331,3 +331,58 @@ fn forgetting_a_member_deletes_its_rows_and_refuses_it_for_good() {
         ErrorCode::NotFound
     );
 }
+
+#[test]
+fn an_event_of_an_attempt_whose_row_went_is_not_written() {
+    let t = store();
+    let (a, _) = ended(&t, 10);
+    assert!(t
+        .m
+        .ack_and_release(&a, CoordinatorEpoch(1), 20, false)
+        .unwrap());
+    let before = count(&t, "SELECT count(*) FROM event");
+    // A late note of the cleanup, through the worker's own handle and the
+    // member's, and an unseen-once event: none is kept.
+    t.own
+        .append_event(None, Some(&a), "agent_cleanup_failed", &json!({}), 30)
+        .unwrap();
+    t.m.append_event(None, Some(&a), "late", &json!({}), 30)
+        .unwrap();
+    t.own
+        .append_events_unseen(
+            None,
+            &a,
+            "late",
+            "k",
+            &[("x".into(), json!({"k": "x"}))],
+            30,
+        )
+        .unwrap();
+    assert_eq!(count(&t, "SELECT count(*) FROM event"), before);
+    // Events of the worker itself are still written.
+    t.own
+        .append_event(None, None, "agent", &json!({}), 30)
+        .unwrap();
+    assert_eq!(count(&t, "SELECT count(*) FROM event"), before + 1);
+}
+
+#[test]
+fn the_ack_wait_judges_the_wall_clock_only_through_the_hold_rule() {
+    let t = store();
+    // The first sample holds; then the wall clock that follows the
+    // monotonic one is used; a forward step holds again.
+    assert_eq!(t.own.release_clock_cutoff("b", 1_000, 0, 0).unwrap(), None);
+    assert_eq!(
+        t.own.release_clock_cutoff("b", 1_010, 10, 0).unwrap(),
+        Some(1_010)
+    );
+    assert_eq!(
+        t.own.release_clock_cutoff("b", 10_000_000, 20, 5).unwrap(),
+        None
+    );
+    // A new boot holds too.
+    assert_eq!(
+        t.own.release_clock_cutoff("c", 10_000_010, 1, 0).unwrap(),
+        None
+    );
+}

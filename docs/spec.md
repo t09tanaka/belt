@@ -2309,7 +2309,7 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 
 **`ack_wait` の7日。** 段階3の後、7日が効くのは、親がACKも `release_attempt` も送れなかったattemptだけである: 親が7日のあいだ接続しなかったもの、親がまだ回収を閉じていないもの（待ち続けている回収、`observation` がunknownのもの）、retireを確認したもの。成功した回収と打ち切った回収の写しは、閉じた時点で消える。
 
-**接続時の照合。** 親は、workerとの接続を確立するたびに1回、そのworkerに残る自分のattemptのうち、terminalで、ACKも `release_attempt` も受けていないものを、新しい読み取り操作 `list_unreleased` で列挙する。要求は `after`（attempt ID）と `limit`（500まで）を持ち、答えはattempt IDの昇順の1 pageと、続きがあるかである。workerは主キー `(coordinator_id, attempt_id)` で引く。親は、各IDについて自分のDBを主キーで引く。**行が無ければ `release_attempt` を送る。行があり、回収が `gave_up` で閉じていれば、`release_attempt` を送る**（打ち切りの時点で送った解放が届かなかった分を拾う。親は、解放が受理されたことを記録しない。workerが列挙しなくなることが、受理の記録である）。それ以外の行があれば何もしない（通常の回収が扱う）。
+**接続時の照合。** 親は、workerとの接続を確立するたびに1回、そのworkerに残る自分のattemptのうち、terminalで、ACKも `release_attempt` も受けていないものを、新しい読み取り操作 `list_unreleased` で列挙する。要求は `after`（attempt ID）と `limit`（500まで）を持ち、答えはattempt IDの昇順の1 pageと、続きがあるかである。workerは主キー `(coordinator_id, attempt_id)` で引く。親は、各IDについて自分のDBを主キーで引く。**行が無ければ `release_attempt` を送る。行があり、回収が `gave_up` で閉じていれば、`release_attempt` を送る**（打ち切りの時点で送った解放が届かなかった分を拾う。親は、解放が受理されたことを記録しない。workerが列挙しなくなることが、受理の記録である）。それ以外の行があれば何もしない（通常の回収が扱う）。1回の照合で読むのは8 page（4,000件）までで、続きはworkerごとのcursor（親のメモリ。失っても次の照合が先頭から読むだけである）から次の照合が読み、末尾に着いたらcursorを消す（次は先頭から）。`release_attempt` が `OVERLOADED`（supervisorがまだlockを持つ、試用中）で断られたか、そのattemptのsubmitが答えを待っていた場合は、そのworkerの照合を次のpassに残し、そのpageを読み直す。照合の途中のDBの失敗では、残りのworkerも次のpassに残す。親は、submitを決めた時点で「submitが答えを待っている」印を付け（同じattemptの複数のsubmitは数で数える）、印を付けた後に親DBでそのattemptがterminalでないことを確かめてから送る。
 
 行が無いことは、「この親はそのattemptをもう送らない」の証明である: 親は、submitを送る前に必ずattemptの行を作り、行を消すのは刈り取りだけで、attempt IDは使い回さない。回収が閉じていることは、attemptがterminalであることを含むので、同じ証明になる（下の (c)）。試用のrollbackは行を戻すが、試用中のcoordinatorは刈り取りも `release_attempt` も行わない（25.1の8）。
 
@@ -2335,8 +2335,8 @@ ACKの後に7日残していた規則はやめる。回収が済んだ結果を�
 | agentの `drive` | `src/worker/agent.rs` | terminalでないattemptを進めるとき | 行が無い |
 | agentの `settling`（`workers stop` の集計） | 同上 | terminalでないattemptを数えるとき | 同上。今は `supervisors/` の全部を見ているので、worker DBのterminalでないattemptだけを見るように改める |
 | agentの `ack`（resultの無いattemptのACK・解放） | 同上 | 行のあるattemptの要求を処理するとき | 行が無ければ、lockを開く前に記録が答える |
-| agentの `interrupt_offline`（`group send-key` が、agentを止めた状態で古いattemptを止めるとき） | 同上 | terminalでないattemptについて | 行が無い |
-| agentの `settle`（復旧） | 同上 | 起動時に、terminalでないattemptについて | 行が無い |
+| agentの `interrupt_offline`（`group send-key` が、agentを止めた状態で古いattemptを止めるとき）。fileを**作る**取得 | 同上 | terminalでないattemptについて | terminalでない行は消されない（消すのはterminalの行だけ）ので、unlinkと重ならない。取った後に行が無いかterminalなら、持ったままunlinkしてから手放す |
+| agentの `settle`（復旧）。fileを**作る**取得 | 同上 | 起動時と監視の中で、terminalでないattemptについて | 同上。作るのは、起動されたがまだlockを取っていないsupervisor（agentの再起動の直前に起動したもの）を締め出すためである。作らない取得では、fileが無いときに何も締め出さず、その間にsupervisorがlockを取って `Starting` に進み、復旧の確定と同時に走りうる |
 | 別のscopeで動くsupervisorの照合 `config::traffic::foreign_supervisors` | `src/config/traffic.rs` | `attempts/*/supervise.json` と `setup/builders/*/spec.json` を読み、scopeが違うものについてlockを取る。台帳は読まない | `attempts/<attempt>/` を、unlinkより先に消してある。`supervise.json` が無ければ、そのattemptのlockを開かない |
 
 unlinkを行うのは、`dropped_attempt` の続きを行う処理（`remove_dropped_attempts`。今はlockに触れない）である。段階3で、directoryを消した後に、lockを**作らずに**取り、取ったままunlinkしてから手放す処理を足す。fileが無ければ何もしない。取れなければ（supervisorが生きている。terminalのattemptでは起きないはずである）、`dropped_attempt` の行を残して次の起動に回す。`remove_dropped_attempts` は、`worker_attempt` に行が残るattemptを飛ばす（`attempt_id_held`）ので、行を消すtransactionのcommitの後にだけ働く。
@@ -2344,11 +2344,15 @@ unlinkを行うのは、`dropped_attempt` の続きを行う処理（`remove_dro
 最後の行の照合を呼ぶのは、`config::traffic::hold` で、呼び出し元は3つある: workerの起動（`src/service/worker.rs`。`agent.lock` を取った後）、residentの起動（`src/service/resident.rs`。**`agent.lock` を取る前**。`agent.lock` は、その後のagentの開始の中で取る）、`ResolvedConfig::worker_runtime`（`src/config/runtime.rs`。両方の起動から呼ばれる）。したがって、この照合は `agent.lock` で守られているとは言えず、動いているagentの削除と同時に走り得る。次の2つを規則とする。
 
 - **directoryが先、lockが後。** 上の順序のとおり、`attempts/<attempt>/` を消してからlockをunlinkする。照合が `supervise.json` を読めるのは、unlinkより前だけである。
-- **照合は、fileを作らずに取る。** `SupervisorLock::try_acquire` は、確かめるだけの呼び出しでもfileを作る。段階3で、作る取得（supervisorの起動だけ）と、作らない取得（agentの5か所、unlinkの処理、`foreign_supervisors`）に分ける。作らない取得は、fileが無ければ「supervisorは居ない」と答える。これで、`supervise.json` を読んだ直後にdirectoryとlockが消えても、照合はlockを作り直さない。setup builderのlock（`src/setup/builder.rs`。builderのdirectoryの中）は、builderと一緒に消えるので変えない。
+- **照合は、fileを作らずに取る。** `SupervisorLock::try_acquire` は、確かめるだけの呼び出しでもfileを作る。段階3で、作る取得（supervisorの起動と、terminalでないattemptを確定する復旧の `settle`・`interrupt_offline`）と、作らない取得（agentの `drive`・`settling`・`ack`、unlinkの処理、`foreign_supervisors`）に分ける。作らない取得は、fileが無ければ「supervisorは居ない」と答える。これで、`supervise.json` を読んだ直後にdirectoryとlockが消えても、照合はlockを作り直さない。setup builderのlock（`src/setup/builder.rs`。builderのdirectoryの中）は、builderと一緒に消えるので変えない。
 
-段階3より前の版の `hold` は、作る取得のままである。その版のresidentかworkerが、段階3のagentの削除と同時に起動の途中にあり、`supervise.json` を読んだ後・directoryが消えた後にlockを取ると、空のlock fileが1個できる。害は無い（そのattemptのsupervisorは二度と起動されず、fileの有無を「supervisorが居る」と読む処理は無い）。残ったfileは、次のagentの起動時の走査（25.11）が、行が無いことを見て消す。
+段階3より前の版の `hold` は、作る取得のままである。その版のresidentかworkerが、段階3のagentの削除と同時に起動の途中にあり、`supervise.json` を読んだ後・directoryが消えた後にlockを取ると、空のlock fileが1個できる。害は無い（そのattemptのsupervisorは二度と起動されず、fileの有無を「supervisorが居る」と読む処理は無い）。残ったfileは、次のagentの起動時の走査（25.11）が、行が無いことを見て消す（`sweep_supervisor_locks`。1回の起動で10,000 entryまで。行も `attempts/<attempt>/` も `dropped_attempt` の行も無く、名前が `<attempt>.lock` で、linkが1つの普通のfileだけを、作らずに取って持ったままunlinkする）。
 
-**全走査をやめる。** 「まだ動いているsupervisorの数」は、`supervisors/` を読まず、worker DBのterminalでないattemptのlockだけを直接のpathで調べる。
+**全走査をやめる。** 「まだ動いているsupervisorの数」は、`supervisors/` を読まず、worker DBのterminalでないattemptのlockだけを直接のpathで調べる。resultを保存した後もまだ動いているsupervisorは、このagentが起動したものなら子processとして（reapされるまで）数える。前のagentの代から引き継いだsupervisorが、terminalになった後に終わるまでの短い間だけは数えない（数えるには、terminalの行すべてのlockを調べることになる）。
+
+**解放の後片付けが失敗したとき。** 解放の受理の後のworkspaceの片付け（fast-worktreeの削除、置いたsecret fileの消去）が失敗し、`cleanup-pending` か `workspace.json` が残ったら、attemptのdirectoryと `dropped_attempt` の行を残す。tickが32件ずつやり直し（`DROPPED_PER_TICK`）、片付けが済んでから、directory・lock・`dropped_attempt` の行を消す。
+
+**ack_waitの時計。** `ack_wait` の判定は、壁時計を第23章のHoldの規則（結果の回収の時計と同じ `clock_policy::step`。状態はworker DBの `release_clock`）を通して読む。初回・別のboot・壁時計の段差の後は、monotonicで `ack_wait` が経つまで何も消さない。
 
 ### (c) 重複防止の記録
 
@@ -2357,7 +2361,7 @@ unlinkを行うのは、`dropped_attempt` の続きを行う処理（`remove_dro
 - **読み手**: 遅れて届いたsubmitの写し（同じ `attempt_id` を、`RETIRED` または既存の終わり方で答える）と、親の `get_attempt`（終わり方の語だけを答える。resultは「期限切れ」）。
 - **解放済みの記録を消す時点**: その解放（ACKか `release_attempt`）より前に、そのメンバーの接続から読まれ得たsubmitが、すべて処理を終えたとき（下の「解放済みの記録を消してよい条件」）。通常は、解放の受理から数ミリ秒の後である。接続が閉じるのを待たない。
 - **未解放の記録**（`ack_wait` を過ぎたattemptのもの）: 親が `release_attempt` を送るまで消さない。親はそのattemptを未確定として持っている可能性があり、送り直し得る。`release_attempt` を受けたら解放済みに変え、上の規則で消える。`list_unreleased` は、terminalで未解放のattemptの行と、未解放の記録の両方を列挙する。
-- **上限**: メンバーごとに10,000件（解放済みと未解放の合計。約2 MB。届かなかったtombstoneの上限と同じ値）。上限に達したメンバーからの新しいsubmitは、`OVERLOADED`（`overloaded_reason.reason = "attempt_records"`）で断る。他のメンバーのsubmitには影響しない。この答えを受けた親は、そのworkerについて照合（`list_unreleased`）を行う。
+- **上限**: メンバーごとに10,000件（解放済みと未解放の合計。約2 MB。届かなかったtombstoneの上限と同じ値）。上限に達したメンバーからの新しいsubmitは、`OVERLOADED`（`overloaded_reason.reason = "attempt_records"`）で断る。他のメンバーのsubmitには影響しない。この答えを受けた親は、そのworkerについて照合（`list_unreleased`）を行う。記録のあるattemptのsubmitは、新しい受理の検査（同時の上限・drain・capability）より先に記録が答える（`RETIRED`）。
 - **上限が受け持つもの。** 解放済みの記録は、下の条件で、解放の直後に消える。同時に在る解放済みの記録は、「処理の途中のsubmitが在る間に受理した解放の数」で、submitの処理は1件が1つのtransactionと検査だけであり、同時に動く要求はagent全体で64（`MAX_CONCURRENT_REQUESTS`）なので、通常は0か数件である。1本の接続を長く保つ親でも、記録は溜まらない。したがって、上限に届くのは未解放の記録だけで、それは「このメンバーが、7日のあいだACKも解放も送らず、今も行を持っているattempt」（回収を閉じていないもの、unknownのもの、retireを確認したもの）が10,000件を超えた状態である。この数を実装から導く上限は無い（worker 1台が7日に終えるattemptの数は、利用者の使い方で決まる）ので、歯止めとして10,000件を置く。値は、届かなかったtombstoneの上限に合わせた。断りは日常の経路ではなく、回収しない親の異常の表示である。
 - **戻らないメンバー**: `belt group forget`（下）を実行しないまま居なくなったメンバーの記録は、上限（10,000件、約2 MB）までで止まり、それ以上は増えない（新しいsubmitが来ない）。消すのは `belt group forget` である。メンバーの数は利用者の操作で決まる。
 
@@ -2405,7 +2409,7 @@ workerは、接続ごとに、取り出したsubmitへ通し番号を付け、�
 
 **規則。** 命令を分ける。`workers forget <worker>` の意味は変えない。workerのマシンで、戻らないメンバーの記録を消すのは、新しい命令 `belt group forget <member>` とする。
 
-- 前提: そのメンバーが、このマシンのグループの一覧に無い（外してある）こと。そのメンバーのterminalでないattemptが無いこと（あれば件数を示して断る。leaseの失効で止まるのを待つ）。
+- 前提: 更新の試用中でないこと（25.1の規則8。試用中は `CONFLICT` で断る）。そのメンバーが、このマシンのグループの一覧に無い（外してある）こと。そのメンバーのterminalでないattemptが無いこと（あれば件数を示して断る。leaseの失効で止まるのを待つ）。
 - 行うこと（worker DBの1 transaction）: そのメンバーの `worker_attempt` とその子、event、重複防止の記録、tombstone、`member_epoch`、`retired_identity`、`group_member` の行を消し、**`refused_member`（`coordinator_id`、名前、時刻）に1行を書く**。attemptのdirectoryは、その後に消す。
 - `refused_member` にある `coordinator_id` の接続は、proofの後に、理由 `member_forgotten` で断る。`group send-key` でそのメンバーに鍵を渡しても、このマシンは受け付けない。そのメンバーが戻るには、stateを作り直して新しい `coordinator_id` を得る。
 - `refused_member` の行は消さない。行の数は、利用者がこの命令を実行した回数で、実行の数では増えない。1,024行を上限とし、超える命令は断る。
@@ -2416,7 +2420,7 @@ workerは、接続ごとに、取り出したsubmitへ通し番号を付け、�
 
 ### (e) workerのevent
 
-attemptに属さないworkerのevent（起動、identity、GCの記録）は、`retention_days` 日で、`seq` の小さい順に、1 tickで1,000行まで消す。読み手は親の `watch_events` と診断である。attemptのeventは、(b) でattemptと一緒に消す。
+attemptに属さないworkerのevent（起動、identity、GCの記録）は、`retention_days` 日で、`seq` の小さい順に、1 tickで1,000行まで消す。読み手は親の `watch_events` と診断である。attemptのeventは、(b) でattemptと一緒に消す。行の無いattemptのeventは書かない（`append_event` が、行が無ければ書かずに捨てる。解放の後の片付けの記録や、終わりかけのsupervisorの記録）。消す処理の無いeventが残らないためである。
 
 **安全の証明（段階3の全体）。** 結果の写しを読むのは、submitしたメンバーの回収だけで、そのメンバーが「もう読まない」と述べた後に消す（成功した回収はACK、打ち切った回収は閉じた時点の解放、刈り取ったrunは行の不在）。attemptの行を読むのは、そのメンバーの `get_attempt`・`get_result`・`watch_events` と、遅れたsubmitの照合で、前の3つは解放の後には来ず、最後のものは重複防止の記録が答える。記録を消した後に同じattemptのsubmitが届く経路は、(c) と (d) で閉じている。
 

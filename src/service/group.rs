@@ -220,6 +220,15 @@ pub(crate) fn forget(
     spec: &Spec,
     member: &str,
 ) -> Result<Value, ApiError> {
+    // Spec 25.1 rule 8: no deletion while an upgrade is on trial (a
+    // rollback would restore a database whose rows lost their directories,
+    // and the refusal of the member with it).
+    if crate::worker::control::in_trial(&spec.worker_state_dir) {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "an upgrade of this worker is on trial; forget the member after it is committed or rolled back",
+        ));
+    }
     if workers::registrations(env)?.iter().any(|e| e.id == member) {
         return Err(ApiError::new(
             ErrorCode::InvalidInput,
@@ -341,6 +350,31 @@ mod tests {
             std::fs::set_permissions(&resident, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(run().stdout, format!("path {action}").as_bytes());
         }
+    }
+
+    #[test]
+    fn forget_is_refused_while_an_upgrade_is_on_trial() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = BTreeMap::from([("HOME".into(), root.path().to_str().unwrap().into())]);
+        let worker = WorkerId::parse("local").unwrap();
+        let spec = Spec {
+            state_dir: root.path().into(),
+            worker_state_dir: root.path().into(),
+            worker_id: worker,
+            cluster_key_path: root.path().join("deliberately-absent-key"),
+            executable: root.path().join("belt"),
+            env: env.clone(),
+            repo_root: None,
+            expected_cluster: None,
+            managed_service: None,
+        };
+        std::fs::write(crate::worker::control::trial_path(root.path()), b"{}").unwrap();
+        let member = crate::ids::CoordinatorId::generate().to_string();
+        let e = forget(&env, &spec, &member).unwrap_err();
+        assert!(e.message.contains("on trial"), "{e:?}");
+        // Nothing was written: no database, no refusal.
+        assert!(!root.path().join("worker.db").exists());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::{Coordinator, Result, WorkerLink};
 use crate::ids::{AttemptId, RequestId, WorkerId};
 use crate::results::plan::Verdict;
 use crate::wire::{ListUnreleasedRequest, ReleaseAttemptRequest, Request, Response, SchemaVersion};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 /// Pages of `list_unreleased` one reconciliation reads; a worker with more
@@ -16,32 +16,39 @@ const PAGES: usize = 8;
 
 /// The attempts whose submit is on its way: neither `ack_collected` nor
 /// `release_attempt` is sent for them until it is answered (or its
-/// connection failed).
+/// connection failed). Counted: two submits of one attempt may be on their
+/// way at once, and the first answer must not clear the mark of the other.
 #[derive(Debug, Default)]
-pub struct InFlight(Mutex<BTreeSet<AttemptId>>);
+pub struct InFlight(Mutex<BTreeMap<AttemptId, usize>>);
 
-/// A submit in flight; it leaves the set when dropped.
+/// A submit in flight; it is uncounted when dropped.
 pub struct Sending<'a>(&'a InFlight, AttemptId);
 
 impl Drop for Sending<'_> {
     fn drop(&mut self) {
-        self.0.set().remove(&self.1);
+        let mut set = self.0.set();
+        if let Some(n) = set.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                set.remove(&self.1);
+            }
+        }
     }
 }
 
 impl InFlight {
-    fn set(&self) -> std::sync::MutexGuard<'_, BTreeSet<AttemptId>> {
+    fn set(&self) -> std::sync::MutexGuard<'_, BTreeMap<AttemptId, usize>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A submit of `attempt` is sent from now until the guard goes.
+    /// A submit of `attempt` is on its way from now until the guard goes.
     pub fn sending(&self, attempt: &AttemptId) -> Sending<'_> {
-        self.set().insert(attempt.clone());
+        *self.set().entry(attempt.clone()).or_insert(0) += 1;
         Sending(self, attempt.clone())
     }
 
     pub fn contains(&self, attempt: &AttemptId) -> bool {
-        self.set().contains(attempt)
+        self.set().contains_key(attempt)
     }
 }
 
@@ -66,10 +73,12 @@ pub fn judge_unreleased(row: bool, verdict: Option<Verdict>) -> Unreleased {
 }
 
 /// Send `release_attempt` for each of `attempts` over `link`, unless a
-/// submit of it is in flight or the link did not agree the feature. Every
-/// answer is accepted as it comes: a worker that has nothing of the attempt
-/// any more (`NOT_FOUND`) has what the release asks for, and one that does
-/// not answer lists it again at the next connection.
+/// submit of it is in flight or the link did not agree the feature. A
+/// worker that has nothing of the attempt any more (`NOT_FOUND`) has what
+/// the release asks for. `false` when something is to be sent again: the
+/// worker did not answer (the rest is not asked now), or it refused one for
+/// now (`OVERLOADED`: a supervisor still holds the attempt's lock, a trial)
+/// or a submit of it was in flight; the caller keeps the worker due.
 pub async fn release_over(
     link: &dyn WorkerLink,
     submits: &InFlight,
@@ -78,8 +87,10 @@ pub async fn release_over(
     if !link.attempt_release_negotiated() {
         return true;
     }
+    let mut all = true;
     for attempt in attempts {
         if submits.contains(attempt) {
+            all = false;
             continue;
         }
         let answer = link
@@ -89,13 +100,17 @@ pub async fn release_over(
                 attempt_id: attempt.clone(),
             }))
             .await;
-        // A worker that does not answer is not asked the rest now: what is
-        // left is listed again at the next reconciliation.
-        if matches!(answer, Err(crate::coordinator::LinkError::Unconfirmed)) {
-            return false;
+        match answer {
+            Err(crate::coordinator::LinkError::Unconfirmed) => return false,
+            Err(crate::coordinator::LinkError::Remote(e))
+                if e.code == crate::error::ErrorCode::Overloaded =>
+            {
+                all = false;
+            }
+            _ => {}
         }
     }
-    true
+    all
 }
 
 impl Coordinator {
@@ -145,8 +160,8 @@ impl Coordinator {
         )
         .into_iter()
         .collect();
-        for worker in due {
-            let Some(link) = self.link_of(&worker) else {
+        for (i, worker) in due.iter().enumerate() {
+            let Some(link) = self.link_of(worker) else {
                 // Not attached: the next attach makes it due again.
                 continue;
             };
@@ -157,16 +172,33 @@ impl Coordinator {
                 inner: link,
                 deadline,
             };
-            if !self.reconcile_one(&link).await? {
-                self.reconcile_due(&worker);
+            match self.reconcile_one(worker, &link).await {
+                Ok(true) => {}
+                Ok(false) => self.reconcile_due(worker),
+                Err(e) => {
+                    // This one and the ones not reached stay due.
+                    for w in &due[i..] {
+                        self.reconcile_due(w);
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(())
     }
 
-    /// One worker; `true` when every page was read.
-    async fn reconcile_one(&self, link: &dyn WorkerLink) -> Result<bool> {
-        let mut after = None;
+    fn cursor(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<WorkerId, AttemptId>> {
+        self.unreleased_after
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One worker, from where its last pass stopped; `true` when the pass
+    /// reached the end of the list (a pass that began at a cursor then
+    /// wraps: the next one, if any is due, starts at the front). A page
+    /// whose releases are to be sent again is read again by the next pass.
+    async fn reconcile_one(&self, worker: &WorkerId, link: &dyn WorkerLink) -> Result<bool> {
+        let mut after = self.cursor().get(worker).cloned();
         for _ in 0..PAGES {
             let answer = link
                 .call(Request::ListUnreleased(ListUnreleasedRequest {
@@ -177,6 +209,7 @@ impl Coordinator {
                 }))
                 .await;
             let Ok(Response::ListUnreleased(page)) = answer else {
+                self.keep_cursor(worker, after);
                 return Ok(false);
             };
             let listed = page.attempts.clone();
@@ -198,17 +231,29 @@ impl Coordinator {
                 })
                 .await?;
             if !release_over(link, &self.submits, &judged).await {
+                self.keep_cursor(worker, after);
                 return Ok(false);
             }
-            if !page.more {
+            let next = page.attempts.last().cloned();
+            if !page.more || next.is_none() {
+                self.cursor().remove(worker);
                 return Ok(true);
             }
-            after = page.attempts.last().cloned();
-            if after.is_none() {
-                return Ok(true);
+            after = next;
+        }
+        self.keep_cursor(worker, after);
+        Ok(false)
+    }
+
+    fn keep_cursor(&self, worker: &WorkerId, after: Option<AttemptId>) {
+        match after {
+            Some(a) => {
+                self.cursor().insert(worker.clone(), a);
+            }
+            None => {
+                self.cursor().remove(worker);
             }
         }
-        Ok(false)
     }
 }
 
@@ -243,6 +288,12 @@ mod tests {
         {
             let _s = f.sending(&a);
             assert!(f.contains(&a));
+            // A second submit of the same attempt: the first answer does
+            // not clear the mark of the other.
+            let second = f.sending(&a);
+            drop(_s);
+            assert!(f.contains(&a));
+            drop(second);
         }
         assert!(!f.contains(&a));
     }

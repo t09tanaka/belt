@@ -284,7 +284,7 @@ async fn serve_proven(
         let taken = agent.request_taken(conn.conn, is_submit);
         let handled = is_submit.then(|| Handled {
             agent: agent.clone(),
-            taken,
+            taken: Some(taken),
         });
         let link = super::agent::Link {
             release,
@@ -301,7 +301,9 @@ async fn serve_proven(
         let session = session.clone();
         let request_boot = connection_boot.clone();
         tokio::spawn(async move {
-            let _handled = handled;
+            // Moved into the handler below: the record of a submit stays
+            // until its handler is done, even if this task goes first.
+            let mut handled = handled;
             let uses_workflow_artifacts = matches!(
                 &request,
                 crate::wire::Request::WorkflowArtifact(_)
@@ -434,8 +436,13 @@ async fn serve_proven(
                     r.preparation_observations = None;
                 }
             }
+            let handled = handled.take();
             let done = tokio::task::spawn_blocking(move || {
-                agent.handle_linked(session, request, Some(&request_boot), link)
+                let response = agent.handle_linked(session, request, Some(&request_boot), link);
+                if let Some(h) = handled {
+                    h.finish();
+                }
+                response
             })
             .await;
             let _ = match done {
@@ -476,16 +483,28 @@ impl Drop for Opened {
     }
 }
 
-/// A submit taken from a connection, handled when dropped (answered,
-/// refused, failed or panicked).
+/// A submit taken from a connection: handled by [`Handled::finish`] at the
+/// end of its handler, or when dropped (refused before the handler, or a
+/// handler that panicked). The drop writes nothing to the database (it may
+/// run on the async runtime): the tick forgets what it lets go of.
 struct Handled {
     agent: Arc<Agent>,
-    taken: super::release::Taken,
+    taken: Option<super::release::Taken>,
+}
+
+impl Handled {
+    fn finish(mut self) {
+        if let Some(taken) = self.taken.take() {
+            self.agent.submit_handled(taken);
+        }
+    }
 }
 
 impl Drop for Handled {
     fn drop(&mut self) {
-        self.agent.submit_handled(self.taken);
+        if let Some(taken) = self.taken.take() {
+            self.agent.submit_handled_later(taken);
+        }
     }
 }
 

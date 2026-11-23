@@ -515,6 +515,10 @@ pub struct Coordinator {
     submits: Arc<release::InFlight>,
     /// The workers whose `list_unreleased` reconciliation is due.
     unreleased_due: Mutex<BTreeSet<WorkerId>>,
+    /// Where the reconciliation of each worker goes on (the last attempt
+    /// it read), so a pass does not read the same first pages again. In
+    /// memory: a lost cursor only means the next pass starts at the front.
+    unreleased_after: Mutex<BTreeMap<WorkerId, AttemptId>>,
     parent_local: Mutex<Option<WorkerId>>,
     preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
     preparation_query: tokio::sync::Mutex<()>,
@@ -589,6 +593,7 @@ impl Coordinator {
             workers: Mutex::default(),
             submits: Arc::default(),
             unreleased_due: Mutex::default(),
+            unreleased_after: Mutex::default(),
             parent_local: Mutex::default(),
             preparation_identities: Mutex::default(),
             preparation_query: tokio::sync::Mutex::new(()),
@@ -1497,6 +1502,21 @@ impl Coordinator {
         asked: &Attached,
     ) -> Result<Sent> {
         let a = &live.record;
+        // Marked at the decision, before anything is awaited (spec 25.6
+        // (xvi)): from here no acknowledgement or release of the attempt is
+        // sent. A collection that made it terminal before the mark is seen
+        // by the look at the record below, and sends nothing.
+        let sending = self.submits.sending(&a.attempt_id);
+        let id = a.attempt_id.clone();
+        let ended = self
+            .db(move |s| {
+                Ok(s.get_attempt(&id)?
+                    .is_none_or(|r| r.state == AttemptState::Terminal))
+            })
+            .await?;
+        if ended {
+            return Ok(Sent::NotTaken);
+        }
         let payload: Option<AttemptPayload> = live
             .placement
             .as_ref()
@@ -1526,7 +1546,6 @@ impl Coordinator {
         let id = a.attempt_id.clone();
         let sends_before = self.db(move |s| s.count_submit_send(&id)).await?;
         drop(actor);
-        let sending = self.submits.sending(&a.attempt_id);
         let answer = link.call(Request::SubmitAttempt(request)).await;
         drop(sending);
         let Some(_actor) = self.answered(&a.worker_id, asked).await? else {

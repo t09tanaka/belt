@@ -481,6 +481,7 @@ CREATE INDEX event_unowned ON event(seq) WHERE attempt_id IS NULL;
 CREATE INDEX worker_attempt_unacked ON worker_attempt(terminal_at_ms)
     WHERE state = 'terminal' AND acked_at_ms IS NULL;
 CREATE INDEX worker_attempt_acked ON worker_attempt(acked_at_ms) WHERE acked_at_ms IS NOT NULL;
+CREATE TABLE release_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state_json TEXT NOT NULL);
 ";
 
 /// What must hold before step `to` of a `kind` database runs, checked in the
