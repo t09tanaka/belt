@@ -130,11 +130,14 @@ pub trait Host: Send + Sync {
     /// `.worktreeinclude` matched. `None` while that source is not in this
     /// worker's store. `wait`: whether the read waits for a deleting pass's
     /// step (the accepted attempt's `prepare`) or not (acceptance, which
-    /// never waits, spec 25.8 5b (a)).
+    /// never waits, spec 25.8 5b (a)). `held`: the shared source lock the
+    /// caller already holds (acceptance), read under instead of taking a
+    /// second one.
     fn secret_paths(
         &self,
         payload: &AttemptPayload,
         wait: bool,
+        held: Option<&crate::source::retention::Guard>,
     ) -> Result<Option<Vec<String>>, ApiError>;
     /// Place the files of a `secret_bundle_put` in the attempt's workspace.
     /// Returns how many are in place.

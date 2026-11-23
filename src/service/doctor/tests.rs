@@ -385,6 +385,7 @@ fn healthy() -> HostFacts {
         cli_jobs_error: None,
         linger: None,
         abandoned_imports: None,
+        source_lock_problem: None,
     }
 }
 fn level(checks: &[Check], id: &str) -> Level {
@@ -2174,4 +2175,17 @@ fn what_released_import_tokens_still_hold_is_counted() {
     let checks = evaluate("mini-a", &facts);
     let text = detail(&checks, "abandoned_imports");
     assert!(text.contains("at least 0 byte") && text.contains("3 incoming source(s)"));
+}
+
+#[test]
+fn a_source_lock_that_cannot_be_taken_fails_the_worker() {
+    let mut facts = healthy();
+    assert!(evaluate("mini-a", &facts)
+        .iter()
+        .all(|c| c.id != "source_lock"));
+    facts.source_lock_problem = Some("is not a plain file".into());
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "source_lock"), Level::Fail);
+    let text = detail(&checks, "source_lock");
+    assert!(text.contains("is not a plain file") && text.contains("INTERNAL"));
 }

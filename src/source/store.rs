@@ -491,6 +491,16 @@ impl SourceStore {
     /// A published manifest. `None` for a capture that never got to publish.
     pub fn manifest(&self, ci_source_id: &str) -> Result<Option<CiManifest>> {
         let guard = self.mutation_guard()?;
+        self.manifest_under(&guard, ci_source_id)
+    }
+
+    /// [`Self::manifest`] under a shared lock the caller already holds, so
+    /// acceptance does not take a second one.
+    pub fn manifest_under(
+        &self,
+        guard: &super::retention::Guard,
+        ci_source_id: &str,
+    ) -> Result<Option<CiManifest>> {
         guard.ensure_source_available(ci_source_id)?;
         self.inner.load_manifest(ci_source_id)
     }
