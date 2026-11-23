@@ -640,3 +640,85 @@ fn the_pass_queries_follow_an_index() {
         assert!(!plan.iter().any(|l| l.starts_with("SCAN")), "{sql}\n{text}");
     }
 }
+
+/// Moves source `id`'s blob alone into an abandoned root `root`; `counted`
+/// keeps its `object_bytes` row. Returns the blob's path.
+fn abandon_blob(env: &Env, id: &str, root: &str, counted: bool) -> std::path::PathBuf {
+    let hash = env
+        .receiver
+        .manifest(id)
+        .unwrap()
+        .unwrap()
+        .object_manifest
+        .entries[0]
+        .hash
+        .clone();
+    env.sql(&format!(
+        "INSERT INTO root(id,kind,source) VALUES('{root}','abandoned',NULL);
+         DELETE FROM member WHERE root='receive:{id}' AND object<>'b:{hash}';
+         UPDATE member SET root='{root}' WHERE root='receive:{id}';
+         DELETE FROM root WHERE id='receive:{id}'"
+    ));
+    if !counted {
+        env.sql(&format!("DELETE FROM object_bytes WHERE id='b:{hash}'"));
+    }
+    let path: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT path FROM object WHERE id='b:'||?1", [&hash], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    env.receiver.root().join(path)
+}
+
+/// Review round 2 (b): before a member of unknown size, a section with less
+/// than half of its budget left ends, the cursor before that member.
+#[test]
+fn an_unknown_size_waits_for_half_a_section() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(200))], YOUNG);
+    let b = env.source(&[("f", &"b".repeat(100))], YOUNG);
+    let c = env.source(&[("f", &"c".repeat(10))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let fb = abandon_blob(&env, &b, "drop:b:1", true);
+    let fc = abandon_blob(&env, &c, "drop:c:1", false);
+    // 1,000: the two known files (200, then 100; each read twice, to
+    // claim and to drain) leave 400, under half
+    let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(report.unlinked, 2, "{report:?}");
+    assert!(!fa.exists() && !fb.exists());
+    assert!(fc.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:c:1'"),
+        1
+    );
+    // the next section takes it
+    let (_, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fc.exists());
+}
+
+/// Review round 2 (a): step 0 pages only roots with members; an empty
+/// abandoned `import:` root still goes, with its token's unused session.
+#[test]
+fn an_empty_import_root_goes_with_its_session() {
+    let env = Env::new();
+    env.sql(
+        "INSERT INTO root(id,kind,source) VALUES('import:t1','abandoned',NULL);
+         INSERT INTO import_session(token,state) VALUES('t1','pending')",
+    );
+    let (what, report) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(what, "progress", "{report:?}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id='import:t1'"),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM import_session WHERE token='t1'"),
+        0
+    );
+}

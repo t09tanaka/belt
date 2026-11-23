@@ -93,7 +93,8 @@ const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 /// order, then each one's members by the primary key (no scan of the other
 /// roots' members, no sort).
 const STEP0_ROOTS: &str = "SELECT id FROM root WHERE kind='abandoned' AND id>=?1
-     AND (id LIKE 'import:%' OR id LIKE 'drop:%' OR id LIKE 'receive:%') ORDER BY id LIMIT ?2";
+     AND (id LIKE 'import:%' OR id LIKE 'drop:%' OR id LIKE 'receive:%')
+     AND EXISTS(SELECT 1 FROM member WHERE root=root.id) ORDER BY id LIMIT ?2";
 const STEP0_MEMBERS: &str = "SELECT m.object,o.path,b.bytes FROM member m
      JOIN object o ON o.id=m.object LEFT JOIN object_bytes b ON b.id=m.object
      WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT ?3";
@@ -328,8 +329,15 @@ impl Index {
         // crash took) go in the same section.
         // (their graph rows go in the same transaction)
         let empty = {
-            const EMPTY: &str = "kind='abandoned' AND (id LIKE 'drop:%' OR id LIKE 'receive:%') AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id)";
+            const EMPTY: &str = "kind='abandoned' AND (id LIKE 'drop:%' OR id LIKE 'receive:%' OR id LIKE 'import:%') AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id)";
             let tx = c.transaction()?;
+            // (an empty `import:` root takes its token's unused session with
+            // it, as the per-root removal below does; step 0's page skips
+            // empty roots, so they go here)
+            tx.execute(
+                &format!("DELETE FROM import_session WHERE state='pending' AND source IS NULL AND run_id IS NULL AND 'import:'||token IN (SELECT id FROM root WHERE {EMPTY})"),
+                [],
+            )?;
             tx.execute(
                 &format!("DELETE FROM graph WHERE root IN (SELECT id FROM root WHERE {EMPTY})"),
                 [],
@@ -366,9 +374,18 @@ impl Index {
             // than a whole section's half is kept (spec: the large-blob
             // rule is a later change).
             let half = BYTE_BUDGET / 2;
-            if let Some(bytes) = bytes.and_then(|b| u64::try_from(b).ok()) {
-                if bytes <= half && bytes > *budget / 2 {
-                    break;
+            match bytes.and_then(|b| u64::try_from(b).ok()) {
+                Some(bytes) => {
+                    if bytes <= half && bytes > *budget / 2 {
+                        break;
+                    }
+                }
+                // (an unknown size may be up to half a section: with less
+                // than half of it left, it waits for the next section)
+                None => {
+                    if *budget < start / 2 {
+                        break;
+                    }
                 }
             }
             cursor = format!("{root}\n{object}");
