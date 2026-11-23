@@ -867,24 +867,75 @@ mod tests {
 
     #[tokio::test]
     async fn follow_reads_github_status_after_the_run_ends() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::sync::oneshot;
+
+        struct HandshakeWriter<'a> {
+            bytes: &'a mut Vec<u8>,
+            started: Option<oneshot::Sender<()>>,
+            updated: oneshot::Receiver<()>,
+        }
+        impl AsyncWrite for HandshakeWriter<'_> {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                assert_eq!(buf, b"before\n");
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                }
+                std::task::ready!(Pin::new(&mut self.updated).poll(cx)).unwrap();
+                self.bytes.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
         let f = Fixture::new();
         f.append(LogStream::Stdout, b"before\n", false);
         let mut observer = f.observer(true);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let (result, ()) = tokio::join!(observer.observe(true, false, &mut out, &mut err), async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            f.append(LogStream::Stderr, b"after\n", true);
-            f.db.record_github_status(
-                &f.run,
-                &serde_json::json!({
-                    "computed": "failure", "posting": "failed", "sha": "0123456789abcdef",
-                    "state": "failure", "context": "local-ci", "error": "unavailable"
-                }),
-                9,
-            )
-            .unwrap();
-            f.terminal(true);
-        });
+        let (started_tx, started_rx) = oneshot::channel();
+        let (updated_tx, updated_rx) = oneshot::channel();
+        let mut writer = HandshakeWriter {
+            bytes: &mut out,
+            started: Some(started_tx),
+            updated: updated_rx,
+        };
+        let (result, ()) = tokio::join!(
+            observer.observe(true, false, &mut writer, &mut err),
+            async {
+                // The first sweep already captured metadata before writing stdout.
+                // Finish all updates before allowing the next sweep to read it.
+                started_rx.await.unwrap();
+                f.append(LogStream::Stderr, b"after\n", true);
+                f.db.record_github_status(
+                    &f.run,
+                    &serde_json::json!({
+                        "computed": "failure", "posting": "failed", "sha": "0123456789abcdef",
+                        "state": "failure", "context": "local-ci", "error": "unavailable"
+                    }),
+                    9,
+                )
+                .unwrap();
+                f.terminal(true);
+                updated_tx.send(()).unwrap();
+            }
+        );
+        drop(writer);
         result.unwrap();
         assert_eq!(out, b"before\n");
         let err = String::from_utf8(err).unwrap();
