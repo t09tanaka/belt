@@ -561,7 +561,9 @@ fn a_restart_in_the_middle_of_an_install_ends_with_the_version_installed() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
     let a = f.consumer();
     assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
-    wait_until(&f, "manager called exactly once", || f.calls() == 1);
+    wait_until_within(&f, "manager called exactly once", PRODUCT_BOUND, || {
+        f.calls() == 1
+    });
     let reopened = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
     let b = AttemptId::generate();
     // The old writer still works in the root: no second one beside it.
@@ -570,7 +572,7 @@ fn a_restart_in_the_middle_of_an_install_ends_with_the_version_installed() {
         ToolPreparationPoll::Pending
     );
     assert_eq!(reopened.builds_started(), 0);
-    wait_until(&f, "reopened builders settled", || {
+    wait_until_within(&f, "reopened builders settled", PRODUCT_BOUND, || {
         reopened.unsettled().is_empty()
     });
     assert!(!f.plan().root().join("receipt.json").exists());
@@ -780,13 +782,26 @@ fn fixture_diagnostics(f: &Fx) -> String {
 }
 
 #[track_caller]
-fn wait_until(f: &Fx, label: &str, mut ready: impl FnMut() -> bool) {
+fn wait_until(f: &Fx, label: &str, ready: impl FnMut() -> bool) {
+    wait_until_within(f, label, Duration::from_secs(30), ready)
+}
+
+/// The product's own bounds for the two waits of a restart, plus room for
+/// the poll: a helper waits up to 60 s for its admission records
+/// (`ADMISSION_WAIT`, src/toolchain/preparation.rs), and a builder that could
+/// not be settled is looked at again 60 times at least 1 s apart
+/// (`REAP_TRIES`, `REAP_PAUSE_MS`, src/setup/builder.rs). A shorter wait here
+/// failed the test while the product was still within what it allows.
+const PRODUCT_BOUND: Duration = Duration::from_secs(65);
+
+#[track_caller]
+fn wait_until_within(f: &Fx, label: &str, bound: Duration, mut ready: impl FnMut() -> bool) {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(30);
+    let deadline = started + bound;
     while !ready() {
         assert!(
             Instant::now() < deadline,
-            "fixture condition timed out: {label}; waited {:?} (deadline 30s) at {}\n{}",
+            "fixture condition timed out: {label}; waited {:?} (deadline {bound:?}) at {}\n{}",
             started.elapsed(),
             std::panic::Location::caller(),
             fixture_diagnostics(f),
@@ -862,7 +877,7 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again()
         ToolPreparationPoll::Pending
     );
     assert_eq!(reopened.builds_started(), 0);
-    wait_until(&f, "reopened builders settled", || {
+    wait_until_within(&f, "reopened builders settled", PRODUCT_BOUND, || {
         reopened.unsettled().is_empty()
     });
     // The barrier goes only after the old writer is seen gone: at the moment
