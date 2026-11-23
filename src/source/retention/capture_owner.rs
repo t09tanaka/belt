@@ -242,14 +242,15 @@ pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
     Ok(found.and_then(|value| value.parse().ok()).unwrap_or(0))
 }
 
-/// How many legacy manifests and how many roots of the `clone_ref` fill
-/// have failed to be read at least 8 times (`legacy_retry`,
-/// `clone_ref_retry`, spec 25.8 5b (h)5, (e)); read like
+/// How many legacy manifests, how many roots of the `clone_ref` fill and
+/// how many objects of the bytes fill have failed at least 8 times
+/// (`legacy_retry`, `clone_ref_retry`, `bytes_retry`, spec 25.8 5b (h)5, (c),
+/// (e)); read like
 /// [`inspect_owners`]. Zero when there is no index or no such table.
-pub fn inspect_retry_failing(state: &Path) -> Result<(u64, u64)> {
+pub fn inspect_retry_failing(state: &Path) -> Result<(u64, u64, u64)> {
     let database = state.join("sources").join("retention.db");
     if !database.is_file() {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     let c = Connection::open_with_flags(
         database,
@@ -271,7 +272,11 @@ pub fn inspect_retry_failing(state: &Path) -> Result<(u64, u64)> {
             Err(error) => Err(error.into()),
         }
     };
-    Ok((count("legacy_retry")?, count("clone_ref_retry")?))
+    Ok((
+        count("legacy_retry")?,
+        count("clone_ref_retry")?,
+        count("bytes_retry")?,
+    ))
 }
 
 impl SourceStore {

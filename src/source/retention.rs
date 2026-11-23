@@ -214,7 +214,7 @@ impl Index {
     fn ensure_size_accounting(db: &mut Connection) -> Result<()> {
         const CHECK: &str = "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')
             AND EXISTS(SELECT 1 FROM pragma_table_info('root') WHERE name='used_ms')
-            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','root_used','graph_source','clone_ref_root'))=8
+            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','root_used','graph_source','clone_ref_root'))=9
             AND (SELECT count(*) FROM meta WHERE key IN ('store_bytes','bytes_fill','clone_ref_fill'))=3";
         let ready: bool = db.query_row(CHECK, [], |r| r.get(0))?;
         if ready {
@@ -238,6 +238,7 @@ impl Index {
              CREATE TABLE IF NOT EXISTS legacy_queue(name TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS legacy_retry(name TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS clone_ref_retry(root TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS bytes_retry(id TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
              INSERT OR IGNORE INTO meta VALUES('store_bytes','0');
              INSERT OR IGNORE INTO meta VALUES('bytes_fill','');
              INSERT OR IGNORE INTO meta VALUES('clone_ref_fill','');",
@@ -342,39 +343,74 @@ impl Index {
         Ok(())
     }
     /// One page of the fill of the rows with no size (spec 25.8 5b (c),
-    /// 25.13): up to `limit` object rows, in id order from the cursor
-    /// `meta.bytes_fill`, are stat-ed and counted when not counted yet; a
-    /// row with no file stays uncounted and is counted when its file is
-    /// placed. A stat that fails for another reason leaves the cursor where
-    /// it is (the next page tries again). The fill is finished (`done`) when
-    /// the cursor reaches the end; each recount starts it again from the
-    /// start (rows an older binary added after a rollback have no size).
-    /// Returns `true` once it is finished.
+    /// 25.13): up to `limit` object rows, first those of `bytes_retry` that
+    /// are due and then those in id order from the cursor `meta.bytes_fill`,
+    /// are stat-ed and counted when not counted yet; a row with no file
+    /// stays uncounted and is counted when its file is placed. A stat that
+    /// fails for another reason (`EACCES`…) gets a row in `bytes_retry`
+    /// (tried again after the delay of [`Self::defer`]) and the page goes
+    /// on, so one object never blocks the rest; the row goes when the
+    /// object is counted or gone. The fill is finished (`done`) when the
+    /// cursor has reached the end and `bytes_retry` is empty; each recount
+    /// starts it again from the start (rows an older binary added after a
+    /// rollback have no size). Returns `true` once it is finished.
     pub(crate) fn fill_bytes(&self, limit: u32) -> Result<bool> {
         let mut c = self.connect()?;
-        let Some(cursor) = Self::fill_cursor(&c, "bytes_fill")? else {
-            return Ok(true);
-        };
-        let rows: Vec<(String, String, bool)> = {
-            let mut s = c.prepare("SELECT o.id,o.path,EXISTS(SELECT 1 FROM object_bytes b WHERE b.id=o.id) FROM object o WHERE o.id>?1 ORDER BY o.id LIMIT ?2")?;
-            let rows = s.query_map(params![cursor, limit], |r| {
+        let now = crate::platform::clock::wall_ms() as i64;
+        let cursor = Self::fill_cursor(&c, "bytes_fill")?;
+        let due: Vec<(String, Option<String>, bool)> = {
+            let mut s = c.prepare("SELECT r.id,o.path,EXISTS(SELECT 1 FROM object_bytes b WHERE b.id=r.id) FROM bytes_retry r LEFT JOIN object o ON o.id=r.id WHERE r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY r.id LIMIT ?2")?;
+            let rows = s.query_map(params![now, limit], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
+        let fresh: Vec<(String, String, bool)> = match &cursor {
+            Some(cursor) => {
+                let mut s = c.prepare("SELECT o.id,o.path,EXISTS(SELECT 1 FROM object_bytes b WHERE b.id=o.id) FROM object o WHERE o.id>?1 ORDER BY o.id LIMIT ?2")?;
+                let rows = s.query_map(params![cursor, limit], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                rows.collect::<std::result::Result<_, _>>()?
+            }
+            None => Vec::new(),
+        };
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (id, path, counted) in &rows {
-            if !counted {
-                self.record_stat(&tx, id, path)?;
+        let rows = due
+            .iter()
+            .map(|(id, path, counted)| (id, path.as_deref(), *counted))
+            .chain(
+                fresh
+                    .iter()
+                    .map(|(id, path, counted)| (id, Some(path.as_str()), *counted)),
+            );
+        for (id, path, counted) in rows {
+            let outcome = match path {
+                Some(path) if !counted => self.record_stat(&tx, id, path),
+                _ => Ok(()),
+            };
+            match outcome {
+                Ok(()) => {
+                    tx.execute("DELETE FROM bytes_retry WHERE id=?1", [id])?;
+                }
+                Err(e) => {
+                    eprintln!("source store size fill of {id}: {e:#}");
+                    Self::defer(&tx, "bytes_retry", "id", id, now)?;
+                }
             }
         }
-        let finished = rows.len() < limit as usize;
-        let next = if finished {
-            "done"
-        } else {
-            &rows.last().unwrap().0
-        };
-        tx.execute("UPDATE meta SET value=?1 WHERE key='bytes_fill'", [next])?;
+        if cursor.is_some() {
+            let next = if fresh.len() < limit as usize {
+                "done"
+            } else {
+                &fresh.last().unwrap().0
+            };
+            tx.execute("UPDATE meta SET value=?1 WHERE key='bytes_fill'", [next])?;
+        }
+        let finished = Self::fill_cursor(&tx, "bytes_fill")?.is_none()
+            && !tx.query_row("SELECT EXISTS(SELECT 1 FROM bytes_retry)", [], |r| {
+                r.get::<_, bool>(0)
+            })?;
         tx.commit()?;
         Ok(finished)
     }
@@ -407,9 +443,11 @@ impl Index {
         let fills_done = || -> Result<bool> {
             Ok(Self::fill_cursor(&c, "bytes_fill")?.is_none()
                 && Self::fill_cursor(&c, "clone_ref_fill")?.is_none()
-                && !c.query_row("SELECT EXISTS(SELECT 1 FROM clone_ref_retry)", [], |r| {
-                    r.get::<_, bool>(0)
-                })?)
+                && !c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM clone_ref_retry) OR EXISTS(SELECT 1 FROM bytes_retry)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?)
         };
         let waiting = Self::meta_value(&c, "bytes_recount_wait")?.is_some();
         let cursor = Self::meta_value(&c, "bytes_recount")?;
@@ -506,19 +544,23 @@ impl Index {
     /// (the row goes when the root is done or gone, so the table is never
     /// bigger than the roots). The same page gives a root with no `used_ms`
     /// the time of the fill (spec 25.8 5b (c)). `true` once the cursor is at
-    /// the end and no retry row is left.
+    /// the end and no retry row is left. Only roots with no `used_ms` are
+    /// selected (a root an older binary completed never gets one, and a
+    /// marked root is skipped without its manifest being read, so a recount
+    /// reads the manifests of the unmarked roots only); a retry row of a
+    /// root that was marked meanwhile is dropped.
     pub(crate) fn fill_clone_refs(&self, limit: u32, budget: u64) -> Result<bool> {
         let mut c = self.connect()?;
         let now = crate::platform::clock::wall_ms() as i64;
         let cursor = Self::fill_cursor(&c, "clone_ref_fill")?;
         let due: Vec<(String, Option<String>)> = {
-            let mut s = c.prepare("SELECT r.root,o.source FROM clone_ref_retry r LEFT JOIN root o ON o.id=r.root AND o.kind='received' WHERE r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY r.root LIMIT ?2")?;
+            let mut s = c.prepare("SELECT r.root,o.source FROM clone_ref_retry r LEFT JOIN root o ON o.id=r.root AND o.kind='received' AND o.used_ms IS NULL WHERE r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY r.root LIMIT ?2")?;
             let rows = s.query_map(params![now, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
         let fresh: Vec<(String, Option<String>)> = match &cursor {
             Some(cursor) => {
-                let mut s = c.prepare("SELECT id,source FROM root WHERE kind='received' AND id>?1 AND source IS NOT NULL ORDER BY id LIMIT ?2")?;
+                let mut s = c.prepare("SELECT id,source FROM root WHERE kind='received' AND used_ms IS NULL AND id>?1 AND source IS NOT NULL ORDER BY id LIMIT ?2")?;
                 let rows = s.query_map(params![cursor, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<std::result::Result<_, _>>()?
             }
@@ -3155,7 +3197,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(store.retention.verifications.load(SeqCst), 1);
         let c = store.retention.connect().unwrap();
         let root_id = format!("legacy:{}", capture.manifest.source_id);
@@ -3250,7 +3298,13 @@ mod tests {
         assert_eq!(diagnostic.source_id, capture.manifest.source_id);
         assert_eq!(diagnostic.limit, 1);
         assert!(diagnostic.bytes > 1);
-        assert_eq!(store.retention.reads.load(SeqCst), 0);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         cursor.manifest_byte_limit = Some(diagnostic.bytes);
         for n in 2..7 {
             store
@@ -3264,7 +3318,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(store.retention.verifications.load(SeqCst), 1);
         assert!(store
             .manifest(&capture.manifest.source_id)
@@ -3350,7 +3410,10 @@ mod tests {
             )
             .unwrap();
         }
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         f.store.retention.verifications.store(0, SeqCst);
         f.store
             .retention
@@ -3362,7 +3425,10 @@ mod tests {
             "held parent was evicted and reread"
         );
         assert_eq!(f.store.retention.verifications.load(SeqCst), 66);
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         f.store.retention.verifications.store(0, SeqCst);
         let mut cache = None;
         let mut completed = false;
@@ -4471,7 +4537,10 @@ mod tests {
                 [],
             )
             .unwrap();
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         let mut cursor = deletion::RetentionCursor::default();
         assert!(
             f.store
@@ -4925,7 +4994,7 @@ mod tests {
         assert_eq!(refs(&c), expected);
         // the migration fills the same rows for a root made before 5b
         c.execute_batch(
-            "DELETE FROM clone_ref; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+            "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
         )
         .unwrap();
         assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
@@ -5248,7 +5317,7 @@ mod tests {
             state.join("sources").join("retention.db"),
         )
         .unwrap();
-        assert_eq!(inspect_retry_failing(&state).unwrap(), (0, 2));
+        assert_eq!(inspect_retry_failing(&state).unwrap(), (0, 2, 0));
         // a budget of one byte reads one manifest a page
         assert!(!receiver.retention.fill_clone_refs(32, 1).unwrap());
         assert!(receiver.retention.fill_clone_refs(32, 1).unwrap());
@@ -5358,7 +5427,7 @@ mod tests {
         assert!(!unused);
     }
     #[test]
-    fn a_stat_that_fails_for_another_reason_keeps_the_bytes_fill_in_place() {
+    fn a_stat_that_fails_for_another_reason_is_retried_and_never_blocks_the_bytes_fill() {
         let f = Fixture::new();
         let (receiver, m, want, bytes) = received_fixture(&f);
         receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
@@ -5368,17 +5437,44 @@ mod tests {
             "DELETE FROM object_bytes; UPDATE meta SET value='' WHERE key='bytes_fill';",
         )
         .unwrap();
+        let cursor = || -> String {
+            c.query_row("SELECT value FROM meta WHERE key='bytes_fill'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let retried = || -> i64 {
+            c.query_row("SELECT count(*) FROM bytes_retry", [], |r| r.get(0))
+                .unwrap()
+        };
         let dir = receiver.root().join("objects");
         set_mode(&dir, 0o000);
         let refused = receiver.retention.fill_bytes(1000);
-        set_mode(&dir, 0o755);
-        assert!(refused.is_err());
-        let cursor: String = c
-            .query_row("SELECT value FROM meta WHERE key='bytes_fill'", [], |r| {
-                r.get(0)
-            })
+        // the cursor passed the object (no head-of-line block); the fill is
+        // not done while a retry row is left
+        let first = refused.unwrap();
+        assert!(!first);
+        assert_eq!(cursor(), "done");
+        assert!(retried() >= 1);
+        // not due yet: the fill stays open
+        let again = receiver.retention.fill_bytes(1000).unwrap();
+        assert!(!again);
+        c.execute("UPDATE bytes_retry SET attempts=8,next_ms=0", [])
             .unwrap();
-        assert_eq!(cursor, "");
+        let state = f._root.path().join("state");
+        std::fs::create_dir_all(state.join("sources")).unwrap();
+        std::fs::copy(
+            receiver.root().join("retention.db"),
+            state.join("sources").join("retention.db"),
+        )
+        .unwrap();
+        let failing = inspect_retry_failing(&state).unwrap();
+        // still unreadable when due: the row stays
+        let due = receiver.retention.fill_bytes(1000).unwrap();
+        set_mode(&dir, 0o755);
+        assert!(!due);
+        assert!(failing.2 >= 1);
+        c.execute("UPDATE bytes_retry SET next_ms=0", []).unwrap();
         assert!(receiver.retention.fill_bytes(1000).unwrap());
         let counted: bool = c
             .query_row(
@@ -5388,6 +5484,78 @@ mod tests {
             )
             .unwrap();
         assert!(counted);
+        assert_eq!(retried(), 0);
+        // a retry row of an object that is gone goes too
+        c.execute("INSERT INTO bytes_retry VALUES('b:gone',1,0)", [])
+            .unwrap();
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(retried(), 0);
+    }
+    #[test]
+    fn a_recount_reads_no_manifest_of_a_root_that_has_its_time() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        write_manifest(&receiver, &parent);
+        write_manifest(&receiver, &child);
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let restart = || {
+            c.execute("UPDATE meta SET value='' WHERE key='clone_ref_fill'", [])
+                .unwrap();
+            receiver
+                .retention
+                .reads
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        };
+        // the first pass marks the roots a publication does not (a carried one)
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        // every root is marked: the recount's pass reads no manifest
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(
+            receiver
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // a root an older binary completed has no time and no refs: only
+        // its manifest is read, and it is filled
+        c.execute("DELETE FROM clone_ref", []).unwrap();
+        c.execute(
+            "UPDATE root SET used_ms=NULL WHERE id='receive:'||?1",
+            [&parent.source_id],
+        )
+        .unwrap();
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(
+            receiver
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let unused: i64 = c
+            .query_row(
+                "SELECT count(*) FROM root WHERE kind='received' AND used_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unused, 0);
+        let refs: i64 = c
+            .query_row(
+                "SELECT count(*) FROM clone_ref WHERE root='receive:'||?1",
+                [&parent.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(refs >= 1);
     }
     #[test]
     fn a_manifest_the_legacy_registration_is_working_on_counts_as_received() {
