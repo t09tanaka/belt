@@ -208,7 +208,7 @@ impl Ledger {
             entries_v3: shape(NESTED_SCHEMA_VERSION),
             extra: self.extra.clone(),
         };
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut tmp = crate::paths::temp_file_in(dir)?;
         serde_json::to_writer_pretty(&mut tmp, &wire)?;
         tmp.write_all(b"\n")?;
         tmp.as_file().sync_all()?;

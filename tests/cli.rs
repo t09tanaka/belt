@@ -1473,3 +1473,53 @@ fn invalid_config_is_reported() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("budget"));
 }
+
+/// Ctrl-C while the command runs reaches the wrapper too (its handler does
+/// nothing, the command gets its own copy), and a SIGTERM is passed on to
+/// the command. Whatever the command makes of it (here it ends with 0), the
+/// wrapper does not start tidying up afterwards: no retention sweep
+/// follows, as it does after a command nobody stopped.
+#[test]
+fn a_stop_signal_while_the_command_runs_means_no_sweep_after_it() {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        let env = TestEnv::new();
+        fs::create_dir_all(env.state()).unwrap();
+        fs::write(
+            env.state().join("last-sweep"),
+            r#"{"complete":"2000-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        // What a sweep removes: a temporary file two hours old whose
+        // writer (a pid no process has) is gone.
+        let stray = env.state().join(".ttc-tmp.2147483646.x");
+        fs::write(&stray, "x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stray)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        let started = env.dir.path().join("started");
+        let mut child = env
+            .cmd()
+            .args(["exec", "--", "sh", "-c"])
+            .arg(format!(
+                "trap 'exit 0' TERM; trap '' INT; : > '{}'; sleep 1",
+                started.display()
+            ))
+            .spawn()
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || started.exists()));
+        // Only the wrapper this test started, never a group.
+        let pid = child.id() as libc::pid_t;
+        assert!(pid > 1);
+        unsafe {
+            libc::kill(pid, sig);
+        }
+        assert!(child.wait().unwrap().success(), "signal {sig}");
+        assert!(stray.exists(), "a sweep ran after signal {sig}");
+        // The stamp was not touched either: the next command sweeps.
+        assert!(env.run(&["exec", "--", "true"]).status.success());
+        assert!(!stray.exists());
+    }
+}

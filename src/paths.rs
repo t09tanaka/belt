@@ -13,6 +13,19 @@ pub struct Paths {
     history_file: PathBuf,
 }
 
+/// Every temporary file of this tool is named this, then the pid of the
+/// process that made it, a dot and random characters. The retention sweep
+/// removes one only when that process is gone ([`crate::retention`]).
+pub const TEMP_PREFIX: &str = ".ttc-tmp.";
+
+/// A temporary file in `dir` for an atomic write (write, then rename over
+/// the target), named after this process ([`TEMP_PREFIX`]).
+pub fn temp_file_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(&format!("{TEMP_PREFIX}{}.", std::process::id()))
+        .tempfile_in(dir)
+}
+
 impl Paths {
     /// State under `state_dir` (`ledger.json`, `leases/`, `jobs/`,
     /// `history.jsonl`), configuration read from `config_file`.
@@ -118,6 +131,11 @@ impl Paths {
 
     pub fn history_lock(&self) -> PathBuf {
         self.state_dir.join("history.lock")
+    }
+
+    /// When the retention sweep last ran ([`crate::retention`]).
+    pub fn sweep_stamp(&self) -> PathBuf {
+        self.state_dir.join("last-sweep")
     }
 
     pub fn jobs_dir(&self) -> PathBuf {

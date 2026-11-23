@@ -102,21 +102,53 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
             cfg.jobs_orphan_grace_secs,
         );
     }
-    let exit = match crate::cmd::exec::run_gated(ctx, cfg, &opts, id, &|| {
-        jobs::read_exit(ctx, id).is_some()
-    }) {
+    spawn_log_watch(ctx.clone(), id.to_string(), log_max_bytes(cfg));
+    // The outcome is recorded when the run says how it ends, which is
+    // before it releases its ledger entry and lease: `wait` then never
+    // finds a job with no entry, no lease and no exit file whose runner is
+    // alive (it would call it lost).
+    let ended = std::cell::Cell::new(false);
+    let ending = |e: &exec::Ending| {
+        ended.set(true);
+        let code = match e {
+            exec::Ending::Finished(exit) => exit.code(),
+            exec::Ending::Interrupted(sig) => 128 + sig,
+            exec::Ending::Failed(e) => {
+                eprintln!("task-traffic-controller: {e}");
+                2
+            }
+        };
+        end_job(ctx, cfg, id, code);
+    };
+    let hooks = exec::Hooks {
+        cancelled: &|| !ended.get() && jobs::read_exit(ctx, id).is_some(),
+        // Stderr is the job's log. What the retention sweep has to say
+        // comes after the exit file, when `wait` may already have printed
+        // and removed the log: it is not written there (`gc` shows it).
+        progress: &|line| {
+            if !line.starts_with("task-traffic-controller: cleanup:") {
+                eprintln!("{line}")
+            }
+        },
+        progress_tty: std::io::IsTerminal::is_terminal(&io::stderr()),
+    };
+    let exit = match exec::run_gated_with(ctx, cfg, &opts, id, &hooks, &ending) {
         Ok(Gated::Finished(exit)) => exit,
         Ok(Gated::Interrupted(sig)) => {
-            jobs::write_exit(ctx, id, 128 + sig);
+            end_job(ctx, cfg, id, 128 + sig);
             reraise(sig);
         }
         Err(e) => {
-            eprintln!("task-traffic-controller: {e}");
-            jobs::write_exit(ctx, id, 2);
+            // Already said and recorded, unless it failed before it had a
+            // lease (nothing was ever registered then).
+            if !ended.get() {
+                eprintln!("task-traffic-controller: {e}");
+                end_job(ctx, cfg, id, 2);
+            }
             return Ok(2);
         }
     };
-    jobs::write_exit(ctx, id, exit.code());
+    end_job(ctx, cfg, id, exit.code());
     match exit {
         Exit::Code(c) => {
             crate::signals::restore();
@@ -124,6 +156,37 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
         }
         Exit::Signal(s) => reraise(s),
     }
+}
+
+/// Record how the job ended. The log is cut to `jobs_log_max_mib` first,
+/// so that whoever sees the exit file reads the log in its final size, and
+/// the watcher cuts nothing after it ([`jobs::end`]).
+fn end_job(ctx: &Context, cfg: &Config, id: &str, code: i32) {
+    jobs::end(ctx, id, code, log_max_bytes(cfg));
+}
+
+fn log_max_bytes(cfg: &Config) -> u64 {
+    cfg.jobs_log_max_mib.saturating_mul(1024 * 1024)
+}
+
+/// How often the runner looks at the size of its job's log.
+const LOG_WATCH: Duration = Duration::from_millis(200);
+
+/// Keep the job's log within `max` bytes while the job runs: when it is
+/// longer it is cut, in place, to its last half ([`jobs::cap_running_log`]).
+/// Between two looks it can exceed the limit by what the job writes in
+/// [`LOG_WATCH`]. Ends when the exit file is there.
+fn spawn_log_watch(ctx: Context, id: String, max: u64) {
+    // Never the thread a forwarded signal lands on (see the watchdog).
+    let old = task_traffic_controller::usage::block_all_signals();
+    thread::spawn(move || loop {
+        thread::sleep(LOG_WATCH);
+        if jobs::read_exit(&ctx, &id).is_some() {
+            return;
+        }
+        let _ = jobs::cap_running_log(&ctx, &id, max);
+    });
+    task_traffic_controller::usage::restore_signals(&old);
 }
 
 /// Once the grace period is over, a job nobody waits on is cancelled:
@@ -189,10 +252,10 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
             "usage: task-traffic-controller wait [--no-output] <job-id>...".into(),
         ));
     }
-    let mut waiter_locks = Vec::with_capacity(ids.len());
+    let mut waiter_locks: Vec<Option<lock::Lock>> = Vec::with_capacity(ids.len());
     for id in ids {
         jobs::load(ctx, id)?;
-        waiter_locks.push(jobs::take_waiter(ctx, id)?);
+        waiter_locks.push(Some(jobs::take_waiter(ctx, id)?));
     }
     let mut lost_strikes: HashMap<&str, u32> = HashMap::new();
     let mut final_code = 0;
@@ -235,12 +298,24 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
                 continue;
             }
             let lost = matches!(state, JobState::Lost);
-            report(ctx, id, code, lost, no_output)?;
+            let handed_over = report(ctx, id, code, lost, no_output)?;
             if final_code == 0 && code != 0 {
                 final_code = code;
             }
             reported.push(id.as_str());
             progressed = true;
+            // The output has been handed over and nothing reads it again:
+            // remove it now, unless another `wait` is on the job. Only the
+            // output of a job that has its exit record: a job reported as
+            // lost keeps its log (its runner may only have been slow, and
+            // the log is what is left to look at). The descriptor and exit
+            // file, a few bytes, stay for `jobs` and a repeated `wait`.
+            if let Some(i) = ids.iter().position(|x| x == id) {
+                waiter_locks[i] = None;
+            }
+            if handed_over && !lost {
+                jobs::remove_output(ctx, id);
+            }
         }
         if !progressed {
             thread::sleep(POLL_INTERVAL);
@@ -249,7 +324,10 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
     Ok(final_code)
 }
 
-fn report(ctx: &Context, id: &str, code: i32, lost: bool, no_output: bool) -> Result<()> {
+/// Print the job's header and, unless `no_output`, its log. True when the
+/// log was printed in full (or there is none to print): only then may it be
+/// removed.
+fn report(ctx: &Context, id: &str, code: i32, lost: bool, no_output: bool) -> Result<bool> {
     let job = jobs::load(ctx, id)?;
     let argv = task_traffic_controller::key::argv_string(&job.argv);
     let stdout = io::stdout();
@@ -265,15 +343,20 @@ fn report(ctx: &Context, id: &str, code: i32, lost: bool, no_output: bool) -> Re
             format!("exit {code}")
         }
     )?;
-    if !no_output {
-        if let Ok(log) = std::fs::read(ctx.paths.job_log(id)) {
+    if no_output {
+        return Ok(false);
+    }
+    match std::fs::read(ctx.paths.job_log(id)) {
+        Ok(log) => {
             out.write_all(&log)?;
             if !log.ends_with(b"\n") {
                 writeln!(out)?;
             }
+            out.flush()?;
+            Ok(true)
         }
+        Err(e) => Ok(e.kind() == io::ErrorKind::NotFound),
     }
-    Ok(())
 }
 
 pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
@@ -344,6 +427,20 @@ pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// Whether `cancel` may write the exit record itself. Only when the job has
+/// no ledger entry and nobody holds its lease: a held lease is a live
+/// runner (mis-seen, or still registering), and it writes its own record
+/// under its cutting order ([`jobs::end`]); one written here could land
+/// while its watcher is cutting the log, and `wait` would print a log
+/// mid-cut and remove it.
+pub fn may_write_exit(entry_present: bool, lease_held: bool) -> bool {
+    !entry_present && !lease_held
+}
+
+fn runner_alive_not_cancelled(id: &str) {
+    println!("{id}: its runner is alive but not in the queue yet; not cancelled, try again");
+}
+
 pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
     if ids.is_empty() {
         return Err(Error::Spawn(
@@ -351,13 +448,19 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
         ));
     }
     let ledger = lock::load_reaped(ctx)?;
+    let mut code = 0;
     for id in ids {
         jobs::load(ctx, id)?;
         match state_of(ctx, id, &ledger) {
             JobState::Done(c) => println!("{id}: already finished (exit {c})"),
             JobState::Lost => {
-                jobs::write_exit(ctx, id, 2);
-                println!("{id}: runner already gone, marked lost");
+                if may_write_exit(ledger.find(id).is_some(), lock::lease_is_held(ctx, id)) {
+                    jobs::write_exit(ctx, id, 2);
+                    println!("{id}: runner already gone, marked lost");
+                } else {
+                    runner_alive_not_cancelled(id);
+                    code = 1;
+                }
             }
             JobState::Queued | JobState::Running => {
                 match ledger.find(id).map(|e| e.pid) {
@@ -370,28 +473,32 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
                         }
                         println!("{id}: sent SIGTERM to runner {pid}");
                     }
-                    _ => {
+                    _ if may_write_exit(false, lock::lease_is_held(ctx, id)) => {
                         // Runner not registered yet: the exit file doubles
                         // as the cancellation request it will see on start.
                         jobs::write_exit(ctx, id, 128 + libc::SIGTERM);
                         println!("{id}: cancelled before it started");
                     }
+                    _ => {
+                        runner_alive_not_cancelled(id);
+                        code = 1;
+                    }
                 }
             }
         }
     }
-    Ok(0)
+    Ok(code)
 }
 
-/// Remove job files finished more than `keep_days` ago. Returns the count.
-pub fn gc(ctx: &Context, keep_days: u64) -> Result<usize> {
-    let cutoff = ctx.clock.now() - chrono::Duration::days(keep_days as i64);
-    let mut n = 0;
-    for j in jobs::list(ctx)? {
-        if j.finished_at.map(|t| t < cutoff).unwrap_or(false) {
-            jobs::remove_files(ctx, &j.id);
-            n += 1;
-        }
+#[cfg(test)]
+mod tests {
+    use super::may_write_exit;
+
+    #[test]
+    fn cancel_writes_the_exit_only_without_an_entry_and_a_lease() {
+        assert!(may_write_exit(false, false));
+        assert!(!may_write_exit(false, true));
+        assert!(!may_write_exit(true, false));
+        assert!(!may_write_exit(true, true));
     }
-    Ok(n)
 }

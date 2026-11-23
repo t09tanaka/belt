@@ -1525,6 +1525,9 @@ fn gc_keeps_a_marker_exactly_as_long_as_its_record() {
     std::fs::write(ctx.paths.measurements_dir().join("p.pending"), b"").unwrap();
     // Per key: only m0 (the oldest of "a") loses its record.
     assert_eq!(managed::trim_history(&ctx, 2).unwrap(), 1);
+    // m0's marker went with its record, at the trim; the gc only has the
+    // `.pending` of an attempt that never appended left to remove.
+    assert!(!ctx.paths.measurements_dir().join("m0.applied").exists());
     assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
     let mut left: Vec<String> = std::fs::read_dir(ctx.paths.measurements_dir())
         .unwrap()
@@ -1533,13 +1536,7 @@ fn gc_keeps_a_marker_exactly_as_long_as_its_record() {
     left.sort();
     assert_eq!(
         left,
-        [
-            "m1.applied",
-            "m2.applied",
-            "m3.applied",
-            "m4.applied",
-            "p.pending"
-        ]
+        ["m1.applied", "m2.applied", "m3.applied", "m4.applied"]
     );
     // Every marker left has its record, so none is dropped (the old
     // behaviour kept the newest N markers overall and could keep one whose
@@ -1569,8 +1566,9 @@ fn trimming_the_history_waits_for_the_history_lock() {
     );
     drop(held);
     assert_eq!(managed::trim_history(&ctx, 1).unwrap(), 1);
-    // The marker of the dropped record goes with the next gc, not before.
-    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
+    // The marker of the dropped record went with it.
+    assert!(!ctx.paths.measurements_dir().join("m0.applied").exists());
+    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 0);
 }
 
 // ---- descendants recorded while the command runs, and `resolve --force` ----
@@ -2718,7 +2716,9 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
     terminal_sidecar(&ctx, "old", now - days(10), false);
     terminal_sidecar(&ctx, "recent", now - days(1), false);
     let _owner = terminal_sidecar(&ctx, "in-ledger", now - days(10), true);
-    // Not terminal, however old: never removed.
+    // Registered, never launched, and without an entry: what a crash
+    // between writing the sidecar and saving the ledger leaves. Kept while
+    // the file is young.
     let (_, g) = registered(
         managed::register(
             &ctx,
@@ -2741,23 +2741,93 @@ fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
         f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age * 86400 + 5))
             .unwrap();
     }
-    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 2);
-    let mut left: Vec<String> = std::fs::read_dir(&m)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    left.sort();
+    std::fs::write(m.join("notes.txt"), b"x").unwrap();
+    // A launch that was begun, with no entry, and another version's
+    // sidecar (JSON, but not ours): kept as long as a finished one is.
+    let mut begun = sidecar(&ctx, "live");
+    begun.command_id = "begun".into();
+    begun.phase = task_traffic_controller::receipt::Phase::LaunchIntent;
+    managed::write_sidecar(&ctx, &begun).unwrap();
+    std::fs::write(m.join("foreign.json"), br#"{"version":99}"#).unwrap();
+    let listing = || {
+        let mut left: Vec<String> = std::fs::read_dir(&m)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        left
+    };
+    // Only sidecars are looked at here (temporary files are the retention
+    // sweep's, names that are not ours are nobody's).
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
     assert_eq!(
-        left,
+        listing(),
         [
             ".tmpNEW",
+            ".tmpOLD",
+            "begun.json",
             "corrupt.json",
+            "foreign.json",
             "in-ledger.json",
             "live.json",
+            "notes.txt",
             "recent.json"
         ]
     );
     assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 0);
+    // An hour after they were written, the unreadable sidecar and the one
+    // that never got an entry go. A held lease keeps one.
+    let hour_old = std::time::SystemTime::now() - Duration::from_secs(3600 + 5);
+    for name in ["corrupt.json", "live.json", "begun.json", "foreign.json"] {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(m.join(name))
+            .unwrap();
+        f.set_modified(hour_old).unwrap();
+    }
+    let lease = task_traffic_controller::lock::take_lease(&ctx, "live").unwrap();
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert!(m.join("live.json").exists() && !m.join("corrupt.json").exists());
+    drop(lease);
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert_eq!(
+        listing(),
+        [
+            ".tmpNEW",
+            ".tmpOLD",
+            "begun.json",
+            "foreign.json",
+            "in-ledger.json",
+            "notes.txt",
+            "recent.json"
+        ]
+    );
+    // `managed_keep_days` after they were last written, those two go as
+    // well: nothing has an entry for them, so nothing else ever would
+    // look at them again. A held lease keeps one.
+    let week_old = std::time::SystemTime::now() - Duration::from_secs(7 * 86_400 + 60);
+    for name in ["begun.json", "foreign.json"] {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(m.join(name))
+            .unwrap();
+        f.set_modified(week_old).unwrap();
+    }
+    let lease = task_traffic_controller::lock::take_lease(&ctx, "begun").unwrap();
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert!(m.join("begun.json").exists() && !m.join("foreign.json").exists());
+    drop(lease);
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 1);
+    assert_eq!(
+        listing(),
+        [
+            ".tmpNEW",
+            ".tmpOLD",
+            "in-ledger.json",
+            "notes.txt",
+            "recent.json"
+        ]
+    );
     // Nothing to read at all is nothing to remove.
     let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
     assert_eq!(managed::gc_sidecars(&none, 7).unwrap(), 0);

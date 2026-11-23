@@ -54,7 +54,9 @@ pub fn run(ctx: &Context, cfg: &Config, mut opts: Opts, nested: Option<&str>) ->
     }
 }
 
-/// [`exec::run_gated`] with progress lines on stderr.
+/// [`exec::run_gated`] with progress lines on stderr: the waiting lines,
+/// and after the command the `cleanup:` line of each step of the retention
+/// sweep that failed, when this run did the sweep.
 pub fn run_gated(
     ctx: &Context,
     cfg: &Config,

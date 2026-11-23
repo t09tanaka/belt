@@ -40,23 +40,85 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
+/// Whether `path` still names the file `file` is open on (same device and
+/// inode). A lock file may be unlinked by whoever finds it unused, so a lock
+/// only counts once this holds *after* the lock was taken: otherwise the
+/// lock is on a file nobody else can find, and the next taker would lock a
+/// new file of the same name at the same time.
+pub(crate) fn names(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// Exclusive lock with polling and timeout. Only contention is retried.
+/// The lock returned is on the file `path` names now ([`names`]).
 pub fn acquire(path: &Path, timeout: Duration) -> Result<Lock> {
-    let file = open_lock_file(path)?;
     let start = Instant::now();
     loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(Lock { file }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if start.elapsed() >= timeout {
-                    return Err(Error::LockTimeout(format!(
-                        "timed out after {timeout:?} waiting for {}",
-                        path.display()
-                    )));
+        let file = open_lock_file(path)?;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= timeout {
+                        return Err(Error::LockTimeout(format!(
+                            "timed out after {timeout:?} waiting for {}",
+                            path.display()
+                        )));
+                    }
+                    thread::sleep(POLL);
                 }
-                thread::sleep(POLL);
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+        }
+        if names(&file, path) {
+            return Ok(Lock { file });
+        }
+        release(&file);
+    }
+}
+
+/// Unlock explicitly. Closing the file is not enough: a process forked by
+/// another thread at this moment holds a copy of the descriptor until it
+/// execs, and the lock would stay with that copy.
+fn release(file: &File) {
+    let _ = FileExt::unlock(file);
+}
+
+/// [`acquire`] without waiting: `None` when the lock is busy.
+pub fn try_acquire(path: &Path) -> Result<Option<Lock>> {
+    match acquire(path, Duration::ZERO) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(Error::LockTimeout(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the lock file `path` unless somebody holds it. The file is
+/// unlinked while this call holds its exclusive lock, taken without
+/// waiting, so a taker that had already opened it either finds it busy or
+/// gets the lock on a file the name no longer points to, notices
+/// ([`names`]) and starts again. True when the file is gone afterwards.
+pub fn remove_if_unheld(path: &Path) -> bool {
+    loop {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+            return std::fs::symlink_metadata(path).is_err();
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let gone = names(&file, path).then(|| std::fs::remove_file(path).is_ok());
+                release(&file);
+                match gone {
+                    Some(gone) => return gone,
+                    // Unlinked (and perhaps made again) meanwhile: look
+                    // again.
+                    None => continue,
+                }
+            }
+            Err(_) => return false,
         }
     }
 }
@@ -184,57 +246,95 @@ pub fn snapshot_read_only(ctx: &Context) -> Result<ReadOnlySnapshot> {
 /// inherit it.
 pub fn take_lease(ctx: &Context, id: &str) -> Result<Lock> {
     let path = ctx.paths.lease_file(id);
-    try_take_lease(ctx, id)?
-        .ok_or_else(|| Error::Ledger(format!("lease {} already held", path.display())))
+    // Whoever looks whether a lease is held, or removes one nobody holds,
+    // has it locked for an instant (and a released version looks at every
+    // file in `leases/` during `gc`). That is not an owner: ask again for a
+    // moment before believing it.
+    let start = Instant::now();
+    loop {
+        if let Some(lock) = try_take_lease(ctx, id)? {
+            return Ok(lock);
+        }
+        if start.elapsed() >= LEASE_PROBE_WAIT {
+            return Err(Error::Ledger(format!(
+                "lease {} already held",
+                path.display()
+            )));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
+
+/// How long [`take_lease`] takes a busy lease for somebody's look at it.
+const LEASE_PROBE_WAIT: Duration = Duration::from_millis(250);
 
 /// [`take_lease`], but `None` when another process holds it.
 pub fn try_take_lease(ctx: &Context, id: &str) -> Result<Option<Lock>> {
     let path = ctx.paths.lease_file(id);
-    let file = open_lock_file(&path)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(Lock { file })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(Error::Ledger(format!(
-            "lease {} cannot be locked: {e}",
-            path.display()
-        ))),
+    loop {
+        let file = open_lock_file(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) if names(&file, &path) => return Ok(Some(Lock { file })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && names(&file, &path) => {
+                return Ok(None)
+            }
+            // The file was unlinked between the open and the lock: the
+            // lock (or its refusal) is about a file that is gone.
+            Ok(()) => release(&file),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                return Err(Error::Ledger(format!(
+                    "lease {} cannot be locked: {e}",
+                    path.display()
+                )))
+            }
+        }
     }
 }
 
 /// True when some process currently holds the lease lock for `id`.
 pub fn lease_is_held(ctx: &Context, id: &str) -> bool {
-    let path = ctx.paths.lease_file(id);
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
-        return false;
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = FileExt::unlock(&file);
-            false
-        }
-        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
-    }
+    #[cfg(test)]
+    LEASE_LOOKS.with(|n| n.set(n.get() + 1));
+    is_held(&ctx.paths.lease_file(id))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread looked at a lease ([`lease_is_held`]).
+    pub(crate) static LEASE_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Take a *shared* lock on `path` (several holders allowed), held until drop.
 pub fn take_shared(path: &Path) -> Result<Lock> {
-    let file = open_lock_file(path)?;
-    file.lock_shared()?;
-    Ok(Lock { file })
+    loop {
+        let file = open_lock_file(path)?;
+        file.lock_shared()?;
+        if names(&file, path) {
+            return Ok(Lock { file });
+        }
+        release(&file);
+    }
 }
 
 /// True when at least one shared or exclusive holder exists for `path`.
 pub fn is_held(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
-        return false;
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = FileExt::unlock(&file);
-            false
+    loop {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+            return false;
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                // Unlocked at once and explicitly: this look must not be
+                // taken for a holder by the next one.
+                release(&file);
+                if names(&file, path) {
+                    return false;
+                }
+                // Free, but not the file the name points to any more.
+            }
+            Err(e) => return e.kind() == std::io::ErrorKind::WouldBlock,
         }
-        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
     }
 }
 
@@ -336,26 +436,88 @@ pub fn reap_dead(ctx: &Context, ledger: &mut Ledger) -> Vec<String> {
     for id in &dead {
         ledger.remove(id);
         cache_of(ctx).remove(id);
-        let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+        remove_if_unheld(&ctx.paths.lease_file(id));
     }
     dead
 }
 
+/// Whether the lease file of an id without a ledger entry is a leftover: it
+/// must be [`ORPHAN_LEASE_AFTER_SECS`] old. A younger one may belong to a
+/// command between taking its lease and registering, and released versions
+/// of this tool lock the path they opened without looking again, so the
+/// file must not go while one of them may be between its open and its lock.
+pub fn orphan_lease_due(
+    modified: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(modified) >= chrono::Duration::seconds(ORPHAN_LEASE_AFTER_SECS)
+}
+
+/// See [`orphan_lease_due`]. An hour: the open and the lock are two system
+/// calls apart.
+pub const ORPHAN_LEASE_AFTER_SECS: i64 = 3600;
+
 /// Remove lease files that no ledger entry refers to (left by crashes
-/// between lease creation and ledger registration).
-pub fn sweep_orphan_leases(ctx: &Context, ledger: &Ledger) {
+/// between lease creation and ledger registration), once they are
+/// [`ORPHAN_LEASE_AFTER_SECS`] old and only while nobody holds them
+/// ([`remove_if_unheld`]). Returns how many were removed.
+pub fn sweep_orphan_leases(ctx: &Context, ledger: &Ledger) -> usize {
+    let old = old_lease_ids(ctx, &mut || true);
+    remove_orphan_leases(ctx, ledger, &old, &mut || true)
+}
+
+/// The ids of the lease files that are [`ORPHAN_LEASE_AFTER_SECS`] old: the
+/// ones [`remove_orphan_leases`] may remove. Only a listing; no lock is
+/// needed or touched. `go` is asked before each file; false stops.
+pub(crate) fn old_lease_ids(ctx: &Context, go: &mut dyn FnMut() -> bool) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(ctx.paths.leases_dir()) else {
-        return;
+        return Vec::new();
     };
+    let now = ctx.clock.now();
+    let mut ids = Vec::new();
     for ent in rd.flatten() {
+        if !go() {
+            break;
+        }
         let name = ent.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".lock")) else {
             continue;
         };
-        if ledger.find(id).is_none() && !lease_is_held(ctx, id) {
-            let _ = std::fs::remove_file(ent.path());
+        if ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| orphan_lease_due(t.into(), now))
+        {
+            ids.push(id.to_string());
         }
     }
+    ids
+}
+
+/// Of the old lease files `ids` ([`old_lease_ids`]), remove those `ledger`
+/// has no entry for and nobody holds. The caller holds the ledger lock and
+/// read `ledger` under it. A lease is only looked at (locked for an
+/// instant) here, after its age and the ledger said it is a leftover.
+/// `allow` is asked before each; false stops.
+pub(crate) fn remove_orphan_leases(
+    ctx: &Context,
+    ledger: &Ledger,
+    ids: &[String],
+    allow: &mut dyn FnMut() -> bool,
+) -> usize {
+    let mut n = 0;
+    for id in ids {
+        if ledger.find(id).is_some() {
+            continue;
+        }
+        if !allow() {
+            break;
+        }
+        if remove_if_unheld(&ctx.paths.lease_file(id)) {
+            n += 1;
+        }
+    }
+    n
 }
 
 #[cfg(test)]
@@ -404,6 +566,76 @@ mod tests {
         drop(ledger(&ctx).unwrap());
         l.save(&ctx.paths.ledger_file()).unwrap();
         (d, ctx)
+    }
+
+    #[test]
+    fn a_lock_counts_only_on_the_file_its_name_points_to() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("x.lock");
+        let file = open_lock_file(&path).unwrap();
+        assert!(names(&file, &path));
+        // Unlinked: the open file is nobody's.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!names(&file, &path));
+        // Made again under the same name: another file.
+        let again = open_lock_file(&path).unwrap();
+        assert!(!names(&file, &path));
+        assert!(names(&again, &path));
+        // A lock on the unlinked file holds nobody off the new one, and
+        // does not make the name look held.
+        file.lock_exclusive().unwrap();
+        assert!(!is_held(&path));
+        let got = acquire(&path, Duration::ZERO).unwrap();
+        assert!(names(&got.file, &path));
+        assert!(is_held(&path));
+    }
+
+    #[test]
+    fn a_lock_file_goes_only_when_nobody_holds_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("x.lock");
+        // Nothing there: gone already.
+        assert!(remove_if_unheld(&path));
+        let held = take_shared(&path).unwrap();
+        assert!(!remove_if_unheld(&path));
+        assert!(path.exists());
+        drop(held);
+        assert!(remove_if_unheld(&path));
+        assert!(!path.exists());
+        let held = acquire(&path, Duration::ZERO).unwrap();
+        assert!(try_acquire(&path).unwrap().is_none());
+        assert!(!remove_if_unheld(&path));
+        drop(held);
+        assert!(try_acquire(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_busy_lease_is_asked_again_for_a_moment_and_then_believed() {
+        let (_d, ctx) = state_with(&[]);
+        let held = take_lease(&ctx, "a").unwrap();
+        assert!(try_take_lease(&ctx, "a").unwrap().is_none());
+        let start = Instant::now();
+        assert!(take_lease(&ctx, "a").is_err());
+        assert!(start.elapsed() >= LEASE_PROBE_WAIT);
+        // Somebody only looking: gone within the wait.
+        let ctx2 = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = thread::spawn(move || {
+            tx.send(()).unwrap();
+            take_lease(&ctx2, "a").is_ok()
+        });
+        rx.recv().unwrap();
+        drop(held);
+        assert!(t.join().unwrap());
+    }
+
+    #[test]
+    fn a_lease_without_an_entry_is_a_leftover_only_after_an_hour() {
+        let now = Utc::now();
+        let at = |secs| now - chrono::Duration::seconds(secs);
+        assert!(!orphan_lease_due(at(ORPHAN_LEASE_AFTER_SECS - 1), now));
+        assert!(orphan_lease_due(at(ORPHAN_LEASE_AFTER_SECS), now));
+        assert!(!orphan_lease_due(at(-5), now));
     }
 
     #[test]

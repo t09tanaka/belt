@@ -52,7 +52,9 @@ pub struct Opts {
     pub env: Option<std::collections::BTreeMap<String, String>>,
     /// `Some`: the child's stdout and stderr are appended to this file
     /// (created if missing) and its stdin is `/dev/null`. `None`: all three
-    /// are inherited.
+    /// are inherited. The caller owns the file: nothing here truncates,
+    /// rotates or removes it, so its size and lifetime are the caller's to
+    /// bound.
     pub stdout_log: Option<PathBuf>,
 }
 
@@ -247,7 +249,9 @@ pub enum Gated {
 
 /// Callbacks into the caller of [`run_gated`].
 pub struct Hooks<'a> {
-    /// Polled while waiting; true cancels the run (as SIGTERM would).
+    /// Polled while waiting; true cancels the run (as SIGTERM would). Also
+    /// asked after the command, before and between the items of the
+    /// retention sweep: true means no sweep, or ends it.
     pub cancelled: &'a dyn Fn() -> bool,
     /// Receives each "waiting ..." progress line.
     pub progress: &'a dyn Fn(&str),
@@ -350,20 +354,110 @@ pub fn run_gated(
     id: &str,
     hooks: &Hooks,
 ) -> Result<Gated> {
+    run_gated_with(ctx, cfg, opts, id, hooks, &|_| {})
+}
+
+/// How a gated run is ending: what [`run_gated_with`] tells its caller
+/// before the run's ledger entry and lease are released.
+#[derive(Debug)]
+pub enum Ending<'a> {
+    /// The command ran and ended like this.
+    Finished(Exit),
+    /// Stopped by this signal before the command started.
+    Interrupted(i32),
+    /// The run failed with this error after it had taken its lease.
+    Failed(&'a crate::error::Error),
+}
+
+/// [`run_gated`], calling `ending` once, as soon as it is known how the run
+/// ends and *before* its ledger entry and lease are released. Whoever
+/// records the outcome somewhere else (a job's exit file) does it there, so
+/// that an observer never finds the run gone from the ledger, its lease
+/// free, and no outcome: that would look like a run that died.
+///
+/// The entry keeps its budget while `ending` runs, so it must be short.
+/// Nothing is released earlier than without it. `ending` is not called when
+/// the run fails before it has taken its lease.
+///
+/// After a run that finished by itself, the retention sweep runs when it
+/// is due ([`crate::retention::sweep_if_due`]): the command is over and its
+/// entry released, so it delays nobody's start. Not after a command that a
+/// signal ended, and not when a stop is waiting
+/// ([`crate::Supervisor::stop_pending`]) or `hooks.cancelled` says so; a
+/// stop that arrives during the sweep ends it at its next item. No signal
+/// is taken from the supervisor for this: whatever
+/// [`crate::Supervisor::take_pending`] holds when the run is over is still
+/// there for the caller. Each step that failed is passed to
+/// `hooks.progress` as a `task-traffic-controller: cleanup: ...` line, and
+/// nothing the sweep does, a panic included, changes what is returned.
+pub fn run_gated_with(
+    ctx: &Context,
+    cfg: &Config,
+    opts: &Opts,
+    id: &str,
+    hooks: &Hooks,
+    ending: &dyn Fn(&Ending),
+) -> Result<Gated> {
     let plan = plan(ctx, cfg, opts)?;
+    // The lease is taken before the ledger entry so the entry is never
+    // observed without a held lease.
+    let guard = OwnerGuard::new(lock::take_lease(ctx, id)?, id, false);
+    let told = std::cell::Cell::new(false);
+    let tell = |e: Ending| {
+        if !told.replace(true) {
+            ending(&e)
+        }
+    };
+    let out = gated(ctx, cfg, opts, id, hooks, plan, &guard, &tell);
+    if let Err(e) = &out {
+        tell(Ending::Failed(e));
+    }
+    drop(guard);
+    let (exit, record) = match out? {
+        Gate::Interrupted(sig) => return Ok(Gated::Interrupted(sig)),
+        Gate::Finished(exit, record) => (exit, record),
+    };
+    let _ = managed::append_record(ctx, &record);
+    // Not after a command that was stopped: whoever stopped it wants this
+    // process gone, not tidying up.
+    if !matches!(exit, Exit::Signal(_)) {
+        crate::retention::after_command(
+            ctx,
+            &crate::retention::Keep::of(cfg),
+            hooks.cancelled,
+            hooks.progress,
+        );
+    }
+    Ok(Gated::Finished(exit))
+}
+
+enum Gate {
+    Interrupted(i32),
+    Finished(Exit, Box<Record>),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated(
+    ctx: &Context,
+    cfg: &Config,
+    opts: &Opts,
+    id: &str,
+    hooks: &Hooks,
+    plan: Plan,
+    guard: &OwnerGuard,
+    tell: &dyn Fn(Ending),
+) -> Result<Gate> {
     let limits = cfg.limits();
 
-    // Register as waiting. The lease is taken before the ledger entry so
-    // the entry is never observed without a held lease. A busy ledger lock
-    // (a saturated machine can stall its holder for seconds) is retried
-    // rather than failing a command that may have queued for minutes.
-    let guard = OwnerGuard::new(lock::take_lease(ctx, id)?, id, false);
+    // Register as waiting. A busy ledger lock (a saturated machine can
+    // stall its holder for seconds) is retried rather than failing a
+    // command that may have queued for minutes.
     ctx.supervisor.waiting();
-    let mut stop = || stop_requested(ctx, id, hooks);
+    let mut stop = || stop_requested(ctx, id, hooks, tell);
     if let managed::Pushed::Interrupted(sig) =
         managed::push_entry(ctx, id, opts, &plan, None, Some(&mut stop))?
     {
-        return Ok(Gated::Interrupted(sig));
+        return Ok(Gate::Interrupted(sig));
     }
 
     let enqueued = ctx.clock.monotonic();
@@ -375,8 +469,8 @@ pub fn run_gated(
         every_non_tty: Duration::from_secs(cfg.progress_interval_secs_non_tty.max(1)),
     };
     loop {
-        if let Some(sig) = stop_requested(ctx, id, hooks) {
-            return Ok(Gated::Interrupted(sig));
+        if let Some(sig) = stop_requested(ctx, id, hooks, tell) {
+            return Ok(Gate::Interrupted(sig));
         }
         // The command that asked for this one has ended (stopped, most
         // likely): nobody is left to want it, so it is not started as a
@@ -385,8 +479,9 @@ pub fn run_gated(
             (hooks.progress)(
                 "task-traffic-controller: the command this was started from has ended; not starting",
             );
+            tell(Ending::Interrupted(libc::SIGTERM));
             remove_entry(ctx, id);
-            return Ok(Gated::Interrupted(libc::SIGTERM));
+            return Ok(Gate::Interrupted(libc::SIGTERM));
         }
         let Waiting {
             reason,
@@ -441,32 +536,37 @@ pub fn run_gated(
     let sig = ctx.supervisor.take_pending();
     if sig != 0 || (hooks.cancelled)() {
         let sig = if sig != 0 { sig } else { libc::SIGTERM };
+        tell(Ending::Interrupted(sig));
         remove_entry(ctx, id);
-        return Ok(Gated::Interrupted(sig));
+        return Ok(Gate::Interrupted(sig));
     }
-    let ran = match managed::run_plain_command(ctx, &guard, opts, limits) {
+    let ran = match managed::run_plain_command(ctx, guard, opts, limits) {
         // A signal landed after the last check above but before the command
         // existed: it never starts. Same path as an interruption while
         // waiting.
         Ok(runner::Launch::Interrupted(sig)) => {
+            tell(Ending::Interrupted(sig));
             remove_entry(ctx, id);
-            return Ok(Gated::Interrupted(sig));
+            return Ok(Gate::Interrupted(sig));
         }
         Ok(runner::Launch::Ran(r)) => Ok(r),
         Err(e) => Err(e),
     };
     let cpu_secs = ran.as_ref().map_or(0.0, |r| r.outcome.cpu_secs);
+    match &ran {
+        Ok(r) => tell(Ending::Finished(r.outcome.exit)),
+        Err(e) => tell(Ending::Failed(e)),
+    }
     let entry = settle_entry(ctx, id, opts.parent.as_deref(), cpu_secs);
-    drop(guard);
     let Ran {
         outcome: out,
         started_at,
         contended,
     } = ran?;
     let key = plan.key;
-    let _ = history::append(
-        ctx.paths.history_file(),
-        &Record {
+    Ok(Gate::Finished(
+        out.exit,
+        Box::new(Record {
             key: key.hash,
             repo: key.repo,
             subdir: key.subdir,
@@ -487,14 +587,13 @@ pub fn run_gated(
             contended,
             measurement_id: None,
             extra: Default::default(),
-        },
-    );
-    Ok(Gated::Finished(out.exit))
+        }),
+    ))
 }
 
 /// The signal that stopped a run while it waited (SIGTERM for a
 /// cancellation), after removing its entry; `None` to carry on.
-fn stop_requested(ctx: &Context, id: &str, hooks: &Hooks) -> Option<i32> {
+fn stop_requested(ctx: &Context, id: &str, hooks: &Hooks, tell: &dyn Fn(Ending)) -> Option<i32> {
     let sig = ctx.supervisor.take_pending();
     let sig = if sig != 0 {
         sig
@@ -503,6 +602,7 @@ fn stop_requested(ctx: &Context, id: &str, hooks: &Hooks) -> Option<i32> {
     } else {
         return None;
     };
+    tell(Ending::Interrupted(sig));
     remove_entry(ctx, id);
     Some(sig)
 }
@@ -511,7 +611,8 @@ pub(crate) fn remove_entry(ctx: &Context, id: &str) {
     settle_entry(ctx, id, None, 0.0);
 }
 
-/// Remove the entry `id` and its lease, adding the `cpu_secs` its command
+/// Remove the entry `id` and its lease file (the caller holds the lease, so
+/// the file goes while it is locked), adding the `cpu_secs` its command
 /// used to what its `parent` (if that is still there) has seen its nested
 /// entries use. Returns the entry as it was, when the ledger could be
 /// read.
@@ -740,6 +841,72 @@ mod tests {
                 cwd: dir.to_path_buf(),
                 ..Opts::default()
             }
+        }
+
+        /// The caller hears how the run ends while the entry is still in
+        /// the ledger and the lease still held, so whatever it records
+        /// there exists before anybody can find the run gone.
+        #[test]
+        fn the_ending_is_told_before_the_entry_and_the_lease_are_released() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, _clock) = ctx_in(dir.path());
+            let seen = Cell::new(0);
+            let registered = |id: &str| {
+                Ledger::load(&ctx.paths.ledger_file())
+                    .unwrap()
+                    .find(id)
+                    .is_some()
+            };
+            let ending = |e: &Ending| {
+                seen.set(seen.get() + 1);
+                assert!(matches!(e, Ending::Finished(Exit::Code(3))), "{e:?}");
+                assert!(registered("r"));
+                assert!(lock::lease_is_held(&ctx, "r"));
+                // Not recorded yet either: the record follows the release.
+                assert!(history::read_all(ctx.paths.history_file())
+                    .unwrap()
+                    .is_empty());
+            };
+            let got = run_gated_with(
+                &ctx,
+                &Config::default(),
+                &opts(dir.path(), &["sh", "-c", "exit 3"]),
+                "r",
+                &Hooks::quiet(),
+                &ending,
+            )
+            .unwrap();
+            assert!(matches!(got, Gated::Finished(Exit::Code(3))));
+            assert_eq!(seen.get(), 1);
+            assert!(!registered("r"));
+            assert!(!lock::lease_is_held(&ctx, "r"));
+            assert!(!ctx.paths.lease_file("r").exists());
+
+            // Cancelled while waiting: told once, as a SIGTERM, with the
+            // lease still held.
+            let seen = Cell::new(0);
+            let ending = |e: &Ending| {
+                seen.set(seen.get() + 1);
+                assert!(matches!(e, Ending::Interrupted(libc::SIGTERM)), "{e:?}");
+                assert!(lock::lease_is_held(&ctx, "c"));
+            };
+            let hooks = Hooks {
+                cancelled: &|| true,
+                progress: &|_| {},
+                progress_tty: false,
+            };
+            let got = run_gated_with(
+                &ctx,
+                &Config::default(),
+                &opts(dir.path(), &["true"]),
+                "c",
+                &hooks,
+                &ending,
+            )
+            .unwrap();
+            assert!(matches!(got, Gated::Interrupted(libc::SIGTERM)));
+            assert_eq!(seen.get(), 1);
+            assert!(!registered("c"));
         }
 
         #[test]

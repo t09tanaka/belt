@@ -227,7 +227,7 @@ pub fn load_sidecar(ctx: &Context, id: &str) -> Loaded {
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = crate::paths::temp_file_in(dir)?;
     serde_json::to_writer_pretty(&mut tmp, value)?;
     tmp.write_all(b"\n")?;
     tmp.as_file().sync_all()?;
@@ -689,6 +689,9 @@ pub struct OwnerGuard {
     /// The recorder of the command's descendants failed in this process, so
     /// nothing can be ruled out: [`finish`] does not release.
     tracker_unknown: std::sync::atomic::AtomicBool,
+    /// The retention numbers of the configuration it was registered with,
+    /// for the sweep [`finish`] runs when one is due.
+    keep: Option<crate::retention::Keep>,
 }
 
 impl OwnerGuard {
@@ -698,7 +701,13 @@ impl OwnerGuard {
             id: id.to_string(),
             managed,
             tracker_unknown: std::sync::atomic::AtomicBool::new(false),
+            keep: None,
         }
+    }
+
+    fn with_keep(mut self, keep: crate::retention::Keep) -> Self {
+        self.keep = Some(keep);
+        self
     }
 
     pub fn command_id(&self) -> &str {
@@ -927,7 +936,7 @@ pub fn register(
         Ok(Pushed::Existing { seq, sidecar }) => (seq, false, sidecar.phase, sidecar.boot_id),
         Ok(Pushed::Terminal(sc)) => {
             drop(lease);
-            let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+            lock::remove_if_unheld(&ctx.paths.lease_file(id));
             return Ok(Registration::AlreadyTerminal(sc));
         }
         Ok(Pushed::Interrupted(_)) => unreachable!("register passes no stop hook"),
@@ -935,7 +944,7 @@ pub fn register(
             drop(lease);
             // Only if nobody registered it meanwhile.
             if !matches!(e, Error::Conflict(_)) {
-                let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+                lock::remove_if_unheld(&ctx.paths.lease_file(id));
             }
             return Err(e);
         }
@@ -949,7 +958,7 @@ pub fn register(
             newly_registered: newly,
             boot_id,
         },
-        OwnerGuard::new(lease, id, true),
+        OwnerGuard::new(lease, id, true).with_keep(crate::retention::Keep::of(cfg)),
     ))
 }
 
@@ -1256,6 +1265,7 @@ fn launch_command(
 /// free the budget with nothing recorded.
 pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()> {
     let id = guard.id.clone();
+    let sweeps = sweeps_after(&kind);
     if guard.managed {
         if guard
             .tracker_unknown
@@ -1309,8 +1319,21 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
         })?;
     }
     exec::remove_entry(ctx, &id);
+    let keep = guard.keep;
     drop(guard);
+    // The command is over and its budget free: the retention sweep, when
+    // one is due. Only after a command that ended well: a caller that
+    // cancels, or has a failure to deal with, gets its answer at once.
+    if let (Some(keep), true) = (keep, sweeps) {
+        crate::retention::after_command(ctx, &keep, &|| false, &|line| eprintln!("{line}"));
+    }
     Ok(())
+}
+
+/// Whether [`finish`] runs the retention sweep (when one is due) after a
+/// command that ended as `kind`: only after one that exited with 0.
+pub fn sweeps_after(kind: &TerminalKind) -> bool {
+    matches!(kind, TerminalKind::Exited { code: 0 })
 }
 
 /// Settle a managed entry by hand after investigating it (for example a
@@ -1383,7 +1406,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
     if ledger.remove(id) {
         ledger.save(&ctx.paths.ledger_file())?;
     }
-    let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+    lock::remove_if_unheld(&ctx.paths.lease_file(id));
     Ok(())
 }
 
@@ -1591,7 +1614,7 @@ pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Resul
             if ledger.remove(id) {
                 ledger.save(&ctx.paths.ledger_file())?;
             }
-            let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+            lock::remove_if_unheld(&ctx.paths.lease_file(id));
         }
         _ => settle_by_hand(ctx, id, kind, &detail)?,
     }
@@ -1599,22 +1622,75 @@ pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Resul
     Ok(typed(r))
 }
 
+/// Append `rec` to the history under the history lock, so it cannot land
+/// between a trim's read and its replacement of the file. One flock per
+/// record. A lock that stays busy for a second is not waited for: the
+/// record is then appended without it (a trim carries over what was
+/// appended while it wrote, so only the instant of its rename is exposed).
+pub fn append_record(ctx: &Context, rec: &Record) -> Result<()> {
+    let _lock = lock::acquire(
+        &ctx.paths.history_lock(),
+        ctx.ledger_lock_timeout
+            .min(std::time::Duration::from_secs(1)),
+    )
+    .ok();
+    history::append(ctx.paths.history_file(), rec)
+}
+
 /// Trim the history to `keep` records per key, under the history lock so a
 /// concurrent [`record_measurement`] cannot append between the read and the
 /// rewrite (which would drop the record but leave its `.applied` marker).
 /// Returns the records dropped.
 pub fn trim_history(ctx: &Context, keep: usize) -> Result<usize> {
+    trim_history_aged(ctx, keep, None)
+}
+
+/// [`trim_history`], and with `cutoff` also drop the records of every key
+/// whose newest record started before it ([`history::trim_aged`]).
+pub fn trim_history_aged(
+    ctx: &Context,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
-    history::trim(ctx.paths.history_file(), keep)
+    trim_history_locked(ctx, keep, cutoff)
+}
+
+/// [`trim_history_aged`] for a caller that holds the history lock.
+pub(crate) fn trim_history_locked(
+    ctx: &Context,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<usize> {
+    let (dropped, ids) = history::trim_collect(ctx.paths.history_file(), keep, cutoff)?;
+    // A marker lives exactly as long as its record: remove it now, under
+    // the same lock, not when a later sweep notices.
+    for id in ids {
+        let _ = std::fs::remove_file(ctx.paths.measurements_dir().join(format!("{id}.applied")));
+    }
+    let _ = std::fs::remove_dir(ctx.paths.measurements_dir());
+    Ok(dropped)
 }
 
 /// Remove the `.applied` markers whose measurement no longer has a record in
 /// the history. A marker is kept for as long as its record is: the history
 /// keeps the newest records per key ([`history::trim`]), and what it still
 /// holds is exactly what a replayed measurement could duplicate. Run after
-/// [`trim_history`]. Returns how many were removed.
+/// [`trim_history`].
+///
+/// Also settles the `.pending` markers an attempt left behind (it failed
+/// or died between the two markers of [`record_measurement`]). An attempt
+/// holds the history lock for its whole length, so under that lock a
+/// `.pending` is always a dead attempt's: when its record is in the history
+/// it becomes `.applied` (what a retry would conclude), otherwise it is
+/// removed (a retry appends again). Returns how many files were removed.
 pub fn gc_measurements(ctx: &Context) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
+    gc_measurements_locked(ctx)
+}
+
+/// [`gc_measurements`] for a caller that holds the history lock.
+pub(crate) fn gc_measurements_locked(ctx: &Context) -> Result<usize> {
     let Ok(rd) = std::fs::read_dir(ctx.paths.measurements_dir()) else {
         return Ok(0);
     };
@@ -1624,55 +1700,201 @@ pub fn gc_measurements(ctx: &Context) -> Result<usize> {
         .collect();
     let mut removed = 0;
     for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
-        let stem = p.file_stem().and_then(|s| s.to_str());
-        let applied = p.extension().is_some_and(|x| x == "applied");
-        if applied
-            && stem.is_some_and(|s| !recorded.contains(s))
-            && std::fs::remove_file(&p).is_ok()
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("applied") => {
+                if !recorded.contains(stem) && std::fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+            Some("pending") => {
+                if recorded.contains(stem) {
+                    // Applied before it is removed, so a crash here still
+                    // leaves one of the two.
+                    if std::fs::write(p.with_extension("applied"), b"").is_ok() {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                } else if std::fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Empty: remove it too (creators hold this lock).
+    let _ = std::fs::remove_dir(ctx.paths.measurements_dir());
+    Ok(removed)
+}
+
+/// Remove the sidecars of managed commands that the retention rule says go
+/// ([`crate::retention::sidecar_due`]): one that ended more than
+/// `keep_days` ago (the receipt of a finished run is only needed so a
+/// repeated registration finds its outcome), and one an hour old that was
+/// never launched or is not JSON and has neither a ledger entry nor a held
+/// lease (a crash between writing the sidecar and saving the ledger left
+/// it), and one whose launch was begun (or that another version wrote)
+/// that has neither and was last written `keep_days` ago. One whose entry
+/// is in the ledger is never removed. Files that are not sidecars are not
+/// touched here. Returns how many were removed.
+pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
+    // Found without the lock, removed under it, so a registration cannot
+    // slip in between the look at the ledger and the removal.
+    let found = sidecar_candidates(ctx, keep_days, &mut || true);
+    let _guard = lock::ledger(ctx)?;
+    let ledger = Ledger::load(&ctx.paths.ledger_file())?;
+    Ok(remove_sidecars_locked(
+        ctx,
+        &ledger,
+        &found,
+        keep_days,
+        &mut || true,
+    ))
+}
+
+/// What the sidecar of `id` is to the retention rule, as it is on disk now.
+/// `None`: no such file.
+fn sidecar_view(ctx: &Context, id: &str, in_ledger: bool) -> Option<crate::retention::SidecarView> {
+    use crate::retention::SidecarKind;
+    let p = ctx.paths.managed_file(id);
+    let modified = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+    let kind = match load_sidecar(ctx, id) {
+        Loaded::Missing => return None,
+        Loaded::Ok(sc) if sc.phase == Phase::Terminal => {
+            SidecarKind::Ended(sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at))
+        }
+        Loaded::Ok(sc) if sc.phase == Phase::Registered => SidecarKind::NeverLaunched,
+        // Another version's sidecar is JSON too: only what no version
+        // could have finished writing is a leftover.
+        Loaded::Corrupt(_)
+            if std::fs::read(&p)
+                .is_ok_and(|b| serde_json::from_slice::<serde_json::Value>(&b).is_err()) =>
+        {
+            SidecarKind::Unparseable
+        }
+        _ => SidecarKind::Other,
+    };
+    let child_alive = kind == SidecarKind::Other && recorded_child_alive(&p);
+    Some(crate::retention::SidecarView {
+        kind,
+        in_ledger,
+        lease_held: false,
+        child_alive,
+        modified: modified.into(),
+    })
+}
+
+/// Whether the child a sidecar file records (`child.pid`, and
+/// `child.pgid` when there is one) is running, asked with signal 0 only
+/// ([`crate::retention::pid_alive`]). Read from the JSON as it is, so another
+/// version's file is understood too. No child recorded: not alive. A file
+/// or pid that cannot be read, or a pid that must never be signalled,
+/// counts as alive.
+fn recorded_child_alive(path: &Path) -> bool {
+    use crate::retention::pid_alive;
+    // It was read as JSON a moment ago: failing now proves nothing.
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return true;
+    };
+    let Some(child) = v.get("child").filter(|c| !c.is_null()) else {
+        return false;
+    };
+    let Some(pid) = child.get("pid").and_then(|p| p.as_u64()) else {
+        return true;
+    };
+    if u32::try_from(pid).map_or(true, pid_alive) {
+        return true;
+    }
+    match child.get("pgid").filter(|g| !g.is_null()) {
+        None => false,
+        Some(g) => g
+            .as_i64()
+            .and_then(|g| u32::try_from(g).ok())
+            .is_none_or(pid_alive),
+    }
+}
+
+/// The ids of the sidecars that [`crate::retention::sidecar_due`] would let
+/// go if they had no ledger entry and no lease holder, oldest file first:
+/// what [`remove_sidecars_locked`] then looks at again under the ledger
+/// lock. Everything that takes time is done here, without any lock: the
+/// listing, and reading and parsing each file. The oldest come first so
+/// that a sweep that runs out of time has looked at the ones most likely
+/// to go. `go` is asked before each file is read; false stops.
+pub(crate) fn sidecar_candidates(
+    ctx: &Context,
+    keep_days: u64,
+    go: &mut dyn FnMut() -> bool,
+) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
+        return Vec::new();
+    };
+    let now = ctx.clock.now();
+    let mut old: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for ent in rd.filter_map(|e| e.ok()) {
+        let p = ent.path();
+        let (Some(id), true) = (
+            p.file_stem().and_then(|s| s.to_str()),
+            p.extension().is_some_and(|x| x == "json"),
+        ) else {
+            continue;
+        };
+        let Ok(modified) = ent.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        old.push((modified, id.to_string()));
+    }
+    old.sort();
+    let mut found = Vec::new();
+    for (_, id) in old {
+        if !go() {
+            break;
+        }
+        if sidecar_view(ctx, &id, false)
+            .is_some_and(|v| crate::retention::sidecar_due(&v, now, keep_days))
+        {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// Remove those of the sidecars `ids` ([`sidecar_candidates`]) that the
+/// retention rule lets go. The caller holds the ledger lock and read
+/// `ledger` under it, so no registration can slip in between the look and
+/// the removal. Each one is read again here (it may have been registered
+/// anew since it was found), and its lease is looked at last, only when
+/// everything else says it goes. `allow` is asked before each; false stops.
+pub(crate) fn remove_sidecars_locked(
+    ctx: &Context,
+    ledger: &Ledger,
+    ids: &[String],
+    keep_days: u64,
+    allow: &mut dyn FnMut() -> bool,
+) -> usize {
+    let now = ctx.clock.now();
+    let mut removed = 0;
+    for id in ids {
+        if ledger.find(id).is_some() {
+            continue;
+        }
+        if !allow() {
+            break;
+        }
+        let due = sidecar_view(ctx, id, false)
+            .is_some_and(|v| crate::retention::sidecar_due(&v, now, keep_days));
+        if due
+            && !lock::lease_is_held(ctx, id)
+            && std::fs::remove_file(ctx.paths.managed_file(id)).is_ok()
         {
             removed += 1;
         }
     }
-    Ok(removed)
-}
-
-/// Remove the sidecars of managed commands that ended more than `keep_days`
-/// ago and have no ledger entry (the receipt of a finished run is only
-/// needed so a repeated registration finds its outcome), and temporary files
-/// of that age that an interrupted write left behind. A sidecar that is not
-/// terminal, one that cannot be read, and one whose entry is still in the
-/// ledger are never removed. Returns how many files were removed.
-pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
-    // Under the ledger lock, so a registration cannot slip in between the
-    // look at the ledger and the removal.
-    let _guard = lock::ledger(ctx)?;
-    let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
-        return Ok(0);
-    };
-    let ledger = Ledger::load(&ctx.paths.ledger_file())?;
-    let cutoff = ctx.clock.now() - chrono::Duration::days(keep_days as i64);
-    let mut removed = 0;
-    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
-        let old = match p.file_stem().and_then(|s| s.to_str()) {
-            Some(id) if p.extension().is_some_and(|x| x == "json") => match load_sidecar(ctx, id) {
-                Loaded::Ok(sc) => {
-                    sc.phase == Phase::Terminal
-                        && ledger.find(id).is_none()
-                        && sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at) < cutoff
-                }
-                _ => false,
-            },
-            // Not a sidecar: what a crashed atomic write leaves.
-            _ => p
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| DateTime::<Utc>::from(t) < cutoff),
-        };
-        if old && std::fs::remove_file(&p).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    removed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1713,7 +1935,20 @@ pub fn record_measurement(ctx: &Context, measurement_id: &str, rec: &Record) -> 
         measurement_id: Some(measurement_id.to_string()),
         ..rec.clone()
     };
-    history::append(ctx.paths.history_file(), &rec)?;
+    if let Err(e) = history::append(ctx.paths.history_file(), &rec) {
+        // Settle the marker now rather than leave it for a sweep: if the
+        // failed append still wrote the record, a retry must see a
+        // duplicate, otherwise it appends again.
+        let wrote = history::read_all(ctx.paths.history_file()).is_ok_and(|all| {
+            all.iter()
+                .any(|r| r.measurement_id.as_deref() == Some(measurement_id))
+        });
+        if wrote {
+            let _ = std::fs::write(&applied, b"");
+        }
+        let _ = std::fs::remove_file(&pending);
+        return Err(e);
+    }
     std::fs::write(&applied, b"")?;
     let _ = std::fs::remove_file(&pending);
     Ok(Measured::Applied)

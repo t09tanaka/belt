@@ -92,32 +92,169 @@ pub fn for_key(path: &Path, key: &str) -> Result<Vec<Record>> {
 
 /// Keep only the newest `keep` records per key. Returns records dropped.
 pub fn trim(path: &Path, keep: usize) -> Result<usize> {
-    let all = read_all(path)?;
+    trim_aged(path, keep, None)
+}
+
+/// [`trim`], and with `cutoff` also drop every record of a key whose newest
+/// record started before it (a command nobody has run since). A key that
+/// was seen after `cutoff` keeps its newest `keep` records whatever their
+/// age. Returns records dropped.
+pub fn trim_aged(path: &Path, keep: usize, cutoff: Option<DateTime<Utc>>) -> Result<usize> {
+    Ok(trim_collect(path, keep, cutoff)?.0)
+}
+
+/// Which of `all` (oldest first) a trim keeps, as indexes, and the
+/// `measurement_id`s that no kept record carries any more. An id that a
+/// kept record still carries is not returned, even when another record with
+/// it is dropped: its marker is what stops the measurement from being
+/// applied again.
+pub fn trim_plan(
+    all: &[Record],
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> (Vec<usize>, Vec<String>) {
     let mut counts: HashMap<&str, usize> = HashMap::new();
-    for r in &all {
+    let mut newest: HashMap<&str, DateTime<Utc>> = HashMap::new();
+    for r in all {
         *counts.entry(r.key.as_str()).or_default() += 1;
+        let t = newest.entry(r.key.as_str()).or_insert(r.started_at);
+        if r.started_at > *t {
+            *t = r.started_at;
+        }
     }
     let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut kept = Vec::new();
-    for r in &all {
+    let mut dropped = Vec::new();
+    for (i, r) in all.iter().enumerate() {
         let n = seen.entry(r.key.as_str()).or_default();
         *n += 1;
-        if counts[r.key.as_str()] - *n < keep {
-            kept.push(r);
+        let stale = cutoff.is_some_and(|c| newest[r.key.as_str()] < c);
+        if !stale && counts[r.key.as_str()] - *n < keep {
+            kept.push(i);
+        } else {
+            dropped.push(i);
         }
     }
-    let dropped = all.len() - kept.len();
-    if dropped > 0 {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        for r in &kept {
-            let mut line = serde_json::to_string(r)?;
-            line.push('\n');
-            tmp.write_all(line.as_bytes())?;
+    let still: std::collections::HashSet<&str> = kept
+        .iter()
+        .filter_map(|&i| all[i].measurement_id.as_deref())
+        .collect();
+    let mut gone: Vec<String> = Vec::new();
+    for i in dropped {
+        if let Some(id) = all[i].measurement_id.as_deref() {
+            if !still.contains(id) && !gone.iter().any(|g| g == id) {
+                gone.push(id.to_string());
+            }
         }
+    }
+    (kept, gone)
+}
+
+fn parse(bytes: &[u8]) -> Vec<Record> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Record>(line).ok())
+        .collect()
+}
+
+/// How many of `bytes` are whole lines: up to and including the last
+/// newline. The rest is a line that is not finished.
+pub fn whole_lines(bytes: &[u8]) -> usize {
+    bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+}
+
+/// What was appended to `path` after its first `from` bytes.
+fn appended_since(path: &Path, from: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut out = Vec::new();
+    f.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// [`trim_aged`], also returning the `measurement_id` of every record it
+/// dropped for good ([`trim_plan`]), so the caller can remove their markers
+/// at once. A history left with no record is removed, not kept as an empty
+/// file.
+///
+/// The file is replaced by a new one. Callers serialise with every writer
+/// of this version through the history lock; a released version appends
+/// without it, so what was appended while the new file was being written is
+/// carried over before the replacement. Only an append that lands between
+/// that last look and the rename (two system calls apart) is lost, and a
+/// line still half written at the last look is cut off (its writer holds
+/// the old file, so nothing could finish it).
+pub fn trim_collect(
+    path: &Path,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<(usize, Vec<String>)> {
+    trim_collect_with(path, keep, cutoff, &mut || {})
+}
+
+/// [`trim_collect`], calling `before_last_look` after the kept lines are
+/// written and before what was appended meanwhile is carried over (a seam
+/// for tests).
+fn trim_collect_with(
+    path: &Path,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+    before_last_look: &mut dyn FnMut(),
+) -> Result<(usize, Vec<String>)> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(e) => return Err(e.into()),
+    };
+    // Only whole lines are records. What follows the last newline is a
+    // line somebody is still writing (a released version appends without
+    // the lock): it is carried over with whatever comes after, as far as it
+    // is whole at the last look.
+    let whole = whole_lines(&bytes);
+    let all = parse(&bytes[..whole]);
+    let (kept, gone_ids) = trim_plan(&all, keep, cutoff);
+    let dropped = all.len() - kept.len();
+    if dropped == 0 {
+        return Ok((0, gone_ids));
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = crate::paths::temp_file_in(dir)?;
+    // How much of `tmp` is written, and how much of it ends at a newline.
+    let mut written = 0u64;
+    for &i in &kept {
+        let mut line = serde_json::to_string(&all[i])?;
+        line.push('\n');
+        tmp.write_all(line.as_bytes())?;
+        written += line.len() as u64;
+    }
+    let mut cut = written;
+    before_last_look();
+    let mut at = whole as u64;
+    loop {
+        let more = appended_since(path, at)?;
+        if more.is_empty() {
+            break;
+        }
+        tmp.write_all(&more)?;
+        if let Some(i) = more.iter().rposition(|&b| b == b'\n') {
+            cut = written + i as u64 + 1;
+        }
+        written += more.len() as u64;
+        at += more.len() as u64;
+    }
+    // Nothing can complete a line that is still half written here: its
+    // writer holds the old file. Left in, it would merge with the next
+    // append into one malformed line and lose that record too.
+    if cut < written {
+        tmp.as_file_mut().set_len(cut)?;
+    }
+    if cut == 0 {
+        std::fs::remove_file(path)?;
+    } else {
         tmp.persist(path).map_err(|e| e.error)?;
     }
-    Ok(dropped)
+    Ok((dropped, gone_ids))
 }
 
 #[cfg(test)]
@@ -209,6 +346,120 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_record_keeps_its_marker_while_a_kept_record_has_the_same_id() {
+        let with = |key: &str, id: Option<&str>| {
+            let mut r = rec(key, 1.0);
+            r.measurement_id = id.map(str::to_string);
+            r
+        };
+        // "dup" was appended twice (a resend that slipped through): the
+        // older copy is dropped, the newer one is kept, so its marker stays.
+        // "old" is only in a dropped record. "kept" is only in a kept one.
+        let all = [
+            with("a", Some("dup")),
+            with("a", Some("old")),
+            with("a", Some("old")),
+            with("a", None),
+            with("a", Some("dup")),
+            with("a", Some("kept")),
+        ];
+        let (kept, gone) = trim_plan(&all, 2, None);
+        assert_eq!(kept, [4, 5]);
+        assert_eq!(gone, ["old"]);
+        // Nothing dropped, nothing gone.
+        assert_eq!(trim_plan(&all, 6, None), ((0..6).collect(), vec![]));
+    }
+
+    #[test]
+    fn trim_carries_over_what_was_appended_without_the_lock_and_keeps_such_a_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        append(&p, &rec("a", 1.0)).unwrap();
+        append(&p, &rec("a", 2.0)).unwrap();
+        let len = std::fs::metadata(&p).unwrap().len();
+        append(&p, &rec("a", 3.0)).unwrap();
+        let more = appended_since(&p, len).unwrap();
+        assert_eq!(parse(&more).len(), 1);
+        assert_eq!(parse(&more)[0].wall_secs, 3.0);
+        assert!(appended_since(&p, std::fs::metadata(&p).unwrap().len())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn whole_lines_end_at_the_last_newline() {
+        assert_eq!(whole_lines(b""), 0);
+        assert_eq!(whole_lines(b"abc"), 0);
+        assert_eq!(whole_lines(b"abc\n"), 4);
+        assert_eq!(whole_lines(b"abc\nde"), 4);
+        assert_eq!(whole_lines(b"\n"), 1);
+    }
+
+    /// The tail of a line that was half written when the trim looked, and
+    /// arrives before the trim's last look, is carried over whole.
+    #[test]
+    fn a_line_caught_half_written_is_carried_over_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        for w in [1.0, 2.0, 3.0] {
+            append(&p, &rec("k", w)).unwrap();
+        }
+        let mut line = serde_json::to_string(&rec("k", 4.0)).unwrap();
+        line.push('\n');
+        let (head, tail) = line.split_at(line.len() / 2);
+        let add = |text: &str| {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        add(head);
+        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || add(tail)).unwrap();
+        assert_eq!(dropped, 2);
+        let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
+        assert_eq!(walls, vec![3.0, 4.0]);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+
+        // A file of whole lines that are all dropped is removed.
+        let r = dir.path().join("r.jsonl");
+        append(&r, &rec("k", 1.0)).unwrap();
+        assert_eq!(trim(&r, 0).unwrap(), 1);
+        assert!(!r.exists());
+    }
+
+    /// A half line nobody finishes (a writer that died, or one whose tail
+    /// lands in the old file after the trim's last look) must not be
+    /// persisted: the next append would merge with it and be lost.
+    #[test]
+    fn a_half_line_nobody_finishes_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        for w in [1.0, 2.0, 3.0] {
+            append(&p, &rec("k", w)).unwrap();
+        }
+        let mut line = serde_json::to_string(&rec("k", 4.0)).unwrap();
+        line.push('\n');
+        let head = &line[..line.len() / 2];
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(head.as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(trim(&p, 1).unwrap(), 2);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.ends_with('\n'), "{text:?}");
+        append(&p, &rec("k", 5.0)).unwrap();
+        let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
+        assert_eq!(walls, vec![3.0, 5.0]);
+
+        // With nothing kept, the half line alone does not keep the file.
+        let q = dir.path().join("q.jsonl");
+        append(&q, &rec("k", 1.0)).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&q).unwrap();
+        f.write_all(head.as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(trim(&q, 0).unwrap(), 1);
+        assert!(!q.exists());
+    }
+
+    #[test]
     fn trim_keeps_newest_per_key() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("history.jsonl");
@@ -224,5 +475,45 @@ mod tests {
         );
         assert_eq!(for_key(&p, "b").unwrap().len(), 1);
         assert_eq!(trim(&p, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn trim_aged_drops_keys_not_seen_since_the_cutoff_and_nothing_else() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        let at = |days_ago: i64| Utc::now() - chrono::Duration::days(days_ago);
+        let put = |key: &str, days_ago: i64| {
+            let mut r = rec(key, 1.0);
+            r.started_at = at(days_ago);
+            append(&p, &r).unwrap();
+        };
+        // "old": every record before the cutoff. "mixed": one old, one new
+        // (the key is still in use, so both stay). "new": recent.
+        put("old", 200);
+        put("old", 100);
+        put("mixed", 200);
+        put("mixed", 1);
+        put("new", 2);
+        let cutoff = Some(at(90));
+        assert_eq!(trim_aged(&p, 200, cutoff).unwrap(), 2);
+        assert!(for_key(&p, "old").unwrap().is_empty());
+        assert_eq!(for_key(&p, "mixed").unwrap().len(), 2);
+        assert_eq!(for_key(&p, "new").unwrap().len(), 1);
+        assert_eq!(trim_aged(&p, 200, cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn trim_aged_keeps_a_key_whose_newest_record_is_exactly_the_cutoff() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        let cutoff = Utc::now();
+        let mut r = rec("edge", 1.0);
+        r.started_at = cutoff;
+        append(&p, &r).unwrap();
+        assert_eq!(trim_aged(&p, 200, Some(cutoff)).unwrap(), 0);
+        r.started_at = cutoff - chrono::Duration::seconds(1);
+        let q = d.path().join("h2.jsonl");
+        append(&q, &r).unwrap();
+        assert_eq!(trim_aged(&q, 200, Some(cutoff)).unwrap(), 1);
     }
 }

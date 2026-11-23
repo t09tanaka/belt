@@ -225,6 +225,16 @@ pub trait Supervisor: Send + Sync {
     fn take_pending(&self) -> i32 {
         0
     }
+    /// Whether a stop was asked for, without taking anything: every signal
+    /// [`Supervisor::take_pending`] would return stays there for its
+    /// caller. True also for a stop that is seen and not kept (the
+    /// terminal's Ctrl-C while the command runs, which the command gets by
+    /// itself). The library asks before and during the retention sweep
+    /// that follows a command ([`crate::retention::sweep_if_due`]), which
+    /// then ends at its next item.
+    fn stop_pending(&self) -> bool {
+        false
+    }
     /// The command was spawned (`group`: it leads its own process group, so
     /// signals go to the whole group). From here the supervisor may forward
     /// stop signals itself, straight from its handlers, which closes the
@@ -264,6 +274,9 @@ pub struct Context {
     pub reap_cache: Arc<Mutex<HashMap<String, crate::lock::Cached>>>,
     /// Seconds before a kept entry is assessed again.
     pub reassess_secs: i64,
+    /// How long the retention sweep that follows a command may take
+    /// ([`crate::retention::SWEEP_BUDGET`]).
+    pub sweep_budget: Duration,
 }
 
 impl Context {
@@ -300,6 +313,7 @@ impl Context {
             ledger_lock_timeout: crate::lock::LEDGER_LOCK_TIMEOUT,
             reap_cache: Arc::default(),
             reassess_secs: crate::reap::REASSESS_SECS,
+            sweep_budget: crate::retention::SWEEP_BUDGET,
         }
     }
 
