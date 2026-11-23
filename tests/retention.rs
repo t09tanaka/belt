@@ -764,11 +764,17 @@ fn recorded_repo(w: &World, main: &Path) -> PathBuf {
     fs::create_dir_all(main).unwrap();
     w.git(main, &["init", "-q", "-b", "trunk"]);
     w.git(main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    recorded_repo_at(w, main)
+}
+
+/// [`recorded_repo`] for a repository that is there already.
+fn recorded_repo_at(w: &World, main: &Path) -> PathBuf {
     let mut c = Command::new(BIN);
     w.env(&mut c);
+    let name = main.file_name().unwrap().to_str().unwrap();
     let wt = main.with_extension("wt");
     let out = c
-        .args(["add", "-b", "x", wt.to_str().unwrap(), "HEAD"])
+        .args(["add", "-b", name, wt.to_str().unwrap(), "HEAD"])
         .current_dir(main)
         .output()
         .unwrap();
@@ -1017,6 +1023,34 @@ fn a_walk_hands_the_unused_repositories_to_a_detached_process_and_does_not_wait(
     w.add("wt3");
     wait_gone(&there.join("pool/wt-1-1-0"));
     assert!(!there.join("pool/wt-1-1-0").exists());
+}
+
+#[test]
+fn the_pool_of_an_old_name_is_emptied_and_the_one_in_use_is_not_touched() {
+    let w = World::new();
+    // The checkout was at `old`, was moved to `new`, and a symlink was
+    // put at the old path: its commands now use another directory of the
+    // cache, and the one of the old path is left with a spare.
+    let (old, new) = (w.base.join("repos/old"), w.base.join("repos/new"));
+    let old_key = recorded_repo(&w, &old);
+    let registered = spare(&w, &old, &old_key, "wt-1700000000-2000000000-0");
+    fs::rename(&old, &new).unwrap();
+    std::os::unix::fs::symlink(&new, &old).unwrap();
+    let new_key = recorded_repo_at(&w, &new);
+    assert_ne!(old_key, new_key);
+    assert_eq!(locked(&w, &new), ["fast-worktree pool"]);
+    unused_for(&old_key, WEEK + 60);
+    retire(&w, &[&old_key, &new_key]);
+    // The old name's spares go, as any spare is discarded: the files and
+    // the registration, found through the symlink.
+    wait_gone(&registered);
+    assert!(!registered.exists() && !old_key.join("pool/wt-1-1-0").exists());
+    assert_eq!(locked(&w, &new), Vec::<String>::new());
+    // What the repository uses now is as it was.
+    assert!(new_key.join("pool/wt-1-1-0").is_dir());
+    assert!(new_key.join("pool/fill.log").is_file());
+    // The old name's directory stays: the checkout is there.
+    assert!(old_key.join("lifecycle.lock").is_file());
 }
 
 /// The worktrees that git lists as locked, with the reason of each.

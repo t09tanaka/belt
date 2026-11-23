@@ -66,7 +66,7 @@ change bumps the minor version).
     low-priority `fast-worktree cache retire` process (a hidden
     subcommand), which starts a deleter of its own for what it moves. A
     sweep no longer looks at a trash entry's sibling on another volume
-    either: the deleter is given it with its note.
+    either: the deleter is given its note and then it.
 - Lock files (`.store.lock`, `lifecycle.lock`, `fill.lock`, the
   registration lock in `.git`, the trash's `.lock`) and the directories
   that hold them are not deleted while their repository is there: versions

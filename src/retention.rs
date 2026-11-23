@@ -143,7 +143,8 @@ fn sweep(main: Option<&Path>, hourly: bool) {
 /// removals on another volume left next to its worktrees.
 ///
 /// These run git and may wait for the repository's own locks, which is why
-/// they are done here and never for another repository.
+/// they are done here and never, in a command that somebody waits for, for
+/// another repository.
 fn own(root: &Path, main: &Path, hourly: bool) {
     let repo = root.join(paths::repo_key(main));
     if fs::create_dir_all(&repo).is_err() {
@@ -418,9 +419,10 @@ fn look(main: &Path, repo: &Path) -> Outside {
 /// which walks all repositories, takes a `.store.lock` only to remove
 /// records, which a rename of the directory does not disturb. They are
 /// still taken first, without waiting (held: the directory stays this
-/// time), and once they are held it is asked again whether the repository
-/// is still not in use and its checkout still missing.
-fn remove_gone(repo: &Path, main: &Path) -> Option<PathBuf> {
+/// time), and once they are held everything is asked again: the look
+/// before may have taken hours (a mount that came back), and a command may
+/// have run or a disk been taken out meanwhile.
+fn remove_gone(repo: &Path, record: &Record) -> Option<PathBuf> {
     let mut locks = vec![repo.join(crate::ecosystem::LIFECYCLE_LOCK)];
     for (_, dir) in cache::dirs(repo) {
         locks.push(dir.join(pool::FILL_LOCK));
@@ -435,7 +437,9 @@ fn remove_gone(repo: &Path, main: &Path) -> Option<PathBuf> {
             Err(_) => {}
         }
     }
-    if !unused(local(repo).last_used, SystemTime::now(), IDLE) || seen(main) != Seen::NotFound {
+    let still = unused(local(repo).last_used, SystemTime::now(), IDLE)
+        && is_gone(record.devices, &look(&record.main, repo));
+    if !still {
         return None;
     }
     trash::move_aside(repo).ok()
@@ -451,6 +455,10 @@ fn remove_gone(repo: &Path, main: &Path) -> Option<PathBuf> {
 /// - Else its pool is emptied ([`pool::retire`]): through git when the
 ///   checkout is there, and without it (the registrations stay for
 ///   [`pool::drop_dangling`]) when it cannot be reached.
+///
+/// The locks in the cache are taken without waiting (busy: the next walk
+/// asks again). Git's registration lock in a repository that is there is
+/// waited for, as by any command there: nobody waits for this process.
 ///
 /// What is moved into the trash is added to `moved`.
 fn retire_one(repo: &Path, moved: &mut Vec<PathBuf>) {
@@ -476,7 +484,11 @@ fn retire_one(repo: &Path, moved: &mut Vec<PathBuf>) {
     let outside = look(&record.main, repo);
     if is_gone(record.devices, &outside) {
         // Busy: not stamped, so that the next walk asks again.
-        moved.extend(remove_gone(repo, &record.main));
+        moved.extend(remove_gone(repo, &record));
+        return;
+    }
+    // The look may have taken long: a command may have run meanwhile.
+    if !unused(local(repo).last_used, SystemTime::now(), IDLE) {
         return;
     }
     let main = (outside.main == Seen::Found).then_some(record.main.as_path());
@@ -515,9 +527,13 @@ fn spawn_retire(repos: &[PathBuf]) {
     let Some(exe) = util::background_exe() else {
         return;
     };
+    let root = paths::cache_root();
     let prepare = |mut c: Command| {
+        // Not the caller's directory: a process that hangs on a dead
+        // mount would keep the volume of that directory busy too.
         c.args(["cache", "retire"])
             .args(repos)
+            .current_dir(&root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

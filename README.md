@@ -1198,7 +1198,7 @@ once.
   `<cache>/<repo>-<hash>/.retention-stamp`), a command deletes the kept refs
   that are no longer needed, the pool's leftovers, and the registrations of
   spares that are no longer there. This part runs git and may wait for that
-  repository's locks, so it is never done for another repository; and it
+  repository's locks, so no command does it for another repository; and it
   says what it deletes, so `pool fill`, which mostly runs in the background
   with its output in a log file, leaves it (and its hour) to the next
   command.
@@ -1215,7 +1215,9 @@ once.
   walk to one detached, low-priority process (`fast-worktree cache retire`,
   at most 200 of them, each at most once a day while its directory stays).
   Only this process looks at their checkouts, and nobody waits for it. It
-  takes every lock without waiting, and looks again once it holds them.
+  takes the locks in the cache without waiting (a busy one: the next walk
+  asks again) and looks again once it holds them; where the checkout is
+  there, it discards the spares with git as any command does.
 
 A sweep never fails the command that made it. A stamp that cannot be written
 is said once, and the walk is then made by every command.
@@ -1231,7 +1233,7 @@ is said once, and the walk is then made by every command.
 | `pool/fill.log` | the pool | 7 days after the last fill wrote to it, and no longer than the repository is in use; started afresh when it passes 1 MiB | the repository's hourly sweep; the detached process |
 | Registration of a spare whose directory is gone | `<git dir>/worktrees/wt-*` | until the next command in the repository | the repository's hourly sweep |
 | Trash entry | `<cache>/trash` | deleted at once in the background; a leftover of a killed deleter after 10 minutes, a `keep-` entry (a worktree `hook remove` kept) for 24 hours | the next fast-worktree command after those times |
-| Hidden sibling `.fast-worktree-trash-*` | next to a removed worktree on another volume than the cache | as a trash entry | the same, by the note the trash keeps of it, which goes with it; without a note, the next removal next to it and the repository's hourly sweep, by its name |
+| Hidden sibling `.fast-worktree-trash-*` | next to a removed worktree on another volume than the cache | as a trash entry | the same, by the note the trash keeps of it, which goes just before it; without a note, the next removal next to it and the repository's hourly sweep, by its name |
 | Kept ref whose commit a local branch or a tag has | `refs/fast-worktree/kept/*` | 25 hours: it protects nothing, but the removal that made it may be running, and the restore command for a worktree kept in the trash names it | the repository's hourly sweep (never `pool fill`), `kept prune`; a line on stderr names the ref, the commit and the branch or tag |
 | Any other kept ref (nothing has its commit, or only a remote-tracking branch) | the same | 30 days (the date in the ref's name) | the same; the line says that the 30 days passed and that `git gc` may drop the commit |
 | Lock files: `.store.lock` (one for each project), `lifecycle.lock`, `pool/fill.lock`; the directories they are in; `.main` and `.retention-stamp` | `<cache>/<repo>` | until the repository is gone (below): a few small files and empty directories for a repository | the detached process, once the repository ran no command for 7 days and its main checkout was deleted: the whole `<cache>/<repo>` at once |

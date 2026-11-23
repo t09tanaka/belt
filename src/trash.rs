@@ -320,7 +320,7 @@ pub fn sweep() {
 }
 
 /// What [`sweep`] deletes, for the trash directory `dir` at time `now`. A
-/// note goes with its sibling, right after it, once the sibling's name
+/// note goes with its sibling, just before it, once the sibling's name
 /// says stale (before that the sibling may be about to be put there),
 /// whether or not the sibling is still there.
 fn stale(dir: &Path, now: u64) -> Vec<PathBuf> {
@@ -353,9 +353,13 @@ fn stale(dir: &Path, now: u64) -> Vec<PathBuf> {
         }
         // The sibling is on another volume, which may be a network mount
         // that is down: it is not looked at here, in a command that
-        // somebody waits for. The deleter takes it, and then its note.
-        out.push(target);
+        // somebody waits for. The deleter takes its note, and then it. In
+        // that order, so that a deleter that hangs on that mount is not
+        // joined by another one with every command; should it die before
+        // the sibling is deleted, the sibling is still found by its name
+        // ([`sweep_siblings`]).
         out.push(e.path());
+        out.push(target);
     }
     out
 }
@@ -404,8 +408,8 @@ mod tests {
         assert!(note.is_file());
         // Not stale yet: neither the sibling nor the note goes.
         assert!(stale(&dir, 100 + SWEEP_AFTER_SECS).is_empty());
-        // Stale: the sibling for the deleter, and its note right after it.
-        let both = vec![d.clone(), note.clone()];
+        // Stale: its note for the deleter, and the sibling right after it.
+        let both = vec![note.clone(), d.clone()];
         assert_eq!(stale(&dir, 100 + SWEEP_AFTER_SECS + 1), both);
         // The sibling is not looked at here (it may be on a mount that is
         // down): gone or not, the deleter is given both, and the note
@@ -429,7 +433,7 @@ mod tests {
         let note = dir.join("beside-keep-200-100-1-1-wt");
         assert_eq!(fs::read(&note).unwrap(), d.as_os_str().as_bytes());
         assert!(stale(&dir, 200).is_empty(), "kept until its time is up");
-        assert_eq!(stale(&dir, 201), vec![d.clone(), note.clone()]);
+        assert_eq!(stale(&dir, 201), vec![note.clone(), d.clone()]);
         // A rename that fails leaves no note behind.
         assert!(beside(&base.join("vol/none"), "100-1-2-none", &dir).is_err());
         assert!(!dir.join("beside-100-1-2-none").exists());
