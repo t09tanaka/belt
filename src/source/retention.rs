@@ -4530,6 +4530,7 @@ mod tests {
                 )
             })
             .collect();
+        assert!(!expected.is_empty(), "the fixture names its repository");
         assert_eq!(refs(&c), expected);
         // the migration fills the same rows for a root made before 5b
         c.execute_batch(
