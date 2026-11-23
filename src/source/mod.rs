@@ -202,17 +202,23 @@ fn capture_of(
         Err(error) => {
             // An install that stopped part-way created only what it lists as
             // installed. The rest is given back now: a file that was there
-            // already (a dedup hit, or the one with other content that
-            // stopped the install) is not this capture's, and one that was
-            // not reached does not exist. What was installed stays reserved,
-            // for the abandonment to release.
+            // already with this content (a dedup hit) is not this capture's,
+            // and one that was not reached does not exist. What was installed
+            // stays reserved, for the abandonment to release, and so does the
+            // first file the install did not account for: the one it stopped
+            // at, which may be there with other content. The abandonment
+            // finds out which: not there, the content, or a file no root
+            // holds that is not its content, which it removes.
             if let Some(part) = error.downcast_ref::<StagedInstallError>() {
                 let rows = reserved.lock().unwrap_or_else(|e| e.into_inner());
-                let installed: std::collections::HashSet<&PathBuf> =
-                    part.installed.iter().collect();
+                let kept: std::collections::HashSet<&PathBuf> = part.installed.iter().collect();
+                let stopped = rows
+                    .iter()
+                    .map(|(to, _)| to)
+                    .find(|to| !kept.contains(to) && !part.reused.contains(to));
                 let keys: Vec<&str> = rows
                     .iter()
-                    .filter(|(to, _)| !installed.contains(to))
+                    .filter(|(to, _)| !kept.contains(to) && Some(to) != stopped)
                     .map(|(_, key)| key.as_str())
                     .collect();
                 // best effort, on the way out of an error: a reservation

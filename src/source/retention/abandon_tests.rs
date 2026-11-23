@@ -1166,65 +1166,188 @@ fn a_file_whose_install_was_cut_short_is_released_after_the_scratch_directory() 
     parts.assert_nothing_left(&run);
 }
 
+/// Plant `bytes` at `path` as a file of the store would be: mode 0644, one
+/// name.
+fn plant(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let new = path.with_extension("planting");
+    std::fs::write(&new, bytes).unwrap();
+    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::rename(&new, path).unwrap();
+}
+
+/// The capture of `parts.input` for `run`, without the secret file.
+fn capture_plain(
+    parts: &Parts,
+    run: &RunId,
+) -> Result<crate::source::Captured, crate::error::ApiError> {
+    let key = crate::secrets::key::load(&parts.root.path().join("key")).unwrap();
+    capture_run(
+        &BTreeMap::new(),
+        &parts.sources,
+        &parts.vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[],
+        },
+        run,
+        &SourceRequest::Directory {
+            dir: parts.input.clone(),
+        },
+        &CaptureParams::default(),
+    )
+}
+
 /// An install that stops part-way fails the capture: here a file that is not
-/// this manifest is at the manifest's destination, and the manifest is
-/// installed last. The capture gives back every reservation but those of the
-/// files it created, so the abandonment deletes exactly those, finishes, and
-/// leaves the file that was there as it was.
+/// this manifest is at the manifest's destination (a manifest an older
+/// version renamed without a sync, cut short by a power loss), and the
+/// manifest is installed last. One object of the input was there already,
+/// with its content. The capture gives back the reservation of that object,
+/// keeps those of the files it created and of the file it stopped at; the
+/// abandonment deletes the created ones and the stopping file, which no root
+/// holds and which is not its content, and keeps the object that was there.
+/// The next capture of the same content succeeds.
 #[test]
 fn an_install_that_stops_part_way_keeps_only_what_it_created_reserved() {
-    let capture = |parts: &Parts, run: &RunId| {
-        let key = crate::secrets::key::load(&parts.root.path().join("key")).unwrap();
-        capture_run(
-            &BTreeMap::new(),
-            &parts.sources,
-            &parts.vault,
-            &SecretInputs {
-                key: &key,
-                declared: &[],
-            },
-            run,
-            &SourceRequest::Directory {
-                dir: parts.input.clone(),
-            },
-            &CaptureParams::default(),
-        )
-    };
-    // The name of the manifest of the input, from a store of its own.
-    let id = {
-        let other = Parts::new();
-        capture(&other, &RunId::generate())
-            .unwrap()
-            .manifest
-            .ci_source_id
-    };
+    // The name of the manifest of the input, and one of its objects, from a
+    // store of its own.
+    let other = Parts::new();
+    let id = capture_plain(&other, &RunId::generate())
+        .unwrap()
+        .manifest
+        .ci_source_id;
+    let theirs = other
+        .stored_files()
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("/objects/"))
+        .unwrap();
     let parts = Parts::new();
-    let planted = parts
-        .state
-        .join("sources/manifests")
-        .join(format!("{id}.json"));
-    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
-    std::fs::write(&planted, b"not this manifest").unwrap();
+    let sources = parts.state.join("sources");
+    let reused = sources.join(theirs.strip_prefix(other.state.join("sources")).unwrap());
+    plant(&reused, &std::fs::read(&theirs).unwrap());
+    let planted = sources.join("manifests").join(format!("{id}.json"));
+    plant(&planted, b"not this manifest");
     let run = RunId::generate();
     parts.sources.own_capture_as(&run, &gone()).unwrap();
-    capture(&parts, &run).unwrap_err();
+    capture_plain(&parts, &run).unwrap_err();
     assert_eq!(std::fs::read(&planted).unwrap(), b"not this manifest");
     assert_eq!(parts.scratch_dirs(), Vec::<PathBuf>::new());
-    // Every object (the files and the unsent `.env`) was installed before
+    // Every object (the files and the unsent `.env`) is in the store before
     // the manifest stopped the install.
     let objects = FILES + 1;
     assert_eq!(parts.stored_files().len(), objects + 1);
-    // Reserved: what the install created, and nothing else.
+    // Reserved: what the install created, and the file it stopped at.
     assert_eq!(
         parts.count("SELECT count(*) FROM member WHERE object LIKE 'b:%'") as usize,
-        objects
+        objects - 1
     );
-    assert_eq!(parts.count("SELECT count(*) FROM member") as usize, objects);
+    assert_eq!(
+        parts.count(&format!(
+            "SELECT count(*) FROM member WHERE object='m:{id}'"
+        )),
+        1
+    );
+    let report = parts.passes();
+    assert_eq!(
+        (report.finished, report.unknown, report.corrupt_held),
+        (1, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(parts.stored_files(), vec![reused.clone()]);
+    assert_eq!(parts.index_rows(), 0);
+    // Nothing blocks the content any more.
+    let run = RunId::generate();
+    parts.sources.own_capture_as(&run, &gone()).unwrap();
+    capture_plain(&parts, &run).unwrap();
+    assert_eq!(parts.stored_files().len(), objects + 1);
+}
+
+/// A file that stopped an install and that another root holds is never
+/// removed, whatever its content: it is kept and counted, for `doctor`.
+#[test]
+fn a_file_that_stopped_an_install_and_another_root_holds_is_kept_and_counted() {
+    let parts = Parts::new();
+    let first = RunId::generate();
+    parts.sources.own_capture_as(&first, &me()).unwrap();
+    let id = capture_plain(&parts, &first).unwrap().manifest.ci_source_id;
+    let manifest = parts
+        .state
+        .join("sources/manifests")
+        .join(format!("{id}.json"));
+    plant(&manifest, b"not this manifest any more");
+    let held = parts.stored_files();
+    let run = RunId::generate();
+    parts.sources.own_capture_as(&run, &gone()).unwrap();
+    capture_plain(&parts, &run).unwrap_err();
+    // Every object was there with its content: only the manifest stays
+    // reserved.
+    assert_eq!(
+        parts.count(&format!(
+            "SELECT count(*) FROM member WHERE object='m:{id}'"
+        )),
+        2
+    );
+    let report = parts.passes();
+    assert_eq!(
+        (report.finished, report.unknown, report.corrupt_held),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert_eq!(parts.stored_files(), held);
+    assert_eq!(
+        std::fs::read(&manifest).unwrap(),
+        b"not this manifest any more"
+    );
+}
+
+/// A file a reservation names whose only other holder is the reservation of
+/// another root that never got its source (an abandoned one that stays) is
+/// kept, and so is that holder's membership.
+#[test]
+fn a_file_only_another_reservation_holds_is_kept() {
+    let parts = Parts::new();
+    let run = killed_at(&parts, "installed");
+    let files = parts.stored_files();
+    assert!(!files.is_empty());
+    let key: String = parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT object FROM member WHERE object LIKE 'b:%' ORDER BY object LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let other = "capture:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let c = parts.sources.retention.connect().unwrap();
+    c.execute("INSERT INTO root VALUES(?1,'abandoned',NULL)", [other])
+        .unwrap();
+    c.execute("INSERT INTO member VALUES(?1,?2)", [other, key.as_str()])
+        .unwrap();
     let report = parts.passes();
     assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
-    assert_eq!(parts.stored_files(), vec![planted.clone()]);
-    assert_eq!(std::fs::read(&planted).unwrap(), b"not this manifest");
-    assert_eq!(parts.index_rows(), 0);
+    let left = parts.stored_files();
+    assert_eq!(left.len(), 1);
+    assert!(left[0].ends_with(&key[2..]));
+    assert_eq!(parts.count("SELECT count(*) FROM member"), 1);
+    assert_eq!(parts.run_files(&run), Vec::<PathBuf>::new());
+}
+
+/// A reservation whose file was never installed goes with the rows of its
+/// object: nothing is left that no page visits.
+#[test]
+fn a_reservation_of_a_file_never_installed_leaves_no_object_row() {
+    let parts = Parts::new();
+    let run = killed_at(&parts, "reserved");
+    assert!(parts.count("SELECT count(*) FROM object") > 0);
+    let report = parts.passes();
+    assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
+    parts.assert_nothing_left(&run);
+    assert_eq!(parts.count("SELECT count(*) FROM object"), 0);
+    assert_eq!(parts.count("SELECT count(*) FROM publication"), 0);
 }
 
 /// A capture whose input keeps changing gives up after its passes. Every
@@ -1564,6 +1687,17 @@ fn a_reservation_is_all_or_nothing_and_only_of_what_the_index_names() {
     // A destination that is not the object's place.
     let bad = Intent {
         destination: parts.root.path().join("outside").join(&one),
+        ..object(&one)
+    };
+    assert!(index.reserve_capture(&root, &[object(&two), bad]).is_err());
+    // The object's place under another root.
+    let bad = Intent {
+        destination: parts
+            .root
+            .path()
+            .join("other/objects")
+            .join(&one[..2])
+            .join(&one),
         ..object(&one)
     };
     assert!(index.reserve_capture(&root, &[object(&two), bad]).is_err());

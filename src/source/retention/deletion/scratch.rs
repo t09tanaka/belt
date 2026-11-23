@@ -127,7 +127,7 @@ impl Index {
                 IntentKind::SecretBundle { .. } => continue,
             };
             ensure!(
-                intent.destination.ends_with(&path),
+                intent.destination == self.path.join(&path),
                 "a staged file is bound for a place the index does not name"
             );
             rows.push((intent.destination.clone(), key, path));
@@ -233,6 +233,16 @@ fn names_in(dir: &File) -> Result<Vec<std::ffi::CString>> {
     Ok(names)
 }
 
+#[cfg(test)]
+type Hook = Option<Box<dyn FnMut(&std::ffi::OsStr)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run between the `lstat` of a directory and its `openat`, in tests.
+    static BETWEEN: std::cell::RefCell<Hook> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn remove_entry(
     dir: &File,
     name: &std::ffi::OsStr,
@@ -260,6 +270,12 @@ fn remove_entry(
         rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
         return Ok(());
     }
+    #[cfg(test)]
+    BETWEEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(name)
+        }
+    });
     let below: File = rustix::fs::openat(dir, name, DIR, Mode::empty())?.into();
     let opened = rustix::fs::fstat(&below)?;
     ensure!(
@@ -297,5 +313,68 @@ mod tests {
         assert!(super::is_ours((7u64, 501), (7, 501)));
         assert!(!super::is_ours((7u64, 0), (7, 501)));
         assert!(!super::is_ours((8u64, 501), (7, 501)));
+    }
+
+    fn opened(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).unwrap()
+    }
+
+    fn device(path: &std::path::Path) -> rustix::fs::Dev {
+        rustix::fs::stat(path).unwrap().st_dev
+    }
+
+    /// An entry that is not on the file system the removal started on stays,
+    /// and so does everything under it.
+    #[test]
+    fn an_entry_on_another_device_is_not_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("s");
+        std::fs::create_dir_all(scratch.join("objects")).unwrap();
+        std::fs::write(scratch.join("objects/f"), b"x").unwrap();
+        let other = device(root.path()).wrapping_add(1);
+        let error = super::remove_entry(
+            &opened(root.path()),
+            "s".as_ref(),
+            other,
+            Some(super::Top::Own),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not provably ours"),
+            "{error:#}"
+        );
+        assert!(scratch.join("objects/f").exists());
+    }
+
+    /// A directory swapped for another between its `lstat` and its `openat`
+    /// is not entered: neither it nor the one that was there is emptied.
+    #[test]
+    fn a_directory_swapped_while_it_is_removed_stays() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("s");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("f"), b"x").unwrap();
+        let aside = root.path().join("aside");
+        let swap = root.path().join("swap");
+        std::fs::create_dir(&swap).unwrap();
+        std::fs::write(swap.join("g"), b"y").unwrap();
+        let (from, to, other) = (scratch.clone(), aside.clone(), swap.clone());
+        super::BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                std::fs::rename(&from, &to).unwrap();
+                std::fs::rename(&other, &from).unwrap();
+            }))
+        });
+        let error = super::remove_entry(
+            &opened(root.path()),
+            "s".as_ref(),
+            device(root.path()),
+            Some(super::Top::Own),
+        )
+        .unwrap_err();
+        super::BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(format!("{error:#}").contains("changed while"), "{error:#}");
+        assert!(aside.join("f").exists());
+        assert!(scratch.join("g").exists());
     }
 }

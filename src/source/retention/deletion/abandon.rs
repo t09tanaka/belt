@@ -53,6 +53,9 @@ pub struct AbandonReport {
     /// Object and manifest files claimed in this call (at most 32).
     pub paths: u32,
     pub unknown: u32,
+    /// Files a reservation named that another root holds and that are not
+    /// their content: kept, for `doctor`.
+    pub corrupt_held: u32,
     pub errors: Vec<String>,
 }
 
@@ -467,10 +470,23 @@ impl SourceStore {
                     }
                     cursor.object = object.clone();
                     if unfinished && self.retention.destination_absent(object, path) {
-                        c.execute(
+                        // The object a reservation alone named goes with it:
+                        // no member is left, and no claim was ever made.
+                        let tx = c.transaction()?;
+                        tx.execute(
                             "DELETE FROM member WHERE root=?1 AND object=?2",
                             params![root, object],
                         )?;
+                        let unheld = "NOT EXISTS(SELECT 1 FROM member WHERE object=?1) AND NOT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1)";
+                        tx.execute(
+                            &format!("DELETE FROM object WHERE id=?1 AND {unheld}"),
+                            [object],
+                        )?;
+                        tx.execute(
+                            &format!("DELETE FROM publication WHERE object=?1 AND {unheld}"),
+                            [object],
+                        )?;
+                        tx.commit()?;
                         continue;
                     }
                     match self.retention.release_member(
@@ -480,8 +496,9 @@ impl SourceStore {
                         path,
                         &mut budget.bytes,
                         true,
+                        unfinished,
                     )? {
-                        Released::Shared => {}
+                        Released::Shared(corrupt) => report.corrupt_held += u32::from(corrupt),
                         Released::Unproven(error) => {
                             report.unknown += 1;
                             report.errors.push(error);
