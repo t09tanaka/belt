@@ -345,7 +345,7 @@ Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要�
 
 明示 `retry` は通常と同じterminal・停止確定・回収・control revisionの条件を満たした場合だけ、同runの新attemptとして同じ原本を再実行する。baselineは作り直さない。元のsecret globs契約はprivate bindingに保持し、現在のproject configを再loadしない。原本secretはbounded/no-followのread-only処理で実行時の値をmaskし、bundleの配置・chmod・消去を原本へ行わない。元globsと現在の `.worktreeinclude` が選ぶpath集合がbaselineのsecret inventoryと違えば実行・retryを拒否し、新しい `exec` によるbaseline作成を求める。値の変更だけなら現物をmaskして実行でき、元Vault bundleの消去は妨げにならない。例外は1つで、CIのsplit Jobのfail-fastが一度も配置しないままcancelしたShardは、停止を証明するattemptが無くてもretryできる（何も実行されていないため）。attemptを持たないそれ以外のtaskを含むretryは断る。
 
-private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。現段階ではbindingの個別GCは行わず、親stateの削除まで保持する。（第25章の段階1・段階2で、放棄された取り込みとrunの刈り取りのときに消すように変える。提出を断ったrunのbindingは、今もその場で消す。）bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
+private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。提出を断ったrunのbindingはその場で消し、提出されなかった（放棄された）取り込みのbindingは、その取り込みと一緒に消す（25.4の (b)・(c)）。受理されたrunのbindingは、現段階では親stateの削除まで保持する。（第25章の段階2で、runの刈り取りのときに消すように変える。）bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
 
 依存の準備は、プロジェクトの `.fast-worktree.toml` の `[[clone]]`（と `post_add`）が担う。attempt workspaceをfast-worktreeで作る方針と、`.worktreeinclude` の扱いは22.5で定める。第8章のSetupRecipeとtemplateは、workflowのsetup stepの再利用に限る。`.fast-worktree.toml` を持たないプロジェクトでは、第8章の `[prepare]` が代わりを務める。両方がある場合は `.fast-worktree.toml` を優先し、`ci plan` が準備の出所（`fast-worktree` / `[prepare]` / workflowのsetup step）を表示する。
 
@@ -2042,7 +2042,9 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 ### (b) 提出されなかった取り込み
 
-**今の挙動。** 取り込みはCLIのprocessの中で、runの行ができる前に行われる（`src/service/submit.rs`・`src/service/ci_run.rs` → `service::input::capture` → `secrets::capture::capture_run` → `source::capture_for_run`）。順序は次のとおりである。
+(b) と (c) は実装してある。下の「段階1より前の挙動」は、この規則が入る前の挙動である。
+
+**段階1より前の挙動。** 取り込みはCLIのprocessの中で、runの行ができる前に行われる（`src/service/submit.rs`・`src/service/ci_run.rs` → `service::input::capture` → `secrets::capture::capture_run` → `source::capture_for_run`）。順序は次のとおりである。
 
 1. `sources/secrets.lock` を取る（secret fileがあるとき）。
 2. `sources/runs/<run>.lock` を作って取る（`lock_run`）。
@@ -2056,18 +2058,18 @@ LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` 
 
 enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（消すのは、提出が断られたときの `in-place/<run>.json` と、取り込みが失敗したときの平文の束だけ）。2と3の間で終わればlockだけが残り、6の後で終わればpending rootは無く、runのrootとそのmember・graphを名指して消すものが無い。親では、残った平文の束を片付ける処理が呼ばれていない（`sweep_store_copies` を呼ぶのはworkerだけである）。secretの束が際限なく残る。
 
-また、runの行が無いrunへのcancelを、今の実装は受理する（`control.rs` の `resolve` は、`Target::Run` を行の有無を見ずに通す）。取り込みの途中のCtrl-Cは、まだenqueueしていないrun IDへcancelを送り（`ci_run.rs`、`service/control.rs` の `cancel_and_stop`）、`run_cancel_intent`・`run_id` つきの `event`・`control_request` の行ができる。これは意図した挙動で（後から届くenqueueがcancelを引き継ぐ。`storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate`）、enqueueが届かなければ、この3つの行を消すものが無い。利用者が打ち間違えたrun IDへのcancelでも同じ行ができる。
+また、runの行が無いrunへのcancelを、段階1より前の実装は受理した（`control.rs` の `resolve` は、`Target::Run` を行の有無を見ずに通す）。取り込みの途中のCtrl-Cは、まだenqueueしていないrun IDへcancelを送り（`ci_run.rs`、`service/control.rs` の `cancel_and_stop`）、`run_cancel_intent`・`run_id` つきの `event`・`control_request` の行ができる。これは意図した挙動で（後から届くenqueueがcancelを引き継ぐ。`storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate`）、enqueueが届かなければ、この3つの行を消すものが無い。利用者が打ち間違えたrun IDへのcancelでも同じ行ができる。
 
 **規則。** 取り込みに持ち主を与える。
 
-- **持ち主の行が、最初の永続の書き込みである。** 取り込みを行う提出（`submit` と `ci run`）は、run IDを決めた直後、上の1より前に、`sources/retention.db` の `capture_owner` に1行を書く: run ID、状態（`capturing`）、pending rootのID（まだNULL）、場所、pid、processの開始identity。この行がcommitされるまで、lockもfileも作らない。pending rootのIDは、pending rootを作るのと同じtransactionで、この行に書く。
+- **持ち主の行が、最初の永続の書き込みである。** 取り込みを行う提出（`submit` と `ci run`）は、run IDを決めた直後、上の1より前に、`sources/retention.db` の `capture_owner` に1行を書く: run ID、状態（`capturing`）、pending rootのID（まだNULL）、場所、pid、processの開始identity。この行がcommitされるまで、lockもfileも作らない。pending rootのIDは、pending rootを作るのと同じtransactionで、この行に書く。storeそのものの固定のfile（`retention.db`、`mutation.lock`、directory）は、行より先にある（行はその `retention.db` に書く）。`capture_owner` の表は、`retention.db` を次に開いたときに足し、その版（`user_version`）は上げない: 更新のrollback（24.8）は `retention.db` を戻さないので、版を上げると、戻した古い版がこのfileを開けなくなる。古い版は、知らない表を読まない。
 - **計画の下書きは対象外。** 計画のための取り込み（`service/planning.rs` の `capture_into`）は、下書きのdirectory（`ci-plan-*/`）の中の、そのcommandだけのstoreへ書く。持ち主は下書きのdirectoryで、(a) の規則がdirectoryごと消す。`capture_owner` の行は書かない。
-- **引き渡し。** residentは、enqueueがrunの行をcommitした後に、その行を消す。enqueueは、既存の規則どおりsourceのguardを取ってからDBを操作し、commitまで持ち続ける（第23章）。取り込みを持つrunでは、そのguardの下で、`capture_owner` の行が `capturing` であることと、`sources/runs/<run>` があることを確かめ、どちらかが欠ければ `NOT_FOUND`（理由 `capture_abandoned`）で断って何も作らない。
+- **引き渡し。** residentは、enqueueがrunの行をcommitした後に、その行を消す。enqueueは、既存の規則どおりsourceのguardを取ってからDBを操作し、commitまで持ち続ける（第23章）。取り込みを持つrunでは、そのguardの下で、`capture_owner` の行が `capturing` であることと、`sources/runs/<run>` があることを確かめ、どちらかが欠ければ `NOT_FOUND`（理由 `capture_abandoned`）で断って何も作らない。この確認は、runの行がまだ無いときにだけ行う（行があれば、引き渡しは済んでいる）。
 - **持ち主の行を消すのはresidentだけである。** 取り込んだprocessは、自分の失敗（取り込みの失敗、enqueueの拒否、Ctrl-C）で終わるとき、平文の束（`sources/secrets/<run>.json`）をその場で消し（既存）、行の状態を `given_up` に変えてから終わる。行は消さない。残りは、削除の所有を持つresidentが消す。CLIは、sourceの削除の所有（第23章のBの排他）と親DBを持たないので、objectと親DBの行を自分では消せない。
-- **放棄の判定。** 状態が `given_up` の取り込みと、持ち主のprocessが居ない（場所が同じで、pidが居ないか開始identityが違う）取り込みは、放棄されたものである。状態が `capturing` で持ち主のprocessが生きている取り込みは進行中で、何があっても消さない。場所が違う行は判定できないので残し、`doctor` が示す。
-- **消す時点。** residentが、次の3つの出来事で、そのrunの放棄の処理を行う。(1) enqueueを断ったとき（その要求を処理するその場）。(2) 行の無いrunへのcancelを、放棄を理由に断ったとき（下）。(3) 保持driverのpass（25.11）。passごとに `capture_owner` の行を全部見る（行の数は、進行中と放棄された取り込みの数である）。(3) はcrashと、要求を1つも送らずに終わったCLIの受け皿である。
-- **放棄の処理。** sourceの削除の所有を取り、親DBにそのrunの行が無いことを確かめ直してから、下の「消すもの」を消す。runの行があれば、引き渡しは済んでいるので `capture_owner` の行だけを消す。
-- **消すもの。** すべて、run IDと、行が持つpending rootのIDだけから名指せる。この順で消す。
+- **放棄の判定。** 状態が `given_up` の取り込みと、持ち主のprocessが居ない（場所が同じで、pidが居ないか開始identityが違う）取り込みは、放棄されたものである。状態が `capturing` で持ち主のprocessが生きている取り込みは進行中で、何があっても消さない。場所が違う行は判定できないので残し、`doctor` が示す。場所・pid・開始identityと「居ない」の証明は、所有marker（`platform::owned_temp`）と同じものを使う: 場所が同じとは、hostとPID namespaceが同じことで、その上でOSのbootが違えば、持ち主はそのbootと一緒に終わっている。pidのprocessが居ても、その開始が記録より明らかに後なら別のprocessである。それ以外（読めない、zombie）は「居ない」としない。
+- **消す時点。** residentが、次の3つの出来事で、そのrunの放棄の処理を行う。(1) enqueueを断ったとき（その要求を処理するその場）。断ったresidentは、runの行が無いことを確かめた上で、行の状態を `given_up` にしてから放棄の処理を行う。持ち主のprocessが生きていて `capturing` のままでも、断られたenqueueがその取り込みの終わりである（CLIは、断られたrun IDでenqueueを送り直さない。送り直しても `capture_abandoned` で断られる）。residentが止まる途中で断ったときと、更新の試用中は行わず、(3) に任せる。(2) 行の無いrunへのcancelを、放棄を理由に断ったとき（下）。(3) 保持driverのpass（25.11）。passごとに `capture_owner` の行を全部見る（行の数は、進行中と放棄された取り込みの数である）。(3) はcrashと、要求を1つも送らずに終わったCLIの受け皿である。
+- **放棄の処理。** sourceの削除の所有を取り、親DBにそのrunの行が無いことを確かめ直してから、下の「消すもの」を消す。runの行があれば、引き渡しは済んでいるので `capture_owner` の行だけを消す（持ち主の状態と場所に依らない）。sourceの削除の所有を待たずに取れなければ、何もせず、次のpassに任せる。
+- **消すもの。** すべて、run IDと、行が持つpending rootのIDだけから名指せる。この順で消す。directoryは走査しない。run IDが名指すfile（3・4・5・7）は、自分のuidの通常のfileで、link数が1のときだけunlinkし、symlinkをたどらない。そうでないものは残し、その段で止めて、`capture_owner` の行も残す（次のpassがやり直し、`doctor` が行を示す）。Vaultが使用中のときも、その段で止めて次のpassに回す。
   1. 親DBの、そのrun IDの `run_cancel_intent`・`control_request`・`event` の行。1つのtransactionで、runの行が無いことを確かめ直して消す。
   2. 親Vaultの `secrets/<run>.json`（第23章のCの手順。claimを先に書く）と、完了した `vault_delete_claim` の行。Vaultの一時fileは (a) の規則が消す。
   3. 平文の束 `sources/secrets/<run>.json`。
@@ -2076,12 +2078,12 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
   6. runのroot（`id = <run>`、`kind = 'run'`）とpending root（行のID）の、memberとgraph。他のrootが持たないobjectとmanifestのfile（下）。memberが空になったrootの行。そのrunの `import_session`・`run_expiry` の行。
   7. `sources/runs/<run>.lock`（25.1の (A)）。
   8. 最後に `capture_owner` の行。
-- **放棄されたrootのobject。** 今のBのpageは、期限の来たrunのrootを起点にするので、行の無いrunのrootと、どのrunにも結び付かなかったpending rootを訪れない。rootの行だけを消すと、objectのfileが残る。したがって、Bのpageの起点に「放棄された取り込みのrunのrootとpending root」を足し、そのmemberのうち他のrootが持たないobjectとmanifestを、Bの保護（claimを先に、所有するpathだけ、内容の検証、32件・64 MiB）のまま消す。rootの行は、memberが空になってから消す。1 passで終わらなければ、`capture_owner` の行を残して次のpassが続ける。
+- **放棄されたrootのobject。** 今のBのpageは、期限の来たrunのrootを起点にするので、行の無いrunのrootと、どのrunにも結び付かなかったpending rootを訪れない。rootの行だけを消すと、objectのfileが残る。したがって、Bのpageの起点に「放棄された取り込みのrunのrootとpending root」を足し、そのmemberのうち他のrootが持たないobjectとmanifestを、Bの保護（claimを先に、所有するpathだけ、内容の検証、32件・64 MiB）のまま消す。rootの行は、memberが空になってから消す。1 passで終わらなければ、`capture_owner` の行を残して次のpassが続ける。放棄の処理は、objectを消す前に、2つのrootの種類を `abandoned` に変え、そのrootの未完了のgraphの行を消す。`abandoned` のrootは、「memberがまだ分からないroot（`source` がNULL）」として数えない（3の途中で終わった取り込みのpending rootは、そのままではBとCのpageとclaimの再生を止め続けるため）。それ以外の保護（古いmanifestの登録が済んでいること、ほかに `source` がNULLのrootと未完了のgraphが無いこと）は、Bと同じである。放棄の処理が書いたclaimには印を付け、crashで残った分は放棄のpassが再生する（出来事で消すものなので、時計のHoldを待たない。印の無いclaimは、今までどおりBのpageが再生する）。**memberになる前のfile**: local-ciは、objectとmanifestのfileを書き終えてから、それをpending rootのmemberとして登録する（`register_held`）。その間に終わった取り込みが書いたfileのうち、まだmemberでないものは、どの行からも名指せないので、消さずに残る（25.16）。
 - **行の無いrunへのcancel。** residentは、runの行が無いrunへのcancelを、**そのrunの `capture_owner` の行が `capturing` で、場所が同じで、持ち主のprocessが生きているときだけ**受理する。それ以外（行が無い、`given_up`、持ち主が居ない、場所が違う）は `NOT_FOUND` で断り、`run_cancel_intent`・`event`・`control_request` のどれも書かない。行が放棄を示していれば、断ったその場で放棄の処理を行う。確認と書き込みは、enqueueと同じくsourceのguard（共有）の下で行い、親DBのtransactionの中でrunの行の有無を確かめ直す（行があれば、行のあるrunへの通常のcancelになる）。受理したcancelが書く `control_request` の行には、run IDを書く（下のschema）。
 - **持ち主の行を書かない版が作った取り込み。** 最初の公開版が持ち主の行を書くので、書かない公開版は無い。公開前の版のCLIが残した取り込み（runの行も `capture_owner` の行も無い `sources/runs/<run>`）は、進行中か放棄かを証明できないので消さず、`doctor` が件数を示す。公開前の版が残した、行の無いrunの `run_cancel_intent`・`control_request`・`event` は、段階1のmigrationが消す（migrationは `coordinator.lock` の下で動き、その時点で進行中の取り込みのcancelを消しても、失われるのは「まだ提出していないrunのcancelの予約」だけである。そのCLIは、段階1のresidentに `capture_abandoned` で断られる。このmigrationは、更新の試用中にも動く。消すのは親DBの行だけで、fileは消さない。rollbackは親DBを退避から戻すので、25.1の8に反しない）。
 - **期限。** 放棄された取り込みは、residentが断った要求があればその場で、無ければ、residentが動いていれば保持driverの次のpass（60秒以内）で、動いていなければ次のresidentの起動直後のpassで消える。
 
-**挙動の変更。** (1) 行の無いrun IDへのcancelは、進行中の取り込みのものを除いて `NOT_FOUND` になる。今は受理して、`accepted = false`・`cancel_requested = true` の答えを返している。CLIの `cancel <run>` は、存在しないrun IDに `NOT_FOUND` を返す。(2) `storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate` は、進行中の `capture_owner` の行を前提に加えた形に変える（cancelの予約がenqueueと配置の門より先に効くことは変えない）。行の無いrunへのcancelを前提なしで受理することを確かめている試験（`service/resident/tests.rs` の、提出前の `cancel_and_stop` の試験を含む）は、前提を足すか、`NOT_FOUND` を期待する形に変える。(3) 取り込みの途中のCtrl-Cは今までどおり受理される（持ち主の行が最初に書かれているので）。持ち主の行を書く前のCtrl-Cは、何も作っていないので、cancelを送らずに終わる。
+**挙動の変更。** (1) 行の無いrun IDへのcancelは、進行中の取り込みのものを除いて `NOT_FOUND` になる。今は受理して、`accepted = false`・`cancel_requested = true` の答えを返している。CLIの `cancel <run>` は、存在しないrun IDに `NOT_FOUND` を返す。(2) `storage/tests.rs` の `run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate` は、進行中の `capture_owner` の行を前提に加えた形に変える（cancelの予約がenqueueと配置の門より先に効くことは変えない）。行の無いrunへのcancelを前提なしで受理することを確かめている試験（`service/resident/tests.rs` の、提出前の `cancel_and_stop` の試験を含む）は、前提を足すか、`NOT_FOUND` を期待する形に変える。(3) 取り込みの途中のCtrl-Cは今までどおり受理される（持ち主の行が最初に書かれているので）。CLIは、cancelを送った後に、行を `given_up` にして終わる。持ち主の行を書く前のCtrl-Cは、何も作っていないので、cancelを送らずに終わる（結果の状態は `not_submitted`）。(4) CLIは、run IDへのcancelに `NOT_FOUND` が返ったら、停止の確認を待たずに終わる（状態は `run_not_found`。止めるものが無い）。
 
 **安全の証明。** 取り込みの各時点でprocessが終わった場合に、残るものと、それを名指すものを挙げる。番号は「今の挙動」の順序で、0は持ち主の行の書き込みである。
 
@@ -2090,7 +2092,7 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 | 0より前 | 何も無い | 該当なし |
 | 0の後、2の前 | `capture_owner` の行 | 行そのもの |
 | 2の後、3の前 | 加えて `sources/runs/<run>.lock` | run ID |
-| 3の途中・後 | 加えてpending root、そのmember、objectとmanifestのfile、平文の束と `.secrets.tmp-*` | 行のpending rootのID（rootと同じtransactionで書く）、run ID。`.secrets.tmp-*` は (a) |
+| 3の途中・後 | 加えてpending root、そのmember、objectとmanifestのfile、平文の束と `.secrets.tmp-*` | 行のpending rootのID（rootと同じtransactionで書く）、run ID。`.secrets.tmp-*` は (a)。memberになる前のobjectとmanifestのfileは、名指すものが無い（残る。25.16） |
 | 4の後 | 加えてrunのrootとそのmember | run ID（`root.id`） |
 | 5の後 | 加えて `sources/runs/<run>` | run ID |
 | 6の途中 | pending rootのmemberの一部が外れている。外れたmemberは、先にrunのrootへ写してある（`handoff_page` は、写した後に外す） | run IDとpending rootのID。両方のrootを起点にする |
@@ -2100,17 +2102,17 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 | 9を送った後、residentのcommitの前 | 同上 | 下の (2) |
 | commitの後、行を消す前 | runの行と `capture_owner` の行 | 放棄の処理が、runの行を見て `capture_owner` の行だけを消す |
 
-どの時点でも、残っているものは、`capture_owner` の行（run IDとpending rootのID）から名指せる。行より先に作られるものは無い。
+memberになる前のfile（上の3の行）を除いて、どの時点でも、残っているものは、`capture_owner` の行（run IDとpending rootのID）から名指せる。行より先に作られるものは無い。
 
 (1) 進行中の取り込みは、状態が `capturing` で持ち主のprocessが生きている間は消されない。(2) 持ち主が終わった後に届くenqueue（CLIが送った直後に終わった場合）と放棄の処理は、sourceのguard（enqueueは共有、削除は排他）で直列になる。enqueueが先ならrunの行があり、放棄の処理は `capture_owner` の行だけを消す。放棄の処理が先ならenqueueは、行が無いことを見て断る。(3) 行の無いrunへのcancelと放棄の処理も、同じguardで直列になる。cancelが先なら、放棄の処理は消すものの1でその行を消す。放棄の処理が先なら、cancelは持ち主の行が無いことを見て断り、何も書かない。cancelを受理した後にenqueueが届けば、3つの行はrunのものになり、刈り取りが消す（25.5）。届かなければ、持ち主のprocessが終わるか `given_up` を書いた後に、放棄の処理が消す。したがって、行の無いrunのcancelの行で、消すものが決まっていないものは無い。(4) `sources/runs/<run>.lock` を開くのは、そのrunを取り込むprocessだけで（`lock_run` の呼び出しは取り込みの1か所）、lockより先に持ち主の行があり、そのprocessは居ないか、`given_up` を書いて取り込みを終えている。run IDは使い回さない。(5) 起動時の走査は、`sources/runs/` と `in-place/` のentryを「行の無いrunのもの」として消すことをしない（25.11）。これらを消すのは、`capture_owner` の行を起点にしたこの規則と、刈り取りだけである。
 
 **受け入れ試験。** (i) 上の表の各時点（0の後、2の後、3の途中、4の後、5の後、6の途中、6の後、7の後、8の後）でCLIをSIGKILLし、次のpassの後に、`sources/retention.db` のそのrunの行（`capture_owner`・`root`・`member`・`graph`・`import_session`）、他のrootが持たないobjectとmanifest、`sources/runs/<run>` とlock、平文の束、Vaultの束、in-placeのbindingが、どれも残らない（時点ごとに1つ。fileと行を列挙して確かめる）。(ii) 取り込み中（持ち主が生きている）にresidentを再起動しても何も消えず、続くenqueueが成功する。(iii) CLIがenqueueを送った直後に終わり、放棄の処理と競っても、「runが受理されて全部残る」か「断られて全部消える」のどちらかになる。(iv) 提出が断られたとき、断ったその場で全部消える（次のpassを待たない）。(v) 場所が違う行は消えず、`doctor` に出る。(vi) 放棄された取り込みのobjectのfileが、他のrootが持たなければ消え、持てば残る。(vii) 持ち主の行の無い `sources/runs/<run>` は消えず、`doctor` に出る。(viii) `capture_owner` の行が無いrun IDへのcancelが `NOT_FOUND` で、親DBの行が1つも増えない。(ix) 取り込み中のcancelは受理され、その後CLIをSIGKILLすると、次のpassで `run_cancel_intent`・`control_request`・`event` のそのrunの行が残らない。(x) 取り込み中のcancelの後にenqueueが届くと、今までどおりcancel済みのrunになる。(xi) cancelの受理と放棄の処理を競わせ、「受理されて、後の放棄の処理が行を消す」か「`NOT_FOUND` で何も書かれない」のどちらかになる。(xii) `given_up` を書いたCLIからのcancelは `NOT_FOUND` で、その場で放棄の処理が行われる。(xiii) 計画の下書きの取り込みが `capture_owner` の行を書かない。
 
-**schema。** `sources/retention.db`: `capture_owner(run_id PRIMARY KEY, state, root, place, pid, start)`。親DB: `control_request.run_id` と索引（cancelとretryの受理が対象のrunを書く。既存の行は、migrationが `target_json` から埋める）、索引 `event(run_id, seq)`、`event_no_delete` を外す（行の無いrunのeventを消すため。段階1でeventを消すのは放棄の処理だけである）。migrationは、runの行が無いrun IDの `run_cancel_intent`・`control_request`・`event` を消す。
+**schema。** `sources/retention.db`: `capture_owner(run_id PRIMARY KEY, state, root, place, pid, start)`（版は上げない。上の規則）。`root.kind` の値 `abandoned`。`source_delete_claim` のclaimの印（JSONの中。古い版は読み飛ばす）。親DB: `control_request.run_id` と索引（cancelとretryの受理が対象のrunを書く。既存の行は、migrationが `target_json` から埋める）、索引 `event(run_id, seq)`、`event_no_delete` を外す（行の無いrunのeventを消すため。段階1でeventを消すのは放棄の処理だけである）。migrationは、runの行が無いrun IDの `run_cancel_intent`・`control_request`・`event` を消す。
 
 ### (c) `in-place/<run>.json`
 
-**今の挙動。** 提出が断られたときだけ消す。通常のrunのものは消さない。
+**段階1より前の挙動。** 提出が断られたときだけ消す。通常のrunのものは消さない。
 
 **規則。** 持ち主はrunである。消すのは、提出が断られたとき（既存）、取り込みが放棄されたとき（上の (b)）、runの刈り取り（段階2）である。段階1で入るのは前の2つである。
 
@@ -2495,7 +2497,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | event（runかattemptのもの） | `coordinator.db` の `event` | `show`・`logs`・配置の理由・GitHub status | 消さない（triggerが禁じる） | runと一緒 | 2 | 25.5 |
 | event（どちらも持たないもの） | 同上 | 診断 | 消さない | `retention_days` 日 | 2 | 時刻 |
 | `control_request` | `coordinator.db` | 同じ `request_id` の再送 | 消さない。runの列が無い | runと一緒 | 1（列）、2 | 25.5 |
-| 行の無いrunへのcancelの行 | `coordinator.db` の `run_cancel_intent`・`control_request`・`event`（そのrun ID） | 後から届くenqueue | どのrun IDへのcancelでも書く。enqueueが届かなければ消さない | 進行中の取り込みのrunについてだけ書く（取り込み1つにつき、予約1行、cancelの要求ごとに受領とeventが1行ずつ）。enqueueが届けばrunと一緒に、届かなければ放棄の処理で消す | 1 | 25.4の (b) |
+| 行の無いrunへのcancelの行 | `coordinator.db` の `run_cancel_intent`・`control_request`・`event`（そのrun ID） | 後から届くenqueue | 進行中の取り込みのrunについてだけ書く。enqueueが届かなければ、放棄の処理で消す（段階1より前は、どのrun IDへのcancelでも書き、消さなかった） | 進行中の取り込みのrunについてだけ書く（取り込み1つにつき、予約1行、cancelの要求ごとに受領とeventが1行ずつ）。enqueueが届けばrunと一緒に、届かなければ放棄の処理で消す | 1 | 25.4の (b) |
 | `pending_delete`・`result_delete_claim` | `coordinator.db` | 削除の再実行 | fileを消した後に消す | 同じ | 既存 | fileが無いこと |
 | `ci_test_timing` | `coordinator.db` | Shardの分割 | 消さない | 最後に書いてから14日 | 2 | 時刻 |
 | 退役させたidentity | `coordinator.db` の `worker_identity_tombstone`・`identity_retired_notice` | 接続の拒否 | 消さない | 未決（25.16） | なし | なし |
@@ -2503,18 +2505,18 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 結果 | `results/<attempt>/`（result・log・artifact・`tmp/*.part`） | `logs`・`outputs`・CIの後のJobのdownload | attemptごとに、終了と回収を閉じた時点の遅い方から `retention_days` 日。workflow artifactは、runが終わってから `retention_days` 日。spoolは1 GiB/task、artifactは1 GiB/upload | 同じ。刈り取りの段3が残りを消す | 既存（残りは2） | 排他pinと、回収が閉じていること |
 | readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | 消さない。結果のGCが、行の無いrunのpinも作る | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
 | 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日（終点は25.3の (a)） | 同じ | 既存 | 索引に参照が無いこと、排他lock |
-| 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | 行を消さない。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
-| runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 消さない | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
-| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る（親では、片付ける処理が呼ばれていない） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
+| 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | runの行は消さない。放棄された取り込みの行（`capture_owner`、そのrootとmember・graph、`import_session`）は、放棄の処理で消す。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
+| runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 提出されたrunのものは消さない。提出されなかった取り込みのものは、放棄の処理で消す | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
+| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わった取り込みのものは、放棄の処理で消す。一時fileは残る（25.4の (a) が入るまで） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
 | bundle | `sources/bundles/<source>-<32hex>.bundle` | 進行中の配送（offsetからの再開） | sourceごとに4個まで。配送の成功時に消す。失敗・放棄では残る | 加えて、そのsourceを参照するrunが無くなったときに消す | 2 | 索引に参照するrunが無いこと |
 | 親のGit領域 | `sources/git/<key>.git`（`refs/local-ci/snapshots/<source>`・`index/<source>`・`heads/*` とGit object） | bundleの作成、次の取り込み | 消さない | refはsourceが在る間。objectはrefを消してから最長14日と24時間（25.5）。`heads/*` と、refを消す関数は未決（25.16） | 2（関数があれば） | refが無いこと、Gitの猶予 |
 | 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | 共有の固定lock | `sources/secrets.lock`、sourceの変更lock | 取り込み | 固定 | unlinkしない | 既存 | 該当なし |
 | 計画の下書き | `ci-plan-*/` | 書いたcommandだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 同上 |
-| 親Vault | `secrets/<run>.json`、`parent-retention.json`、lock | 配送、`retry` | runが終わった時点で消す。提出されなかったrunのものは残る | 加えて、放棄された取り込みのものを消す | 既存、1（放棄） | 第23章のC、25.4の (b) |
+| 親Vault | `secrets/<run>.json`、`parent-retention.json`、lock | 配送、`retry` | runが終わった時点で消す。放棄された取り込みのものは、放棄の処理で消す | 同じ | 既存、1（放棄） | 第23章のC、25.4の (b) |
 | Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 所有を証明できないものは数えるだけで残す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | FrozenPlan | `ci-plans/<digest>` | CI runの進行 | 名指す待ちのtaskが無くなって `retention_days` 日 | 同じ | 既存 | 名指すtaskが無いこと |
-| in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときだけ消す | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
+| in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときと、取り込みが放棄されたときに消す。受理されたrunのものは消さない | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
 | 実測 | `stats/costs-v1.sqlite`（`costs`・`preparation_namespaces`・`preparation_receipts`・`cost_eviction`） | 配置の見積 | `costs` 4,096行、`preparation_namespaces` 4,096 | 同じ | 既存 | 順位 |
 | 更新の試用 | `upgrade/`（`record.json`、退避したDBと設定） | rollback | 試用の間。同時に1つ | 同じ | 既存 | commitの記録 |
 | DBの準備の途中 | `.init-*` | `init` の続き | `init` とrollbackが片付ける | 加えて25.4の (a) | 1 | `init.json` に無いことと、持ち主 |
@@ -2643,13 +2645,13 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 
 | 章 | 今の文 | 変える段階 | 変わった後 |
 | - | - | - | - |
-| 第6章 | private bindingは個別GCを行わず、親stateの削除まで保持する | 1、2 | 放棄された取り込みと、runの刈り取りで消す |
+| 第6章 | 受理されたrunのprivate bindingは、親stateの削除まで保持する（放棄された取り込みのbindingは、段階1で消すようにしてある） | 2 | runの刈り取りで消す |
 | 第11章 | retire・重複排除の最小記録はclusterの寿命中保持する | 2（親）、3（worker） | 親の記録はrunと一緒に、workerの記録は25.6の (c) で消す |
 | 第11章 | `list_attempts` は500件を超えると `INVALID_INPUT` | 変えない | 照合には `list_unreleased` を使う |
 | 第13章 | 入力、ログ、結果の既定保持はterminal後7日。回収の判定の記録は消さない | 2、3 | 回収の記録はrunと一緒に消す。workerの写しは解放の受理で消す |
 | 第13章 | 打ち切った回収ではACKを送らず、開き直せる | 3 | ACKは送らない。打ち切りの時点で `release_attempt` を送り、workerはその場で写しを消す。開き直しはできなくなる（開き直す経路は製品に無い。足す変更が、写しを残す期間を定める。25.6） |
 | 第13章 | resultなしで確定したattemptに後からresultが保存された場合の検出（`ack_collected` の `CONFLICT`、digestを照合した読み取りの後の保存の拒否） | 変えない | 成功した回収のACKは変わらない。`release_attempt` はdigestを運ばないが、resultを持たないattemptへは、supervisorのlockを取れたときだけ受理する |
-| （記述は無い。実装は、行の無いrun IDへのcancelを受理して記録する） | なし | 1 | 進行中の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（25.4の (b)） |
+| （他の章に記述は無い。段階1より前の実装は、行の無いrun IDへのcancelを受理して記録した） | なし | 1（入れてある） | 進行中の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（25.4の (b)） |
 | 第15章 | 退役したidentityはtombstoneを永続保持する | 未決 | 25.16 |
 | 第15章 | バイナリはversion別directoryへ配置する | 4 | 名指すものの無い版を消す |
 | 第15章（記述は無い。実装は、stateが残っていると一時workerの起動を断る） | なし | 1 | 25.4の (d) |
@@ -2699,3 +2701,4 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 - **retireを確認したattemptのworkerの写し。** 親がretireを確認したattemptは、親がその結果を読まない。workerが受理していたものは、今は `ack_wait`（7日）か、runの刈り取りの `release_attempt` まで、workerに写しが残る。確認の時点で `release_attempt` を送れば、その場で消せる。閉じるには、(1) 親が、retireを確認した後に、そのattemptのsubmitを送り直さないこと（25.6の (c) の証明は「terminalの記録の後は送らない」に依っており、retire済みのattemptは親の側でterminalにならない）、(2) workerの側で、retireを確認したattemptがterminalになっていること（`release_attempt` はterminalのattemptだけ受理する）、を実装で確かめる必要がある。
 - **導入のhelperが残っていないことの確認**（25.7の (b)）。規則は書いたが、helperがどのprocess groupで起動されるか、今のbuilderの片付けがその終了を確かめているかは確認していない。段階4の実装の最初に確かめる。
 - **組み込んだライブラリの自動保持**（task-traffic-controller、fast-worktree、portool）。それぞれの版の採用のときに、beltが呼ぶ関数を25.10の表に書く。
+- **memberになる前のobjectとmanifest（25.4の (b)）。** 取り込みがlocal-ciの書き込みの途中か、その直後（memberの登録の前）に終わると、書かれたobjectとmanifestのfileは、どのrootのmemberでもなく、`capture_owner` の行からも名指せない。段階1はこれを消さない（残る。件数も数えない: 数えるには `sources/objects/` の全走査が要る）。取り込みの大半の時間はこの区間なので、SIGKILLやCtrl-Cで残りやすい。案は、(1) local-ciが書く前に、書くfileをpending rootの下に記録できるようにする（local-ciの側の変更）、(2) 放棄された取り込みのpending rootが `source` を持たないときだけ、排他lockの下で、索引に行の無いobjectを上限つきで走査して消す、のどちらかである。どちらも、進行中の取り込みが書いたfileを消さない証明が要る。

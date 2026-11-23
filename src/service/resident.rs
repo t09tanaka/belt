@@ -1344,7 +1344,6 @@ enum Control {
     Reload(oneshot::Sender<Reply>),
     Forget(WorkerId, oneshot::Sender<Reply>),
 }
-#[allow(clippy::too_many_arguments)]
 /// Why the enqueue of a run whose capture has no live claim is refused (spec
 /// 25.4 (b)): its `capture_owner` row is not `capturing` (the owner gave up,
 /// or the capture was abandoned and deleted, or no row was ever written), or
@@ -1403,6 +1402,7 @@ enum UnsubmittedCancel {
     Unknown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
     coordinator: Arc<Coordinator>,
