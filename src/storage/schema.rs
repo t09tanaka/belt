@@ -673,6 +673,40 @@ BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
 DELETE FROM run_cancel_intent WHERE run_id NOT IN (SELECT run_id FROM run);
 DELETE FROM control_request WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM run);
 DELETE FROM event WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM run);"#.into(),
+            // Spec 25.5. The pruning of a run deletes its rows, so the two
+            // triggers that kept them for the life of the cluster change:
+            // a retire tombstone goes with its attempt, and the journal may
+            // lose an event unless it is the event of a run that has a row
+            // and no mark, or names only an attempt of such a run. (An event
+            // of a run without a row could go since the step before; an
+            // event of no run and no attempt goes by its age.) The indexes
+            // are the ones the pruning seeks by: the events of no run and
+            // no attempt in their order, the runs of a source and of a
+            // secret bundle, and the marked runs (a pass continues them
+            // first, and must not read every run to find them); and the
+            // placements of a task, the matrix groups of a run and the
+            // permits of a group, which the delete of their parent row
+            // looks for. A test
+            // timing carries when it was last written; the rows of an older
+            // file count from this step.
+            r#"DROP TRIGGER retire_tombstone_no_delete;
+DROP TRIGGER event_no_delete;
+CREATE TRIGGER event_no_delete BEFORE DELETE ON event
+WHEN EXISTS (SELECT 1 FROM run WHERE run_id = OLD.run_id AND pruning_at_ms IS NULL)
+  OR (OLD.run_id IS NULL AND OLD.attempt_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM attempt a JOIN task t USING(task_id) JOIN run r USING(run_id)
+        WHERE a.attempt_id = OLD.attempt_id AND r.pruning_at_ms IS NULL))
+BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
+CREATE INDEX event_unowned ON event(seq) WHERE run_id IS NULL AND attempt_id IS NULL;
+CREATE INDEX run_source ON run(source_id);
+CREATE INDEX run_secret_bundle ON run(secret_bundle_id);
+CREATE INDEX run_pruning ON run(run_id) WHERE pruning_at_ms IS NOT NULL;
+CREATE INDEX placement_task ON placement(task_id);
+CREATE INDEX matrix_group_run ON matrix_group(run_id);
+CREATE INDEX matrix_permit_group ON matrix_permit(group_id);
+ALTER TABLE ci_test_timing ADD COLUMN written_at_ms INTEGER NOT NULL DEFAULT 0;
+UPDATE ci_test_timing SET written_at_ms = CAST(strftime('%s','now') AS INTEGER) * 1000;
+CREATE INDEX ci_test_timing_written ON ci_test_timing(written_at_ms);"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
@@ -684,6 +718,12 @@ DELETE FROM event WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT run_id FROM
 /// (the tests that rewind a file run every later step again).
 #[cfg(test)]
 pub(crate) const UNDO_CAPTURE_STEP: &str = "DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;";
+
+/// What takes a coordinator file back to before the step of spec 25.5 (the
+/// tests that rewind a file run every later step again). It comes before
+/// [`UNDO_CAPTURE_STEP`] in a rewind.
+#[cfg(test)]
+pub(crate) const UNDO_PRUNE_STEP: &str = "DROP INDEX event_unowned; DROP INDEX run_source; DROP INDEX run_secret_bundle; DROP INDEX run_pruning; DROP INDEX placement_task; DROP INDEX matrix_group_run; DROP INDEX matrix_permit_group; DROP INDEX ci_test_timing_written; ALTER TABLE ci_test_timing DROP COLUMN written_at_ms; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event WHEN OLD.run_id IS NULL OR EXISTS (SELECT 1 FROM run WHERE run_id = OLD.run_id) BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; CREATE TRIGGER retire_tombstone_no_delete BEFORE DELETE ON retire_tombstone BEGIN SELECT RAISE(ABORT, 'retire tombstones are kept for the life of the cluster'); END;";
 
 /// The compatibility table for a list of migration steps.
 pub(crate) fn compat(step_count: usize) -> CompatTable {

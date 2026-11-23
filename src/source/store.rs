@@ -966,6 +966,18 @@ impl SourceStore {
         Ok(n)
     }
 
+    /// [`Self::remove_bundles`] for a caller that holds the source lock
+    /// exclusively (the pruning of the last run of the source, spec 25.5).
+    pub(crate) fn remove_bundles_held(&self, ci_source_id: &str) -> Result<usize> {
+        let mut n = 0;
+        for p in self.bundles_of(ci_source_id)? {
+            if remove_if_there(&p)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     fn run_record_path(&self, run: &RunId) -> PathBuf {
         self.inner.root().join("runs").join(run.as_str())
     }

@@ -1893,7 +1893,18 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     // Isolate read-only IPC evidence from the enabled background input GC.
     // Production uses the same nonblocking busy skip while a reader holds SH.
     let _source_gc_pin = resident.captured.sources.mutation_guard().unwrap();
-    let before_rows = coordinator.store().snapshot_rows_for_test();
+    // The pin above keeps the result pages of the retention loop out; the
+    // pruning pass of the same loop (spec 25.5) still samples the clock of
+    // the result collection on every tick, whatever runs there are. That
+    // one row belongs to the loop, and no read of an estimate touches it.
+    let rows = |store: &CoordinatorStore| {
+        store
+            .snapshot_rows_for_test()
+            .into_iter()
+            .filter(|(table, _)| table != "result_gc_clock")
+            .collect::<Vec<_>>()
+    };
+    let before_rows = rows(coordinator.store());
     let before_sources = files(&root.path().join("parent/sources"));
     let traffic = root.path().join(".local/state/task-traffic-controller");
     let before_traffic = files(&traffic);
@@ -1991,7 +2002,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         frozen_json
     );
     assert_eq!(before_preferred, gate.preferred());
-    assert_eq!(before_rows, coordinator.store().snapshot_rows_for_test());
+    assert_eq!(before_rows, rows(coordinator.store()));
     assert_eq!(before_epoch, coordinator.epoch());
     assert_eq!(before_generation, gate.generation());
     assert_eq!(before_readiness, gate.snapshot());
@@ -2296,4 +2307,41 @@ async fn a_local_worker_link_that_ends_for_another_reason_ends_the_resident_with
         let message = error.to_string();
         assert!(message.starts_with(expected), "{name}: {message}");
     }
+}
+
+/// Spec 25.11, the scan at start: a stop between the last transaction of a
+/// pruning and the unlink of its pin leaves the pin of a run without a row.
+/// The next resident removes it before it serves anything, and leaves the
+/// pin of a run that has its row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_removes_the_pin_of_a_run_without_a_row_when_it_starts() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let state = root.path().join("parent");
+    let stop = |resident: Resident| async move {
+        let client = resident.client();
+        let runner = tokio::spawn(resident.run());
+        assert!(matches!(
+            client.request(Operation::Shutdown).await.unwrap(),
+            Reply::Stopping
+        ));
+        runner.await.unwrap().unwrap();
+    };
+    let resident = delivery_resident_on(root.path(), "/usr/bin:/bin").await;
+    let (run, gone) = (RunId::generate(), RunId::generate());
+    resident
+        .coordinator
+        .store()
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    stop(resident).await;
+    crate::results::pin::RunPin::ensure(&state, &gone).unwrap();
+    let pin = |run: &RunId| state.join(format!("reader-pins/{run}.lock"));
+    assert!(pin(&run).exists() && pin(&gone).exists());
+    let resident = delivery_resident_on(root.path(), "/usr/bin:/bin").await;
+    assert!(pin(&run).exists(), "the pin of a run stays");
+    assert!(
+        !pin(&gone).exists(),
+        "the pin of no run is removed at start"
+    );
+    stop(resident).await;
 }

@@ -345,7 +345,7 @@ Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要�
 
 明示 `retry` は通常と同じterminal・停止確定・回収・control revisionの条件を満たした場合だけ、同runの新attemptとして同じ原本を再実行する。baselineは作り直さない。元のsecret globs契約はprivate bindingに保持し、現在のproject configを再loadしない。原本secretはbounded/no-followのread-only処理で実行時の値をmaskし、bundleの配置・chmod・消去を原本へ行わない。元globsと現在の `.worktreeinclude` が選ぶpath集合がbaselineのsecret inventoryと違えば実行・retryを拒否し、新しい `exec` によるbaseline作成を求める。値の変更だけなら現物をmaskして実行でき、元Vault bundleの消去は妨げにならない。例外は1つで、CIのsplit Jobのfail-fastが一度も配置しないままcancelしたShardは、停止を証明するattemptが無くてもretryできる（何も実行されていないため）。attemptを持たないそれ以外のtaskを含むretryは断る。
 
-private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。提出を断ったrunのbindingはその場で消し、提出されなかった（放棄された）取り込みのbindingは、その取り込みと一緒に消す（25.4の (b)・(c)）。受理されたrunのbindingは、現段階では親stateの削除まで保持する。（第25章の段階2で、runの刈り取りのときに消すように変える。）bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
+private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。提出を断ったrunのbindingはその場で消し、提出されなかった（放棄された）取り込みのbindingは、その取り込みと一緒に消す（25.4の (b)・(c)）。受理されたrunのbindingは、runの刈り取り（25.5の段5）で消す。bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
 
 依存の準備は、プロジェクトの `.fast-worktree.toml` の `[[clone]]`（と `post_add`）が担う。attempt workspaceをfast-worktreeで作る方針と、`.worktreeinclude` の扱いは22.5で定める。第8章のSetupRecipeとtemplateは、workflowのsetup stepの再利用に限る。`.fast-worktree.toml` を持たないプロジェクトでは、第8章の `[prepare]` が代わりを務める。両方がある場合は `.fast-worktree.toml` を優先し、`ci plan` が準備の出所（`fast-worktree` / `[prepare]` / workflowのsetup step）を表示する。
 
@@ -755,7 +755,7 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - `STALE_EPOCH` を受け取った親は、新しい親に交代したものとして、以後は配置も制御も行わない。
 - 配置を記録した未ACKの需要は、workerの受理を記録したときのほか、attemptがterminalになったとき、retireが確認されたときにも解消する。
 
-retire・重複排除の最小記録はclusterの寿命中保持する（attemptが届かなかったtombstoneだけは、24.4の規則で消してよい）。（第25章の段階2・段階3で、runの刈り取りと、workerの重複防止の記録の規則に変える。）大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
+retire・重複排除の最小記録のうち、親の記録（`retire_tombstone`）は、runの刈り取り（25.5）でそのattemptの行と一緒に消す。workerの記録はclusterの寿命中保持する（attemptが届かなかったtombstoneだけは、24.4の規則で消してよい）。（workerの記録は、第25章の段階3で、重複防止の記録の規則に変える。）大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
 
 # 12. lease、停止、再接続、再起動
 
@@ -929,7 +929,7 @@ matrixのoutputは既定で元のmatrix順に集約し、完了到着順によ�
 
 中間artifactはupload step時点でimmutableに固定し、親で検証・永続保存したreceiptを公開してからstepを完了する。download側はこのreceiptを待つ。最終run回収とは別の処理とし、後段がUnit terminalまでartifactを待つdeadlockを作らない。同名artifactのconflictもworkflow単位で判定し、別workflowが同名のartifactをuploadしてもconflictにならない（local-ci 0.8.0以降の実装と同じ）。別workflowのartifactはdownloadできない。同名artifactは同じworkflow内では既定でconflict、明示overwriteは新しいartifact versionとして記録する。matrixにはvariantを含む名前または明示reducerを必要とする。
 
-`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は消さない。（第25章の段階2で、runの刈り取りのときにrunと一緒に消すように変える。workerの側の写しの保持は、段階3で変える。）
+`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は、runの刈り取り（25.5）でrunと一緒に消す。runは、終わってから `retention_days` 日で、行・結果・入力ごと親から消え、その後の `show`・`logs`・`outputs`・`retry`・`cancel` は `NOT_FOUND` になる。（workerの側の写しの保持は、第25章の段階3で変える。）
 
 secret bundleの内容はartifact・outputs・ログspoolのいずれにも含めない（第22章）。
 
@@ -1503,7 +1503,7 @@ outputs/export CLI も configured read-only store の identity 検証後に Coor
 新しい metadata 読取から blocking worker の drain と最終出力/flush 完了まで invocation 外側で保持する。
 owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
 ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
-pin inode は parent state とともに保持し、unlink/置換しない。（第25章の段階2で、run の刈り取りの最後に unlink するように変える。）最初の GC 対応版以降の owner と
+pin inode は run が在る間保持し、置換しない。run の刈り取りの最後（25.5 の段8）に、排他で取った owner が unlink する。pin を作るのは、行があって印の無い run についてだけで、行の無い run の pin は owner の起動時の走査が消す（25.11）。最初の GC 対応版以降の owner と
 reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
 resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
 known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
@@ -1632,6 +1632,14 @@ all Vault state are excluded from this source API. The D resident driver below s
 C Vault page after dedicated B+C deletion review. Vault-only secret erasure must
 never create a source-run expiry. Unsupported SQLite identity checks fail closed without opening/closing a live DB
 validation descriptor, preserving unrelated POSIX SQLite writer locks.
+
+Since the pruning of runs (spec 25.5) the per-run rows of this index are not permanent. The pruning of a run
+deletes, under the same exclusive source lock and with the same per-file proof and claim as B, the run's root with
+its memberships and graph rows, the run record and its lock, `run_expiry`, the completed `vault_delete_claim`, the
+`import_session` rows and the `capture_owner` row of the run, and the bundle files of a source that no run names any
+more. What the fence refused is refused by the run having no row in the parent database (the fence is only reached
+for a run that has one; between the removal of the fence and of the row the mark of the run refuses a retry). The
+Git refs and objects of the parent's Git area still stay (25.16).
 
 
 #### Parent Vault retention (C; scheduled by D below)
@@ -1956,7 +1964,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | - | - | - | - |
 | 0 | 既存の挙動の修正。入力の保持の終点の誤り、runの印 `pruning` と断り | なし | できる |
 | 1 | crashの受け皿と、持ち主が単純なもの。所有の証明つきの一時file、提出されなかった取り込み（行の無いrunへのcancelを含む）、`in-place/<run>.json`、一時workerの起動し直し | 段階0（印は使わないが、同じmigrationに入れてよい） | できる |
-| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる。ただし、親のGit領域のrefを消す部分は、local-ciの関数の有無に依る（25.16） |
+| 2 | runの刈り取り | 段階0、段階1の取り込みの持ち主 | できる（入れてある）。段7（`release_attempt` の送信）は段階3と一緒に入れる。親のGit領域のrefを消す部分は、local-ciに関数が無いので入れていない（25.16） |
 | 3 | workerの側の結果の写しと、重複防止の記録 | 段階2（`release_attempt` を送る時点が刈り取りにある）。wireの機能 `attempt_release_v1` | できる |
 | 4 | 古いbinaryと、toolchainのroot | なし（段階3と独立） | できる |
 | 5 | workerが受け取ったsourceとclone | 5a（workerの取り込みの持ち主）は独立。5bは5aの後。wireの機能 `input_missing_v1` | できる（5bの、受け取りを拒否したときの空のcloneの扱いだけは25.9） |
@@ -2177,9 +2185,11 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 
 **刈り取り**は、投げたメンバーが1つのrunを自分のディスクから完全に消す処理である。
 
-**今の挙動。** 親は、runの行とeventを消さない。`reader-pins/<run>.lock`、`sources/runs/<run>` とそのlock、`sources/retention.db` の行、通常のrunの `in-place/<run>.json` を消さない。結果・入力・Vaultは、それぞれの保持driverが消している（第23章）。
+**今の挙動（段階2を入れた後）。** 親は、下の8段のうち、段7（`release_attempt` の送信。段階3と一緒に入れる）と、段4の親のGit領域のrefの削除（local-ciに関数が無い。25.16）を除いて、この節のとおりに消す。段階2より前は、runの行とevent、`reader-pins/<run>.lock`、`sources/runs/<run>` とそのlock、`sources/retention.db` の行、通常のrunの `in-place/<run>.json` を消さなかった。結果・入力・Vaultは、刈り取りより前に、それぞれの保持driverが消している（第23章）。刈り取りは、その残りを消す。
 
-**条件。** runが終わっていて（25.3の述語）、終点から `retention_days`（既定7日）が過ぎていること。`observation` がunknownのattemptを持つrunは、述語の3で条件を満たさない。時計がHoldの間、試用中は行わない。
+**条件。** runが終わっていて（25.3の述語）、終点から `retention_days`（既定7日）が過ぎていること。`observation` がunknownのattemptを持つrunは、述語の3で条件を満たさない。時計がHoldの間、試用中は行わない。時計は、結果のGCの時計（親DBの `result_gc_clock`）である。
+
+印は取り消せないので、後の段が求めるものは、すべて印の条件に含める。次の2つを、述語に足して確かめる。(1) taskを1つも持たないrunは、閉じている（`run.closed_at_ms` がある）ときだけ終わっているとし、終点は閉じた時刻とする。閉じていないrunは、最初のtaskがこれから作られ得る（受理の直後のrunを、時刻0に終わったrunと読まない）。入力の保持の終点（25.3の (a)）は、taskの無いrunに終点を返さないままである（そのrunの入力は、刈り取りの段4が消す）。(2) retireされていないattemptのterminationが、この版で型として読めること（入力の保持が `input_retention_binding` で確かめているのと同じ検査）。読めない記録を持つrunは、印を付けずに全体を残す。印の後の段は、保持期間・ACK・時計を確かめ直さない。
 
 **7日の読み手。** `show`・`logs`・`outputs`・明示 `retry`・GitHub statusの再投稿である。どれもrunの行と、結果または入力を一緒に必要とする。入力が消えたrunはretryできず（第6章）、結果が消えたrunは `logs`・`outputs` が読めない。行だけを結果より長く残す読み手は無いので、行も同じ時点で消す。runの行を読んで学習する処理（見積、forecast、testの時間）は無い（それぞれ別の表を読む）。
 
@@ -2189,12 +2199,16 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 | - | - | - |
 | 1 | `run.pruning_at_ms` を書く。同じtransactionで条件を確かめる | 印が無ければ何も起きていない。あれば2から |
 | 2 | 親Vaultのsecret bundleを消す（第23章のC。通常は、runが終わった時点で保持期間を待たずに消してある） | Cのclaimの再実行 |
-| 3 | runの排他pinを、待たずに取る。取れなければ（readerが読んでいる）このrunを次のpassに回す。取れたら、結果（`results/<attempt>/` のresult・log・artifact・`tmp/`）を、既存の結果のGCの手順で全部消す。印のあるrunでは、保持期間の判定を省く（条件で済んでいる） | 削除claimの再実行（既存）。`result_delete_claim` と `pending_delete` の行は、fileを消した後に消える |
-| 4 | 入力の所属を外し、他のrunが参照しないmanifestとobjectを消す（第23章のB）。そのsourceを参照するrunが他に無ければ、そのsourceのbundle（`sources/bundles/<source>-<32hex>.bundle`）と、親のGit領域のそのsourceのref（下） | Bのclaimの再実行。bundleとrefの削除は冪等 |
+| 3 | runの排他pinを、待たずに取る。取れなければ（readerが読んでいる）このrunを次のpassに回す。pinのfileが無いrunは、読み手が居ないものとして、pinなしで進む（readerはfileを作らず、作る側は印の無いrunにだけ作る。attemptを名指す関数は、断られたときにpinのfileを消し得る）。取れたら、結果（`results/<attempt>/` のresult・log・artifact・`tmp/`）を、既存の結果のGCの手順（参照を外してclaimを書く、fileを消す、claimを消す）で全部消す。印のあるrunでは、保持期間・ACK・回収の状態の判定を省く（条件で済んでいる）。結果のstoreのものでないlocatorの参照は、参照だけを外す（fileはbeltのものでない）。参照が無くなった後、そのrunの各attemptの `results/<attempt>/` を消す（参照を持たないattemptに、途中で終わった転送の `tmp/` だけが残っている場合がある） | 削除claimの再実行（既存）。`result_delete_claim` と `pending_delete` の行は、fileを消した後に消える |
+| 4 | 取り込みの持ち主の行が保留のrootを名指していれば、その取り込みのscratch directory（`sources/staging/<ulid>/`）を先にまるごと消す（放棄の処理の段6と同じ）。入力の所属を外し、他のrunが参照しないmanifestとobjectを消す（第23章のB）。そのsourceを参照するrunが他に無ければ、そのsourceのbundle（`sources/bundles/<source>-<32hex>.bundle`）と、親のGit領域のそのsourceのref（下） | Bのclaimの再実行。bundleとrefの削除は冪等 |
 | 5 | runごとのfileと索引の行: `in-place/<run>.json`、`sources/runs/<run>`、`sources/retention.db` のそのrunの行（`run_expiry`、完了した `vault_delete_claim`、そのrunのrootとそのmember・graph、`import_session`、`capture_owner`）、最後に `sources/runs/<run>.lock` | 各削除は冪等。未完了のclaimが残るrunは、ここで止めて次のpassに回す |
 | 6 | 親DBの行を、下の順で消す。1 transactionは1,000行まで | 印のあるrunの残りの行を、同じ順で続ける |
 | 7 | 最後のtransaction（`run` の行を消すもの）のcommitの後、そのrunのattemptのうち、workerが受理していて、ACK済みでないものに `release_attempt` を送る（段階3が入っていれば。届かなくてよい。25.6）。送る相手の一覧（workerとattempt ID）は、段6でattemptの行を消すtransactionが、消す前に読んでメモリに持つ | 一覧は失われる。送らなかった分は、接続時の照合（25.6）が拾う |
 | 8 | `reader-pins/<run>.lock` をunlinkし、排他pinを手放す（25.1の (B)）。結果のGCのcursorがこのrunを指していれば、cursorを捨てる（下） | 行が無くpinだけが残る。起動時の走査が消す（25.11） |
+
+**1 passの上限。** runは32件（印のあるrunを先に、run IDの順で。進めないrunが後ろのrunを待たせないように、続きの位置をメモリに持つ）、結果のpathは32件（段3のclaimと、attemptごとのdirectory `results/<attempt>/` の削除を1件ずつ数える）、入力のpathは32件と検証64 MiB（段階1の放棄の処理と同じ関数の上限）、行は1,000行のtransactionを64回までである。どの上限も、1 passの全runで共有する（runごとに取り直さない）。上限に達したrunは、印を持ったまま次のpassが続ける。attemptのdirectoryの走査は、続きの位置（task IDとattempt IDの順）をメモリに持ち、次のpassがそこから続ける（失っても、走査をやり直すだけで、消してよいものは変わらない）。印のあるrunは、部分索引 `run(run_id) WHERE pruning_at_ms IS NOT NULL` で探す（全runを読まない）。印のあるrunの数は `doctor` が示す。段4が入力の保持のgate（旧形式のmanifestの登録が済んでいない、進行中の取り込みがある、graphが終わっていない）で止まっている間は、`doctor` の行と、residentのログの `run pruning held` の行が、そのgateの名前（`legacy_registration`・`capture`・`graph`）を示す。
+
+**段4・段5の実装。** 段階1の「放棄された取り込み」の処理（25.4の (b)）と同じ関数を使う: sourceの変更lockを待たずに排他で取り、親DBでrunに印があることを確かめ直してから、runのroot（と、取り込みの持ち主の行が名指すpending root）の所属を外し、他のrootが持たないfileを、証明・claim・unlinkの順で消す。したがって、段4は第23章のBのpage（時計と `input_retention_binding` を確かめる）を経ずに、印を根拠に消す。証明できないfile、進行中の取り込み（所属の分からないroot）がある間は、そのrunをそこで止めて次のpassに回す。段2のVaultも、同じく放棄の処理の関数（Vaultのclaim・unlink・完了）を使う。
 
 **passをまたぐpin。** 排他pinは、段3から同じpassの終わりまで持ち、passの終わりに手放す。passをまたいでは持たない。次のpassは取り直す。pinを持たない間も、印がすべての読み手を断る（25.3）ので、半分消えたrunは見えない。印の前に共有pinを取って読み始めたreaderは、排他pinを取れない間、刈り取りを段3で待たせる。
 
@@ -2209,7 +2223,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 
 **段6の行を消す順。** 外部キー（`PRAGMA foreign_keys=ON`）を満たすため、子から先に消す。runのattemptとtaskは `task(run_id, task_id)`・`attempt(task_id, attempt_id)` の索引でたどる。
 
-1. `event`: `run_id` がこのrunのもの（新しい索引 `event(run_id, seq)`）と、このrunの各attemptの `attempt_id` を持つもの（既存の索引 `event(attempt_id, seq)`）。後者は、`run_id` がNULLでattemptだけを持つevent（`submit_deferred`・`worker_excluded` など、`Coordinator::note` が書くもの）を拾う。
+1. `event`: `run_id` がこのrunのもの（新しい索引 `event(run_id, seq)`）と、このrunの各attemptの `attempt_id` を持つもの（既存の索引 `event(attempt_id, seq)`）。後者は、`run_id` がNULLでattemptだけを持つevent（`submit_deferred`・`worker_excluded` など、`Coordinator::note` が書くもの）を拾う。後者で消すのは `run_id` がNULLかこのrunのものだけで、このrunのattemptを名指して別のrunを名指すeventは、そのrunのものとして残し、数える（この版の書き手は、どれもattemptの属するrunを名指すので、作られない）。行の無いattemptを名指すeventは、`append_event` と `append_events_unseen` が `NOT_FOUND` で断る（どのrunの刈り取りにも拾われないeventを作らない）。
 2. `result_delete_claim`・`pending_delete`（このrunのlocatorのもの。段3で空になっているはずで、残っていれば段3へ戻る）。
 3. `result_gc_ref`、`blob_ref`（attemptごと。`result_gc_ref` は `blob_ref` の削除に連鎖する）。
 4. `workflow_download`（consumerがこのrunのattempt）、`workflow_upload_inflight`、`workflow_artifact`（`run_id`）。
@@ -2217,7 +2231,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 6. `attempt`。
 7. `matrix_group`、`ci_driver_transition`、`run_cancel_intent`、`control_request`（`run_id`）。
 8. `task`。
-9. `run`。同じtransactionで、どのrunも参照しなくなった `source_ref`・`secret_bundle_ref` の行（新しい索引 `run(source_id)`・`run(secret_bundle_id)` で確かめる）。
+9. `run`。同じtransactionで、どのrunも参照しなくなった `source_ref`・`secret_bundle_ref` の行（新しい索引 `run(source_id)`・`run(secret_bundle_id)` で確かめる）。このtransactionだけは、sourceのlockを排他で、待たずに取ってから行う。submitは、sourceのlockを共有で持ったまま `source_ref` を書き、その後の別のtransactionでrunの行を入れる。排他で持つ間はその2つの間にsubmitが居ないので、変わらないtreeの再submitが、消えた `source_ref` を外部キーで指して失敗することは無い。lockが取れなければ（submitか取り込みの最中）、このrunは次のpassが続ける。
 
 1つのtransactionの中でもこの順を守る。途中のtransactionで止まっても、残っている行は常に「親の行がある子」だけなので、外部キーは満たされる。
 
@@ -2235,7 +2249,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 
 | 参照 | 答え |
 | - | - |
-| 利用者の `show`・`logs`・`outputs`・`retry`・`cancel` | `NOT_FOUND`。メッセージで、終了から `retention_days` 日でrunを消すことを伝える。cancelも何も書かない（刈り取ったrunには `capture_owner` の行が無いので、25.4の (b) の規則で断られる。`run_cancel_intent`・`event`・`control_request` の行はできない） |
+| 利用者の `show`・`logs`・`outputs`・`retry`・`cancel` | `NOT_FOUND`。メッセージで、終了から `retention_days` 日でrunを消すことを伝える（runを名指した場合。taskを名指した場合は、taskの行が無いので、どのrunのものだったかを言えず、従来の `NOT_FOUND` のままである）。cancelも何も書かない（刈り取ったrunには `capture_owner` の行が無いので、25.4の (b) の規則で断られる。`run_cancel_intent`・`event`・`control_request` の行はできない） |
 | 同じ `request_id` で送り直したcancel・`retry` | 刈り取りの途中（印がある間）は `run_pruned`、後は `NOT_FOUND`。保存した答えは返さない（25.3） |
 | workerに残る、親DBに行の無いattempt | 親は、自分の行があるattemptについてだけworkerへ尋ねる（追跡は行から始まる）ので、行の無いattemptの答えを受け取る経路は無い。workerの答え（`inspect` の件数、eventなど）に行の無いattemptが現れても、親は行を作らず、leaseも更新せず、そのworkerの他のattemptの処理を止めない。workerの側は、段階3の照合（25.6）が消す。段階3が入るまでは、workerが従来どおり `ack_wait` の7日で結果を消し、行は残る |
 | 遅れて届いた古いsubmitの写し | workerの記録が断る（今は消さないtombstoneとattemptの行、段階3からは重複防止の記録） |
@@ -2245,7 +2259,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 
 - **runもattemptも持たないevent**（起動、epoch、GCの失敗の記録など）: 診断のために読む。書いてから `retention_days` 日で、`seq` の小さい順に消す。1 passで1,000行まで。新しい部分索引 `event(seq) WHERE run_id IS NULL AND attempt_id IS NULL` を使う。
 - **`ci_test_timing`**: Shardの分割が読む。行に最後に書いた時刻を足し、14日（setup templateの放置の日数と同じ。読み手は「最近動いたtestの時間」だけを使う）書かれなかった行を消す。1 passで1,000行まで。
-- **`removed_member` と `removed-members.json`**: 外したメンバーを断るために読む。coordinator DBのあるhostでは表が正で、以前の形式の `removed-members.json` は、読んで表へ移した時点で消す。coordinator DBの無いhost（workerだけのhost）では、移す先が無いので `removed-members.json` が正のまま残る（`src/service/group/rotate.rs`）。これは固定のfile（1個。中の項目は利用者が外した名前の数）として25.10に挙げる。どちらも、そのメンバーを戻したときに項目を消す。
+- **`removed_member` と `removed-members.json`**: 外したメンバーを断るために読む。coordinator DBのあるhostでは表が正で、以前の形式の `removed-members.json` は、読んで表へ移した時点で消す。読めないfileや移せないfileは、警告を出してそのまま残し、`group rotate` は失敗しない（次のrotateがまた試す）。coordinator DBの無いhost（workerだけのhost）では、移す先が無いので `removed-members.json` が正のまま残る（`src/service/group/rotate.rs`）。これは固定のfile（1個。中の項目は利用者が外した名前の数）として25.10に挙げる。どちらも、そのメンバーを戻したときに項目を消す。
 - **退役させたidentityの記録**（`worker_identity_tombstone`・`identity_retired_notice`）: 消す時点は未決である（25.16）。段階2では消さず、triggerも外さない。
 - **`stats/costs-v1.sqlite`**: 配置の見積が読む実測。`costs` は4,096行、`preparation_namespaces` は4,096、`preparation_receipts` と `cost_eviction` はそれに従う。書くたびに古いものを消す（既存）。
 
@@ -2262,7 +2276,7 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 
 **受け入れ試験。** (i) 条件を満たしたrunが、表の8段を経て、25.10の「親のstate directory」のrunごとの行をすべて残さない（fileとDBの行を列挙して確かめる）。(ii) 各段の直後でresidentを止め、再起動後のpassが続きを行い、同じ結果になる（段ごとに1つ）。(iii) 外部キーを有効にしたまま、1 transaction 1,000行で、3,000行を超えるrunを消せる。(iv) `run_id` がNULLでattemptを持つeventが残らない。(v) readerが共有pinを持つ間、段3が進まず、readerが開いたfileは消えない（印の後の次の行の読み取りは `NOT_FOUND` で、追いかけて読むreaderは途中で止まり得る。25.3）。(vi) 刈り取りの途中のどの時点でも、`show`・`ls`・`ci status --post` が `NOT_FOUND` か何も出さない。(vii) 同じsourceを別のrunが参照していれば、manifest・object・bundle・refが残る。(viii) workflow artifactが、producerのattemptの保持期間を過ぎても、runが終わって保持期間が過ぎるまで残る。(ix) workerだけのhostで `removed-members.json` が残り、外したメンバーを断り続ける。(x) retire済みのattemptを持つrunが刈り取られる。(xi) `git gc` が `--prune=now` を使わない。(xii) 刈り取った後、workerがそのrunのattemptをまだ持っている状態で接続しても、親に行ができず、同じworkerの他のattemptの追跡と回収が進む。(xiii) 結果のGCのcursorが指すrunを刈り取り、その後の結果のGCのpageを何回動かしても、`reader-pins/<run>.lock` ができない。印のあるrun・刈り取ったrunのattemptを名指して共有pinを取ろうとしても、pinができず `NOT_FOUND` になる。(xiv) 刈り取ったrunへのcancelと、同じ `request_id` の再送が `NOT_FOUND` で、親DBの行が増えない。(xv) 段階2より前のschemaの版のCLIの `logs`・`outputs` が、DBを開けずに終わり、`reader-pins/` に何も作らない。
 
-**schema。** 親DB: `retire_tombstone_no_delete` を外す。`event(seq) WHERE run_id IS NULL AND attempt_id IS NULL`、`run(source_id)`、`run(secret_bundle_id)` の索引。`ci_test_timing` に最後に書いた時刻と索引。`event_no_delete` を外すか、条件を広げる（上の「外すtrigger」。段階1は、行の無いrunのeventの削除だけを通す条件つきにしている）。（`event(run_id, seq)`、`control_request.run_id` は段階1。）schemaの版を上げる。`sources/retention.db`: `import_session(run_id)` の索引。wireの変更は無い。
+**schema。** 親DB: `retire_tombstone_no_delete` を外す。`event(seq) WHERE run_id IS NULL AND attempt_id IS NULL`、`run(source_id)`、`run(secret_bundle_id)` の索引。印のあるrunを探す部分索引 `run(run_id) WHERE pruning_at_ms IS NOT NULL`。親の行を消すときに子を探す索引 `placement(task_id)`・`matrix_group(run_id)`・`matrix_permit(group_id)`（無いと、外部キーの確認が表の全走査になる）。`ci_test_timing` に最後に書いた時刻（`written_at_ms`。既存の行は、この段階のmigrationの時刻から数える）と索引。`event_no_delete` は条件を広げてある: 断るのは、行があって印の無いrunのeventと、`run_id` がNULLでそのようなrunのattemptを名指すeventの削除だけである（上の「外すtrigger」。段階1は、行の無いrunのeventの削除だけを通す条件つきにしていた）。（`event(run_id, seq)`、`control_request.run_id` は段階1。）schemaの版を上げる。`sources/retention.db`: `import_session(run_id)` の索引。wireの変更は無い。
 
 ## 25.6 段階3: workerの側の結果の写しと、重複防止の記録
 
@@ -2495,83 +2509,103 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 
 **今の挙動。** workerが受け取ったsource（`sources/manifests/`・`sources/objects/` と、`clones/<repo>` の中のrefとGit object）を消す処理は無い。受け取ったfileの数だけ増える。読み手は `blob_verify`（何が既にあるかの答え）と、attemptのworkspaceの準備である。受理は、sourceがstoreに無くても受け付け（`src/worker/agent.rs:2697`〜`2708`。artifactを宣言しないpayloadではsourceを見ない）、準備の時にsourceが無ければ、型の無い失敗（`NOT_FOUND`、`src/worker/machine.rs:202`〜`207`）でattemptを終える。
 
-**前提。** 段階5a（受け取りのpending rootの持ち主と解放）が先に入っていること。失敗した受け取りが入れたblobは、5aの前は、blobごとのpending root（`src/source/store.rs:603`、`src/source/retention.rs:636` の `import_blob`）が持ち続ける。5aは、それを受け取りの作業directoryが持つtokenに束ね、作業directoryを捨てるときに解放する。5bは、5aのtokenの解放を、索引の行を消すだけの処理から、`release_member`（`src/source/retention/deletion.rs:374`）でtokenのrootのmemberを外す処理に変える。公開に失敗した受け取りのblobのうち、他のrootが持たないものは、そこで（claim・内容の確認・unlinkの順で）消える。公開が済んだ受け取りのblobは `receive:<source>` のrootも持つので残る。この解放は、下の (d) と同じく、sourceの変更lockを待たずに排他で取って行い、取れなければtokenを作業directoryに記録したまま次のtickでやり直す（作業directoryは、解放が済んでから消す）。したがって5bは `sources/objects/` の全走査をしない。5aより前の版が残したpending rootの行は、5aの起動時の処理が消すので、5bの時点では残っていない。
+**前提。** 段階5a（受け取りのpending rootの持ち主と解放）が先に入っていること。失敗した受け取りが入れたblobは、5aの前は、blobごとのpending root（`src/source/store.rs:603`、`src/source/retention.rs:636` の `import_blob`）が持ち続ける。5aは、それを受け取りの作業directoryが持つtokenに束ね、作業directoryを捨てるときに解放する。5bは、次の2点を5aに求める。
 
-**原則: lockが基準である。** 受け取ったsourceを消すのは、sourceの変更lock（`sources/mutation.lock`。`src/source/retention.rs:261` の `guard`。storeに1つで、sourceごとではない）を排他で持っている間だけである。消す処理は、そのlockの下で `worker.db` を直接読み、参照を確かめる。`retention.db` に参照の行は書かない。したがって、参照の行と受理の行が食い違う窓も、持ち主の居ない参照を拾う走査も無い。段階2が親で提出と刈り取りを分けるのと同じ形である（提出は共有で `source_ref` を書いてからrunの行を入れ、刈り取りは排他を待たずに取って確かめ直す。25.5の段9）。
+- **tokenのrootの種類は `receipt` とする**（5aの実装は今 `kind='pending'`・`source` が空のrootを作る。`src/source/retention.rs:842`）。`receipt` のrootは、memberの行が持つものの全部である: 受け取りがblobを入れるのは `import_blob` だけで、objectの行とmemberの行を同じtransactionで書き、そのtransactionが、そのobjectのclaimが無いことを確かめる（`src/source/retention.rs:642`〜`670`）。したがって、「memberの分からないroot」（取り込み中の親のroot。中身をfileに書いてから登録する）を理由に全体を止める3つの確認（`drain_claim` の `src/source/retention/deletion.rs:335`、`retention_page` の `:566`、`check_sdk_available` と組になる `begin_import`・公開の前提）は、`kind NOT IN ('abandoned','receipt')` に狭める。`receipt` のrootが持つobjectは、どれも `member` の行で守られる（`drain_claim` の `EXISTS(member WHERE object)`）。
+- **tokenの解放は、先にrootを `abandoned` にしてから**、`release_member` でmemberを外す（25.4の放棄と同じ順）。他のrootが持たないobjectは、そこで（claim・内容の確認・unlinkの順で）消え、公開が済んだ受け取りのblobは `receive:<source>` のrootも持つので残る。解放は、下の (d) の1つの区切りとして、sourceの変更lockを待たずに排他で取って行い、取れなければtokenを作業directoryに記録したまま次のtickでやり直す（作業directoryは、解放が済んでから消す）。tokenのrootが `abandoned` になった後に途中で終わっても、残ったmemberは (d) の段0が外す。
+
+したがって5bは `sources/objects/` の全走査をしない。5aより前の版が残したpending rootの行は、5aの起動時の処理が消すので、5bの時点では残っていない。
+
+**storeは親と共有しない。** workerのsourceのstoreは `worker_state_dir/sources`（`src/service/bootstrap.rs:25`、`:333`、`src/worker/machine.rs:58`）で、親のstate（`sources/`）とは別のdirectoryである。同じmachineで親とworkerを動かしても、段階1・2の削除と5bは、別の `retention.db` と別の `mutation.lock` を扱う。設定で同じdirectoryを指した場合に備え、5bのpassは、そのstoreに親のroot（`kind` が `run`・`import`）があれば、何も消さずにpassを終え、eventを1回書く。
+
+**原則: lockが基準である。** 受け取ったsourceを消すのは、sourceの変更lock（`sources/mutation.lock`。`src/source/retention.rs:267` の `guard`。storeに1つで、sourceごとではない）を排他で持っている間だけである。消す処理は、そのlockの下で `worker.db` を直接読み、参照を確かめる。`retention.db` に参照の行は書かない。段階2が親で提出と刈り取りを分けるのと同じ形である（25.5の段9）。
+
+**claimを区切りの外へ持ち越さない。** 排他を持つ1つの区切りの中で書いたclaimは、同じ区切りの中で消し終える（`release_member` はclaimの直後に `drain_claim` を呼ぶ。`src/source/retention/deletion.rs:484`）。claimが残っている間は、`begin_import` も公開（`ensure_sdk_available`、`src/source/store.rs:744`）も、どのsourceについても断る（`src/source/retention.rs:799`、`:830`）ので、claimを持ち越すとstore全体が止まる。crashで残ったclaimは、次のpassの最初に消す（(d) の段0）。`drain_claim` が断ったclaim（内容が変わった等）は残る。残っている間は、passは他のものを消さず、受け取りと公開は送り直しになる。人が直すまでの間だけで、eventに理由を書く。
 
 #### (a) 参照
 
-- **参照の定義。** source `S` が参照されているとは、`worker.db` に、どのメンバーのものでも、`state <> 'terminal'` で、payloadの `source_id` が `S` のattemptの行があること、または、`received` のroot（`receive:<P>`）のうち参照されているsource `P` のgraphの行（`graph(root, source)`。submoduleのsourceを名指す。`src/source/retention.rs:551`〜`576`）が `S` を名指すこと、である。submoduleのsourceは、親のsourceが消えた後の次の判定で参照されなくなる。
-- **索引。** `worker_attempt` には今、sourceの列が無い（`src/storage/schema.rs:313`〜`335`。sourceは `spec_json` の中にある）。段階5bは、列 `worker_attempt.source_id` と部分索引 `worker_attempt(source_id) WHERE state <> 'terminal'` を足す（25.13）。migrationは、terminalでない行についてだけ `spec_json` から列を埋める（件数は受理の上限 `max_live_attempts` で頭打ち）。terminalの行は空のままでよい（判定に使わない）。`graph` には `source` から引く索引が無い（主キーは `(root, source)`、`src/source/retention.rs:174`）ので、索引 `graph(source, root)` を足す。判定は、どちらも索引の検索1回である。
-- **受理。** workerは、submitを受理するとき、sourceの変更lockを**共有で、待たずに**取り、sourceがstoreにあることの確認から、`worker.db` の受理のcommit（`submit_within`、`src/storage/worker.rs:780`、呼び出しは `src/worker/agent.rs:2740`）までの間、持ち続ける。取れなければ（消す処理が排他で持っている）、何も書かずに `OVERLOADED`（新しい理由 `source_store`。送り直せる）で答える。lockを取る位置は、`submit_within` の外（DBのactorとtransactionの外）で、source に依る検査（`secret_paths`、`src/worker/agent.rs:2706`）より前である。共有lockは待たないので、`worker.db` の書き込みとの間に待ちの輪はできない（`mutation_guard` の約束、`src/source/retention.rs:816`）。
-- **安全の証明。** 消す処理は排他を持って `worker.db` を読み、受理は共有を持って「sourceがある」を確かめてからcommitする。排他と共有は同時に持てないので、どの受理も、(i) 消す処理の確認より前にcommitが済んでいる（確認がその行を見て消さない）か、(ii) 消す処理がlockを放した後に「sourceがある」を確かめる（消えていれば下の (b) で断る）か、のどちらかである。受理されたattemptがterminalになるまで、そのsourceは参照されている。準備の時（`src/worker/machine.rs:202`）にsourceが無いことは、この規則の下では起きない。起きたら（人がfileを消した等）、今と同じ型の無い失敗のままにする。
+- **参照の定義。** source `S` が参照されているとは、次のどちらかが成り立つことである。(1) `worker.db` に、どのメンバーのものでも、`state <> 'terminal'` で、`source_id` が `S` のattemptの行がある。(2) `receive:<S>` 以外のrootのgraphの行（`graph(root, source)`。受け取ったsourceが使うsubmoduleのsourceを名指す。`src/source/retention.rs:551`〜`576`）が `S` を名指す。(2) は、親のsourceが参照されているかに依らない: 親のsourceが在る間、子は消えない。親が消える（そのrootとgraphの行が消える）と、子は (1) と (c) の時刻だけで判定される。子は、自分の `used_ms` が古くても、親が在る間は残る。
+- **索引。** `worker_attempt` には今、sourceの列が無い（`src/storage/schema.rs:313`〜`335`）。段階5bは、列 `worker_attempt.source_id` と部分索引 `worker_attempt(source_id) WHERE state <> 'terminal'` を足す（25.13）。migrationは、terminalでない行についてだけ `spec_json` から列を埋める。`graph` には `source` から引く索引が無い（主キーは `(root, source)`、`src/source/retention.rs:174`）ので、索引 `graph(source, root)` を足す。判定は、どちらも索引の検索1回である。
+- **受理。** workerは、新しいattemptのsubmit（`worker.db` に行が無いもの。`fresh`、`src/worker/agent.rs:2682`〜`2684`）を受理するとき、sourceの変更lockを**共有で、待たずに**取り、sourceがstoreにあることの確認から、`worker.db` の受理のcommit（`submit_within`、`src/storage/worker.rs:780`）までの間、持ち続ける。取れなければ、何も書かずに `OVERLOADED`（新しい理由 `source_store`。送り直せる）で答える。lockを取る位置は、`submit_within` の外で、sourceに依る検査（`secret_paths`、`src/worker/agent.rs:2706`）より前である。既に行のあるattemptのsubmit（送り直し）は、今と同じく行を読んで答え、sourceを確かめない: そのattemptがterminalでなければ、sourceは (1) で参照されていて消えていない。
+- **attemptのための読み手。** 受理されたattemptのための読み取り（準備の `manifest_in`、`src/worker/machine.rs:93`、`agent.rs:973`〜`987` から。CIのsupervisorの `store.manifest`、`src/supervisor/ci_task.rs:330`〜`334`。blobとclosureを読む `src/source/store.rs:465`・`:473`・`:531`・`:586`・`:804`）は、いずれも共有lockを待たずに取り（`guard(false)`、`try_lock_shared`、`src/source/retention.rs:280`〜`282`）、取れなければ型の無い失敗になる。5bは、これらを、共有lockを**待つ**取り方（10 msから倍にして500 msまでの間隔で取り直し、120秒で諦めて今と同じ失敗）に変える。消す処理が排他を持つのは、(d) の1つの区切り（object 1つの確認とunlink、またはsource 1つの切り離し）の間だけで、1つの区切りが読むのは1つのblobの2回分（`release_member` の確認と `drain_claim` の確かめ直し）までである。120秒は、受け取れる大きさのblob（`max_blob_bytes`、`src/worker/blob_policy.rs:29`）の2回分のhashより長い。受理は、agentのtickを止めないよう、待たずに `OVERLOADED` で答えるまま（上）とする。
+- **安全の証明。** 消す処理は排他を持って `worker.db` を読み、受理は共有を持って「sourceがある」を確かめてからcommitする。排他と共有は同時に持てないので、どの受理も、(i) 消す処理の確認より前にcommitが済んでいる（確認がその行を見て消さない）か、(ii) 消す処理がlockを放した後に「sourceがある」を確かめる（manifestが消えていれば下の (b) で断る）か、のどちらかである。消す処理は、確認と同じ区切りの中でmanifestを消す（(d) の段3）ので、確認から後のどの受理も、manifestの無いsourceを見る。受理されたattemptがterminalになるまで、そのsourceは参照されている。準備の時（`src/worker/machine.rs:202`）にsourceが無いことは、この規則の下では起きない。起きたら（人がfileを消した等）、今と同じ型の無い失敗のままにする。
 
 #### (b) 消えたsourceを名指すsubmit: 型つきの断り
 
-- **規則。** 受理の時点で、payloadの名指すsourceがstoreに無い（manifestが公開されていない）submitは、新しいcode `INPUT_MISSING` で断り、attemptの行を書かない（tombstoneも書かない）。断りには `source_id` を付ける。artifactの有無に依らず、受理は必ずsourceの有無を確かめる（今はartifactを宣言しないpayloadではsourceを読まない。第13章の文が変わる。25.14）。
-- **親の扱い。** 親は `INPUT_MISSING` を受けたら、その接続の `ready` から、そのworkerの、そのsourceの行を外す（`InputGate` の `retain`、`src/coordinator/input_gate.rs:108`）。attemptは配置済みのまま、送っていない扱い（`Sent::NotTaken`）にし、sourceを配送し直す。配送が `ready` を公開した後、次のtickが同じattemptを送り直す。`INPUT_MISSING` は受理されていないので、taskのretryの回数に数えない。同じattemptが `INPUT_MISSING` で3回続けて断られたら、親はそのattemptをretireし（理由 `input_missing`）、taskのretryの規則で次のattemptを作る（このときは回数に数える）。workerがsourceを受け取ると、公開が最後に使った時刻を記録する（(c)）ので、配送し直した直後に期限で消えることは無く、3回続くのは、量の上限で毎回押し出されるときだけである。
-- **前提の確認（`ready` が先）。** 最初の配置は、そのworkerの `ready` に、同じrun・source・`manifest_digest` があるときだけ行う（`src/coordinator/mod.rs:2053`〜`2068`）。`ready` を持たない（gateの無い）linkは、製品の経路に無い（`ResolvedConfig::attach_worker`、`src/config/runtime.rs:44`、を呼ぶのはtestだけ）。ただし、配置の後の送り直し（`src/coordinator/mod.rs:1446` と `2613` の `submit`）は、送る時に `ready` を確かめ直さない。したがって「submitの前に必ず `ready` がある」は最初の配置についてだけ成り立ち、送り直しでは成り立たない。上の規則は、どちらの場合も同じ断りと配送し直しで扱うので、準備の時の型つきの失敗は要らない。
+- **規則。** 新しいattemptのsubmitで、payloadの名指すsourceがstoreに無い（manifestが公開されていない）ものは、新しいcode `INPUT_MISSING` で断り、attemptの行を書かない（tombstoneも書かない）。断りには `source_id` を付ける。artifactの有無に依らず、新しいattemptの受理は必ずsourceの有無を確かめる（今はartifactを宣言しないpayloadではsourceを読まない。第13章の文が変わる。25.14）。
+- **親の扱い。** 親は `INPUT_MISSING` を受けたら、その接続の `ready` から、そのworkerの、そのsourceの行を外す（`InputGate::retain`、`src/coordinator/input_gate.rs:108`、接続ごとの `src/coordinator/link.rs:193`）。attemptは配置済みのまま、送っていない扱い（`Sent::NotTaken`）にする。配送し直しは、residentの配送のloopが行う: loopは、そのworkerの、terminalでないattemptのinputを頁で読み（`input_page(live_cursor, 64, Some(worker))`、`src/service/resident/delivery.rs:49`〜`56`）、`ready` に無いものを配送し、確かめた後に `ready` に入れる（`publish_verified`、`delivery.rs:224`）。
+- **`ready` が戻るまで送らない。** 配置の後の送り直し（`Step::Submit`、`src/coordinator/mod.rs:1446`。`send_placed`、`:2613`）は、今は `ready` を確かめずにtickごとに送る。5bでは、`INPUT_MISSING` を受けたattemptを、そのworkerの `ready` に同じrun・source・`manifest_digest` が戻るまで、どちらの経路でも送らない（`Sent::Withheld`）。印は、親のprocessのmemoryに、attemptごとに1つ（`(attempt, source, digest)` と、戻った `ready` の世代）持つ。attemptがterminalになるか配置が外れると消える。親が再起動すると印は消えるが、再起動の後の最初の送り直しは、断られれば同じ印をまた付けるだけである。
+- **回数。** `INPUT_MISSING` は受理されていないので、taskのretryの回数に数えない。数えるのは、新しい `ready`（印を付けた後に `ready` が戻ったこと）の後の送り直しへの断りだけで、それが3回続いたら、親はそのattemptをretireし（理由 `input_missing`）、taskのretryの規則で次のattemptを作る（このときは回数に数える）。回数は上の印と同じ所（親のmemory）に持つ。ふつうの送り直しの間の断りは数えない。workerがsourceを受け取ると、公開が最後に使った時刻を記録する（(c)）ので、配送し直した直後に期限で消えることは無く、3回続くのは、量の上限で毎回押し出されるときだけである。
+- **前提の確認（`ready` が先）。** 最初の配置は、そのworkerの `ready` に、同じrun・source・`manifest_digest` があるときだけ行う（`src/coordinator/mod.rs:2053`〜`2068`）。`ready` を持たない（gateの無い）linkは、製品の経路に無い（`ResolvedConfig::attach_worker`、`src/config/runtime.rs:44`、を呼ぶのはtestだけ）。
 - **古い親。** wireの機能 `input_missing_v1` を交渉した親にだけ `INPUT_MISSING` で断る。交渉していない親からのsubmitは、今と同じく受理し、準備の時の `NOT_FOUND` で終える（共有lockの規則は同じに守るので、受理の後に消えることは無い）。
-- **`blob_verify` と消す処理。** `blob_verify` は何も変更せず、lockも持たない（第11章）。`present` と答えたblobが、公開の前に消されることがある。公開（`publish_checked_root`、`src/source/store.rs:746`）は、manifestの名指すblobが無いと `corrupt` で失敗し（`src/source/store.rs:755`〜`771`）、今は受け取り全体を拒否して作業directoryを捨てる（`src/worker/blobs.rs:1437`〜`1459`）。段階5bでは、公開の時に、名指すblobが「無い」か「削除のclaim中」（`ensure_blob_available` が断る。`src/source/store.rs:753`）のときは拒否せず、作業directoryを残したまま `INPUT_MISSING`（`missing` に足りないblobを入れる）で答える。親は、そのsourceの配送を `blob_verify` からやり直す。claim中のblobは、`blob_verify` が「無い」と答える（`blob_size` が `ensure_blob_available` を確かめる。`src/source/store.rs:444`〜`446`）ので、親は送り直し、受け取りは、claimが済んだ後に入れる（claim中の取り込みは `OVERLOADED` で断る。送り直せる）。blobの大きさが違う等、内容の誤りは今と同じに拒否する。
+- **`blob_verify` と消す処理。** `blob_verify` は何も変更せず、lockも持たない（第11章）。`present` と答えたblobが、公開の前に消されることがある。公開（`publish_checked_root`、`src/source/store.rs:746`）は、manifestの名指すblobが無いと `corrupt` で失敗し、今は受け取り全体を拒否して作業directoryを捨てる（`src/worker/blobs.rs:1437`〜`1459`）。段階5bでは、公開の時に、名指すblobが「無い」か「削除のclaim中」のときは拒否せず、作業directoryを残したまま `INPUT_MISSING`（`missing` に足りないblobを入れる）で答える。親は、そのsourceの配送を `blob_verify` からやり直す。claimは区切りの外へ残らない（上）ので、「claim中」は、crashの後と、`drain_claim` が断った後にだけ起きる。blobの大きさが違う等、内容の誤りは今と同じに拒否する。作業directoryを残すので、その受け取りが展開で付けたref（作業directoryの `made`。今は拒否の時に消す、`src/worker/blobs.rs:1449`〜`1455`）も残る。作業directoryを捨てる処理（5aの24時間と、受け取りの拒否）は、`made` のrefを、そのcloneの取り込みlockの下で消す。ただし、`clone_ref` の行（(e)）が名指すrefは残す。
 
 #### (c) 量: storeを上限で抑え、sourceごとには数えない
 
-- **bytes。** `retention.db` の `object` の行に、列 `bytes` を足す（25.13）。登録（`publish_checked_root` の `register_held`、`src/source/retention.rs:382`、と取り込みの予約）のときに、fileの大きさを書く。合計を `meta` の1行（`store_bytes`）に持ち、行を足す・消すtransactionで同じだけ増減する。sourceごとのbytesは持たない（objectは複数のsourceが共有するので、sourceごとの合計は意味を持たない）。既に在る行は、migrationがmarkerを置き、消す処理の各passが、`bytes` の空いた行を1,000行までstatして埋める。全部埋まるまで、量による削除（下の2）は行わず、期限による削除（下の1）だけを行う。
-- **最後に使った時刻。** `root` の行に列 `used_ms` を足す（`received` のrootだけが使う）。記録するのは、公開（`publish_checked_root`。workerの公開はこの関数を通り、`finish_import` を呼ばない。`src/source/store.rs:713`〜`723`、`743`〜`745`）、attemptの受理（共有lockの下、`worker.db` のcommitの後）、attemptのterminal、の3か所である。`blob_verify` では記録しない。受理とterminalでの記録は、共有lockが取れなければ記録を省く（時刻が古く見えるだけで、参照の判定は `worker.db` で行うので安全は変わらない）。
+- **bytes。** `retention.db` の `object` の行に、列 `bytes` を足す（25.13）。合計を `meta` の1行（`store_bytes`）に持つ。増やすのは、objectの行を入れる文（`INSERT OR IGNORE`、`src/source/retention.rs:550`、`570`、`664`）が実際に行を入れたとき（`changes() = 1`）だけで、同じtransactionで足す。減らすのは、objectのfileを消し終えたtransactionである: `drain_claim` の完了のtransaction（`src/source/retention/deletion.rs:397`〜`408`）でobjectの行を消して引く（今はobjectの行を残す。消した後に同じobjectが入れば、`INSERT` が行を入れ直して足す）。放棄の処理（`abandon.rs:482`）とscratchの削除（`scratch.rs:183`）がobjectの行を消すときも、同じtransactionで引く。`publication` の行は残す（世代の番号が、古いclaimと古い読み手を断る。行の数は、入ったことのあるobjectの数で、25.9）。この規則は親のstoreにも同じに効く（同じcodeである）。既に在る行は、migrationがmarkerを置き、各passが、`bytes` の空いた行を1,000行までstatして埋める。fileが無い行には0を書く。全部埋まるまで、量による削除（下の2）は行わず、期限による削除（下の1）だけを行う。
+- **最後に使った時刻。** `root` の行に列 `used_ms` を足す（`received` のrootだけが使う）。記録するのは、公開（`publish_checked_root`。workerの公開はこの関数を通り、`finish_import` を呼ばない。`src/source/store.rs:713`〜`723`、`743`〜`745`）、attemptの受理（共有lockの下、`worker.db` のcommitの後）、attemptのterminal、の3か所である。`blob_verify` では記録しない。受理とterminalでの記録は、共有lockが取れなければ記録を省く（時刻が古く見えるだけで、参照の判定は `worker.db` で行うので安全は変わらない）。submoduleのsourceは、親のgraphの行が守る（(a) の (2)）ので、子のrootの時刻は記録しない。
 - **規則。** 参照されていない受け取ったsourceのうち、
   1. 最後に使ってから14日を過ぎたものを消す。
   2. `store_bytes` が20 GiBを超えている間は、最後に使った時刻の古い順に消す。
-  数値は、setup templateと同じ14日・20 GiBである（読み手は、同じrepositoryの次の配送の差分。2週間使われなかったsourceの差分は、新しいsourceの差分より小さくならない）。1の判定は時計の規則（第23章）に従い、時計がHoldの間は行わない。2は順序にだけ時刻を使い、Holdの間も行う（順序が誤っても、参照の判定は時刻に依らない）。共有のobjectは、最後のmemberと一緒にだけ消える（`release_member`）。上限を超えたままでも、参照されているsourceは消さない。
+  数値は、setup templateと同じ14日・20 GiBである。1の判定は時計の規則（第23章）に従い、時計がHoldの間は行わない。2は順序にだけ時刻を使い、Holdの間も行う。共有のobjectは、最後のmemberと一緒にだけ消える（`release_member`）。上限を超えたままでも、参照されているsourceは消さない。
 
 #### (d) 消す手順と、1回の上限
 
-workerのagentのtick（既存の監視の周期）で、60秒に1回まで行う。試用中（24.8）は行わない。
+workerのagentのtick（既存の監視の周期）で、60秒に1回まで行う。試用中（24.8）は行わない。1つのpassは、いくつかの**区切り**から成る。区切りごとに、sourceの変更lockを**待たずに**排他で取り、終えたら放す。取れなければ（受理・受け取り・公開・読み取りの最中）、そのpassを終える。
 
-1. 候補を、`root(kind='received')` から、`used_ms` の古い順に索引で選ぶ（索引 `root(kind, used_ms)`。25.13）。
-2. sourceの変更lockを、**待たずに**排他で取る。取れなければ（受理・受け取り・公開の最中）このpassを終える。
-3. 候補1つについて、(a) の参照を `worker.db` と `graph` の索引で確かめ直す。参照されていれば次の候補へ。
-4. cloneのrefを消す（(e)）。
-5. `receive:<S>` のrootのmemberを、`release_member` で外す。他のrootが持たないobjectは、claimをcommitしてから、所有するpathだけを、内容を確かめてunlinkする（Bの保護のまま。`src/source/retention/deletion.rs:253`、`300`）。最後に `root` の行と、そのgraphの行を消す。
-6. 排他を放す。次の候補へ（2から）。
+0. **残りの片付け。** 区切りの最初に、(i) 終わっていないclaim（`source_delete_claim` の `done=0`）があれば、`drain_claim` で消す。(ii) `kind='abandoned'` のroot（切り離したsourceと、解放の途中のtoken）にmemberが残っていれば、1つのobjectを `release_member` で外す（他のrootも持てばmemberだけを外し、持たなければclaim・確認・unlinkまでこの区切りで行う）。memberが無くなったrootは、その行を消す。(i)・(ii) のどちらかを行った区切りは、そこで終える（次の区切りへ）。
+1. **門。** `source` が空で `kind NOT IN ('abandoned','receipt')` のroot（登録の途中の `receive:<S>` は `pending` で `source` が空。`src/source/retention.rs:442`、`498`）、または `graph.done=0` の行があれば、何も消さずにpassを終える（`retention_page` の `unknown` と同じ。`src/source/retention/deletion.rs:566`）。これらは、途中で終わった公開が残すもので、その受け取りの続きか、作業directoryを捨てる処理が片付ける。
+2. **候補。** `root(kind='received')` から、`used_ms` の古い順に索引で1つ選ぶ（索引 `root(kind, used_ms)`。25.13）。(c) の規則に当たらなければpassを終える。
+3. **切り離し**（1つのtransaction）。(a) の参照を `worker.db` と `graph` の索引で確かめ直す。参照されていれば、次の候補へ（同じ区切りのまま2から。1つの区切りで確かめる候補は32件まで）。参照されていなければ、同じtransactionで、`receive:<S>` のmemberを、新しいroot `drop:<S>:<ulid>`（`kind='abandoned'`、`source` は空）へ移し、`receive:<S>` の行とそのgraphの行を消し、そのrootの `clone_ref` の行（(e)）を消す。続けて、manifest `m:<S>` のmemberを (ii) と同じく外す（他のrootが持たなければ、claim・確認・unlinkを、この区切りの中で行う）。この区切りの後、`S` のmanifestは無く、受理は `INPUT_MISSING` で断る。`S` のblobは `drop:` のrootが持ち、`blob_verify` は `present` と答えうるが、公開の時に無くなっていれば (b) で `INPUT_MISSING` になる。`S` を受け取り直すと、新しい `receive:<S>` を作り、`register_held` が全部のmemberを登録し直す（`complete` は行の無いrootでは偽、`src/source/retention.rs:413`〜`424`）。同じblobを `drop:` も持っていれば、`drop:` のmemberを外すだけで、blobは残る。
+4. **cloneのref**（(e)）。3で `clone_ref` の行が無くなった `(clone, source)` のrefを消す。この区切りの中で、cloneの取り込みlockが取れなければ、そのrefを `meta` の `ref_drop:<clone>:<source>` に残し、次の区切りの段0の後に試す（行の数は、切り離したsourceのref数で頭打ち）。
+5. 排他を放す。次の区切りへ。
 
-**1回の上限。** sourceは32件、内容の検証は64 MiBまで（段階2と同じ）。排他は候補1つの3〜5の間だけ持つ。候補1つが検証する量は、そのpassの残りの64 MiBまでで、超える分はclaimを残したまま次のpassが続ける（claim中のblobは `blob_verify` が「無い」と答え、受け取りは断られて送り直されるので、続きの間も正しい）。したがって排他を持つ時間は、64 MiBの読み取りとhash、`git update-ref` 2回、transaction数回で、通常1秒より短い。その間の受理は `OVERLOADED` で断られ、送り直される。
+**1回の上限。** 1つのpassで切り離すsourceは32件まで、内容の検証は64 MiBまで。ただし、passの最初の1つのobjectは、大きさに依らず扱う（`release_member` に、そのobjectの大きさの2倍の予算を渡す。今の `release_member` は予算の半分を確認に充て、`examine` は予算より大きいblobを断る。`src/source/retention/deletion.rs:276`、`451`〜`463`。passの予算をそのまま渡すと、32 MiBを超えるblobは消せない）。したがって、どの大きさのblobも、少なくとも1 passに1つは進む。排他を持つ時間は、1つの区切りで、1つのobjectの2回分の読み取りとhash、`git update-ref` 数回、transaction数回である。その間の受理は `OVERLOADED` で断られ、送り直される。attemptのための読み手は待つ（(a)）。
 
 #### (e) cloneのref、gc、cloneのdirectory
 
-- **ref。** 段の4で、同じ排他の下で、さらにそのcloneの取り込みlock（`clones/<name>.import.lock`、`src/workspace/mod.rs:202`。bundleの展開はこれを待って取る。`src/worker/blobs.rs:1186`）を待たずに排他で取り、local-ci 0.19.0の `remove_imported_refs`（`refs/local-ci/snapshots/<S>` と `refs/local-ci/index/<S>` を消す。local-ci 0.19.0の `src/source/transfer.rs:130`）を呼ぶ。取れなければ、このsourceを次のpassに回す。beltがworkerの受け取りで付けるrefは、この2つだけである（`ObjectsRepo::import_refs`、`src/source/store.rs:222`〜`241`。`refs/local-ci/heads/*` は付けない）ので、`ObjectsRepo::drop_ref` で別に消すものは無い。submoduleのsourceのsnapshotのrefは、そのsource自身が消えるときに消える。cloneは、manifestの `repository_id` から `clones/r-<sha256の先頭8 byteの16進>`（`src/workspace/plan.rs:33`〜`37`）として引く。取り込みlockの下で消すので、同じsourceを取り込み直す展開と、refの付け外しが入れ違うことは無い。
-- **gc。** Git objectは、`git gc --prune=14.days.ago` で回収する。sourceのlockの外で、refを消したcloneについてだけ、1つのcloneに1日1回まで（最後に行った時刻を `retention.db` の `meta` の行 `gc:<name>` に持つ。行の数はcloneの数で頭打ち）。`--prune=now` は使わない（workspaceはcloneのobject storeを共有し、利用者のcommandがbeltのlockを持たずに、refを付ける前のobjectを書く。Gitの14日の猶予と、既に在るobjectを書き直すときの時刻の更新が、それを守る）。消したsourceのGit objectは、最長でrefを消してから14日と1日残る。
-- **cloneのdirectoryは消さない。** `<clone>/.git` の中の `fast-worktree-registration.lock` は、fast-worktree 0.4.0以降の版が、beltのlockを持たずに、pathを照合し直さずに開く（fast-worktree 0.7.0の `src/git.rs:128`〜`131`。belt自身のcloneのlockも、取得の後にinodeを照合しない。`src/workspace/mod.rs:863`、`882`）ので、25.1の (A) も (B) も示せない。cloneの数は、受け取ったrepositoryの種類（`repository_id`）の数で頭打ちになる。今の `remove_clone_if_empty`（`src/workspace/mod.rs:243`。受け取りを拒否したとき、この受け取りが作ったrefの無いcloneを消す。`src/worker/blobs.rs:1250`、`1457`）の扱いは25.9に置く。
+- **どのcloneにrefを付けたかの記録。** 受け取りは、sourceのsnapshotとindexのrefを、そのsourceのmanifestの `repository_id` のcloneではなく、受け取った（親の）sourceのcloneに付ける。submoduleのsourceのrefも親のcloneに付く（`ObjectsRepo::import_refs`、`src/source/store.rs:222`〜`241`、呼び出しは `src/worker/blobs.rs:1279`）。そこで、公開（`publish_checked_root`）は、付けたrefごとに `retention.db` の `clone_ref(clone, source, root)` の行を、rootの登録と同じtransactionで書く（`root` は `receive:<P>`）。同じrepositoryの2つのsourceが同じsubmoduleのrefを共有するときは、行が2つになる。refを消すのは、`(clone, source)` の行が1つも無くなったときだけである。行の数は、graphの行の数で頭打ちになる。5bの前に受け取ったsourceには行が無い。migrationは、`received` のrootのgraphの行ごとに、親のmanifestの `repository_id` のcloneについて行を書く（今のcodeが付ける先と同じ）。
+- **ref。** 段の4で、同じ排他の下で、さらにそのcloneの取り込みlock（`clones/<name>.import.lock`、`src/workspace/mod.rs:202`。bundleの展開はこれを待って取る。`src/worker/blobs.rs:1186`）を待たずに排他で取り、local-ci 0.19.0の `remove_imported_refs`（`refs/local-ci/snapshots/<S>` と `refs/local-ci/index/<S>` を消す）を呼ぶ。beltがworkerの受け取りで付けるrefは、この2つだけである（`refs/local-ci/heads/*` は付けない）。cloneは、`repository_id` から `clones/r-<sha256の先頭8 byteの16進>`（`src/workspace/plan.rs:33`〜`37`）として引く。取り込みlockの下で消すので、同じsourceを取り込み直す展開と、refの付け外しが入れ違うことは無い。
+- **gc。** Git objectは、`git gc --prune=14.days.ago` で回収する。sourceのlockの外で、refを消したcloneについてだけ、1つのcloneに1日1回まで（最後に行った時刻を `meta` の行 `gc:<name>` に持つ。行の数はcloneの数で頭打ち）。gcの間は、そのcloneの取り込みlockを待たずに排他で持つ（取れなければ、そのcloneのgcを次のpassへ回す）。展開は、bundleの前提のcommitがrefから届くことを確かめてから展開する（`holds_base` は `rev-list <前提> --not --all` が空であることを見る。`src/source/store.rs:315`〜`325`）ので、前提のobjectはgcが消さない。取り込みlockは、展開がpackとrefを書く間にgcが到達の判定をすることを除く。`--prune=now` は使わない（workspaceはcloneのobject storeを共有し、利用者のcommandがbeltのlockを持たずに、refを付ける前のobjectを書く。Gitの14日の猶予と、既に在るobjectを書き直すときの時刻の更新が、それを守る）。消したsourceのGit objectは、最長でrefを消してから14日と1日残る。
+- **cloneのdirectoryは消さない。** `<clone>/.git` の中の `fast-worktree-registration.lock` は、fast-worktree 0.4.0以降の版が、beltのlockを持たずに、pathを照合し直さずに開く（fast-worktree 0.7.0の `src/git.rs:128`〜`131`。belt自身のcloneのlockも、取得の後にinodeを照合しない。`src/workspace/mod.rs:863`、`882`）ので、25.1の (A) も (B) も示せない。cloneの数は、受け取ったrepositoryの種類（`repository_id`）の数で頭打ちになる。今の `remove_clone_if_empty`（`src/workspace/mod.rs:243`）の扱いは25.9に置く。
 
 #### (f) `GuardedObjectStore::put_bytes` を消す
 
-`GuardedObjectStore::put_bytes`（`src/source/store.rs:384`）は製品の呼び出し元が無い。段階5bの実装の変更でこの関数を消す。これを書き込みのfixtureに使うtestは、別の書き手（`SourceStore` の予約つきの取り込みか、`ingest_blob_with_token`）に置き換え、assertは減らさない: `fixture_run_fence_does_not_change_content_identity_or_new_publication_generation`（`src/source/retention.rs:2806`、呼び出しは `2861`）、`opened_reader_keeps_source_shared_guard_after_async_waiter_cancellation`（`2901`、`2908`）、`guarded_sdk_view_retains_shared_ownership_and_claim_fences_its_callback`（`2939`、`2952`）、`source_upload_opens_verified_descriptors_without_links_or_whole_reads`（`tests/it/source_capture.rs:1646`、`1651`・`1683`）、`measured_tests::upload`（`src/service/forward.rs:564`、`578`。`contiguous_chunks_with_size_probes_are_complete_but_resume_is_unknown` が使う）。
+`GuardedObjectStore::put_bytes`（`src/source/store.rs:384`）は製品の呼び出し元が無い。段階5bの実装の変更でこの関数を消す。これを書き込みのfixtureに使うtestは、別の書き手（`SourceStore` の予約つきの取り込みか、`ingest_blob_with_token`）に置き換え、assertは減らさない: `fixture_run_fence_does_not_change_content_identity_or_new_publication_generation`（`src/source/retention.rs`）、`opened_reader_keeps_source_shared_guard_after_async_waiter_cancellation`、`guarded_sdk_view_retains_shared_ownership_and_claim_fences_its_callback`、`source_upload_opens_verified_descriptors_without_links_or_whole_reads`（`tests/it/source_capture.rs`）、`measured_tests::upload`（`src/service/forward.rs`。`contiguous_chunks_with_size_probes_are_complete_but_resume_is_unknown` が使う）。
 
 #### (g) 受け入れ試験
 
-1. 受理と削除の競合: 消す処理が排他を持つ間のsubmitは `OVERLOADED` で断られ、行が無い。消す処理が「参照なし」を確かめてから放すまでの間に届いたsubmitが、放した後に `INPUT_MISSING` で断られ、attemptの行が残らない（共有lockの取得を外すと、sourceの無いattemptが受理されて失敗する）。
+1. 受理と削除の競合: 消す処理が排他を持つ間の新しいsubmitは `OVERLOADED` で断られ、行が無い。消す処理が切り離した後に届いたsubmitが `INPUT_MISSING` で断られ、attemptの行が残らない（共有lockの取得を外すと、sourceの無いattemptが受理されて失敗する）。
 2. 受理した後のsourceは、attemptがterminalになるまで、期限と量のどちらでも消えない（`worker_attempt.source_id` の確認を外すと消える）。
 3. 他のメンバーの、terminalでないattemptが名指すsourceも消えない。
-4. submoduleのsource: 親のsourceが参照されている間、子は消えない。親が消えた次の判定で、子が消える。
-5. `INPUT_MISSING` を受けた親が、そのworkerの `ready` を外し、配送し直し、同じattemptを送り直して受理される。taskのretryの回数は増えない。3回続くとretireされ、回数が1増える。
+4. submoduleのsource: 親のsourceが在る間、子は、自分の `used_ms` が14日より古くても消えない（親を繰り返し使い、子の時刻が古いまま）。親が消えた次の判定で、子が消える（graphの (2) の確認を外すと、親が在るのに子が消える）。
+5. `INPUT_MISSING` を受けた親が、そのworkerの `ready` を外し、`ready` が戻るまで、tickが何回進んでも同じattemptを送らない（送り直しの経路の両方で）。配送のloopが配送し直して `ready` が戻った後に送り直し、受理される。taskのretryの回数は増えない。`ready` が戻るたびに断られることが3回続くとretireされ、回数が1増える。`ready` が戻らないまま何tick進んでもretireされない。
 6. `input_missing_v1` を交渉しない親には、今と同じく受理して `NOT_FOUND` で終える。
-7. `blob_verify` と削除の競合: `present` と答えたblobが公開の前に消されると、公開は `INPUT_MISSING` で答え、作業directoryが残り、`blob_verify` からやり直した配送で公開される。claim中のblobは `blob_verify` が「無い」と答える。
-8. 取り込み直しと、refの削除の競合: 取り込みlockを持つ展開の間、refの削除はそのsourceを次のpassに回す。展開と公開の後、`refs/local-ci/snapshots/<S>` が残り、workspaceが作れる（取り込みlockの取得を外すと、refが消えて準備が失敗する）。
-9. workspaceがobjectを書いている間のgc: refの無いobject（workspaceの中の `git commit` が書いた、refを付ける前のもの）が、`git gc --prune=14.days.ago` の後も残り、そのcommitにrefを付けられる。`--prune=now` に変えると失敗する。
+7. `blob_verify` と削除の競合: `present` と答えたblobが公開の前に消されると、公開は `INPUT_MISSING` で答え、作業directoryと `made` のrefが残り、`blob_verify` からやり直した配送で公開される。作業directoryを捨てると `made` のrefが消え、`clone_ref` が名指すrefは残る。
+8. 取り込み直しと、refの削除の競合: 取り込みlockを持つ展開の間、refの削除はそのrefを次の区切りに回す。展開と公開の後、`refs/local-ci/snapshots/<S>` が残り、workspaceが作れる（取り込みlockの取得を外すと、refが消えて準備が失敗する）。
+9. workspaceがobjectを書いている間のgc: refの無いobjectが、`git gc --prune=14.days.ago` の後も残り、そのcommitにrefを付けられる。`--prune=now` に変えると失敗する。展開が取り込みlockを持つ間はgcを行わず、次のpassで行う（取り込みlockの取得を外すと、gcが展開と同時に走る）。
 10. 期限: 最後に使ってから14日を過ぎた、参照の無いsourceが消える。13日のものは残る。時計がHoldの間は消えない。
 11. 量: 合計が20 GiB（試験では小さい値）を超えると、古い順に、参照の無いsourceだけが消え、上限を下回ったところで止まる。共有のobjectは最後のsourceと一緒にだけ消える。
 12. 最後に使った時刻: 公開・受理・terminalで更新され、`blob_verify` では変わらない。
-13. bytesの埋め戻し: migrationの後、各passが1,000行まで埋め、埋まるまで量による削除をしない。`store_bytes` が、行の足し引きと一致する。
-14. 1回の上限: 33件の候補で、1 passは32件で止まる。64 MiBを超えるsourceは、claimを残して次のpassで終わる。排他を持つ間の受理は断られ、送り直しで受理される。
-15. cloneのdirectoryは、どの削除の後も残る。gcは1つのcloneに1日1回まで。
-16. 失敗した受け取りの残り: 公開の前に拒否された受け取りが入れたblobは、作業directoryを捨てるときのtokenの解放で消え、他の受け取りや公開済みのsourceも持つblobは残る。解放の時に排他が取れなければ、tokenと作業directoryが残り、次のtickで消える（`sources/objects/` を走査しない）。
-17. 試用中は何も消さない。
-18. `put_bytes` を消した後、(f) の5つのtestが同じassertで通る。
+13. bytes: migrationの後、各passが1,000行まで埋め、fileの無い行には0を書き、埋まるまで量による削除をしない。sourceを消して同じ内容を受け取り直した後、`store_bytes` が、在るfileの大きさの合計と一致する（drainでの引き算か、`changes() = 1` の条件を外すと一致しない）。放棄とscratchの削除の後も一致する。
+14. 1回の上限: 33件の候補で、1 passは32件で止まる。64 MiBを超える量は次のpassに回り、passの間にclaimが残らない。64 MiBより大きいblob（試験では予算を小さくして、予算の半分より大きいblob）が、1 passに1つ消える（最初の1つの例外を外すと、何passでも消えない）。
+15. 区切りの間の読み手: 消す処理が排他を持つ間に、別の（参照されている）sourceの準備とCIのsupervisorのmanifestの読み取りが、失敗せずに待って読める（待つ取り方を外すと型の無い失敗になる）。
+16. 受け取りが進行中の間の削除: 別のsourceの受け取り（`receipt` のroot）と、`INPUT_MISSING` の後に残した作業directoryがある間も、5bのpassはsourceを消し、passの後に `begin_import` と公開が断られない。tokenの解放が、自分のrootのblobを消し終える（`receipt` を門と `drain_claim` の確認から除くのを外すと、passが何も消さないか、claimが残って `begin_import` が断られる）。
+17. 一部だけ消したsourceの受け取り直し: sourceの切り離しの後、そのblobの一部だけが消えた状態で、同じsourceを受け取り直すと、新しい `receive:<S>` が全部のblobを持ち、その後のpassが `drop:` のrootを片付けても、`S` のblobが全部残り、workspaceが作れる（切り離しをやめて `receive:<S>` を残すと、受け取り直したblobがtokenの解放で消える）。
+18. submoduleのref: 親のcloneに付いた子のsnapshotのrefが、`clone_ref` の行が無くなったときに、親のcloneから消える。同じsubmoduleを使う別の親が在る間は残る。
+19. cloneのdirectoryは、どの削除の後も残る。gcは1つのcloneに1日1回まで。
+20. 失敗した受け取りの残り: 公開の前に拒否された受け取りが入れたblobは、作業directoryを捨てるときのtokenの解放で消え、他の受け取りや公開済みのsourceも持つblobは残る。解放の時に排他が取れなければ、tokenと作業directoryが残り、次のtickで消える（`sources/objects/` を走査しない）。
+21. crashの後: 区切りの中のclaimの後にkillすると、次のpassの段0が消し終え、その後は `begin_import` が通る。
+22. 親と同じdirectoryを指したstoreでは、5bは何も消さない。
+23. 試用中は何も消さない。
+24. `put_bytes` を消した後、(f) の5つのtestが同じassertで通る。
 
 ## 25.9 段階5bで閉じなかったこと
 
-段階5bの設計メモ（以前のこの節）の9つは、25.8の5bで閉じた（1: `received` のrootを起点に、`release_member` でBの保護のまま消す。2: 型つきの断り `INPUT_MISSING`。3: 受理は共有lockを待たずに取り、削除は排他を待たずに取る。4: local-ci 0.19.0の `remove_imported_refs`。5: Gitの猶予つきのgcだけを使う。6: cloneのdirectoryは消さない。7: storeの合計を上限で抑える。8: `put_bytes` を消す。9: 5aのtokenの解放を `release_member` にする）。残るのは次である。
+段階5bの設計メモ（以前のこの節）の9つは、25.8の5bで閉じた（1: `received` のrootを起点に、`release_member` でBの保護のまま消す。2: 型つきの断り `INPUT_MISSING`。3: 受理は共有lockを待たずに取り、削除は排他を待たずに区切りごとに取る。4: local-ci 0.19.0の `remove_imported_refs` と `clone_ref`。5: Gitの猶予つきのgcだけを使う。6: cloneのdirectoryは消さない。7: storeの合計を上限で抑える。8: `put_bytes` を消す。9: 5aのtokenを `receipt` にし、解放を `release_member` にする）。残るのは次である。
 
-- **受け取りを拒否したときの、空のcloneの削除。** 今の `remove_clone_if_empty`（`src/workspace/mod.rs:243`。`src/worker/blobs.rs:1250`、`1457` から呼ぶ）は、その受け取りが新しく作ったcloneにrefが1つも無ければ、`clones/<name>.lock` の下でdirectoryごと消す。cloneの中の `fast-worktree-registration.lock` と `belt-workspace.*` について、25.1の (A) も (B) も示していない（作ったばかりでrefが無いので、workspaceは作れないが、fast-worktreeを単独で動かすprocessが開かないことは示していない）。段階5bの「cloneのdirectoryは消さない」の例外として残すか、消すのをやめるかを決める。決めるまで、今の挙動のままとする。
+- **受け取りを拒否したときの、空のcloneの削除。** 今の `remove_clone_if_empty`（`src/workspace/mod.rs:243`。`src/worker/blobs.rs:1250`、`1457` から呼ぶ）は、その受け取りが新しく作ったcloneにrefが1つも無ければ、`clones/<name>.lock` の下でdirectoryごと消す。cloneの中の `fast-worktree-registration.lock` と `belt-workspace.*` について、25.1の (A) も (B) も示していない。ただし、危険は小さい: 呼び出し元の2つは、どちらも取り込みlockを持ち、この取り込みが作ったcloneだけを対象にする。refの無いcloneは、workspaceの作成が `fw.add` の前の `has_commit` で失敗する（`src/workspace/mod.rs:345`）ので、beltはその中のlockを開かない。残るのは、fast-worktreeを単独で動かすprocessが、作ったばかりのcloneを開くことだけである。段階5bの「cloneのdirectoryは消さない」の例外として残すか、消すのをやめるかを決める。決めるまで、今の挙動のままとする。
+- **`publication` の行。** objectの行は、fileを消すときに消す（(c)）が、`publication` の行は、世代の番号のために残す。行の数は、そのstoreに入ったことのある、内容の違うobjectの数で、1行は数十byteである。消すには、古い世代を持つ読み手とclaimが残っていないことを示す必要がある。
 
 ## 25.10 場所ごとの一覧
 
@@ -2581,22 +2615,22 @@ workerのagentのtick（既存の監視の周期）で、60秒に1回まで行�
 
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
-| runの行（run・task・attempt・placement・collectionなど、25.5の段6の表） | `coordinator.db` | `show`・`ls`・`retry`・回収・復旧 | 消さない | runが在る間。刈り取りで消す | 2 | 25.5 |
-| event（runかattemptのもの） | `coordinator.db` の `event` | `show`・`logs`・配置の理由・GitHub status | 消さない（triggerが禁じる） | runと一緒 | 2 | 25.5 |
-| event（どちらも持たないもの） | 同上 | 診断 | 消さない | `retention_days` 日 | 2 | 時刻 |
-| `control_request` | `coordinator.db` | 同じ `request_id` の再送 | 消さない。runの列が無い | runと一緒 | 1（列）、2 | 25.5 |
+| runの行（run・task・attempt・placement・collectionなど、25.5の段6の表） | `coordinator.db` | `show`・`ls`・`retry`・回収・復旧 | runの刈り取りで消す（終わってから `retention_days` 日） | runが在る間。刈り取りで消す | 2 | 25.5 |
+| event（runかattemptのもの） | `coordinator.db` の `event` | `show`・`logs`・配置の理由・GitHub status | runと一緒に消す（triggerは、行があって印の無いrunのeventの削除だけを禁じる。このrunのattemptを名指して別のrunを名指すものは、そのrunと一緒。行の無いattemptを名指すeventは書かない） | runと一緒 | 2 | 25.5 |
+| event（どちらも持たないもの） | 同上 | 診断 | 書いてから `retention_days` 日で消す（1 passで1,000行） | `retention_days` 日 | 2 | 時刻 |
+| `control_request` | `coordinator.db` | 同じ `request_id` の再送 | runと一緒に消す | runと一緒 | 1（列）、2 | 25.5 |
 | 行の無いrunへのcancelの行 | `coordinator.db` の `run_cancel_intent`・`control_request`・`event`（そのrun ID） | 後から届くenqueue | 持ち主の行が `capturing` の取り込み（進行中か、持ち主が `given_up` を書かずに終わったもの）のrunについてだけ書く。enqueueが届かなければ、放棄の処理で消す（段階1より前は、どのrun IDへのcancelでも書き、消さなかった） | 持ち主の行が `capturing` の取り込みのrunについてだけ書く（取り込み1つにつき、予約1行、cancelの要求ごとに受領とeventが1行ずつ）。enqueueが届けばrunと一緒に、届かなければ放棄の処理で消す | 1 | 25.4の (b) |
 | `pending_delete`・`result_delete_claim` | `coordinator.db` | 削除の再実行 | fileを消した後に消す | 同じ | 既存 | fileが無いこと |
-| `ci_test_timing` | `coordinator.db` | Shardの分割 | 消さない | 最後に書いてから14日 | 2 | 時刻 |
+| `ci_test_timing` | `coordinator.db` | Shardの分割 | 最後に書いてから14日で消す（1 passで1,000行） | 最後に書いてから14日 | 2 | 時刻 |
 | 退役させたidentity | `coordinator.db` の `worker_identity_tombstone`・`identity_retired_notice` | 接続の拒否 | 消さない | 未決（25.16） | なし | なし |
-| 外したメンバー | `coordinator.db` の `removed_member` | 接続の拒否 | 戻したときに消す | 外した名前ごとに1行 | 既存 | 利用者の操作 |
+| 外したメンバー | `coordinator.db` の `removed_member`。coordinator DBの無いhostでは `removed-members.json`（固定のfile、1個） | 接続の拒否 | 戻したときに消す。coordinator DBのあるhostに残っていた `removed-members.json` は、次の鍵の更新（`group rotate`）が表へ移して消す（読めなければ警告して残し、次の更新がまた試す） | 外した名前ごとに1行 | 既存、2（fileの移し替え） | 利用者の操作 |
 | 結果 | `results/<attempt>/`（result・log・artifact・`tmp/*.part`） | `logs`・`outputs`・CIの後のJobのdownload | attemptごとに、終了と回収を閉じた時点の遅い方から `retention_days` 日。workflow artifactは、runが終わってから `retention_days` 日。spoolは1 GiB/task、artifactは1 GiB/upload | 同じ。刈り取りの段3が残りを消す | 既存（残りは2） | 排他pinと、回収が閉じていること |
-| readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | 消さない。結果のGCが、行の無いrunのpinも作る | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
+| readerのpin | `reader-pins/<run>.lock` | `logs`・`outputs`・結果のGC | runの刈り取りの最後にunlinkする。作るのは、行があって印が無いときだけ。行の無いrunのpinは、起動時の走査が消す | runが在る間。作るのは、行があって印が無いときだけ | 2 | 25.1の (B)、25.5 |
 | 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日（終点は25.3の (a)）。取り込みは、内容が安定した後にだけここへ入れ、入れる前に索引へ予約を書く。提出されなかった取り込みが入れたものと、取り込みを止めた、どのrootも持たない内容の違うfileは、放棄の処理で消す（25.4の (b)） | 同じ | 既存 | 索引に参照が無いこと、排他lock |
-| 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | runの行は消さない。放棄された取り込みの行（`capture_owner`、そのrootとmember・graph、`import_session`）は、放棄の処理で消す。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は段階5bで消す | 1（`capture_owner` と放棄）、2（runの行）、5b（`put_bytes`） | 指す先が無いこと |
-| runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 提出されたrunのものは消さない。提出されなかった取り込みのものは、放棄の処理で消す | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
+| 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | runの行（runのrootとそのmember・graph、`run_expiry`、完了した `vault_delete_claim`、`import_session`、`capture_owner`）は刈り取りで、放棄された取り込みの行は放棄の処理で消す | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない。段階5bで消す | 1（`capture_owner` と放棄）、2（runの行）、5b（`put_bytes`） | 指す先が無いこと |
+| runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 提出されたrunのものは刈り取りで、提出されなかった取り込みのものは放棄の処理で消す | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
 | 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わった取り込みのものは、放棄の処理で消す。一時fileは、保持driverが `sources/secrets.lock` を待たずに排他で取れたpassと、workerの起動（`sweep_store_copies`）で消す | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
-| bundle | `sources/bundles/<source>-<32hex>.bundle` | 進行中の配送（offsetからの再開） | sourceごとに4個まで。配送の成功時に消す。失敗・放棄では残る | 加えて、そのsourceを参照するrunが無くなったときに消す | 2 | 索引に参照するrunが無いこと |
+| bundle | `sources/bundles/<source>-<32hex>.bundle` | 進行中の配送（offsetからの再開） | sourceごとに4個まで。配送の成功時に消す。失敗・放棄で残ったものは、そのsourceを参照する最後のrunの刈り取りで消す | 加えて、そのsourceを参照するrunが無くなったときに消す | 2 | 索引に参照するrunが無いこと |
 | 親のGit領域 | `sources/git/<key>.git`（`refs/local-ci/snapshots/<source>`・`index/<source>`・`heads/*` とGit object） | bundleの作成、次の取り込み | 消さない | refはsourceが在る間。objectはrefを消してから最長14日と24時間（25.5）。`heads/*` と、refを消す関数は未決（25.16）。取り込みの予約とscratch directoryの対象外で、途中で終わった取り込みが書いたobjectとrefも同じ扱いである | 2（関数があれば） | refが無いこと、Gitの猶予 |
 | 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残るものは、そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動）が、名前かmarkerで所有を証明できたものだけ消す。取り込みが書く一時fileとcommitのcheckoutは、ここではなく、下のscratch directoryに書く | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | 取り込みのscratch directory | `sources/staging/<ulid>/`（local-ciが作る `objects/`・`manifests/`・`secrets/`・`tmp/` と、commitの取り込みのcheckout `commit-<sha>-*/`） | その取り込みだけ | 取り込みが、戻る前に中身ごと消す（消せなければ取り込みは失敗する）。途中で終わった取り込みのものは、放棄の処理が、storeのfileより先に、中身ごと消す。計画の下書きのものは、下書きのdirectoryと一緒に消える | 取り込みの間だけ。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1 | `capture_owner` の行が名指すこと、sourceの排他lock（取り込みは共有で持つ）、自分のuid・同じfilesystem・symlinkをたどらないこと（25.4の (b)） |
@@ -2605,7 +2639,7 @@ workerのagentのtick（既存の監視の周期）で、60秒に1回まで行�
 | 親Vault | `secrets/<run>.json`、`parent-retention.json`、lock | 配送、`retry` | runが終わった時点で消す。放棄された取り込みのものは、放棄の処理で消す | 同じ | 既存、1（放棄） | 第23章のC、25.4の (b) |
 | Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 名前（`.belt-tmp.…`）が所有を証明し、排他leaseの下で持ち主が居ないものを消す。名前を解釈できないものは数えるだけで残す（古い形の名前は、排他leaseの下で消す） | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | FrozenPlan | `ci-plans/<digest>` | CI runの進行 | 名指す待ちのtaskが無くなって `retention_days` 日 | 同じ | 既存 | 名指すtaskが無いこと |
-| in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときと、取り込みが放棄されたときに消す。受理されたrunのものは消さない | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
+| in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときと、取り込みが放棄されたときに消す。受理されたrunのものは、刈り取りで消す | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
 | 実測 | `stats/costs-v1.sqlite`（`costs`・`preparation_namespaces`・`preparation_receipts`・`cost_eviction`） | 配置の見積 | `costs` 4,096行、`preparation_namespaces` 4,096 | 同じ | 既存 | 順位 |
 | 更新の試用 | `upgrade/`（`record.json`、退避したDBと設定） | rollback | 試用の間。同時に1つ | 同じ | 既存 | commitの記録 |
 | 公開の直前のstage（鍵・binary・DB・入力・serviceの定義） | `.init-*` | `init` の続き | journalが名指すものは、`init` の回復が公開を済ませ、取り消しが消す。一時fileの走査は見ない。journalに書く前に終わった `init` の残りは、次の `init` が、回復の後に持ち主の居ないものを消す（config directory、binaryのdirectory。親のstateは、自分のjournalがそこのDBを公開済みのときだけ。DBのstageの横の `-wal`・`-shm`・`-journal`・`.init-lock` も同じ走査で消す）。serviceの定義のdirectoryの残りと、古い形の `.init-<ulid>` は残る（1回のkillにつき高々1個。serviceの定義は数KB）。親のstateのDBのstageは、どの `init` もそこのDBを公開しない間は残る（同じく1回のkillにつき高々1個と、その横の4つ） | 同じ | 1 | `init.json` に無いことと、持ち主 |
@@ -2627,9 +2661,9 @@ workerのagentのtick（既存の監視の周期）で、60秒に1回まで行�
 | workspace | `workspaces/<attempt>` | attemptのcommand | terminalで消す。32個まで | 同じ | 既存 | terminalと、supervisorのlock |
 | supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 消さない。全部を走査する | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
 | secretの配置 | workspaceの中、`secret-index/<attempt>.json`、`.secrets.tmp-*`、`secrets/` | attemptのcommand | terminalで消す | 同じ | 既存 | terminal |
-| 受け取ったsource | `sources/manifests/`、`sources/objects/` | `blob_verify`、workspaceの準備 | 消さない | 参照されていない（terminalでないattemptも、参照されているsourceのgraphも名指さない）ものを、最後に使ってから14日で消す。store全体が20 GiBを超える間は、古い順に消す。共有のobjectは最後のmemberと一緒に消える。公開に失敗した受け取りのblobは、tokenの解放で消す | 5b | sourceの変更lockの排他と `worker.db` の確認（25.8の5bの (a)） |
+| 受け取ったsource | `sources/manifests/`、`sources/objects/` | `blob_verify`、workspaceの準備 | 消さない | 参照されていない（terminalでないattemptも、他の受け取ったsourceのgraphも名指さない）ものを、最後に使ってから14日で消す。store全体が20 GiBを超える間は、古い順に消す。共有のobjectは最後のmemberと一緒に消える。公開に失敗した受け取りのblobは、tokenの解放で消す | 5b | sourceの変更lockの排他と `worker.db` の確認（25.8の5bの (a)） |
 | workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | `import_session`・`root(kind='pending')`・`member` が、受け取ったblobごとに増える | 公開か放棄で消す | 5a | 25.8 |
-| clone | `clones/<repo>` | bundleの展開、workspaceの準備 | 消さない。refは、受け取りを拒否したときだけ消す | directoryは消さない（数は `repository_id` の種類で頭打ち）。消したsourceのref（`snapshots/<S>`・`index/<S>`）は同じ排他と取り込みlockの下で消し、Git objectは `git gc --prune=14.days.ago`（1つのcloneに1日1回まで）で回収する | 5b | Gitの14日の猶予（25.8の5bの (e)） |
+| clone | `clones/<repo>` | bundleの展開、workspaceの準備 | 消さない。refは、受け取りを拒否したときだけ消す | directoryは消さない（数は `repository_id` の種類で頭打ち）。消したsourceのref（`snapshots/<S>`・`index/<S>`）は、付けたcloneごとの記録（`clone_ref`）が無くなったときに、同じ排他と取り込みlockの下で消し、Git objectは `git gc --prune=14.days.ago`（1つのcloneに1日1回まで）で回収する | 5b | Gitの14日の猶予（25.8の5bの (e)） |
 | 受け取り途中 | `incoming/<source>/` | 送り手の再開 | 16個、合計64 GiB、1つ32 GiB。24時間進まなかったものは、16個に達したときだけ消す | 24時間進まなければ、tickで消す | 5a | 進んでいないこと |
 | 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残るものは、workerの起動（`agent.lock` の下）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | `agent.lock` と持ち主 |
 | setup template | `setup/templates/<key>/` と、最後に使った時刻のstamp `<key>.used` | setupの適用 | 20 GiB、14日、run scopeは1時間。stampは、templateの無いものを片付けのときに消す | 同じ | 既存 | copy中でないこと、pin |
@@ -2723,11 +2757,11 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | - | - | - | - | - |
 | 0 | `run.pruning_at_ms`。schemaの版を上げる | なし | なし | 断る理由 `run_pruned`。印の確認を再送の受領より先にする |
 | 1 | `control_request.run_id` と索引（既存の行は `target_json` から埋める）。索引 `event(run_id, seq)`。`event_no_delete` を、行の無いrunのeventの削除だけを通す条件つきのtriggerに置き換える。行の無いrunの `run_cancel_intent`・`control_request`・`event` を消す | なし | `capture_owner(run_id, state, root, place, pid, start)`（版は上げない）。`root.kind` の値 `abandoned`。claimの印。取り込みの予約（`member` の行）とscratch directory（`sources/staging/<ulid>/`）は、表も列も足さない | 断る理由 `capture_abandoned`。行の無いrunへのcancelは、持ち主の行が `capturing` の取り込みのものだけ受理し、ほかは `NOT_FOUND`（挙動の変更）。`ephemeral.json`・`ephemeral.lock`。一時fileの名前の規則（場所はhash） |
-| 2 | `retire_tombstone_no_delete` を外す。`event_no_delete` を外すか、条件を広げる（段階1の条件は、行の無いrunのeventしか通さない。刈り取りは、行の在るrunのeventと、attemptだけを持つeventを消す）。索引 `event(seq)`（部分）、`run(source_id)`、`run(secret_bundle_id)`。`ci_test_timing` の時刻と索引。schemaの版を上げる | なし | `import_session(run_id)` の索引 | なし |
+| 2 | `retire_tombstone_no_delete` を外す。`event_no_delete` の条件を広げる（断るのは、行があって印の無いrunのeventと、そのようなrunのattemptだけを名指すeventの削除）。索引 `event(seq)`（部分）、`run(source_id)`、`run(secret_bundle_id)`、`run(run_id)`（印のあるrunの部分索引）、`placement(task_id)`、`matrix_group(run_id)`、`matrix_permit(group_id)`。`ci_test_timing.written_at_ms` と索引。schemaの版を上げる | なし | `import_session(run_id)` の索引 | なし |
 | 3 | なし（submitと解放の排他は、親のprocessの中。打ち切りの時点の `release_attempt` と、照合は、既存の行から決まる） | 重複防止の記録の表、`refused_member`。`event_no_delete`・`tombstone_no_delete` を外す。submitの判定と挿入を1つのtransactionにする。段階3より前にACKされた行の削除（試用の後） | なし | 機能 `attempt_release_v1`、操作 `release_attempt`（controlの種類）・`list_unreleased`、`overloaded_reason.reason = "attempt_records"`、断る理由 `member_forgotten`、`belt group forget <member>` |
 | 4 | なし | toolchainのrootの表と参照の表。既存のrootの行の作成（最初の起動） | なし | なし |
 | 5a | なし | なし | なし（tokenの解放の処理を足す） | なし |
-| 5b | なし | 列 `worker_attempt.source_id` と部分索引 `worker_attempt(source_id) WHERE state <> 'terminal'`（terminalでない行だけ `spec_json` から埋める）。schemaの版を上げる | 列 `object.bytes`（既存の行は各passが埋める）、`meta` の `store_bytes` と `gc:<clone>`、列 `root.used_ms` と索引 `root(kind, used_ms)`、索引 `graph(source, root)` | code `INPUT_MISSING`（`source_id`、公開の時は足りないblobの一覧）、機能 `input_missing_v1`、`OVERLOADED` の理由 `source_store`。`GuardedObjectStore::put_bytes` を消す（公開のAPIではない） |
+| 5b | なし | 列 `worker_attempt.source_id` と部分索引 `worker_attempt(source_id) WHERE state <> 'terminal'`（terminalでない行だけ `spec_json` から埋める）。schemaの版を上げる | 列 `object.bytes`（既存の行は各passが埋める。fileを消すときにobjectの行を消す）、`meta` の `store_bytes`・`gc:<clone>`・`ref_drop:<clone>:<source>`、列 `root.used_ms` と索引 `root(kind, used_ms)`、索引 `graph(source, root)`、表 `clone_ref(clone, source, root)`（migrationが `received` のrootから埋める）、rootの種類 `receipt`（5aのtoken）と `drop:` のroot（`abandoned`） | code `INPUT_MISSING`（`source_id`、公開の時は足りないblobの一覧）、機能 `input_missing_v1`、`OVERLOADED` の理由 `source_store`。`GuardedObjectStore::put_bytes` を消す（公開のAPIではない） |
 
 ## 25.14 他の章との関係
 
@@ -2735,22 +2769,22 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 
 | 章 | 今の文 | 変える段階 | 変わった後 |
 | - | - | - | - |
-| 第6章 | 受理されたrunのprivate bindingは、親stateの削除まで保持する（放棄された取り込みのbindingは、段階1で消すようにしてある） | 2 | runの刈り取りで消す |
+| 第6章 | 受理されたrunのprivate bindingは、親stateの削除まで保持する（放棄された取り込みのbindingは、段階1で消すようにしてある） | 2（入れてある） | runの刈り取りで消す |
 | 第6章 | 内容をprivateなobject storeへ取り込み、安定したらmanifestをatomicに公開する（やり直した回のobjectは、storeに残った） | 1（入れてある） | 内容は取り込みごとのscratch directoryへ書き、安定した後にだけ、索引へ予約を書いてからstoreへ入れる（25.4の (b)） |
-| 第11章 | retire・重複排除の最小記録はclusterの寿命中保持する | 2（親）、3（worker） | 親の記録はrunと一緒に、workerの記録は25.6の (c) で消す |
+| 第11章 | retire・重複排除の最小記録はclusterの寿命中保持する | 2（親。入れてある）、3（worker） | 親の記録はrunと一緒に、workerの記録は25.6の (c) で消す |
 | 第11章 | `list_attempts` は500件を超えると `INVALID_INPUT` | 変えない | 照合には `list_unreleased` を使う |
-| 第13章 | 入力、ログ、結果の既定保持はterminal後7日。回収の判定の記録は消さない | 2、3 | 回収の記録はrunと一緒に消す。workerの写しは解放の受理で消す |
+| 第13章 | 入力、ログ、結果の既定保持はterminal後7日。回収の判定の記録は消さない | 2（入れてある）、3 | 回収の記録はrunと一緒に消す。workerの写しは解放の受理で消す |
 | 第13章 | 打ち切った回収ではACKを送らず、開き直せる | 3 | ACKは送らない。打ち切りの時点で `release_attempt` を送り、workerはその場で写しを消す。開き直しはできなくなる（開き直す経路は製品に無い。足す変更が、写しを残す期間を定める。25.6） |
 | 第13章 | resultなしで確定したattemptに後からresultが保存された場合の検出（`ack_collected` の `CONFLICT`、digestを照合した読み取りの後の保存の拒否） | 変えない | 成功した回収のACKは変わらない。`release_attempt` はdigestを運ばないが、resultを持たないattemptへは、supervisorのlockを取れたときだけ受理する |
 | （他の章に記述は無い。段階1より前の実装は、行の無いrun IDへのcancelを受理して記録した） | なし | 1（入れてある） | 持ち主の行が `capturing` の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（持ち主の行を読めなかったときは、送り直しを求める答え。25.4の (b)） |
 | 第15章 | 退役したidentityはtombstoneを永続保持する | 未決 | 25.16 |
 | 第15章 | バイナリはversion別directoryへ配置する | 4 | 名指すものの無い版を消す |
 | 第15章 | 残ったstateは、次の一時workerが、使われていないことを証明できたときだけ消して起動する（「起動し直し」。段階1で書き足した。それより前は記述が無く、実装はstateが残っていると起動を断っていた） | 1（実装済み） | 25.4の (d) |
-| 第23章 | reader-pinsのinodeはparent stateとともに保持し、unlinkしない | 2 | runの刈り取りの最後にunlinkする |
-| 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
-| 第23章 | Git・bundleの片付けは後続の作業 | 2 | 25.5の段4 |
+| 第23章 | reader-pinsのinodeはparent stateとともに保持し、unlinkしない | 2（入れてある） | runの刈り取りの最後にunlinkする |
+| 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2（入れてある） | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
+| 第23章 | Git・bundleの片付けは後続の作業 | 2（bundleは入れてある。Gitのrefは25.16） | 25.5の段4 |
 | 第23章 | Future expiry of received roots also requires per-import pending ownership | 5a、5b | 25.8が持ち主を定め（5a）、受け取ったrootの削除を定める（5b） |
-| 第13章 | 受理を後の照合へ回すのは、sourceがまだworkerのstoreに無い場合だけ。artifactを宣言しないpayloadでは、受理の時点でsource manifestを読まない | 5b | 受理は必ずsourceの有無を確かめ、無ければ `INPUT_MISSING` で断る（`input_missing_v1` を交渉しない親には今のまま） |
+| 第13章 | 受理を後の照合へ回すのは、sourceがまだworkerのstoreに無い場合だけ。artifactを宣言しないpayloadでは、受理の時点でsource manifestを読まない | 5b | 新しいattemptの受理は必ずsourceの有無を確かめ、無ければ `INPUT_MISSING` で断る（`input_missing_v1` を交渉しない親には今のまま） |
 | 第11章 | `blob_verify` は何も変更しない | 変えない | 公開の時に、`present` と答えたblobが消えていれば、拒否せず `INPUT_MISSING` で答え、親が `blob_verify` からやり直す |
 | 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 実装済み: 名前（`.belt-tmp.…`）で所有を証明し、排他leaseの下で消す。解釈できない名前は残す |
 | 24.4 | 受理したattemptのtombstoneは消さない | 3 | 重複防止の記録に置き換える |
@@ -2793,7 +2827,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 次は、消す時点をこの版では定めていない。閉じるのに要るものを書く。
 
 - **常駐workerの退役させたidentityの記録**（親DBの `worker_identity_tombstone`・`identity_retired_notice`）。件数は退役の回数（利用者の `workers forget` と、同じ名前の新しいidentityの接続）で、実行の数では増えない。閉じるには、同じidentityが戻らないことを何が証明するかを決める必要がある。外したメンバーは `group send-key` で戻れ、戻るときにworkerのidentityを作り直す（24.2）が、作り直す前のidentityのprocessが残っていないことを、親の側から確かめる手段が無い。一時workerのidentityは「起動時にだけ鍵を受け取るので、鍵の更新の後は接続できない」と言えるが、親の記録に、そのidentityが一時workerのものだったという項目が無い。項目を足すか、workerの側の証明（identityを作り直した記録を親へ届ける）を足すかを決める。
-- **親のGit領域とcloneのref**（`refs/local-ci/snapshots/*`・`refs/local-ci/index/*`・`refs/local-ci/heads/*`）。beltは、local-ciのGit領域の中を自分で書き換えない。取り込みがstoreへ入れるobjectとmanifestは、scratch directoryと予約で数えるようになった（25.4の (b)）が、Git領域のobjectとrefは、今もlocal-ciが取り込みの途中で直接書く。途中で終わった取り込み・入力が動いてやり直した取り込みが書いた分も、この項目に含まれる。閉じるには、local-ciのライブラリに次の関数が要る: (1) store（またはclone）とsource IDの集合を受け取り、「残すsource」以外のsnapshotとindexのrefを消す。(2) `heads/*`（履歴の取り込みに使う）について、残すsourceのどれからも要らなくなったものを消す。どれが要るかはlocal-ciだけが知っている。(3) 消したrefの数を返し、進行中の取り込みと競合しない（local-ci自身のlockの下で行う）。beltは、刈り取りの段4から、残すsourceの集合を渡してこの関数を呼ぶ。この関数が無い間、refと、それが指すGit objectは残る。workerのcloneは、この項目から外れる: workerの受け取りが付けるrefは消すsourceのsnapshotとindexの2つだけで（`heads/*` は付けない）、段階5bがsourceごとに `remove_imported_refs` を、取り込みlockの下で呼ぶ（25.8の5bの (e)）。
+- **親のGit領域とcloneのref**（`refs/local-ci/snapshots/*`・`refs/local-ci/index/*`・`refs/local-ci/heads/*`）。beltは、local-ciのGit領域の中を自分で書き換えない。取り込みがstoreへ入れるobjectとmanifestは、scratch directoryと予約で数えるようになった（25.4の (b)）が、Git領域のobjectとrefは、今もlocal-ciが取り込みの途中で直接書く。途中で終わった取り込み・入力が動いてやり直した取り込みが書いた分も、この項目に含まれる。閉じるには、local-ciのライブラリに次の関数が要る: (1) store（またはclone）とsource IDの集合を受け取り、「残すsource」以外のsnapshotとindexのrefを消す。(2) `heads/*`（履歴の取り込みに使う）について、残すsourceのどれからも要らなくなったものを消す。どれが要るかはlocal-ciだけが知っている。(3) 消したrefの数を返し、進行中の取り込みと競合しない（local-ci自身のlockの下で行う）。beltは、刈り取りの段4から、残すsourceの集合を渡してこの関数を呼ぶ。この関数が無い間、refと、それが指すGit objectは残る。採用している版（local-ci 0.18.5）と0.19.0には、この関数は無い: `remove_imported_refs` はあるが、cloneに `import_objects` が付けたrefを消す関数で、storeのGit領域を対象にせず、「残すsource」の集合も `heads/*` も扱わず、進行中の取り込みと競合しないためのlockも取らない。したがって段階2は、refの削除と `git gc` を入れていない（25.5の受け入れ試験の (xi) は、`git gc` を呼ぶコードが無いので該当しない）。 workerのcloneは、この項目から外れる: workerの受け取りが付けるrefは消すsourceのsnapshotとindexの2つだけで（`heads/*` は付けない）、段階5bがsourceごとに `remove_imported_refs` を、取り込みlockの下で呼ぶ（25.8の5bの (e)）。
 - **受け取りを拒否したときの、空のcloneの削除**（25.9）。段階5bのほかの部分は25.8で定めた。
 - **retireを確認したattemptのworkerの写し。** 親がretireを確認したattemptは、親がその結果を読まない。workerが受理していたものは、今は `ack_wait`（7日）か、runの刈り取りの `release_attempt` まで、workerに写しが残る。確認の時点で `release_attempt` を送れば、その場で消せる。閉じるには、(1) 親が、retireを確認した後に、そのattemptのsubmitを送り直さないこと（25.6の (c) の証明は「terminalの記録の後は送らない」に依っており、retire済みのattemptは親の側でterminalにならない）、(2) workerの側で、retireを確認したattemptがterminalになっていること（`release_attempt` はterminalのattemptだけ受理する）、を実装で確かめる必要がある。
 - **導入のhelperが残っていないことの確認**（25.7の (b)）。規則は書いたが、helperがどのprocess groupで起動されるか、今のbuilderの片付けがその終了を確かめているかは確認していない。段階4の実装の最初に確かめる。
