@@ -62,9 +62,9 @@ pub struct AbandonCursor {
     object: String,
 }
 
-struct Budget {
-    paths: u32,
-    bytes: u64,
+pub(super) struct Budget {
+    pub(super) paths: u32,
+    pub(super) bytes: u64,
 }
 
 enum Outcome {
@@ -73,7 +73,7 @@ enum Outcome {
     Continuing,
 }
 
-fn would_block(error: &anyhow::Error) -> bool {
+pub(super) fn would_block(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
@@ -118,7 +118,7 @@ impl Index {
             Err(error) => Err(error.into()),
         }
     }
-    fn unlink_run_file(&self, directory: &str, private: bool, name: &str) -> Result<()> {
+    pub(super) fn unlink_run_file(&self, directory: &str, private: bool, name: &str) -> Result<()> {
         match self.run_directory(directory, private)? {
             Some(dir) => unlink_owned(&dir, name),
             None => Ok(()),
@@ -264,7 +264,14 @@ impl SourceStore {
         fault("abandon_after_rows")?;
         // 2. The Vault bundle, by the Vault's own claim, unlink and
         // completion, and then the completed claim.
-        if !self.abandon_vault(owner, vault, c, &run, &mut budget.bytes)? {
+        if !self.abandon_vault(
+            owner,
+            vault,
+            c,
+            &run,
+            &mut budget.bytes,
+            "capture_abandoned",
+        )? {
             return Ok(Some(Outcome::Continuing));
         }
         fault("abandon_after_vault")?;
@@ -292,13 +299,14 @@ impl SourceStore {
 
     /// False when the Vault is busy: nothing was done, a later pass tries
     /// again.
-    fn abandon_vault(
+    pub(super) fn abandon_vault(
         &self,
         owner: &crate::storage::CoordinatorStore,
         vault: &Vault,
         c: &Connection,
         run: &RunId,
         bytes: &mut u64,
+        reason: &str,
     ) -> Result<bool> {
         ensure!(
             vault.matches_source(&self.retention.path),
@@ -337,8 +345,8 @@ impl SourceStore {
                 // The claim of a run that never had a row names no source
                 // binding: the run ID alone names the bundle.
                 c.execute(
-                    "INSERT INTO vault_delete_claim(run_id,source_id,binding_digest,claim_json,done) VALUES(?1,'','capture_abandoned',?2,0)",
-                    params![run.as_str(), serde_json::to_string(&claim)?],
+                    "INSERT INTO vault_delete_claim(run_id,source_id,binding_digest,claim_json,done) VALUES(?1,'',?3,?2,0)",
+                    params![run.as_str(), serde_json::to_string(&claim)?, reason],
                 )?;
                 crate::secrets::vault::retention_fault("after_claim")?;
                 Some((registration, claim))
@@ -361,7 +369,7 @@ impl SourceStore {
     }
 
     /// True when neither root is left.
-    fn abandon_roots(
+    pub(super) fn abandon_roots(
         &self,
         c: &mut Connection,
         run: &RunId,

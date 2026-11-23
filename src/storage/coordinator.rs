@@ -19,8 +19,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod prune;
 mod retention;
 mod workflow_artifact;
+pub use prune::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use retention::{ResultDeleteClaim, ResultGcPage};
 pub use workflow_artifact::{WorkflowArtifact, WorkflowUpload};
 mod collect;
@@ -250,7 +252,18 @@ fn not_found(what: impl Into<String>) -> StorageError {
 pub(crate) const RUN_PRUNED: &str = "run_pruned";
 
 fn run_pruned(run: &str) -> StorageError {
-    not_found(format!("run {run} ({RUN_PRUNED})"))
+    not_found(format!("run {run} ({RUN_PRUNED}; {RUN_RETENTION})"))
+}
+
+/// What the `NOT_FOUND` of a run tells its user (spec 25.5): a run that is
+/// not there may be one whose retention has passed.
+pub(crate) const RUN_RETENTION: &str =
+    "a run is deleted retention_days days after it ended, 7 by default";
+
+/// `NOT_FOUND` for a run that has no row: one that never existed here, or
+/// one that was pruned. Nothing tells the two apart once the row is gone.
+fn no_run(run: &str) -> StorageError {
+    not_found(format!("run {run} ({RUN_RETENTION})"))
 }
 
 /// Whether `run` carries the mark. `known` is false for a file from before
@@ -490,7 +503,7 @@ impl CoordinatorStore {
                         |r| r.get(0),
                     )?;
                     if !known {
-                        return Err(not_found("run"));
+                        return Err(no_run(run.as_str()));
                     }
                     run.to_string()
                 }

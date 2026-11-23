@@ -1,4 +1,6 @@
-//! Parent result retention: one bounded run page per tick.
+//! Parent result retention: one bounded run page per tick, and then one
+//! bounded pass of the pruning of runs (spec 25.5) in the same blocking job,
+//! so the two never overlap (25.11).
 //! A page that fails keeps its data and is tried again later; it never stops
 //! the resident. Losing the fence or the owner does, and the tick loop sees that.
 use super::*;
@@ -16,9 +18,21 @@ fn entries_held(failures: u64, entries: u32) -> String {
     format!("result retention entries held (I/O); entries={entries}; failures={failures}")
 }
 
+/// The line logged when a pass of the pruning kept something: counts only.
+fn pruning_held(report: &run_pruning::PruneReport) -> String {
+    format!(
+        "run pruning held (validation/I/O); kept={}; continuing={}",
+        report.unknown, report.continuing
+    )
+}
+
+/// `inputs` is the parent's source store and Vault: with them every tick
+/// also prunes runs. Without them (a test of the result pages alone) the
+/// loop only collects results.
 pub(super) async fn run(
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
+    inputs: Option<Arc<CapturedInputs>>,
     retention_days: u32,
     cadence: Duration,
     mut stop: watch::Receiver<bool>,
@@ -26,6 +40,7 @@ pub(super) async fn run(
     let mut timer = tokio::time::interval(cadence);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cursor = Cursor::default();
+    let mut pruning = run_pruning::Pruning::default();
     let mut failures = 0u64;
     loop {
         tokio::select! { _ = stop.changed() => return Ok(()), _ = timer.tick() => {} }
@@ -38,17 +53,42 @@ pub(super) async fn run(
             continue;
         }
         let files = files.clone();
+        let inputs = inputs.clone();
         // Keep owner + exclusive pin alive inside the blocking job and
         // await its drain before token/process-owner cleanup on shutdown.
-        let (next, result) = owned_blocking(coordinator.clone(), move |owner| {
+        let (next, result, pruned) = owned_blocking(coordinator.clone(), move |owner| {
             if owner.is_fenced() || owner.in_trial() {
-                return (cursor, Ok(PageReport::default()));
+                return ((cursor, pruning), Ok(PageReport::default()), None);
             }
             let result = page(owner.store(), &files, &mut cursor, retention_days);
-            (cursor, result)
+            // The pruning follows the page in this job: a page never runs
+            // while a run is pruned. A pass that fails keeps its data, like
+            // a page that fails.
+            let pruned = inputs.map(|inputs| {
+                if owner.is_fenced() || owner.in_trial() {
+                    return Ok(run_pruning::PruneReport::default());
+                }
+                run_pruning::pass(
+                    owner.store(),
+                    &files,
+                    &inputs.sources,
+                    &inputs.vault,
+                    &mut cursor,
+                    &mut pruning,
+                    retention_days,
+                    run_pruning::Sample::platform(),
+                )
+            });
+            ((cursor, pruning), result, pruned)
         })
         .await?;
-        cursor = next;
+        (cursor, pruning) = next;
+        match pruned {
+            Some(Ok(report)) if report.unknown > 0 => eprintln!("{}", pruning_held(&report)),
+            // Never the error itself: it can name a private path.
+            Some(Err(_)) => eprintln!("{}", held(&mut failures)),
+            _ => {}
+        }
         if let Ok(report) = &result {
             if report.failed > 0 {
                 eprintln!("{}", entries_held(failures, report.failed));
@@ -342,6 +382,7 @@ pub(super) mod tests {
         let task = tokio::spawn(run(
             f.owner.clone(),
             f.files.clone(),
+            None,
             RETENTION_DAYS,
             Duration::from_millis(10),
             rx,
@@ -386,6 +427,7 @@ pub(super) mod tests {
         let task = tokio::spawn(run(
             f.owner.clone(),
             f.files.clone(),
+            None,
             RETENTION_DAYS,
             Duration::from_millis(10),
             rx,
@@ -411,6 +453,7 @@ pub(super) mod tests {
         let task = tokio::spawn(run(
             f.owner.clone(),
             f.files.clone(),
+            None,
             RETENTION_DAYS,
             Duration::from_millis(10),
             rx,
@@ -440,6 +483,7 @@ pub(super) mod tests {
         let task = tokio::spawn(run(
             f.owner.clone(),
             f.files.clone(),
+            None,
             RETENTION_DAYS,
             Duration::from_millis(10),
             rx,
@@ -472,6 +516,7 @@ pub(super) mod tests {
             run(
                 f.owner.clone(),
                 f.files.clone(),
+                None,
                 RETENTION_DAYS,
                 Duration::from_millis(10),
                 rx,

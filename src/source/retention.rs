@@ -5,7 +5,7 @@ mod deletion;
 mod foreground;
 pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{inspect_owners, CaptureOwner, CaptureVerdict};
-pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
+pub use deletion::{AbandonCursor, AbandonReport, AbandonScope, PruneInputs};
 pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
 use super::SourceStore;
@@ -177,6 +177,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS vault_delete_claim(run_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,binding_digest TEXT NOT NULL,claim_json TEXT NOT NULL,done INTEGER NOT NULL CHECK(done IN (0,1)));
           CREATE INDEX IF NOT EXISTS vault_delete_pending ON vault_delete_claim(done,run_id);
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
+          CREATE INDEX IF NOT EXISTS import_session_run ON import_session(run_id);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
         tx.execute_batch(capture_owner::TABLE)?;

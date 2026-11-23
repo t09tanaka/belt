@@ -18,6 +18,33 @@ pub struct Cursor {
     run_after: Option<crate::ids::RunId>,
     current: Option<(crate::ids::RunId, String)>,
 }
+impl Cursor {
+    /// The pruning of `run` deletes its results and, last, its pin file
+    /// (spec 25.5): a position inside that run is dropped, so no later page
+    /// comes back to it.
+    pub(crate) fn forget(&mut self, run: &crate::ids::RunId) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| current == run)
+        {
+            self.current = None;
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn at(run: &crate::ids::RunId) -> Self {
+        Self {
+            run_after: None,
+            current: Some((run.clone(), "ref".into())),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn names(&self, run: &crate::ids::RunId) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|(current, _)| current == run)
+    }
+}
 #[derive(Debug, Default)]
 pub struct PageReport {
     pub examined: u32,

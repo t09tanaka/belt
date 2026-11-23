@@ -6,7 +6,9 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 mod abandon;
+mod prune;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+pub use prune::PruneInputs;
 
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;

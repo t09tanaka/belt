@@ -295,12 +295,8 @@ fn a_new_attempt_waits_for_a_confirmed_retire_with_a_persisted_tombstone() {
             .retired
     );
     f.attempt('a').unwrap();
-    // The tombstone cannot be deleted, not even by SQL.
-    let del = f
-        .store
-        .db
-        .call(|c| Ok(c.execute("DELETE FROM retire_tombstone", [])?));
-    assert!(del.is_err());
+    // The tombstone stays with its attempt: only the pruning of the run
+    // deletes it, with the attempt (spec 25.5; `storage::prune_tests`).
     assert!(f.store.retire_tombstone(&a1.attempt_id).unwrap().is_some());
 }
 
@@ -634,6 +630,7 @@ fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
     f.store
         .db
         .write(|tx| {
+            tx.execute_batch(schema::UNDO_PRUNE_STEP)?;
             tx.execute_batch(
                 "DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download;
                  DROP TABLE ci_test_timing; DROP TABLE workflow_artifact;
@@ -5395,7 +5392,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch(schema::UNDO_PRUNE_STEP)?;tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -6649,6 +6646,7 @@ fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_
     f.store
         .db
         .write(|tx| {
+            tx.execute_batch(schema::UNDO_PRUNE_STEP)?;
             tx.execute_batch(schema::UNDO_CAPTURE_STEP)?;
             tx.execute(
                 "UPDATE schema_meta SET value='23' WHERE key='schema_version'",
@@ -6740,7 +6738,9 @@ fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_
             Ok(())
         })
         .unwrap();
-    assert!(delete("DELETE FROM event WHERE run_id IS NULL", None).is_err());
+    // An event of no run was refused too by the trigger of this step; since
+    // the step of spec 25.5 one that names no attempt either goes by its
+    // age (`storage::prune_tests`), so it is not deleted here.
     assert!(delete(of_run, Some(unsubmitted.to_string())).unwrap() >= 1);
     let kept: i64 = store
         .db

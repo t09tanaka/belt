@@ -1,4 +1,8 @@
-//! Persistent run lock inodes. Only the owner creates them; no code removes them.
+//! Run lock inodes. Only the owner creates them, for a run that has its row
+//! and no mark; the pruning of the run unlinks its file (spec 25.1 (B), 25.5).
+//! Every acquisition compares the inode it locked with the one the path
+//! names, and a reader never makes the file: a process that opened a file
+//! that was unlinked since is answered "no such pin".
 use crate::ids::RunId;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -99,6 +103,24 @@ impl RunPin {
             ));
         }
         checked(&self._file, &state.join(format!("reader-pins/{run}.lock")))
+    }
+    /// Unlink the pin file and let go of the lock: the last step of the
+    /// pruning of the run (spec 25.5, step 8). Only the exclusive holder
+    /// may, and only while the path still names the inode it locked, so the
+    /// file of another holder is never removed. A process that still has
+    /// the old inode open fails its own comparison (25.1 (B)).
+    pub(crate) fn unlink(self, state: &Path) -> io::Result<()> {
+        let dir = state.join("reader-pins");
+        let path = dir.join(format!("{}.lock", self.run.as_str()));
+        if !self.exclusive {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the exclusive holder unlinks a result pin",
+            ));
+        }
+        checked(&self._file, &path)?;
+        fs::remove_file(&path)?;
+        File::open(dir)?.sync_all()
     }
     fn acquire(state: &Path, run: &RunId, exclusive: bool) -> io::Result<Self> {
         let relative = format!("reader-pins/{}.lock", run.as_str());
