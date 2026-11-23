@@ -75,10 +75,20 @@ impl Setups {
     /// installed before these tables a row (once), let go of the warm-ups of
     /// an earlier start (they lived in that agent's memory), and run a pass
     /// (which finishes a claimed removal).
-    pub(super) fn open_roots(&self) {
-        let Some(db) = &self.roots else {
-            return;
-        };
+    /// The worker DB, opened (and the roots from before given rows, the
+    /// warm-ups of an earlier start let go) at the first use: the agent's
+    /// first tick or the first bind, whichever comes first.
+    pub(super) fn db(&self) -> Option<&WorkerStore> {
+        self.roots
+            .get_or_init(|| {
+                let db = WorkerStore::open(&self.cfg.state_dir, &self.cfg.worker_id).ok()?;
+                self.open_roots(&db);
+                Some(db)
+            })
+            .as_ref()
+    }
+
+    fn open_roots(&self, db: &WorkerStore) {
         if !db.toolchain_roots_seeded().unwrap_or(true) {
             let found = std::fs::read_dir(self.toolchains())
                 .map(|rd| {
@@ -97,14 +107,13 @@ impl Setups {
             let _ = db.seed_toolchain_roots(found, platform::wall_ms());
         }
         let _ = db.toolchain_release_kind("warmup");
-        self.roots_pass(platform::wall_ms());
     }
 
     /// The bind of `consumer` to the root of `plan`, before its receipt is
     /// read. Without the worker DB nothing can remove a root either, and the
     /// root is used as before.
     pub(super) fn bind_root(&self, consumer: &AttemptId, root: &Path) -> bool {
-        let Some(db) = &self.roots else {
+        let Some(db) = self.db() else {
             return true;
         };
         let Some(identity) = root.file_name().and_then(|n| n.to_str()) else {
@@ -119,7 +128,7 @@ impl Setups {
     /// A tool builder references the root it installs into before its helper
     /// starts; while the root is being removed it waits (bounded).
     pub(super) fn hold_root_for_install(&self, id: &BuilderId, root: &Path) -> Result<(), String> {
-        let Some(db) = &self.roots else {
+        let Some(db) = self.db() else {
             return Ok(());
         };
         let identity = root
@@ -143,14 +152,13 @@ impl Setups {
     }
 
     pub(super) fn root_installed(&self, root: &Path) {
-        if let (Some(db), Some(identity)) = (&self.roots, root.file_name().and_then(|n| n.to_str()))
-        {
+        if let (Some(db), Some(identity)) = (self.db(), root.file_name().and_then(|n| n.to_str())) {
             let _ = db.toolchain_installed(identity, platform::wall_ms());
         }
     }
 
     pub(super) fn add_root_refs(&self, identities: Vec<String>, kind: &'static str, holder: &str) {
-        if let Some(db) = &self.roots {
+        if let Some(db) = self.db() {
             if !identities.is_empty() {
                 let _ = db.toolchain_add_refs(identities, kind, holder);
             }
@@ -160,33 +168,47 @@ impl Setups {
     /// The builder's directory is gone (so is everything it started): its
     /// references go.
     pub(super) fn release_builder_roots(&self, id: &BuilderId) {
-        if let Some(db) = &self.roots {
+        if let Some(db) = self.db() {
             let _ = db.toolchain_release("builder", id.as_str());
         }
     }
 
     pub(super) fn release_warmup_roots(&self, consumer: &AttemptId) {
-        if let Some(db) = &self.roots {
+        if let Some(db) = self.db() {
             let _ = db.toolchain_release("warmup", consumer.as_str());
         }
     }
 
     /// From the agent's tick, at most every [`PASS_EVERY_MS`].
-    pub fn roots_tick(&self) {
+    /// The pass runs on its own thread, one at a time: measuring or removing
+    /// a large root never holds up the tick (or a stop that waits for it).
+    pub fn roots_tick(self: &Arc<Self>) {
         let now = platform::monotonic_ms();
         let last = self.last_roots_pass.load(Ordering::SeqCst);
         if last != 0 && now.saturating_sub(last) < PASS_EVERY_MS {
             return;
         }
+        if self.roots_passing.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.last_roots_pass.store(now.max(1), Ordering::SeqCst);
-        self.roots_pass(platform::wall_ms());
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("toolchain-roots".into())
+            .spawn(move || {
+                me.roots_pass(platform::wall_ms());
+                me.roots_passing.store(false, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            self.roots_passing.store(false, Ordering::SeqCst);
+        }
     }
 
     /// One pass (see the module): release what is provably over, then
     /// remove at most one root.
     pub(crate) fn roots_pass(&self, now_ms: u64) -> RootPass {
         let mut pass = RootPass::default();
-        let Some(db) = &self.roots else {
+        let Some(db) = self.db() else {
             pass.held = Some("no_database");
             return pass;
         };

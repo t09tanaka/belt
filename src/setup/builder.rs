@@ -316,9 +316,13 @@ pub struct Setups {
     /// Where the builders found unsettled at the start are.
     leftover_dirs: Mutex<HashMap<AttemptId, PathBuf>>,
     /// The worker DB, for the references to the toolchain roots (25.7 (b)).
-    roots: Option<WorkerStore>,
+    /// Opened at the first use, not at `open`: a legacy start opens the
+    /// host before it holds the enrollment gate, and must create nothing.
+    roots: std::sync::OnceLock<Option<WorkerStore>>,
     /// When the agent's tick last ran a pass over the roots.
     last_roots_pass: AtomicU64,
+    /// A pass over the roots is running.
+    roots_passing: std::sync::atomic::AtomicBool,
 }
 
 impl Setups {
@@ -333,7 +337,6 @@ impl Setups {
         let store = TemplateStore::open(cfg.root().join("templates"))
             .map_err(|e| internal("template store", e))?;
         store.sweep().map_err(|e| internal("template store", e))?;
-        let (cfg_state, cfg_worker) = (cfg.state_dir.clone(), cfg.worker_id.clone());
         let s = Setups {
             probe_gate: Mutex::new(()),
             owner_generation: BuilderId::generate(),
@@ -344,15 +347,15 @@ impl Setups {
             started: AtomicU64::new(0),
             leftover: Mutex::new(BTreeSet::new()),
             leftover_dirs: Mutex::new(HashMap::new()),
-            roots: WorkerStore::open(&cfg_state, &cfg_worker).ok(),
+            roots: std::sync::OnceLock::new(),
             last_roots_pass: AtomicU64::new(0),
+            roots_passing: std::sync::atomic::AtomicBool::new(false),
         };
         s.recover();
         // What a clear renamed aside and did not get to remove. An installer
         // of an earlier run that still works holds the lock of its root, and
         // its trash is left alone.
         adapters::sweep_trash(&s.cfg.state_dir.join("toolchains"));
-        s.open_roots();
         let s = Arc::new(s);
         // A builder that could not be settled now (its supervisor is still
         // alive and was asked to stop) is looked at again until it is.

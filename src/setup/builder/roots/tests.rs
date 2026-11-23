@@ -43,7 +43,11 @@ impl Fixture {
             crate::ids::WorkerId::parse("w-roots").unwrap(),
             "/bin/sh".into(),
         );
-        Setups::open(cfg, Arc::new(NoWorkspace)).unwrap()
+        let s = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+        // What the agent's first tick does (on its own thread there).
+        s.db();
+        s.roots_pass(platform::wall_ms());
+        s
     }
     fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(self.state.join("worker.db")).unwrap()
@@ -104,7 +108,7 @@ fn a_root_from_before_gets_a_row_at_the_first_start_and_goes_when_unused() {
     assert_eq!(f.rows(), vec![A.to_string()]);
     let warm = AttemptId::generate();
     assert!(
-        s.roots
+        s.db()
             .as_ref()
             .unwrap()
             .toolchain_bind(A, warm.as_str(), 1)
@@ -132,7 +136,7 @@ fn a_referenced_root_stays_for_each_kind_of_holder() {
     let f = Fixture::new();
     let root = f.root(A);
     let s = f.open();
-    let db = s.roots.as_ref().unwrap();
+    let db = s.db().unwrap();
     let now = platform::wall_ms();
     let old = now - 30 * DAY;
     let check = |what: &str| {
@@ -264,7 +268,7 @@ fn fourteen_days_and_twenty_gib() {
     assert_eq!(f.rows().len(), 2);
     // Measured: small, nothing goes.
     assert!(s.roots_pass(now).removed.is_empty());
-    let db = s.roots.as_ref().unwrap();
+    let db = s.db().unwrap();
     db.toolchain_set_bytes(A, 11 << 30).unwrap();
     db.toolchain_set_bytes(B, 10 << 30).unwrap();
     assert_eq!(s.roots_pass(now).removed, vec![A.to_string()]);
