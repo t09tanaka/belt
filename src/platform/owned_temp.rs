@@ -527,8 +527,9 @@ pub struct FileSweep {
 
 /// One `readdir` of `dir`: remove the temporary files (named by the rule
 /// above) whose owner is proven gone. Only regular files of this user with
-/// one link are removed, symbolic links are never followed, and entries that
-/// do not start with [`FILE_PREFIX`] are not looked at.
+/// one link, and links of this user (a switch in progress, removed as the
+/// link, never followed), are removed; entries that do not start with
+/// [`FILE_PREFIX`] are not looked at.
 pub fn sweep_files(dir: &Path) -> FileSweep {
     let mut out = FileSweep::default();
     let Ok(entries) = fs::read_dir(dir) else {
