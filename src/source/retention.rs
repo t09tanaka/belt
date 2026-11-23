@@ -4496,7 +4496,9 @@ mod tests {
     #[test]
     fn publication_records_used_time_and_the_clone_refs_of_its_graph() {
         let f = Fixture::new();
-        let (receiver, m, want, bytes) = received_fixture(&f);
+        let (receiver, mut m, want, bytes) = received_fixture(&f);
+        m.repository_id = Some("github:example/repo".into());
+        let m = local_ci::source::seal_manifest(m);
         receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
         let before = crate::platform::clock::wall_ms() as i64;
         receiver.publish_received(&m, None).unwrap();
