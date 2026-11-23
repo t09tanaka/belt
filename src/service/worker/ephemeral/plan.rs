@@ -172,11 +172,7 @@ pub fn examined(
 ) -> Result<(), String> {
     match marker {
         Marker::Ephemeral => {}
-        Marker::Absent => {
-            return Err(
-                "it has no ephemeral.json, so it was not created by an ephemeral worker; an ephemeral worker starts clean and never resumes it".into(),
-            )
-        }
+        Marker::Absent => return Err(ABSENT.into()),
         Marker::Unreadable => {
             return Err("its ephemeral.json cannot be read as an ephemeral worker's marker".into())
         }
@@ -201,6 +197,44 @@ pub fn examined(
     if !local_filesystem(filesystem) {
         return Err(
             "it is not on a local filesystem (a lock on a network or shared filesystem does not show that no other host uses it)".into(),
+        );
+    }
+    if resident_journal {
+        return Err(RESIDENT.into());
+    }
+    Ok(())
+}
+
+const ABSENT: &str = "it has no ephemeral.json, so it was not created by an ephemeral worker; an ephemeral worker starts clean and never resumes it";
+
+/// The names a start that was killed before its marker existed can leave in
+/// the directory it made: the lock, and the marker while it is written.
+pub const UNFINISHED_NAMES: [&str; 2] = ["ephemeral.lock", "ephemeral.json.part"];
+
+/// Whether a state without a marker is only what an ephemeral start left
+/// that was killed while it created the state, and may be removed by the
+/// next one: `names` (everything in the directory) are at most the two a
+/// creation makes before its marker, the directory is on a local filesystem
+/// now (there is no marker to say what its creator saw; elsewhere a start
+/// on another host may be creating it, and a lock here would not show it),
+/// and no persistent worker is installed. `Err` names what failed; then
+/// nothing is written, locked or removed.
+pub fn unfinished(
+    names: &[&[u8]],
+    filesystem: &Filesystem,
+    resident_journal: bool,
+) -> Result<(), String> {
+    let only_a_creation = names.iter().all(|name| {
+        UNFINISHED_NAMES
+            .iter()
+            .any(|known| known.as_bytes() == *name)
+    });
+    if !only_a_creation {
+        return Err(ABSENT.into());
+    }
+    if !local_filesystem(filesystem) {
+        return Err(
+            "it holds only what an ephemeral start that was killed while creating it leaves, but it is not on a local filesystem (a start on another host may be creating it, and a lock here does not show that)".into(),
         );
     }
     if resident_journal {

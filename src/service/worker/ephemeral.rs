@@ -24,7 +24,14 @@
 //! descriptor, by every process it starts, so it is free only when all of
 //! them are gone. Without the proof nothing is removed and no process is
 //! signalled. What is removed is reached only through the descriptor of the
-//! directory that was examined, never again through its path.
+//! directory that was examined, never again through its path, and never
+//! across a filesystem mounted inside it.
+//!
+//! A start killed before its marker existed leaves a directory that holds
+//! at most `ephemeral.lock` and `ephemeral.json.part`. The next start removes
+//! exactly those names, under the lock, and nothing else (`unfinished`).
+//! The exit of a worker that ran removes its state the same way a clearing
+//! does, under the same locks (`clean_up`).
 use super::WorkerSpec;
 use crate::service::resident;
 use crate::service::worker_service::{live_attempts, Paths};
@@ -33,6 +40,7 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -46,6 +54,8 @@ const MARKER_PART: &str = "ephemeral.json.part";
 /// Held shared by the worker and by every process it starts.
 const LOCK: &str = "ephemeral.lock";
 const AGENT_LOCK: &str = "agent.lock";
+/// Held by a worker for as long as it runs on the state.
+const OWNER_LOCK: &str = "worker-owner.lock";
 const MARKER_LIMIT: u64 = 64 * 1024;
 
 /// `ephemeral.json`. `kind` and `filesystem` decide; the rest says which
@@ -77,15 +87,40 @@ struct MarkerFile {
 enum Step {
     /// `create_state`: the directory exists and is empty.
     Directory,
+    /// `create_state`: `ephemeral.lock` was created and is not locked yet.
+    Made,
     /// `create_state`: `ephemeral.lock` exists and is held; no marker yet.
     Locked,
-    /// `reclaim`: proofs 1 to 3 were read; no lock file was opened yet.
+    /// A clearing: what can be read was read and the directory is locked;
+    /// no lock file was opened yet.
     Examined,
-    /// `reclaim`: every proof holds; nothing was removed yet.
+    /// A clearing: the lock files are held; what they prove was not
+    /// checked against the directory yet.
+    Held,
+    /// A clearing: every proof holds; nothing was removed yet.
     Proven,
+    /// A clearing: this one of the names that go last is removed next.
+    Last(&'static str),
 }
 
 fn nowhere(_: Step) {}
+
+/// What a clearing asks of the host, so that a test can answer instead.
+struct Host<'a> {
+    /// Proof 3, asked when it is needed and not once at the start: whether
+    /// a persistent worker's journal exists now.
+    resident: &'a dyn Fn() -> anyhow::Result<bool>,
+    filesystem_of: &'a dyn Fn(&File) -> plan::Filesystem,
+    /// The device an entry is on, from its name and the `st_dev` read.
+    device_of: &'a dyn Fn(&CStr, u64) -> u64,
+    at: &'a dyn Fn(Step),
+}
+
+/// The device as `stat` reported it. A test answers otherwise, to stand in
+/// for a filesystem mounted inside the state.
+fn same_device(_: &CStr, device: u64) -> u64 {
+    device
+}
 
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
@@ -242,29 +277,74 @@ fn names_in(dir: &impl AsFd) -> std::io::Result<Vec<CString>> {
     Ok(names)
 }
 
-/// Remove `name` from the opened directory, with everything below it when
-/// it is a directory. Every step goes from a descriptor to a name inside it
-/// and never follows a link, so nothing outside the opened directory can be
-/// reached, whatever is renamed meanwhile.
-fn remove_at(dir: &impl AsFd, name: &CStr) -> std::io::Result<()> {
-    let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    // The field's type differs between the platforms.
-    #[allow(clippy::unnecessary_cast)]
-    let kind = FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode);
-    if kind != FileType::Directory {
-        return Ok(rustix::fs::unlinkat(dir, name, AtFlags::empty())?);
+/// A removal that stays on the filesystem of the state directory. A child
+/// on another device is a filesystem mounted inside the state (a FUSE or
+/// bind mount that is still alive in a workspace): it is neither entered
+/// nor unlinked, and the directories above it stay. Every step goes from a
+/// descriptor to a name inside it and never follows a link, so nothing
+/// outside the opened directory can be reached, whatever is renamed
+/// meanwhile.
+///
+/// Limit: a bind mount of a directory of the same filesystem has the same
+/// device and is not told apart here.
+struct Walk<'a> {
+    /// The device of the state directory.
+    device: u64,
+    device_of: &'a dyn Fn(&CStr, u64) -> u64,
+    /// What was kept because it is on another device, by its path inside
+    /// the state.
+    mounted: Vec<PathBuf>,
+}
+
+impl Walk<'_> {
+    fn elsewhere(&mut self, name: &CStr, stat: &rustix::fs::Stat, here: &Path) -> bool {
+        // The field's type differs between the platforms.
+        #[allow(clippy::unnecessary_cast)]
+        let device = (self.device_of)(name, stat.st_dev as u64);
+        if device == self.device {
+            return false;
+        }
+        self.mounted.push(here.to_owned());
+        true
     }
-    let below = rustix::fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    for child in names_in(&below)? {
-        remove_at(&below, &child)?;
+
+    /// Remove `name` from the opened directory, with everything below it
+    /// when it is a directory. Whether the name is gone.
+    fn remove(&mut self, dir: &impl AsFd, name: &CStr, inside: &Path) -> std::io::Result<bool> {
+        let here = inside.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if self.elsewhere(name, &stat, &here) {
+            return Ok(false);
+        }
+        // The field's type differs between the platforms.
+        #[allow(clippy::unnecessary_cast)]
+        let kind = FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode);
+        if kind != FileType::Directory {
+            rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
+            return Ok(true);
+        }
+        let below = rustix::fs::openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        // What was opened, not what was looked at: a filesystem mounted on
+        // the name in between is the one this descriptor is on.
+        if self.elsewhere(name, &rustix::fs::fstat(&below)?, &here) {
+            return Ok(false);
+        }
+        let mut emptied = true;
+        for child in names_in(&below)? {
+            emptied &= self.remove(&below, &child, &here)?;
+        }
+        drop(below);
+        if !emptied {
+            return Ok(false);
+        }
+        rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
+        Ok(true)
     }
-    drop(below);
-    Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
 }
 
 fn directory(path: &Path) -> std::io::Result<File> {
@@ -274,12 +354,115 @@ fn directory(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// The directory that holds the state directory, opened, and the name the
+/// state has in it.
+fn place(state: &Path) -> std::io::Result<(File, CString)> {
+    let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it has no parent directory",
+        ));
+    };
+    let name = CString::new(name.as_bytes())?;
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(parent)?;
+    Ok((parent, name))
+}
+
+/// Unlink these names of the opened directory, in this order. One that is
+/// not there is fine.
+fn drop_names(dir: &File, names: &[&'static str], at: &dyn Fn(Step)) -> std::io::Result<()> {
+    for name in names {
+        at(Step::Last(name));
+        match rustix::fs::unlinkat(dir, *name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Remove the name of the directory that was examined and emptied. The name
+/// goes only if it still is that directory; whatever sits there instead is
+/// not this proof's to remove. Not recursive either: what appeared in the
+/// directory meanwhile stays, and so does the directory.
+fn remove_name(parent: &File, name: &CStr, seen: &Metadata, state: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_named(parent, name, seen),
+        "worker state {} was replaced while it was cleared; what is at the path now was left in place",
+        state.display()
+    );
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|e| {
+        anyhow::anyhow!(
+            "worker state {} could not be removed after it was cleared ({}); what is in it now was left in place",
+            state.display(),
+            std::io::Error::from(e)
+        )
+    })
+}
+
+/// Empty the directory that was proven unused and remove its name. The
+/// data goes first, then the lock files, the marker last: a clearing that
+/// was itself killed leaves a state the next start can still prove and
+/// clear, and no name but `ephemeral.lock` outlives the marker.
+///
+/// Where a filesystem is mounted inside the state, what is on it and the
+/// directories above it stay, and so do the locks and the marker: the state
+/// remains one that the next start can prove again once the mount is gone.
+fn erase(
+    state: &Path,
+    dir: &File,
+    parent: &File,
+    name: &CStr,
+    seen: &Metadata,
+    host: &Host<'_>,
+) -> anyhow::Result<()> {
+    let last = [OWNER_LOCK, AGENT_LOCK, LOCK, MARKER];
+    let mut walk = Walk {
+        device: seen.dev(),
+        device_of: host.device_of,
+        mounted: Vec::new(),
+    };
+    for entry in names_in(dir)? {
+        if last.iter().any(|name| entry.as_bytes() == name.as_bytes()) {
+            continue;
+        }
+        walk.remove(dir, &entry, Path::new(""))?;
+    }
+    if !walk.mounted.is_empty() {
+        let mounted: Vec<String> = walk
+            .mounted
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        anyhow::bail!(
+            "worker state {} was not cleared whole: another filesystem is mounted in it at {}. Nothing on a mounted filesystem is removed; the directories above it, the lock files and ephemeral.json were kept. Unmount it; the next `belt worker --ephemeral` then clears the rest",
+            state.display(),
+            mounted.join(", ")
+        );
+    }
+    drop_names(dir, &last, host.at)?;
+    remove_name(parent, name, seen, state)
+}
+
+/// What a clearing found and removed.
+#[derive(Debug, PartialEq, Eq)]
+enum Cleared {
+    /// The state of an ephemeral worker that nothing uses any more.
+    Left,
+    /// What a start that was killed before its marker existed had made.
+    Unfinished,
+}
+
 /// Clear the state an earlier ephemeral start left at `state`, when all five
 /// proofs hold; otherwise fail naming the one that did not, with nothing
 /// removed and no process signalled.
 ///
-/// Proofs 1 to 3 are read first: a state without this role's marker is never
-/// written to and never locked. Then, in this order:
+/// Proofs 1 to 3 are read first: a state with a marker that is not this
+/// role's is never written to and never locked. (One without any marker is
+/// `unfinished`'s.) Then, in this order:
 ///
 /// - The directory itself is locked, so that one start clears at a time (two
 ///   that each made and took a lock file of their own would otherwise both
@@ -293,15 +476,8 @@ fn directory(path: &Path) -> std::io::Result<File> {
 ///   marker" count as proof 1: the marker of a start that is alive cannot be
 ///   read here without its lock being held.
 ///
-/// Every lock stays held until the directory is gone. The marker and the
-/// locks go last, so a clearing that was itself killed leaves a state the
-/// next start can still prove and clear.
-fn reclaim(
-    state: &Path,
-    resident_journal: bool,
-    filesystem_of: impl Fn(&File) -> plan::Filesystem,
-    at: &dyn Fn(Step),
-) -> anyhow::Result<()> {
+/// Every lock stays held until the directory is gone.
+fn clear(state: &Path, host: &Host<'_>) -> anyhow::Result<Cleared> {
     let kept = |why: String| {
         anyhow::anyhow!(
             "worker state {} was left by an earlier start and is kept: {why}",
@@ -312,11 +488,13 @@ fn reclaim(
         .map_err(|e| kept(format!("it is not a private directory of this user ({e})")))?;
     let dir = directory(state).map_err(|e| kept(format!("it cannot be opened ({e})")))?;
     let seen = dir.metadata()?;
-    let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
-        return Err(kept("it has no parent directory".into()));
-    };
-    let name = CString::new(std::os::unix::ffi::OsStrExt::as_bytes(name))?;
+    let (parent, name) =
+        place(state).map_err(|e| kept(format!("its parent directory cannot be opened ({e})")))?;
     let examined = read_marker(&dir);
+    if examined.kind == plan::Marker::Absent {
+        unfinished(state, &dir, &seen, &parent, &name, host, &kept)?;
+        return Ok(Cleared::Unfinished);
+    }
     let by = examined.file.as_ref().map_or_else(String::new, |m| {
         format!(
             " (left by pid {} of boot {}, instance {})",
@@ -328,8 +506,8 @@ fn reclaim(
     plan::examined(
         &examined.kind,
         examined.file.as_ref().and_then(|m| m.filesystem.as_ref()),
-        &filesystem_of(&dir),
-        resident_journal,
+        &(host.filesystem_of)(&dir),
+        (host.resident)()?,
     )
     .map_err(&kept)?;
     if !taken(&dir)? {
@@ -337,7 +515,7 @@ fn reclaim(
             "another ephemeral start is clearing it right now{by}"
         )));
     }
-    at(Step::Examined);
+    (host.at)(Step::Examined);
     let open = |name: &str| {
         private_at(&dir, name, OFlags::RDWR | OFlags::CREATE)
             .map_err(|e| kept(format!("its {name} cannot be examined ({e}){by}")))
@@ -356,6 +534,7 @@ fn reclaim(
         None => false,
     };
     plan::unused(ephemeral_taken, agent_taken).map_err(|why| kept(format!("{why}{by}")))?;
+    (host.at)(Step::Held);
     if examined.read.is_none() || read_marker(&dir).read != examined.read {
         return Err(kept(format!(
             "its ephemeral.json changed while it was examined{by}"
@@ -364,43 +543,101 @@ fn reclaim(
     // A lock on a file that another start has already removed proves nothing
     // about the state now at this path: it must still be the one examined,
     // and the lock held must be the one in it.
-    let parent = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(parent)
-        .map_err(|e| kept(format!("its parent directory cannot be opened ({e})")))?;
-    let still = is_named(&parent, &name, &seen)
-        && ephemeral_lock
-            .metadata()
-            .is_ok_and(|held| is_named(&dir, &c_name(LOCK), &held));
-    if !still {
+    if !(is_named(&parent, &name, &seen) && holds(&dir, &ephemeral_lock)) {
         return Err(kept("it was replaced while it was examined".into()));
     }
-    at(Step::Proven);
-    let last = [AGENT_LOCK, LOCK, MARKER];
-    for entry in names_in(&dir)? {
-        if last.iter().any(|name| entry.as_bytes() == name.as_bytes()) {
-            continue;
-        }
-        remove_at(&dir, &entry)?;
+    (host.at)(Step::Proven);
+    erase(state, &dir, &parent, &name, &seen, host)?;
+    Ok(Cleared::Left)
+}
+
+/// Whether the lock file that is held is the one `ephemeral.lock` names in
+/// the directory now. A hold on a file that was unlinked, or replaced under
+/// its name, says nothing about who holds the one that is there.
+fn holds(dir: &File, lock: &File) -> bool {
+    lock.metadata()
+        .is_ok_and(|held| is_named(dir, &c_name(LOCK), &held))
+}
+
+/// Remove what a start that was killed before its marker existed left: a
+/// directory with nothing in it but `ephemeral.lock` and
+/// `ephemeral.json.part` (spec 25.4 (d)). Also what a creation that failed
+/// and was killed while it took back its files leaves, and what a clearing
+/// leaves that was killed between its last unlink and its `rmdir`.
+///
+/// Nothing is written or locked before the listing, the filesystem and the
+/// journals allow it. Then the directory is locked (one start at a time),
+/// `ephemeral.lock` is opened, or made when it is not there, and taken
+/// exclusively: a start that is creating this state holds it shared from
+/// before its marker, or finds it existing or held and steps back
+/// (`create_state`). With the lock held everything is read again. Only the
+/// two names are unlinked; the directory goes by a non-recursive `rmdir`,
+/// so whatever else appears in it stays. A refusal takes back the lock file
+/// if this call made it and holds it, and nothing else.
+///
+/// An empty state directory can also be one that `init` or a worker's first
+/// lock just made. `init` saves its journal before it makes the directory,
+/// so the journals, read here after the directory was opened, exclude it.
+/// For any other maker the next file it creates either is seen by the
+/// second listing (kept), lands between that listing and the `rmdir` (which
+/// then fails, kept), or is attempted after the `rmdir` and fails cleanly
+/// with "not found", to be run again.
+fn unfinished(
+    state: &Path,
+    dir: &File,
+    seen: &Metadata,
+    parent: &File,
+    name: &CStr,
+    host: &Host<'_>,
+    kept: &dyn Fn(String) -> anyhow::Error,
+) -> anyhow::Result<()> {
+    let judge = || -> anyhow::Result<Result<(), String>> {
+        let names = names_in(dir)?;
+        let names: Vec<&[u8]> = names.iter().map(|name| name.to_bytes()).collect();
+        Ok(plan::unfinished(
+            &names,
+            &(host.filesystem_of)(dir),
+            (host.resident)()?,
+        ))
+    };
+    judge()?.map_err(kept)?;
+    if !taken(dir)? {
+        return Err(kept(
+            "another ephemeral start is clearing it right now".into(),
+        ));
     }
-    for name in last {
-        match rustix::fs::unlinkat(&dir, name, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(std::io::Error::from(e).into()),
+    (host.at)(Step::Examined);
+    let examine = |e: std::io::Error| kept(format!("its {LOCK} cannot be examined ({e})"));
+    let (lock, made) = match private_at(dir, LOCK, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL) {
+        Ok(lock) => (lock, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            (private_at(dir, LOCK, OFlags::RDWR).map_err(examine)?, false)
         }
+        Err(e) => return Err(examine(e)),
+    };
+    let held = taken(&lock)?;
+    let proven = (|| {
+        if !held {
+            return Err(kept(
+                "its ephemeral.lock is held: an ephemeral worker is creating it right now".into(),
+            ));
+        }
+        (host.at)(Step::Held);
+        judge()?.map_err(|why| kept(format!("it changed while it was examined: {why}")))?;
+        if !(is_named(parent, name, seen) && holds(dir, &lock)) {
+            return Err(kept("it was replaced while it was examined".into()));
+        }
+        Ok(())
+    })();
+    if let Err(refusal) = proven {
+        if made && held && holds(dir, &lock) {
+            let _ = rustix::fs::unlinkat(dir, LOCK, AtFlags::empty());
+        }
+        return Err(refusal);
     }
-    // The examined directory is empty now. Its name goes only if the name
-    // still is that directory; whatever sits there instead is not this
-    // proof's to remove. Not recursive either: what appeared in it meanwhile
-    // stays.
-    anyhow::ensure!(
-        is_named(&parent, &name, &seen),
-        "worker state {} was replaced while it was cleared; what is at the path now was left in place",
-        state.display()
-    );
-    rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(std::io::Error::from)?;
-    Ok(())
+    (host.at)(Step::Proven);
+    drop_names(dir, &[MARKER_PART, LOCK], host.at)?;
+    remove_name(parent, name, seen, state)
 }
 
 /// The state directory this process created, and how to know it is still that one.
@@ -408,6 +645,18 @@ struct Created {
     path: PathBuf,
     dev: u64,
     ino: u64,
+}
+
+/// What a creation has made so far.
+#[derive(Default)]
+struct Made {
+    /// The names this call itself created in the directory.
+    names: Vec<&'static str>,
+    /// `ephemeral.lock`, held shared from the moment it is.
+    lock: Option<File>,
+    /// Another start is removing what it takes for a killed start's
+    /// leftover: nothing here is this call's to touch any more.
+    stepped_back: bool,
 }
 
 /// Create the state: the directory, then `ephemeral.lock` (a new file, never
@@ -423,8 +672,17 @@ struct Created {
 /// stays held until the last of them is gone. Call before any other thread
 /// exists.
 ///
-/// A failure removes what was created. Only a kill between the directory and
-/// the marker leaves a state without a marker, which the next start refuses.
+/// Until the lock is held, another start may take the directory for what a
+/// killed start left and remove it (`unfinished`). It makes or takes
+/// `ephemeral.lock` first, so this call meets it in one of two ways: the
+/// lock file already exists, or the one made here cannot be locked. Either
+/// way this call steps back and touches nothing: the other start removes
+/// the directory, and unlinking a name without holding its lock would not
+/// provably unlink this call's own file.
+///
+/// Any other failure removes the names this call created, and only those,
+/// while the lock is still held. A kill before the marker leaves at most
+/// `ephemeral.lock` and `ephemeral.json.part`, which the next start removes.
 fn create_state(
     path: &Path,
     marker: &MarkerFile,
@@ -435,7 +693,8 @@ fn create_state(
     let meta = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(meta.is_dir(), "worker state is not a directory");
     let dir = directory(path);
-    let alive = (|| -> anyhow::Result<File> {
+    let mut made = Made::default();
+    let filled = (|| -> anyhow::Result<()> {
         let dir = dir.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
         // Everything below is created inside the directory just made, not
         // inside whatever a concurrent start has put at its path.
@@ -444,14 +703,31 @@ fn create_state(
             "worker state was replaced while it was created"
         );
         at(Step::Directory);
-        let lock = private_at(dir, LOCK, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL)?;
+        let stepping_back = || {
+            anyhow::anyhow!(
+                "another ephemeral start is removing the directory at {} right now; start again",
+                path.display()
+            )
+        };
+        let lock = match private_at(dir, LOCK, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                made.stepped_back = true;
+                return Err(stepping_back());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        made.names.push(LOCK);
+        at(Step::Made);
         match lock.try_lock_shared() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                anyhow::bail!("another ephemeral start is clearing this worker state")
+                made.stepped_back = true;
+                return Err(stepping_back());
             }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
+        let lock = made.lock.insert(lock);
         at(Step::Locked);
         let mut marker = marker.clone();
         marker.filesystem = Some(plan::recorded(&filesystem_of(dir)));
@@ -460,43 +736,52 @@ fn create_state(
             MARKER_PART,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
         )?;
+        made.names.push(MARKER_PART);
         part.write_all(&serde_json::to_vec(&marker)?)?;
         part.sync_all()?;
         rustix::fs::renameat(dir, MARKER_PART, dir, MARKER).map_err(std::io::Error::from)?;
+        made.names.push(MARKER);
         dir.sync_all()?;
         anyhow::ensure!(
             std::fs::symlink_metadata(path).is_ok_and(|now| same_file(&now, &meta)),
             "worker state was replaced while it was created"
         );
-        inherit(&lock)?;
-        Ok(lock)
+        inherit(lock)?;
+        Ok(())
     })();
-    let alive = match alive {
-        Ok(alive) => alive,
-        Err(e) => {
-            // What this call made goes, the marker first; anything else in
-            // the directory is left for the next start to judge.
-            if let Ok(dir) = &dir {
-                if dir.metadata().is_ok_and(|now| same_file(&now, &meta)) {
+    match (filled, made.lock.take()) {
+        (Ok(()), Some(alive)) => Ok((
+            Created {
+                path: path.to_owned(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            alive,
+        )),
+        (filled, held) => {
+            // What this call made goes, the marker first, while its lock is
+            // still held; anything else in the directory is left for the
+            // next start to judge.
+            if !made.stepped_back {
+                if let Ok(dir) = &dir {
                     for name in [MARKER, MARKER_PART, LOCK] {
-                        let _ = rustix::fs::unlinkat(dir, name, AtFlags::empty());
+                        if made.names.contains(&name) {
+                            let _ = rustix::fs::unlinkat(dir, name, AtFlags::empty());
+                        }
+                    }
+                }
+                if let Ok((parent, name)) = place(path) {
+                    if is_named(&parent, &name, &meta) {
+                        let _ = rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR);
                     }
                 }
             }
-            if std::fs::symlink_metadata(path).is_ok_and(|now| same_file(&now, &meta)) {
-                let _ = std::fs::remove_dir(path);
-            }
-            return Err(e);
+            drop(held);
+            Err(filled
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("worker state was created without its lock")))
         }
-    };
-    Ok((
-        Created {
-            path: path.to_owned(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-        },
-        alive,
-    ))
+    }
 }
 
 /// Let every process started from here inherit the descriptor: the
@@ -534,17 +819,55 @@ fn resident_installed(journals: &[PathBuf]) -> anyhow::Result<bool> {
 }
 
 /// Remove what was created, if nothing runs in it and it is still the same
-/// directory (never a replacement that happens to sit at the path).
-fn clean_up(created: &Created) -> anyhow::Result<bool> {
+/// directory (never a replacement that happens to sit at the path). `false`:
+/// work is still recorded in it.
+///
+/// The removal is the one a clearing does, under the same locks. The
+/// directory is locked, so no other start examines or clears it meanwhile
+/// (it could otherwise read the marker after `ephemeral.lock` was unlinked,
+/// make a lock of its own and clear at the same time). `worker-owner.lock`
+/// and `agent.lock` are taken, so no worker runs on it. Only then are the
+/// journals read again: a persistent worker installed while this one ran may
+/// have put its own files into the directory, and then everything stays.
+/// This process's own shared hold on `ephemeral.lock` is not turned into
+/// an exclusive one: the directory lock already keeps a clearing out.
+fn clean_up(created: &Created, alive: &File, host: &Host<'_>) -> anyhow::Result<bool> {
     if !plan::removable(live_attempts(&created.path).ok()) {
         return Ok(false);
     }
-    let meta = std::fs::symlink_metadata(&created.path)?;
+    let dir = directory(&created.path)?;
+    let seen = dir.metadata()?;
     anyhow::ensure!(
-        meta.is_dir() && meta.dev() == created.dev && meta.ino() == created.ino,
+        seen.dev() == created.dev && seen.ino() == created.ino,
         "worker state was replaced; left in place"
     );
-    std::fs::remove_dir_all(&created.path)?;
+    let (parent, name) = place(&created.path)?;
+    anyhow::ensure!(
+        taken(&dir)?,
+        "another ephemeral start is examining the worker state right now; it was left in place, and the next `belt worker --ephemeral` clears it"
+    );
+    (host.at)(Step::Examined);
+    let mut held = Vec::new();
+    for name in [OWNER_LOCK, AGENT_LOCK] {
+        let lock = private_at(&dir, name, OFlags::RDWR | OFlags::CREATE)?;
+        anyhow::ensure!(
+            taken(&lock)?,
+            "its {name} is held: a worker still uses this state; it was left in place"
+        );
+        held.push(lock);
+    }
+    (host.at)(Step::Held);
+    anyhow::ensure!(
+        !(host.resident)()?,
+        "a persistent worker was installed on this host while this worker ran; everything in {} was left in place",
+        created.path.display()
+    );
+    anyhow::ensure!(
+        is_named(&parent, &name, &seen) && holds(&dir, alive),
+        "worker state was replaced; left in place"
+    );
+    (host.at)(Step::Proven);
+    erase(&created.path, &dir, &parent, &name, &seen, host)?;
     Ok(true)
 }
 
@@ -564,7 +887,15 @@ fn start(args: &Args) -> anyhow::Result<()> {
     let instance = ulid::Ulid::new().to_string();
     // Only the existence of a resident's journal matters; reading it is not
     // this role's business.
-    let resident = resident_installed(&Paths::resident_journals(&env)?)?;
+    let journals = Paths::resident_journals(&env)?;
+    let resident = resident_installed(&journals)?;
+    // Asked again wherever something is about to be removed.
+    let host = Host {
+        resident: &|| resident_installed(&journals),
+        filesystem_of: &filesystem_of,
+        device_of: &same_device,
+        at: &nowhere,
+    };
     let planned = plan::plan(
         &plan::Request {
             cluster: &args.cluster,
@@ -586,11 +917,13 @@ fn start(args: &Args) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         // Anything at the path, readable or not, is a state left behind.
         _ => {
-            reclaim(&spec.state_dir, resident, filesystem_of, &nowhere)?;
-            eprintln!(
-                "cleared the worker state an earlier ephemeral start left at {}",
-                spec.state_dir.display()
-            );
+            let what = match clear(&spec.state_dir, &host)? {
+                Cleared::Left => "cleared the worker state an earlier ephemeral start left",
+                Cleared::Unfinished => {
+                    "removed what an ephemeral start that was killed while creating its state left"
+                }
+            };
+            eprintln!("{what} at {}", spec.state_dir.display());
         }
     }
     let me = std::process::id();
@@ -607,7 +940,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
         filesystem: None,
     };
     // Held until this process ends; its children hold their own copies.
-    let (created, _alive) = create_state(&spec.state_dir, &marker, filesystem_of, &nowhere)?;
+    let (created, alive) = create_state(&spec.state_dir, &marker, filesystem_of, &nowhere)?;
     let result = (|| {
         let config = spec.validate(&home)?;
         eprintln!(
@@ -624,7 +957,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
     })();
     // Exit 0 only for a complete erase (or an end that had nothing to erase
     // under a failure already being reported).
-    let erased = match clean_up(&created) {
+    let erased = match clean_up(&created, &alive, &host) {
         Ok(true) => Ok(()),
         Ok(false) => {
             let alive = crate::storage::WorkerStore::open_read_only(&created.path)

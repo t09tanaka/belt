@@ -771,6 +771,61 @@ fn the_journal_is_where_an_ephemeral_worker_looks_for_it() {
     assert_eq!(looked_at[0].parent(), paths.journal.parent());
 }
 
+/// Spec 25.4 (d): `init` runs a worker on the worker state. One that an
+/// ephemeral worker made is refused before the first write, by a fresh init
+/// and by one that takes over an installed worker: an `init.json` left by a
+/// later failure would stop every ephemeral start from clearing the state.
+#[tokio::test]
+async fn init_into_an_ephemeral_workers_state_writes_nothing() {
+    fn listing(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_owned()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    found.push((path.clone(), Vec::new()));
+                    pending.push(path);
+                } else {
+                    found.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+    for worker_installed in [false, true] {
+        let (root, context) = fixture();
+        let paths = Paths::resolve(&context.env).unwrap();
+        private_dir(&paths.worker).unwrap();
+        fs::write(paths.worker.join("ephemeral.json"), "{}").unwrap();
+        if worker_installed {
+            private_dir(&paths.config).unwrap();
+            let journal = super::super::worker_service::Paths::journal_path(&context.env).unwrap();
+            fs::write(journal, b"existing worker-only installation").unwrap();
+        }
+        let before = listing(root.path());
+        let error = initialize(context, &mut Unknown)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            super::super::worker::ephemeral::refuse_marked(&paths.worker)
+                .unwrap_err()
+                .to_string(),
+            "installed: {worker_installed}"
+        );
+        assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+        assert_eq!(
+            listing(root.path()),
+            before,
+            "installed: {worker_installed}"
+        );
+        assert!(!paths.journal.exists());
+    }
+}
+
 #[tokio::test]
 async fn malformed_worker_enrollment_is_refused_without_init_writes() {
     let (_root, context) = fixture();

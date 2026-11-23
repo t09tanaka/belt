@@ -320,3 +320,51 @@ fn a_count_taken_before_the_stop_cannot_settle_an_attempt_accepted_after_it() {
     assert_eq!(next(true, true, false), Wait);
     assert_eq!(next(true, true, false), Settled);
 }
+
+#[test]
+fn an_unmarked_state_is_an_unfinished_creation_only_with_its_two_names_at_most() {
+    let apfs = Filesystem::Name("apfs".into());
+    let (lock, part): (&[u8], &[u8]) = (b"ephemeral.lock", b"ephemeral.json.part");
+    assert_eq!(UNFINISHED_NAMES, ["ephemeral.lock", "ephemeral.json.part"]);
+    for names in [&[][..], &[lock], &[part], &[lock, part], &[part, lock]] {
+        assert_eq!(unfinished(names, &apfs, false), Ok(()), "{names:?}");
+    }
+    // Any other name, alone or beside them, and the marker itself.
+    for other in [
+        &b"agent.lock"[..],
+        b"worker.db",
+        b"ephemeral.json",
+        b"ephemeral.lock2",
+        b"ephemeral",
+        b"",
+    ] {
+        for names in [
+            &[other][..],
+            &[lock, other],
+            &[other, part],
+            &[lock, part, other],
+        ] {
+            let error = unfinished(names, &apfs, false).unwrap_err();
+            assert!(error.contains("no ephemeral.json"), "{names:?}: {error}");
+            assert!(error.contains("starts clean"), "{names:?}: {error}");
+        }
+    }
+    // Only where a lock reaches every start that could be creating it.
+    for filesystem in [
+        Filesystem::Name("nfs".into()),
+        Filesystem::Magic(0x6969),
+        Filesystem::Unknown,
+    ] {
+        let error = unfinished(&[lock], &filesystem, false).unwrap_err();
+        assert!(error.contains("not on a local filesystem"), "{error}");
+        assert!(error.contains("killed while creating it"), "{error}");
+    }
+    // Never beside a persistent worker.
+    let error = unfinished(&[], &apfs, true).unwrap_err();
+    assert!(error.contains("persistent worker is installed"), "{error}");
+    // In that order: the names, the filesystem, the journal.
+    let first = unfinished(&[b"worker.db"], &Filesystem::Unknown, true).unwrap_err();
+    assert!(first.contains("no ephemeral.json"), "{first}");
+    let second = unfinished(&[], &Filesystem::Unknown, true).unwrap_err();
+    assert!(second.contains("not on a local filesystem"), "{second}");
+}

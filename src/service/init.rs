@@ -655,6 +655,10 @@ async fn initialize_prepared<L: Launcher>(
     service_inputs_observable(&paths, &context.env)?;
     // Resolve environment and source before writing anything.
     let (mut source, digest) = binary_source(&context.executable)?;
+    // The resident runs a worker on this state. One an ephemeral worker made
+    // is refused here, before the first write: a journal left by a later
+    // failure would stop every ephemeral start from clearing it.
+    super::worker::ephemeral::refuse_marked(&paths.worker)?;
     private_dir_with(&paths.config, durability)?;
     let lockpath = paths.config.join("init.lock");
     match OpenOptions::new()
