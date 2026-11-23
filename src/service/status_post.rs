@@ -134,9 +134,9 @@ fn read(context: &Context, run: &RunId) -> Result<Standing, ApiError> {
 /// The standing is put together from several reads of the rows and of the
 /// result files. The mark is read before the first and after the last of
 /// them: it is never cleared and nothing of a run is deleted before it, so a
-/// run without it after the last read was whole at every read. With it, the
-/// answer is "not found", and never a verdict on rows or files that were
-/// being deleted (a job that "left no result", a status that "cannot be
+/// run that has its row and no mark after the last read was whole at every
+/// read. Otherwise the answer is "not found", and never a verdict on rows or
+/// files that were being deleted (a job that "left no result", a status that "cannot be
 /// decided").
 fn read_from(
     store: &crate::storage::CoordinatorStore,
@@ -146,7 +146,15 @@ fn read_from(
     refuse_pruned(store, run)?;
     let standing = read_rows(store, state_dir, run);
     refuse_pruned(store, run)?;
-    standing
+    // A run whose pruning ran to its end meanwhile has no row, and no mark.
+    match store.run_is_whole(run) {
+        Ok(true) => standing,
+        Ok(false) => Err(ApiError::new(
+            ErrorCode::NotFound,
+            format!("run {run} not found"),
+        )),
+        Err(e) => Err(ApiError::new(ErrorCode::Internal, e.to_string())),
+    }
 }
 
 fn read_rows(

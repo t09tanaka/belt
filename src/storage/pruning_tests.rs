@@ -543,3 +543,25 @@ fn the_migration_that_adds_the_mark_leaves_every_run_without_it() {
     assert!(store.run_is_pruned(&run).unwrap());
     assert!(store.query_run(run).unwrap().is_none());
 }
+
+/// What a reader that reads several times asks after its last read: the run
+/// (and the task it names) has its row and no mark. A run whose pruning ran
+/// to its end has no row and no mark to see, and is not whole either.
+#[test]
+fn a_run_is_whole_only_with_its_row_and_without_the_mark() {
+    let f = fx();
+    let (other, other_task, _, _) = run_in(&f.store);
+    assert!(f.store.run_is_whole(&f.run).unwrap());
+    assert!(f.store.task_is_whole(&f.task).unwrap());
+    assert!(f.store.task_is_whole(&f.waiting).unwrap());
+    mark(&f.store, &f.run);
+    assert!(!f.store.run_is_whole(&f.run).unwrap());
+    assert!(!f.store.task_is_whole(&f.task).unwrap());
+    // Rows that are gone, with or without a mark left to see.
+    delete_half(&f);
+    assert!(!f.store.task_is_whole(&f.waiting).unwrap());
+    assert!(!f.store.run_is_whole(&RunId::generate()).unwrap());
+    assert!(!f.store.task_is_whole(&TaskId::generate()).unwrap());
+    assert!(f.store.run_is_whole(&other).unwrap());
+    assert!(f.store.task_is_whole(&other_task).unwrap());
+}

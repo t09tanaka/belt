@@ -102,7 +102,32 @@ pub enum Response {
     },
 }
 impl CoordinatorStore {
+    /// An answer that is put together from several reads of a task (its
+    /// attempts and their collections, its logs, its outputs) is given only
+    /// when, after the last of them, the task has its row and its run has
+    /// its row and no mark of a pruned run (spec 25.3 (b)): the mark is
+    /// never cleared and rows are deleted only after it, so every read
+    /// before saw the run whole. Otherwise the answer is "not found", and
+    /// nothing that was read of a run that was being deleted is used.
     pub fn query(&self, query: Query) -> Result<Response> {
+        let task = match &query {
+            Query::OutputMetadata { task_id, .. }
+            | Query::LogMetadata { task_id, .. }
+            | Query::Attempts { task_id, .. } => Some(task_id.clone()),
+            _ => None,
+        };
+        let answer = self.query_rows(query);
+        if let Some(task) = task {
+            self.refuse_pruned_task_read(&task)?;
+            if answer.is_ok() && !self.task_is_whole(&task)? {
+                return Err(crate::storage::StorageError::NotFound {
+                    what: format!("task {task}"),
+                });
+            }
+        }
+        answer
+    }
+    fn query_rows(&self, query: Query) -> Result<Response> {
         Ok(match query {
             Query::OutputMetadata {
                 task_id,

@@ -519,10 +519,11 @@ impl CoordinatorStore {
         Ok(crate::results::pin::RunPin::shared(&self.state_dir, &run)?)
     }
     /// Whether `run` carries the mark of a pruned run. A reader that builds
-    /// its answer from several reads asks before the first and after the
-    /// last of them: the mark is never cleared and the rows of a run are
-    /// deleted only after it, so a run without the mark after the last read
-    /// had all its rows at every read before.
+    /// its answer from several reads asks this before the first of them and
+    /// [`Self::run_is_whole`] after the last: the mark is never cleared and
+    /// the rows of a run are deleted only after it, so a run that has its
+    /// row and no mark after the last read had all its rows at every read
+    /// before.
     pub fn run_is_pruned(&self, run: &RunId) -> Result<bool> {
         let (run, pruning) = (run.to_string(), self.pruning);
         self.db.call(move |c| run_marked(c, &run, pruning))
@@ -535,6 +536,32 @@ impl CoordinatorStore {
         }
         let task = task.to_string();
         self.db.call(move |c| refuse_pruned_task(c, &task))
+    }
+    /// Whether `run` has its row and carries no mark, in one snapshot. This
+    /// is what a reader asks after its last read: a run whose pruning ran to
+    /// its end meanwhile has no row, and no mark to see either.
+    pub fn run_is_whole(&self, run: &RunId) -> Result<bool> {
+        let run = run.to_string();
+        let unmarked = unmarked("run", self.pruning);
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND {unmarked})"),
+                [run],
+                |r| r.get(0),
+            )?)
+        })
+    }
+    /// [`Self::run_is_whole`] for the run of `task`, which has its row too.
+    pub(crate) fn task_is_whole(&self, task: &TaskId) -> Result<bool> {
+        let task = task.to_string();
+        let unmarked = unmarked("r", self.pruning);
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM task t JOIN run r USING(run_id) WHERE t.task_id=?1 AND {unmarked})"),
+                [task],
+                |r| r.get(0),
+            )?)
+        })
     }
     /// Prepare a private, fully initialized metadata database without claiming an epoch.
     /// The publish callback journals the staged inode before its no-replace rename.
