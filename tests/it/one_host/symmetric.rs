@@ -18,11 +18,60 @@ use belt::protocol::{ConnectError, Connected, Membership};
 use belt::scheduler::EVENT_TASK_WAITING;
 use belt::secrets::key::ClusterKey;
 use belt::storage::WorkerStore;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A key no member holds.
 fn other_key() -> ClusterKey {
     ClusterKey::from_bytes(vec![9; 32]).unwrap()
+}
+
+/// Keep the last error actually returned to this parent, across reconnects.
+/// Successful requests must not erase the evidence of an earlier failure.
+type AttemptErrors = Arc<Mutex<BTreeMap<AttemptId, String>>>;
+
+struct ObservedLink {
+    // Constructed with ClientLink::new: no gate or negotiated features.
+    inner: ClientLink,
+    errors: AttemptErrors,
+}
+
+impl WorkerLink for ObservedLink {
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        self.inner.read_only_call(request)
+    }
+
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let attempt = match &request {
+                Request::SubmitAttempt(r) => Some(&r.attempt_id),
+                Request::GetAttempt(r) => Some(&r.attempt_id),
+                Request::RenewLease(r) => Some(&r.attempt_id),
+                Request::CancelAttempt(r) => Some(&r.attempt_id),
+                Request::RetireAttempt(r) => Some(&r.attempt_id),
+                Request::ReadLog(r) => Some(&r.attempt_id),
+                Request::GetResult(r) => Some(&r.attempt_id),
+                Request::AckCollected(r) => Some(&r.attempt_id),
+                _ => None,
+            }
+            .cloned();
+            let operation = request.operation();
+            let result = self.inner.call(request).await;
+            if let (Some(attempt), Err(error)) = (attempt, &result) {
+                self.errors
+                    .lock()
+                    .unwrap()
+                    .insert(attempt, format!("{operation:?}: {error:?}"));
+            }
+            result
+        })
+    }
 }
 
 /// One member: its worker agent, and its parent while its resident runs.
@@ -34,6 +83,7 @@ struct Member {
     window: usize,
     dir: TempDir,
     parent: Option<Coordinator>,
+    errors: AttemptErrors,
 }
 
 impl Member {
@@ -117,6 +167,7 @@ fn group(names: &[&str], window: Option<u32>) -> Group {
             window: window.map_or(2, |w| w as usize),
             dir: crate::test_tmp::tempdir().unwrap(),
             parent: None,
+            errors: AttemptErrors::default(),
         }
     });
     Group {
@@ -194,7 +245,10 @@ impl Group {
     async fn link(&self, from: usize, to: usize) {
         let connected = self.connected(from, to).await;
         let connected = connected.unwrap_or_else(|e| panic!("{from} to {to}: {e}"));
-        let link = ClientLink::new(connected.client, Duration::from_secs(30));
+        let link = ObservedLink {
+            inner: ClientLink::new(connected.client, Duration::from_secs(30)),
+            errors: self.members[from].errors.clone(),
+        };
         let to = self.members[to].id.clone();
         self.c(from).attach(to, Arc::new(link)).await;
     }
@@ -274,6 +328,36 @@ impl Group {
                     "  {} on {} {:?} retired={} {:?}\n",
                     a.attempt_id, a.worker_id, a.state, a.retired, a.termination
                 ));
+                if !a.state.is_terminal() {
+                    out.push_str(&format!(
+                        "    parent observation={:?} last_error={:?}\n",
+                        a.observation,
+                        self.members[*i].errors.lock().unwrap().get(&a.attempt_id)
+                    ));
+                    // Read the controlled worker directly: a dead protocol link
+                    // must not hide whether its supervisor actually finished.
+                    let store = self
+                        .worker(&a.worker_id)
+                        .store()
+                        .for_member(c.store().coordinator_id());
+                    out.push_str(&format!(
+                        "    worker state/termination={:?}\n",
+                        store
+                            .get(&a.attempt_id)
+                            .map(|rec| rec.map(|r| (r.state, r.termination)))
+                    ));
+                    for kind in [
+                        "supervisor_stop",
+                        "supervisor_unresolved",
+                        "agent_supervisor_exit",
+                        "agent_gave_up",
+                    ] {
+                        out.push_str(&format!(
+                            "    worker {kind}={:?}\n",
+                            store.events_of(&a.attempt_id, kind)
+                        ));
+                    }
+                }
             }
         }
         for m in &self.members {
