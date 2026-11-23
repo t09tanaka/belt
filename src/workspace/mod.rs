@@ -746,6 +746,9 @@ impl Workspaces {
         let mut report = SweepReport::default();
         let clones = canonical_or(&self.clones_root());
         for (root, scratch_only) in [(self.workspaces_root(), false), (self.clones_root(), true)] {
+            // A scratch directory that its maker was still building has a
+            // name of its own, which proves who made it (spec 25.4 (a)).
+            crate::platform::owned_temp::sweep_unfinished(&root);
             let entries = match std::fs::read_dir(&root) {
                 Ok(e) => e,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

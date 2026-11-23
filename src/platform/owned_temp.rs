@@ -142,31 +142,117 @@ impl Owner {
 
 /// `<parent>/<prefix>XXXXXX/` holding the marker and the empty directory
 /// [`OwnedTemp::path`] that the owner works in.
+///
+/// The directory never stands under that name without its complete marker:
+/// it is built under a name that itself says who makes it (a temporary file
+/// name, [`FILE_PREFIX`]), the marker is written and synced there, and only
+/// then is it renamed. A process that is killed on the way leaves the
+/// directory under the first name, which every sweep reads like that of a
+/// temporary file. So a marker that is missing or cut short never comes from
+/// a kill or a power loss: such a directory is not one of these.
 pub struct OwnedTemp {
     inside: PathBuf,
-    // Removed when this guard is dropped, after `Drop::drop` below.
-    dir: tempfile::TempDir,
+    dir: PathBuf,
+}
+
+/// How many characters follow the prefix in the name of the directory.
+const DIR_RANDOM_LEN: usize = 6;
+
+/// `from` to `to`, never onto anything that is there.
+fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        // A file system without the exclusive rename: look first. What a
+        // plain rename could still replace is an empty directory that
+        // appeared in between, and no directory of this kind is ever empty.
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP) => {
+            match fs::symlink_metadata(to) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
+                Err(e) => Err(e),
+                Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
+            }
+        }
+        other => Ok(other?),
+    }
 }
 
 impl OwnedTemp {
     pub fn new_in(parent: &Path, prefix: &str) -> io::Result<Self> {
-        let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
-        let inside = dir.path().join(INSIDE);
-        fs::create_dir(&inside)?;
         let pid = std::process::id();
-        // Without every fact nothing can be proven later: no marker, and the
-        // directory is only ever removed by this guard.
-        if let (Some(place), StartIdentity::Identity(start)) =
-            (Place::here(), process_start_identity(pid))
-        {
-            let mut marker = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(dir.path().join(MARKER))?;
-            marker.write_all(Owner { place, pid, start }.marker_text().as_bytes())?;
+        let owner = match (Place::here(), process_start_identity(pid)) {
+            (Some(place), StartIdentity::Identity(start)) => Some(Owner { place, pid, start }),
+            _ => None,
+        };
+        Self::new_of(parent, prefix, owner.as_ref(), &rename_new)
+    }
+
+    /// The directory of `owner`, or of a process that cannot say who it is.
+    /// `publish` is [`rename_new`]: it gives the built directory its name.
+    fn new_of(
+        parent: &Path,
+        prefix: &str,
+        owner: Option<&Owner>,
+        publish: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let building_name = owner.and_then(|owner| {
+            let start = StartIdentity::Identity(owner.start.clone());
+            let part = owner_part(Some(&owner.place), &start, owner.pid);
+            // a start without a decimal form gives the name of nobody
+            (part != owner_part(None, &start, owner.pid)).then(|| name_of_part(FILE_PREFIX, &part))
+        });
+        let (Some(owner), Some(building_name)) = (owner, building_name) else {
+            // Without every fact nothing can be proven later: no marker, and
+            // the directory is only ever removed by this guard (or by a
+            // caller that knows no writer can exist: `is_without_marker`).
+            let dir = tempfile::Builder::new()
+                .prefix(prefix)
+                .rand_bytes(DIR_RANDOM_LEN)
+                .tempdir_in(parent)?
+                .keep();
+            let made = Self {
+                inside: dir.join(INSIDE),
+                dir,
+            };
+            fs::create_dir(&made.inside)?;
+            return Ok(made);
+        };
+        // Dropped on every early return below: the directory goes with it.
+        let mut made = Self::build(parent.join(building_name), owner)?;
+        for _ in 0..16 {
+            let published = parent.join(name_of_part(prefix, ""));
+            match publish(&made.dir, &published) {
+                Ok(()) => {
+                    made.inside = published.join(INSIDE);
+                    made.dir = published;
+                    return Ok(made);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
         }
-        Ok(Self { inside, dir })
+        Err(io::ErrorKind::AlreadyExists.into())
+    }
+
+    /// The whole directory of `owner`, marker included and on disk, at
+    /// `building`: a name that proves the same owner. Nothing is under the
+    /// final name yet.
+    fn build(building: PathBuf, owner: &Owner) -> io::Result<Self> {
+        fs::create_dir(&building)?;
+        let made = Self {
+            inside: building.join(INSIDE),
+            dir: building,
+        };
+        fs::create_dir(&made.inside)?;
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(made.dir.join(MARKER))?;
+        marker.write_all(owner.marker_text().as_bytes())?;
+        // On disk before the name is: a power loss must not leave the final
+        // name with a marker that was not written yet.
+        marker.sync_all()?;
+        Ok(made)
     }
 
     /// For tests of other crates' sweeps (`tests/it`): the directory `dir`
@@ -186,11 +272,24 @@ impl OwnedTemp {
         )
     }
 
+    /// For the same tests: the name under which `pid` (started at `start`,
+    /// in this place) builds such a directory before it has its marker.
+    #[doc(hidden)]
+    pub fn building_name_of(pid: u32, start: &str) -> io::Result<String> {
+        let place = Place::here().ok_or_else(|| io::Error::other("place unknown"))?;
+        let start = StartIdentity::Identity(start.to_string());
+        Ok(name_of_part(
+            FILE_PREFIX,
+            &owner_part(Some(&place), &start, pid),
+        ))
+    }
+
     /// Remove the directory now and say whether that worked (dropping the
     /// guard does the same and ignores the result).
-    pub fn close(self) -> io::Result<()> {
-        make_writable(self.dir.path());
-        fs::remove_dir_all(self.dir.path())
+    pub fn close(mut self) -> io::Result<()> {
+        let dir = std::mem::take(&mut self.dir);
+        make_writable(&dir);
+        fs::remove_dir_all(&dir)
     }
 
     /// The empty directory for the owner's use.
@@ -200,14 +299,19 @@ impl OwnedTemp {
 
     /// The directory that holds the marker: what a sweep looks at.
     pub fn outer(&self) -> &Path {
-        self.dir.path()
+        &self.dir
     }
 }
 
 impl Drop for OwnedTemp {
     fn drop(&mut self) {
+        // Closed already: nothing is named.
+        if self.dir.as_os_str().is_empty() {
+            return;
+        }
         // A read-only directory inside would stop the removal at its first entry.
-        make_writable(self.dir.path());
+        make_writable(&self.dir);
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -234,20 +338,38 @@ pub fn make_writable(root: &Path) {
 }
 
 /// Remove every `<parent>/<prefix>*` directory whose marker proves that its
-/// owner is gone. Returns how many were removed.
+/// owner is gone, and every directory that was still being built (under a
+/// temporary file name, see [`OwnedTemp`]) by a process that the name proves
+/// gone. Returns how many were removed.
 pub fn sweep(parent: &Path, prefix: &str) -> usize {
+    sweep_directories(parent, Some(prefix))
+}
+
+/// Only the directories that were still being built: for a place whose
+/// finished directories are judged by its own rules (`workspace`).
+pub fn sweep_unfinished(parent: &Path) -> usize {
+    sweep_directories(parent, None)
+}
+
+fn sweep_directories(parent: &Path, prefix: Option<&str>) -> usize {
     let Ok(entries) = fs::read_dir(parent) else {
         return 0;
     };
     let here = Place::here();
     let mut removed = 0;
     for entry in entries.flatten() {
-        let named = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with(prefix));
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
         let path = entry.path();
-        if named && owner_is_gone(&path, here.as_ref()) {
+        let gone = if name.starts_with(FILE_PREFIX) {
+            unfinished_owner_is_gone(&path, name, here.as_ref())
+        } else {
+            prefix.is_some_and(|prefix| name.starts_with(prefix))
+                && owner_is_gone(&path, here.as_ref())
+        };
+        if gone {
             make_writable(&path);
             if fs::remove_dir_all(&path).is_ok() {
                 removed += 1;
@@ -255,6 +377,17 @@ pub fn sweep(parent: &Path, prefix: &str) -> usize {
         }
     }
     removed
+}
+
+/// True only with proof: a real directory of this user under a temporary
+/// file name whose owner is gone. It is a directory that its maker was
+/// still building: nobody else was ever told its name.
+fn unfinished_owner_is_gone(path: &Path, name: &str, here: Option<&Place>) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    Seen::of(&meta).is_own_directory(effective_uid())
+        && name_is_of_gone_owner(name, FILE_PREFIX, here)
 }
 
 /// Remove the directory `dir` if its marker proves that its owner is gone.
@@ -594,6 +727,12 @@ pub fn new_stage_name() -> String {
 }
 
 fn new_name(kind: &str) -> String {
+    name_of_part(kind, &own_part())
+}
+
+/// `<kind><part>` and random alphanumerics: 12 for a name that carries an
+/// owner, [`DIR_RANDOM_LEN`] for the bare name of a directory.
+fn name_of_part(kind: &str, part: &str) -> String {
     const ALPHABET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut random = [0u8; RANDOM_LEN];
     // Without randomness the exclusive create below the caller does is what
@@ -604,9 +743,14 @@ fn new_name(kind: &str) -> String {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         random.copy_from_slice(&[n.to_le_bytes(), n.to_be_bytes()].concat()[..RANDOM_LEN]);
     }
-    let mut name = format!("{kind}{}", own_part());
+    let len = if part.is_empty() {
+        DIR_RANDOM_LEN
+    } else {
+        RANDOM_LEN
+    };
+    let mut name = format!("{kind}{part}");
     name.extend(
-        random
+        random[..len]
             .iter()
             .map(|b| ALPHABET[usize::from(*b) % ALPHABET.len()] as char),
     );
@@ -699,9 +843,10 @@ pub struct FileSweep {
 
 /// One `readdir` of `dir`: remove the temporary files (named by the rule
 /// above) whose owner is proven gone. Only regular files of this user with
-/// one link, and links of this user (a switch in progress, removed as the
-/// link, never followed), are removed; entries that do not start with
-/// [`FILE_PREFIX`] are not looked at.
+/// one link, links of this user (a switch in progress, removed as the
+/// link, never followed) and directories of this user (a marker directory
+/// that was still being built, see [`OwnedTemp`]) are removed; entries that
+/// do not start with [`FILE_PREFIX`] are not looked at.
 pub fn sweep_files(dir: &Path) -> FileSweep {
     sweep_named(dir, FILE_PREFIX)
 }
@@ -760,8 +905,16 @@ fn sweep_named(dir: &Path, kind: &str) -> FileSweep {
         };
         let path = entry.path();
         let owner = owning_name(name, kind);
-        if file_owner_is_gone(&path, owner, kind, here.as_ref()) && fs::remove_file(&path).is_ok()
-        {
+        let removed = if file_owner_is_gone(&path, owner, kind, here.as_ref()) {
+            fs::remove_file(&path).is_ok()
+        } else if kind == FILE_PREFIX && unfinished_owner_is_gone(&path, name, here.as_ref()) {
+            // a marker directory that its maker was still building
+            make_writable(&path);
+            fs::remove_dir_all(&path).is_ok()
+        } else {
+            false
+        };
+        if removed {
             out.removed += 1;
         } else {
             out.kept += 1;
@@ -1160,6 +1313,188 @@ mod tests {
             uid: me,
         };
         assert!(!other.is_own_file(me) && !other.is_own_directory(me));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The directory stands under its name only with its complete marker,
+    /// and nothing of the building is left beside it.
+    #[test]
+    fn a_directory_appears_under_its_name_with_its_marker() {
+        let parent = parent();
+        let made = OwnedTemp::new_in(parent.path(), "work-").unwrap();
+        let name = made.outer().file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("work-") && name.len() == 5 + DIR_RANDOM_LEN);
+        assert_eq!(names_in(parent.path()), [name.to_string()]);
+        assert_eq!(names_in(made.outer()), [INSIDE, MARKER]);
+        assert_eq!(made.path(), made.outer().join(INSIDE));
+        assert_eq!(names_in(made.path()), [""; 0]);
+        let owner = read_marker(&made.outer().join(MARKER)).expect("a complete marker");
+        assert_eq!(owner.pid, std::process::id());
+        assert_eq!(owner.place, Place::here().unwrap());
+        // a live owner: no sweep takes it, by the marker or by any name
+        assert_eq!(sweep(parent.path(), "work-"), 0);
+        assert_eq!(sweep_files(parent.path()).removed, 0);
+        let outer = made.outer().to_owned();
+        drop(made);
+        assert!(!outer.exists());
+        // while it is built it is under a name that proves the same owner,
+        // and it is complete when it gets its name: nothing is under that
+        // name before
+        let own = Owner {
+            place: Place::here().unwrap(),
+            pid: std::process::id(),
+            start: testing::this_start(),
+        };
+        let asked = std::cell::Cell::new(0);
+        let publish = |from: &Path, to: &Path| {
+            asked.set(asked.get() + 1);
+            let building = from.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(is_own_file_name(&building), "{building}");
+            assert_eq!(names_in(parent.path()), [building]);
+            assert_eq!(names_in(from), [INSIDE, MARKER]);
+            assert_eq!(read_marker(&from.join(MARKER)).as_ref(), Some(&own));
+            assert_eq!(to.parent(), Some(parent.path()));
+            // the first name is taken: another is tried, nothing is replaced
+            if asked.get() == 1 {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            rename_new(from, to)
+        };
+        let made = OwnedTemp::new_of(parent.path(), "work-", Some(&own), &publish).unwrap();
+        assert_eq!(asked.get(), 2);
+        assert_eq!(read_marker(&made.outer().join(MARKER)).as_ref(), Some(&own));
+        assert_eq!(made.path(), made.outer().join(INSIDE));
+        drop(made);
+        assert_eq!(names_in(parent.path()), [""; 0]);
+        // a name that cannot be given: nothing is left
+        let denied = |_: &Path, _: &Path| Err(io::ErrorKind::PermissionDenied.into());
+        let error = OwnedTemp::new_of(parent.path(), "work-", Some(&own), &denied)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let taken = |_: &Path, _: &Path| Err(io::ErrorKind::AlreadyExists.into());
+        let error = OwnedTemp::new_of(parent.path(), "work-", Some(&own), &taken)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(names_in(parent.path()), [""; 0]);
+        // closing removes it, and the guard does not remove another of that name after
+        let made = OwnedTemp::new_in(parent.path(), "work-").unwrap();
+        let outer = made.outer().to_owned();
+        made.close().unwrap();
+        assert!(!outer.exists());
+    }
+
+    /// A process that cannot say who it is makes the directory without a
+    /// marker, directly under its name: what the callers that hold a lock
+    /// against every writer remove as "without marker".
+    #[test]
+    fn a_maker_that_cannot_say_who_it_is_leaves_no_marker() {
+        let parent = parent();
+        let here = Place::here().unwrap();
+        for owner in [
+            None,
+            Some(Owner {
+                place: here.clone(),
+                pid: std::process::id(),
+                start: "other:1".into(),
+            }),
+        ] {
+            let never = |_: &Path, _: &Path| panic!("nothing is built apart");
+            let made = OwnedTemp::new_of(parent.path(), "work-", owner.as_ref(), &never).unwrap();
+            assert_eq!(names_in(made.outer()), [INSIDE]);
+            assert!(is_without_marker(made.outer()));
+            assert_eq!(names_in(parent.path()).len(), 1);
+            assert_eq!(sweep(parent.path(), "work-"), 0);
+            drop(made);
+            assert_eq!(names_in(parent.path()), [""; 0]);
+        }
+    }
+
+    /// A maker that was killed while it built the directory left it under
+    /// the building name, whatever was in it by then: every sweep that
+    /// passes removes it once the name proves the maker gone. Under the
+    /// final name a marker that is empty or cut short is then nobody's doing
+    /// here, and it is kept.
+    #[test]
+    fn a_directory_whose_maker_was_killed_while_building_is_swept() {
+        let (pid, start) = ended_process();
+        let dead = || OwnedTemp::building_name_of(pid, &start).unwrap();
+        let live = OwnedTemp::building_name_of(std::process::id(), &testing::this_start()).unwrap();
+        assert!(parse_file_name(&dead()).is_some() && parse_file_name(&live).is_some());
+        assert!(is_own_file_name(&live));
+        let build = |parent: &Path, name: &str, upto: usize| {
+            let dir = parent.join(name);
+            fs::create_dir(&dir).unwrap();
+            if upto > 0 {
+                fs::create_dir(dir.join(INSIDE)).unwrap();
+            }
+            if upto > 1 {
+                fs::write(dir.join(MARKER), "boot\n4").unwrap();
+            }
+            dir
+        };
+        type Sweep = fn(&Path) -> usize;
+        let sweeps: [Sweep; 3] = [
+            |p| sweep(p, "work-"),
+            |p| sweep_files(p).removed,
+            sweep_unfinished,
+        ];
+        for run in sweeps {
+            let parent = parent();
+            for upto in 0..3 {
+                build(parent.path(), &dead(), upto);
+            }
+            let kept = [
+                build(parent.path(), &live, 2),
+                // in another place, and a name that does not parse
+                build(
+                    parent.path(),
+                    &testing::name_in_another_place(pid, &start, "aaaaaaaaaaa1"),
+                    2,
+                ),
+                build(parent.path(), &format!("{}x", dead()), 2),
+                // the final name with a marker cut short: kept
+                build(parent.path(), "work-GARBLE", 2),
+                build(parent.path(), "work-EMPTY0", 1),
+            ];
+            assert_eq!(run(parent.path()), 3);
+            assert_eq!(names_in(parent.path()).len(), kept.len());
+            for dir in &kept {
+                assert!(dir.exists(), "{dir:?}");
+            }
+        }
+        // a link under such a name is removed as the link, never followed
+        let parent = parent();
+        let target = build(parent.path(), "target", 2);
+        std::os::unix::fs::symlink(&target, parent.path().join(dead())).unwrap();
+        assert_eq!(sweep(parent.path(), "work-"), 0);
+        assert_eq!(sweep_unfinished(parent.path()), 0);
+        assert_eq!(sweep_files(parent.path()).removed, 1);
+        assert_eq!(names_in(&target), [INSIDE, MARKER]);
+    }
+
+    /// The directory never replaces what is under the name already.
+    #[test]
+    fn the_rename_into_the_name_replaces_nothing() {
+        let parent = parent();
+        let (from, to) = (parent.path().join("from"), parent.path().join("to"));
+        fs::create_dir(&from).unwrap();
+        fs::create_dir(&to).unwrap();
+        let error = rename_new(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.exists() && to.exists());
+        fs::remove_dir(&to).unwrap();
+        rename_new(&from, &to).unwrap();
+        assert!(!from.exists() && to.exists());
     }
 
     #[test]
@@ -1801,20 +2136,25 @@ mod tests {
         // not named like ours: never looked at, even with a dead owner's look
         let foreign = put("com.other.product.plist");
         let old_style = put(".tmpAbC123");
-        // a directory with a matching name, and a link to a file elsewhere
+        // a directory with such a name is a marker directory that its maker
+        // was still building (removed with what is in it), and a link to a
+        // file elsewhere is removed as the link
         let dir_named = dir.path().join(testing::dead_name("aaaaaaaaaaa6"));
         fs::create_dir(&dir_named).unwrap();
+        fs::write(dir_named.join(MARKER), b"boot\n").unwrap();
+        let live_dir = dir.path().join(testing::live_name("aaaaaaaaaaa8"));
+        fs::create_dir(&live_dir).unwrap();
         let victim = put("victim");
         let link = dir.path().join(testing::dead_name("aaaaaaaaaaa7"));
         std::os::unix::fs::symlink(&victim, &link).unwrap();
 
         let report = sweep_files(dir.path());
-        assert_eq!(report.removed, 3, "{report:?}");
-        for removed in [&gone, &reused, &link] {
+        assert_eq!(report.removed, 4, "{report:?}");
+        for removed in [&gone, &reused, &link, &dir_named] {
             assert!(fs::symlink_metadata(removed).is_err(), "{removed:?} stays");
         }
         for kept in [
-            &live, &elsewhere, &garbled, &linked, &twin, &foreign, &old_style, &dir_named, &victim,
+            &live, &elsewhere, &garbled, &linked, &twin, &foreign, &old_style, &live_dir, &victim,
         ] {
             assert!(fs::symlink_metadata(kept).is_ok(), "{kept:?} was removed");
         }

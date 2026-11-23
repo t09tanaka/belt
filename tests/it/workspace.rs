@@ -1287,6 +1287,19 @@ fn the_sweeper_clears_what_no_record_names() {
     let garbled_scratch = f.state.join("clones/.clone.garbled");
     std::fs::create_dir_all(&garbled_scratch).unwrap();
     std::fs::write(garbled_scratch.join("owner"), "not a marker").unwrap();
+    // a scratch directory that its maker was still building when it was
+    // killed is under a name that says who made it: gone with a gone maker
+    let building = |root: &str, pid: u32, start: &str| {
+        let name = belt::platform::owned_temp::OwnedTemp::building_name_of(pid, start).unwrap();
+        let dir = f.state.join(root).join(name);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        dir
+    };
+    let half_built = [
+        building("clones", ended_pid, &ended_start),
+        building("workspaces", ended_pid, &ended_start),
+    ];
+    let being_built = building("clones", me, &my_start);
     let foreign = f.state.join("workspaces/notes.txt");
     std::fs::write(&foreign, "mine").unwrap();
     // a leftover that holds a directory it cannot read
@@ -1304,6 +1317,10 @@ fn the_sweeper_clears_what_no_record_names() {
     assert_eq!(report.removed.len(), 6, "{:?}", report.removed);
     assert!(kept.root.exists());
     assert!(foreign.exists() && live_scratch.exists() && garbled_scratch.exists());
+    assert!(being_built.exists());
+    for gone in &half_built {
+        assert!(!gone.exists(), "{gone:?}");
+    }
     for gone in [
         &lost.root,
         &plain,
