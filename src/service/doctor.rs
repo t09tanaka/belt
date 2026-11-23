@@ -157,16 +157,26 @@ pub struct AbandonedImports {
     pub roots: u64,
     pub members: u64,
     pub bytes: u64,
+    /// More files than `doctor` stats: `bytes` is a lower bound.
+    #[serde(default)]
+    pub bytes_truncated: bool,
+    /// Staging directories under `incoming/` whose import token record
+    /// cannot be read: what their token holds is not released until a
+    /// person looks (the record is kept, not guessed at).
+    #[serde(default)]
+    pub unreadable_tokens: u64,
 }
 
 fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
     // read only, never makes a store
-    let (roots, members, bytes) =
+    let (roots, members, bytes, bytes_truncated) =
         crate::source::retention::abandoned_imports_read_only(worker_state).ok()??;
     Some(AbandonedImports {
         roots,
         members,
         bytes,
+        bytes_truncated,
+        unreadable_tokens: crate::worker::blobs::unreadable_import_tokens(worker_state),
     })
 }
 
@@ -678,15 +688,22 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
     if let Some(linger) = &facts.linger {
         out.push(linger::check(host, linger));
     }
-    if let Some(a) = facts.abandoned_imports.filter(|a| a.roots > 0) {
-        out.push(check(
-            "abandoned_imports",
-            Level::Notice,
-            format!(
-                "{} released import token(s) still hold {} membership(s), {} byte(s) only they hold; they go once the store's retention gates open",
-                a.roots, a.members, a.bytes
-            ),
-        ));
+    if let Some(a) = facts
+        .abandoned_imports
+        .filter(|a| a.roots > 0 || a.unreadable_tokens > 0)
+    {
+        let at_least = if a.bytes_truncated { "at least " } else { "" };
+        let mut text = format!(
+            "{} released import token(s) still hold {} membership(s), {at_least}{} byte(s) only they hold; they go once the store's retention gates open",
+            a.roots, a.members, a.bytes
+        );
+        if a.unreadable_tokens > 0 {
+            text.push_str(&format!(
+                "; {} incoming source(s) have an import token record that cannot be read and keep what they hold",
+                a.unreadable_tokens
+            ));
+        }
+        out.push(check("abandoned_imports", Level::Notice, text));
     }
     out
 }

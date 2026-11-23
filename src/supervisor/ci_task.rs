@@ -328,10 +328,17 @@ pub(crate) fn run_task(
     let inputs: TaskInputs = serde_json::from_value(ci.inputs.clone())
         .map_err(|_| "the inputs of the task cannot be read".to_string())?;
     let store = SourceStore::open(state_dir).map_err(|e| format!("the source store: {e}"))?;
-    let manifest = store
-        .manifest(&ci.ci_source_id)
-        .map_err(|e| format!("the source of the attempt: {e}"))?
-        .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?;
+    let manifest = {
+        // (waits for a deleting pass's step, spec 25.8 5b (a); held for
+        // this read only, never for the task)
+        let _held = store
+            .mutation_guard_waiting()
+            .map_err(|e| format!("the source store: {e}"))?;
+        store
+            .manifest(&ci.ci_source_id)
+            .map_err(|e| format!("the source of the attempt: {e}"))?
+            .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?
+    };
     let paths = ci.paths(cancel);
     let run_dir = paths.run_dir.clone();
     if let Some(step) = crate::ci::discovery::DiscoveryStep::from_task(&plan, &ci.task_id) {

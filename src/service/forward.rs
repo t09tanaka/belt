@@ -572,11 +572,16 @@ mod measured_tests {
             measurable: std::sync::atomic::AtomicBool::new(true),
             started: crate::platform::monotonic_ms(),
         });
-        let (hash, _) = source
-            .object_store()
-            .unwrap()
-            .put_bytes(b"abcdefgh")
-            .unwrap();
+        let (hash, _) = {
+            let bytes: &[u8] = b"abcdefgh";
+            let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+            let want = crate::source::diff::BlobWant {
+                hash: hash.clone(),
+                size: 8,
+            };
+            source.ingest_blob(&want, &mut &bytes[..]).unwrap();
+            (hash, 8u64)
+        };
         let file = source.open_blob_verified(&hash).unwrap().file;
         let reader = OwnedUpload {
             file,

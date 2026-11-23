@@ -279,13 +279,24 @@ impl Index {
             "source deletion validation byte budget"
         );
         *budget -= leaf.size;
+        // Blobs are hashed while they are read (a blob may be up to the
+        // receiver's `max_blob_bytes`); only a manifest, which must be parsed,
+        // is held in memory, and it is hashed from the same read.
+        let blob = object.starts_with("b:");
+        let mut hasher = Sha256::new();
         let mut bytes = Vec::new();
-        (&mut file).take(leaf.size + 1).read_to_end(&mut bytes)?;
+        let read = if blob {
+            std::io::copy(&mut (&mut file).take(leaf.size + 1), &mut hasher)?
+        } else {
+            (&mut file).take(leaf.size + 1).read_to_end(&mut bytes)?;
+            hasher.update(&bytes);
+            bytes.len() as u64
+        };
         ensure!(
-            bytes.len() as u64 == leaf.size && Identity::of(&file)? == leaf,
+            read == leaf.size && Identity::of(&file)? == leaf,
             "source changed during validation"
         );
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = format!("{:x}", hasher.finalize());
         let verified = (|| -> Result<()> {
             if let Some(hash) = object.strip_prefix("b:") {
                 ensure!(digest == hash, "source blob content identity mismatch");
@@ -400,10 +411,14 @@ impl Index {
         let tx = c.transaction()?;
         let changed=tx.execute("UPDATE publication SET state='live',incarnation=incarnation+1 WHERE object=?1 AND incarnation=?2 AND state='claimed'",params![claim.object,claim.incarnation])?;
         ensure!(changed == 1, "source claim completion changed");
-        tx.execute(
-            "UPDATE source_delete_claim SET done=1 WHERE object=?1 AND incarnation=?2 AND done=0",
+        // The completed claim row is deleted, not kept as `done=1`: the
+        // generation lives on in `publication.incarnation`, which this same
+        // transaction advanced, so a stale claim or reader is still refused.
+        let removed = tx.execute(
+            "DELETE FROM source_delete_claim WHERE object=?1 AND incarnation=?2 AND done=0",
             params![claim.object, claim.incarnation],
         )?;
+        ensure!(removed == 1, "source claim completion row changed");
         fault("before_completion")?;
         tx.commit()?;
         Ok(())

@@ -18,6 +18,7 @@ pub mod ci_task;
 pub mod control;
 pub mod host;
 pub mod machine;
+pub mod pins;
 pub mod policy;
 pub(crate) mod rekey;
 pub mod serve;

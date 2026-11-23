@@ -3724,3 +3724,34 @@ fn a_record_that_names_no_token_owns_nothing_and_the_source_comes_again() {
     sink.drop_stale(&stale(&l));
     assert!(!f.incoming(&other.source).exists());
 }
+
+/// `doctor` counts the staging directories whose import token record exists
+/// and cannot be read (they keep what their token holds); a missing record
+/// and one that names no token are no owner and are not counted.
+#[test]
+fn doctor_counts_staging_dirs_whose_token_record_cannot_be_read() {
+    let state = crate::test_tmp::tempdir().unwrap();
+    let incoming = state.path().join("incoming");
+    assert_eq!(
+        belt::worker::blobs::unreadable_import_tokens(state.path()),
+        0
+    );
+    for (name, record) in [
+        ("none", None),
+        ("garbage", Some(false)),
+        ("unreadable", Some(true)),
+    ] {
+        let dir = incoming.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        match record {
+            None => {}
+            Some(false) => std::fs::write(dir.join("import-token"), "not a token").unwrap(),
+            // (a directory where the record should be: reading it fails)
+            Some(true) => std::fs::create_dir(dir.join("import-token")).unwrap(),
+        }
+    }
+    assert_eq!(
+        belt::worker::blobs::unreadable_import_tokens(state.path()),
+        1
+    );
+}

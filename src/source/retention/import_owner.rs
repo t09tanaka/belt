@@ -139,6 +139,22 @@ impl SourceStore {
         })
     }
 
+    /// [`Self::release_import`] for a caller that holds the lock over all
+    /// sources: the root is abandoned and its members whose file was never
+    /// written are forgotten; the shared and exclusive parts are left to the
+    /// agent's patrol (`release_abandoned_imports`), so the cost does not
+    /// grow with the token's memberships.
+    pub fn abandon_import_only(&self, id: &str) -> Result<()> {
+        ensure!(is_import_token_id(id), "not an import token id");
+        let root = format!("import:{id}");
+        let _guard = self.mutation_guard()?;
+        let mut c = self.retention.connect_for_import()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.retention.abandon_import(&tx, id)?;
+        tx.commit()?;
+        self.retention.forget_absent_members(&root)
+    }
+
     /// One bounded pass over the abandoned tokens: the shared part under the
     /// shared mutation lock, then the exclusive part only when every gate is
     /// open. A store that is busy is left for the next pass.
@@ -540,7 +556,7 @@ mod tests {
         // the waiting roots and their files stay, counted for `doctor`
         assert_eq!(
             super::super::abandoned_imports_read_only(dir.path()).unwrap(),
-            Some((34, 1000 + 33, 0))
+            Some((34, 1000 + 33, 0, false))
         );
         assert_eq!(claims(&store), 0);
         assert!(store.has_blob(&want(&shared).hash));

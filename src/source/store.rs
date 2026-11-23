@@ -391,14 +391,6 @@ impl GuardedObjectStore<'_> {
     pub fn manifest_path(&self, id: &str) -> PathBuf {
         self.store.inner.manifest_path(id)
     }
-    pub fn put_bytes(&self, bytes: &[u8]) -> Result<(String, u64)> {
-        // SDK writers need a durable unknown root before learning their digest.
-        let hash = format!("{:x}", Sha256::digest(bytes));
-        self.guard.ensure_blob_available(&hash)?;
-        let token = self.store.begin_import()?;
-        self.store.retention.import_blob(&token, &hash)?;
-        self.store.inner.put_bytes(bytes)
-    }
     /// S16 planning's SDK call must execute entirely inside this callback.
     /// Trusted crate code must not return cloned SDK handles from the scope.
     pub(crate) fn with_sdk<T>(
@@ -750,6 +742,95 @@ impl SourceStore {
         self.publish_checked_root(m, &root)?;
         self.finish_import(token, &m.source_id)
     }
+    /// Whether source `id` is in the store: the index has the root
+    /// `receive:<id>` and its `source` is `id` (spec 25.8 5b (b)). The file
+    /// is not looked at, except that while the legacy registration is
+    /// pending a manifest file with no `m:` row counts as present. Call under
+    /// a shared mutation lock (`_held`).
+    pub fn received(&self, _held: &super::retention::Guard, id: &str) -> Result<bool> {
+        if self.retention.received_row(id)? {
+            return Ok(true);
+        }
+        if !self.retention.legacy_registration_pending()?
+            || self.retention.has_object(&format!("m:{id}"))?
+        {
+            return Ok(false);
+        }
+        Ok(self.inner.manifest_path(id).is_file())
+    }
+    /// At the worker's start, under `agent.lock` and before anything is
+    /// received (spec 25.8 5b (h)1 (ii)): the `receive:%` roots with no
+    /// source are settled under the exclusive mutation lock, waited for up
+    /// to 120 s. One whose manifest file is there, is that source's and
+    /// whose blobs and children are in the store finishes its registration;
+    /// any other is abandoned with its graph rows (its members go by the
+    /// later passes). Nothing is done when the lock is not had in time (the
+    /// gate stays closed while such a root exists, so nothing is deleted
+    /// meanwhile) or when the store holds a parent's root. Returns
+    /// `(registered, abandoned)`, or `None` when it did not run.
+    pub fn settle_empty_receive_roots(&self) -> Result<Option<(u32, u32)>> {
+        let Some(_exclusive) = self
+            .retention
+            .guard_exclusive_waiting(std::time::Duration::from_secs(120))?
+        else {
+            return Ok(None);
+        };
+        if self.retention.holds_parent_roots()? {
+            return Ok(None);
+        }
+        let (mut registered, mut abandoned) = (0, 0);
+        let mut seen = BTreeSet::new();
+        loop {
+            let roots = self.retention.empty_receive_roots(1000)?;
+            let fresh: Vec<_> = roots
+                .into_iter()
+                .filter(|r| seen.insert(r.clone()))
+                .collect();
+            if fresh.is_empty() {
+                break;
+            }
+            for root in fresh {
+                let id = root.trim_start_matches("receive:");
+                match self.settled_manifest(id) {
+                    Some(m) => {
+                        self.retention
+                            .register_held(&root, "received", std::sync::Arc::new(m))?;
+                        registered += 1;
+                    }
+                    None => {
+                        if self.retention.abandon_empty_receive_root(&root)? {
+                            abandoned += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some((registered, abandoned)))
+    }
+    /// The manifest of `id` when its file proves a whole publication: the
+    /// file is that source's valid manifest, its blobs are here with their
+    /// sizes, and its children are published. Read under the caller's
+    /// exclusive lock (no other guard is taken).
+    fn settled_manifest(&self, id: &str) -> Option<CiManifest> {
+        let path = self.inner.manifest_path(id);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > 64 << 20 {
+            return None;
+        }
+        let m: CiManifest = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        if m.source_id != id || verify_manifest(&m).is_err() {
+            return None;
+        }
+        let blobs = m.object_manifest.entries.iter().all(|e| {
+            std::fs::symlink_metadata(self.inner.object_path(&e.hash))
+                .is_ok_and(|b| b.is_file() && b.len() == e.size)
+        });
+        let children = m.submodules.iter().all(|s| match &s.source_id {
+            Some(child) => self.retention.received_row(child).unwrap_or(false),
+            None => true,
+        });
+        (blobs && children).then_some(m)
+    }
     fn publish_checked(&self, m: &CiManifest) -> Result<()> {
         self.publish_checked_root(m, &format!("receive:{}", m.source_id))
     }
@@ -758,7 +839,6 @@ impl SourceStore {
         mutation.ensure_sdk_available()?;
         mutation.ensure_source_available(&m.source_id)?;
         verify_manifest(m)?;
-        self.retention.pending(root)?;
         for e in &m.object_manifest.entries {
             mutation.ensure_blob_available(&e.hash)?;
             let p = self.inner.object_path(&e.hash);
@@ -783,7 +863,7 @@ impl SourceStore {
         }
         for s in &m.submodules {
             if let Some(id) = &s.source_id {
-                if !self.inner_has_manifest(id) {
+                if !self.received(&mutation, id)? {
                     return Err(corrupt(format!(
                         "submodule {}: {id} is not in the store",
                         s.path.display()
@@ -791,6 +871,10 @@ impl SourceStore {
                 }
             }
         }
+        // The root is made only after the checks (spec 25.8 5b (h)1): a
+        // publication refused above leaves no empty `receive:<S>` behind. It
+        // is still made before the manifest file, which it protects.
+        self.retention.pending(root)?;
         let bytes = serde_json::to_vec_pretty(m)?;
         let mut tmp = crate::platform::owned_temp::file_in(self.inner.root().join("tmp"))?;
         tmp.write_all(&bytes)?;
@@ -804,15 +888,13 @@ impl SourceStore {
         Ok(())
     }
 
-    fn inner_has_manifest(&self, ci_source_id: &str) -> bool {
-        matches!(self.manifest(ci_source_id), Ok(Some(_)))
-    }
-
     /// Unpack `m` into `dest` (absent or empty). The paths of every source it
     /// is made of are decided on first; then local-ci writes the files, never
     /// through a symlink, and checks the result against the tree digest.
     pub fn materialize(&self, m: &CiManifest, dest: &Path) -> Result<()> {
-        let mutation = self.mutation_guard()?;
+        // A workspace is made for an accepted attempt: it waits for a
+        // deleting pass's step rather than failing (spec 25.8 5b (a)).
+        let mutation = self.mutation_guard_waiting()?;
         mutation.ensure_sdk_available()?;
         for s in self.closure(m)? {
             verify_manifest(&s)?;

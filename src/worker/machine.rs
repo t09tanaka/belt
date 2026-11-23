@@ -7,6 +7,7 @@
 
 use super::blobs::{BlobSink, Incoming};
 use super::host::Host;
+use super::pins::{Pin, SourcePins};
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform;
@@ -38,6 +39,9 @@ pub struct Machine {
     secrets: WorkerSecrets,
     key_path: PathBuf,
     incoming: Incoming,
+    /// What the readers that can outlive their attempt hold (spec 25.8 5b
+    /// (h)7); shared with the setup builders' workspaces.
+    pins: SourcePins,
 }
 
 fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
@@ -79,6 +83,7 @@ impl Machine {
             workspaces,
             secrets,
             key_path,
+            pins: SourcePins::default(),
         })
     }
 
@@ -100,6 +105,7 @@ impl Machine {
     /// agent starts: it clears what builders of an earlier run left.
     pub fn with_setup(mut self, cfg: SetupConfig) -> Result<Self, ApiError> {
         let ws = BuilderWs {
+            pins: self.pins.clone(),
             store: self.store.clone(),
             workspaces: Workspaces::new(self.state_dir.clone(), self.env.clone(), self.fw.clone()),
         };
@@ -207,6 +213,11 @@ fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManife
         )
     };
     let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
+    // An accepted attempt's reader waits for a deleting pass's step instead
+    // of failing (spec 25.8 5b (a)); the read below shares this lock.
+    let _held = store
+        .mutation_guard_waiting()
+        .map_err(|e| internal("source store", format!("{e:#}")))?;
     let m = store
         .manifest(&source)
         .map_err(|e| internal("source store", format!("{e:#}")))?
@@ -224,8 +235,15 @@ fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManife
     Ok(m)
 }
 
+/// A pin on the source of `m`, or the error a missing source gives.
+fn pin(pins: &SourcePins, store: &SourceStore, m: &CiManifest) -> Result<Pin, ApiError> {
+    pins.pin(store, &m.source_id)
+        .map_err(|e| ApiError::new(ErrorCode::NotFound, format!("{e:#}")))
+}
+
 /// The workspaces of the setup builders: made like an attempt's.
 struct BuilderWs {
+    pins: SourcePins,
     store: SourceStore,
     workspaces: Workspaces,
 }
@@ -233,6 +251,9 @@ struct BuilderWs {
 impl BuilderWorkspaces for BuilderWs {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
         let m = manifest_in(&self.store, payload)?;
+        // (the builder's thread is not joined by the attempt's release: it
+        // pins the source for as long as it makes the workspace)
+        let _pin = pin(&self.pins, &self.store, &m)?;
         let repo = match (&m.execution_commit, &m.repository_id) {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
@@ -395,6 +416,9 @@ impl Host for Machine {
             ));
         }
         let m = self.manifest(attempt)?;
+        // (the `prepare` thread reads on after a waiter gives up: it pins
+        // the source until the workspace is made)
+        let _pin = pin(&self.pins, &self.store, &m)?;
         check_toolchain_source(&self.store, &self.state_dir, &m, payload)?;
 
         if payload.in_place {
