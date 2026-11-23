@@ -91,6 +91,27 @@ pub const REASON_SUBMIT_REFUSED: &str = "submit_refused";
 /// for it and the task does not fail.
 pub const REASON_ATTEMPT_ID_IN_USE: &str = "attempt_id_in_use";
 
+/// The reason recorded for an attempt its worker refused with
+/// `INPUT_MISSING` three times in a row, each time after its input had been
+/// delivered there again (spec 25.8 5b (b)). The task goes on by its retry
+/// rule, and this retire counts as one.
+pub const REASON_INPUT_MISSING: &str = "input_missing";
+
+/// How many `INPUT_MISSING` marks the coordinator keeps (one per attempt).
+/// One more drops another: that attempt is then as after a restart of this
+/// process (its next refusal marks it again).
+const INPUT_MISSING_MARKS: usize = 4096;
+
+/// An attempt its worker refused with `INPUT_MISSING` (spec 25.8 5b (b)): it
+/// is not sent again until the worker's `ready` holds its run's source
+/// again. `strikes` counts the refusals that came after `ready` returned.
+#[derive(Debug, Clone)]
+struct MissingMark {
+    run: crate::ids::RunId,
+    source: crate::ids::SourceId,
+    strikes: u8,
+}
+
 /// The event on an attempt whose id its worker could not take. Payload:
 /// `{"worker", "code", "reason", "retire"}` (`retire`: whether a retire was
 /// asked for); written with the tombstone, in one transaction.
@@ -560,6 +581,10 @@ pub struct Coordinator {
     /// them. Kept in this process only: after a restart the `inspect` of
     /// each worker decides anew.
     capacity_refused: Mutex<BTreeSet<WorkerId>>,
+    /// The attempts refused with `INPUT_MISSING`, in this process's memory
+    /// (spec 25.8 5b (b)). A mark goes when its attempt is taken, found
+    /// terminal or retired, and at most [`INPUT_MISSING_MARKS`] are kept.
+    input_missing: Mutex<std::collections::HashMap<AttemptId, MissingMark>>,
     sched: Scheduler,
 }
 
@@ -619,6 +644,7 @@ impl Coordinator {
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             capacity_refused: Mutex::default(),
+            input_missing: Mutex::default(),
             sched,
         })
     }
@@ -1521,7 +1547,13 @@ impl Coordinator {
             })
             .await?;
         if ended {
+            self.forget_missing(&a.attempt_id);
             return Ok(Sent::NotTaken);
+        }
+        // Refused for its input: not sent again, on either path, until the
+        // worker's `ready` holds the input again (spec 25.8 5b (b)).
+        if self.waits_for_input(link, &a.attempt_id) {
+            return Ok(Sent::Withheld);
         }
         let payload: Option<AttemptPayload> = live
             .placement
@@ -1571,7 +1603,43 @@ impl Coordinator {
                 let id = a.attempt_id.clone();
                 self.db(move |s| s.record_seen(&id, true, seen, Observation::Known, wall_ms()))
                     .await?;
+                self.forget_missing(&a.attempt_id);
                 Ok(Sent::Taken)
+            }
+            Err(LinkError::Remote(e)) if e.code == ErrorCode::InputMissing => {
+                // Not taken, nothing stored: not a retry of the task. The
+                // input leaves the worker's `ready` and the attempt waits for
+                // it there. Only refusals after `ready` came back count; the
+                // third retires the attempt.
+                let source = e
+                    .input_missing
+                    .as_ref()
+                    .and_then(|m| crate::ids::SourceId::parse(&m.source_id).ok())
+                    .or_else(|| {
+                        live.placement
+                            .as_ref()
+                            .and_then(|p| p.demand["payload"]["source_id"].as_str())
+                            .and_then(|s| crate::ids::SourceId::parse(s).ok())
+                    });
+                let run = live
+                    .placement
+                    .as_ref()
+                    .and_then(|p| p.demand["payload"]["run_id"].as_str())
+                    .and_then(|s| crate::ids::RunId::parse(s).ok());
+                let (Some(source), Some(run)) = (source, run) else {
+                    self.observe(&a.attempt_id, Observation::Known).await?;
+                    return Ok(Sent::NotTaken);
+                };
+                link.withdraw_input(&source);
+                if self.refused_for_input(&a.attempt_id, run, source) {
+                    self.forget_missing(&a.attempt_id);
+                    self.note_refusal(&a.attempt_id, "submit_input_missing", &e)
+                        .await?;
+                    self.retire_durably(&a.attempt_id, REASON_INPUT_MISSING)
+                        .await?;
+                }
+                self.observe(&a.attempt_id, Observation::Known).await?;
+                Ok(Sent::NotTaken)
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
@@ -1672,6 +1740,60 @@ impl Coordinator {
                 Ok(Sent::NotTaken)
             }
         }
+    }
+
+    /// Whether `attempt` was refused for its input and the worker's
+    /// `ready` does not hold that input again yet. A link that keeps no
+    /// `ready` never withholds.
+    fn waits_for_input(&self, link: &dyn WorkerLink, attempt: &AttemptId) -> bool {
+        let marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mark) = marks.get(attempt) else {
+            return false;
+        };
+        link.placement_inputs().is_some_and(|inputs| {
+            !inputs
+                .ready
+                .iter()
+                .any(|i| i.run_id == mark.run && i.source_id == mark.source)
+        })
+    }
+
+    /// Mark `attempt` refused for its input. Returns whether this was the
+    /// third refusal in a row after its input was ready again: then it is
+    /// retired.
+    fn refused_for_input(
+        &self,
+        attempt: &AttemptId,
+        run: crate::ids::RunId,
+        source: crate::ids::SourceId,
+    ) -> bool {
+        let mut marks = self.input_missing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mark) = marks.get_mut(attempt) {
+            // (sent while marked: `ready` had come back)
+            mark.strikes = mark.strikes.saturating_add(1);
+            return mark.strikes >= 3;
+        }
+        if marks.len() >= INPUT_MISSING_MARKS {
+            if let Some(other) = marks.keys().next().cloned() {
+                marks.remove(&other);
+            }
+        }
+        marks.insert(
+            attempt.clone(),
+            MissingMark {
+                run,
+                source,
+                strikes: 0,
+            },
+        );
+        false
+    }
+
+    fn forget_missing(&self, attempt: &AttemptId) {
+        self.input_missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(attempt);
     }
 
     /// The worker stored nothing of an attempt and will not take it as it

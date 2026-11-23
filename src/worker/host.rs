@@ -83,6 +83,22 @@ pub trait Host: Send + Sync {
     /// committed: the source's `received` root gets the time (spec 25.8 5b
     /// (c)). Called under the lock of [`Self::hold_source`]; best effort.
     fn source_used(&self, _held: &crate::source::retention::Guard, _payload: &AttemptPayload) {}
+    /// An attempt that named `source` is terminal: the source's `received`
+    /// root gets the time (spec 25.8 5b (c)), under the shared lock taken
+    /// without waiting; a busy store skips the record. Best effort.
+    fn source_ended(&self, _source: &crate::ids::SourceId) {}
+    /// Is the payload's source in the store (spec 25.8 5b (b), the
+    /// `received` root)? Asked by a new attempt's acceptance under the lock
+    /// of [`Self::hold_source`]. A host without a source store, and a source
+    /// id that names nothing the store could hold, answer `true`: the later
+    /// check of the preparation decides, as before.
+    fn source_present(
+        &self,
+        _held: &crate::source::retention::Guard,
+        _payload: &AttemptPayload,
+    ) -> Result<bool, ApiError> {
+        Ok(true)
+    }
     /// Once, before any secret is read (process-wide).
     fn disable_core_dumps(&self) -> Result<(), ApiError>;
     /// Plaintext secret bundles a crashed capture left in the source store.

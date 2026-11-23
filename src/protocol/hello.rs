@@ -42,6 +42,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     group::IDENTITY_RETIRED_FEATURE,
     group::SHARED_ADMISSION_FEATURE,
     crate::wire::ATTEMPT_RELEASE_FEATURE,
+    crate::wire::INPUT_MISSING_FEATURE,
 ];
 
 /// The features no connection of this build goes without, on either side

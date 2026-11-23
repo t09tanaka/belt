@@ -198,7 +198,20 @@ impl AgentConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Link {
     pub release: bool,
+    /// The connection agreed `input_missing_v1` (spec 25.8 5b (b)).
+    pub input_missing: bool,
     pub taken: Option<super::release::Taken>,
+}
+
+/// An `INPUT_MISSING` answer for a peer that did not agree
+/// `input_missing_v1` (it cannot read the code) becomes `INTERNAL`, which it
+/// takes for a fault of this host: it delivers again, and nothing it sent was
+/// thrown away (spec 25.8 5b (b), old peers).
+fn unless_agreed(e: ApiError, agreed: bool) -> ApiError {
+    if agreed || e.code != ErrorCode::InputMissing {
+        return e;
+    }
+    ApiError::new(ErrorCode::Internal, e.message)
 }
 
 /// What the connection's `hello` and group proof established: the member
@@ -2066,6 +2079,21 @@ impl Agent {
     /// and the attempt's watcher both come here.
     fn clean(&self, attempt: &AttemptId) {
         let _one = lock(shard(&self.shards, attempt));
+        // The source the attempt used gets the time it ended (spec 25.8 5b
+        // (c)). Every terminal attempt comes here (its watcher, the tick, the
+        // sweep after a restart), so this is the one place that records it;
+        // a cleanup tried again records again, which only makes the time
+        // newer.
+        if let Ok(Some(rec)) = self.store.get(attempt) {
+            if rec.state == AttemptState::Terminal {
+                if let Some(source) = rec.spec["source_id"]
+                    .as_str()
+                    .and_then(|s| SourceId::parse(s).ok())
+                {
+                    self.host.source_ended(&source);
+                }
+            }
+        }
         let pending = self.attempt_dir(attempt).join("cleanup-pending");
         // Persist retry evidence before removing the last secret-bearing spec,
         // including when there is no workspace record. A restart sees it too.
@@ -2904,7 +2932,9 @@ impl Agent {
                 .identity_retired(store, r)
                 .map(Response::IdentityRetired),
             Request::Inspect(r) => self.inspect(store, r).map(Response::Inspect),
-            Request::SubmitAttempt(r) => self.submit(store, r).map(Response::SubmitAttempt),
+            Request::SubmitAttempt(r) => self
+                .submit(store, r, link.input_missing)
+                .map(Response::SubmitAttempt),
             Request::GetAttempt(r) => match self.known(store, &r.attempt_id) {
                 Ok(rec) => self.status(&rec).map(Response::GetAttempt),
                 Err(e) if e.code == ErrorCode::NotFound => {
@@ -2993,7 +3023,9 @@ impl Agent {
             Request::SecretBundlePut(r) => self.secrets(store, r).map(Response::SecretBundlePut),
             Request::BlobPut(r) => {
                 let (host, limits) = (self.host.as_ref(), &self.cfg.blobs);
-                blobs::put(store, host, limits, &self.cfg.state_dir, &r).map(Response::BlobPut)
+                blobs::put(store, host, limits, &self.cfg.state_dir, &r)
+                    .map(Response::BlobPut)
+                    .map_err(|e| unless_agreed(e, link.input_missing))
             }
             Request::BlobVerify(r) => {
                 blobs::verify(self.host.as_ref(), &self.cfg.blobs, &r).map(Response::BlobVerify)
@@ -3110,6 +3142,7 @@ impl Agent {
         self: &Arc<Self>,
         store: &WorkerStore,
         r: SubmitAttemptRequest,
+        input_missing: bool,
     ) -> Result<SubmitAttemptResponse, ApiError> {
         // The claimed hash is the sender's word: recompute it.
         if !r.hash_matches().map_err(|e| invalid(e.to_string()))? {
@@ -3144,6 +3177,25 @@ impl Agent {
             // deleting step runs while the shared lock is held, and a busy
             // store is answered at once (spec 25.8 5b (a)).
             held = self.host.hold_source()?;
+            // A source that is not here refuses the attempt, nothing of it
+            // stored (spec 25.8 5b (b)), whatever the payload declares: the
+            // parent delivers it and sends the same attempt again. A parent
+            // that did not agree `input_missing_v1` cannot read the code: its
+            // attempt is taken as before and ends at the preparation.
+            if input_missing {
+                if let Some(guard) = &held {
+                    if !self.host.source_present(guard, &r.payload)? {
+                        return Err(ApiError::input_missing(
+                            r.payload.source_id.to_string(),
+                            Vec::new(),
+                            format!(
+                                "source {} is not in this worker's store; deliver it and send again",
+                                r.payload.source_id
+                            ),
+                        ));
+                    }
+                }
+            }
             // Against the secret files of its source, when that source is
             // already here. When it is not, the same check runs before the
             // supervisor's spec is written ([`Self::prepare`]): a

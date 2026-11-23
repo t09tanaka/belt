@@ -3220,6 +3220,16 @@ impl Host for RealButCore {
     fn source_used(&self, held: &belt::source::retention::Guard, p: &AttemptPayload) {
         self.0.source_used(held, p)
     }
+    fn source_present(
+        &self,
+        held: &belt::source::retention::Guard,
+        p: &AttemptPayload,
+    ) -> Result<bool, ApiError> {
+        self.0.source_present(held, p)
+    }
+    fn source_ended(&self, s: &SourceId) {
+        self.0.source_ended(s)
+    }
     fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
         self.0.secret_paths(p, w)
     }
@@ -3320,6 +3330,155 @@ async fn acceptance_answers_a_busy_source_store_with_overloaded_and_records_the_
     submit(&c, &a, &p).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
     assert!(used(&index).unwrap() > 1);
+}
+
+/// A captured and received source in a fresh store under `f`, with a
+/// payload that names it.
+fn received_source(
+    f: &Fx,
+) -> (
+    belt::source::SourceStore,
+    BTreeMap<String, String>,
+    String,
+    AttemptPayload,
+) {
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("x.txt"), "x\n").unwrap();
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let id = captured.manifest.ci_source_id.clone();
+    crate::common::publish_as_received(&store, &id);
+    let mut p = payload("true");
+    p.run_id = run;
+    p.source_id = captured.manifest.source_id.clone();
+    let digest = &captured.manifest.manifest_digest;
+    p.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
+    (store, env, id, p)
+}
+
+/// Spec 25.8 5b (b), (g)1, 6, 32, 40: a new attempt whose source the store
+/// does not hold (its `receive:` row is gone, whatever files are left) is
+/// refused with `INPUT_MISSING` naming the source, and nothing of it is
+/// stored. A parent that did not agree `input_missing_v1` gets today's
+/// answer: the attempt is accepted. While the legacy registration is
+/// pending, a manifest file with no `m:` row still counts as there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_refuses_a_source_not_in_the_store_with_input_missing() {
+    let f = fx();
+    let state = f.state();
+    let (_store, env, id, p) = received_source(&f);
+    let index = rusqlite::Connection::open(state.join("sources/retention.db")).unwrap();
+    // Detached by a deleting pass: no `receive:` row; the manifest file may
+    // stay behind. The legacy registration is done.
+    index
+        .execute_batch(&format!(
+            "DELETE FROM root WHERE id='receive:{id}';
+             UPDATE meta SET value='done' WHERE key='legacy_registration';"
+        ))
+        .unwrap();
+    let machine =
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+
+    let a = AttemptId::generate();
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InputMissing, "{e:?}");
+    let named = e.input_missing.as_ref().expect("the source is named");
+    assert_eq!(named.source_id, p.source_id.to_string());
+    assert!(named.missing.is_empty());
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(f.store().tombstone(&a).unwrap().is_none());
+
+    // A parent that does not know the code: accepted, as before.
+    let old = {
+        let (x, y) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            y,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(64)),
+        ));
+        let mut cfg = client_cfg(&f.cluster);
+        cfg.features.retain(|v| v != INPUT_MISSING_FEATURE);
+        connect(x, cfg).await.unwrap().client
+    };
+    let b = AttemptId::generate();
+    submit(&old, &b, &p).await;
+    assert!(f.store().get(&b).unwrap().is_some());
+
+    // Before the legacy registration is done, a manifest file with no `m:`
+    // row is there: accepted.
+    index
+        .execute_batch(&format!(
+            "DELETE FROM object WHERE id='m:{id}';
+             UPDATE meta SET value='pending' WHERE key='legacy_registration';"
+        ))
+        .unwrap();
+    let mut other = p.clone();
+    other.task_id = TaskId::generate();
+    submit(&c, &a, &other).await;
+    assert!(f.store().get(&a).unwrap().is_some());
+}
+
+/// Spec 25.8 5b (c): an attempt that ends gives its source's `received`
+/// root the time it ended, not only the time it was accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_attempt_records_the_use_of_its_source() {
+    let f = fx();
+    let state = f.state();
+    let (_store, env, id, mut p) = received_source(&f);
+    p.commands[0].argv = vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()];
+    let index = rusqlite::Connection::open(state.join("sources/retention.db")).unwrap();
+    let used = |c: &rusqlite::Connection| -> Option<i64> {
+        c.query_row(
+            "SELECT used_ms FROM root WHERE id='receive:'||?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let machine =
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    // (the time of the acceptance is put back: only the end may write it)
+    index
+        .execute("UPDATE root SET used_ms=1 WHERE id='receive:'||?1", [&id])
+        .unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while used(&index) == Some(1) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(used(&index).unwrap() > 1, "the end recorded no use");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

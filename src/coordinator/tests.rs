@@ -804,3 +804,113 @@ async fn in_place_capacity_retries_keep_the_attempt_and_deduplicate_events() {
     }
     assert!(f.c.store().retire_tombstone(&attempt).unwrap().is_none());
 }
+
+/// A worker that refuses every submit with `INPUT_MISSING` and keeps a
+/// `ready` the test fills, as the delivery loop does.
+#[derive(Default)]
+struct Missing {
+    calls: AtomicUsize,
+    ready: std::sync::Mutex<Vec<super::input_gate::ReadyInput>>,
+}
+
+impl WorkerLink for Missing {
+    fn placement_inputs(&self) -> Option<super::input_gate::PlacementInputs> {
+        Some(super::input_gate::PlacementInputs {
+            generation: 1,
+            ready: self.ready.lock().unwrap().clone(),
+            identity: None,
+        })
+    }
+    fn withdraw_input(&self, source: &SourceId) {
+        self.ready
+            .lock()
+            .unwrap()
+            .retain(|i| &i.source_id != source);
+    }
+    fn call(&self, request: Request) -> LinkFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let source = match &request {
+            Request::SubmitAttempt(r) => r.payload.source_id.to_string(),
+            _ => String::new(),
+        };
+        Box::pin(async move {
+            Err(LinkError::Remote(crate::error::ApiError::input_missing(
+                source,
+                Vec::new(),
+                "not here",
+            )))
+        })
+    }
+}
+
+/// Spec 25.8 5b (b), (g)5: an attempt refused with `INPUT_MISSING` loses its
+/// input from the worker's `ready` and is not sent again, on either path,
+/// however many times it is looked at, until `ready` holds it again. Only
+/// the refusals after `ready` came back count; the third retires it with
+/// `input_missing`.
+#[tokio::test]
+async fn input_missing_withholds_the_attempt_until_its_input_is_ready_again() {
+    let f = fx();
+    let link = Arc::new(Missing::default());
+    let attached: Attached = link.clone();
+    f.c.attach(f.worker.clone(), attached.clone()).await;
+    let (_task, attempt) = f.placed().await;
+    let live = |f: &Fx| {
+        f.c.store()
+            .live_attempt(&f.worker, &attempt)
+            .unwrap()
+            .unwrap()
+    };
+    let payload = live(&f).placement.unwrap().demand["payload"].clone();
+    let input = super::input_gate::ReadyInput {
+        run_id: RunId::parse(payload["run_id"].as_str().unwrap()).unwrap(),
+        source_id: SourceId::parse(payload["source_id"].as_str().unwrap()).unwrap(),
+        manifest_digest: Digest::of_bytes(b"manifest"),
+    };
+    macro_rules! send {
+        () => {{
+            let mut report = TickReport::default();
+            f.c.send_placed(&f.worker, &*link, &attached, &attempt, &mut report)
+                .await
+                .unwrap()
+        }};
+    }
+    // The resend of a placed attempt (the tick's `Step::Submit`).
+    macro_rules! resend {
+        () => {{
+            let mut report = TickReport::default();
+            let placed = live(&f);
+            f.c.submit(&*link, &placed, &mut report, &attached)
+                .await
+                .unwrap()
+        }};
+    }
+    let calls = || link.calls.load(Ordering::SeqCst);
+    let retired = |f: &Fx| live(f).retire_reason;
+    link.ready.lock().unwrap().push(input.clone());
+
+    // Refused the first time: `ready` loses the input; nothing counts.
+    assert_eq!(send!(), Sent::NotTaken);
+    assert_eq!(calls(), 1);
+    assert!(link.ready.lock().unwrap().is_empty());
+    for _ in 0..5 {
+        assert_eq!(send!(), Sent::Withheld);
+        assert_eq!(resend!(), Sent::Withheld);
+    }
+    assert_eq!(calls(), 1, "nothing is sent while ready is not back");
+    assert_eq!(retired(&f), None);
+
+    // Each time `ready` comes back the attempt is sent; the third refusal
+    // after that retires it.
+    for round in 1..=3 {
+        link.ready.lock().unwrap().push(input.clone());
+        let sent = if round % 2 == 0 { resend!() } else { send!() };
+        assert_eq!(sent, Sent::NotTaken);
+        assert_eq!(calls(), 1 + round);
+        if round < 3 {
+            assert_eq!(retired(&f), None, "round {round}");
+            assert_eq!(resend!(), Sent::Withheld);
+        }
+    }
+    assert_eq!(retired(&f).as_deref(), Some(REASON_INPUT_MISSING));
+}

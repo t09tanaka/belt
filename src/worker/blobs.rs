@@ -1222,7 +1222,9 @@ impl Incoming {
     ) -> Result<bool, ApiError> {
         let said = |checked: anyhow::Result<()>| match checked {
             Ok(()) => Ok(true),
-            Err(e) if input_fault(&e) => Ok(false),
+            Err(e) if input_fault(&e) || crate::source::store::input_gone(&e).is_some() => {
+                Ok(false)
+            }
             Err(e) => Err(internal("the clone", format!("{e:#}"))),
         };
         for id in carried {
@@ -1706,6 +1708,18 @@ impl Incoming {
             ) else {
                 continue;
             };
+            if let Some(gone) = crate::source::store::input_gone(&e) {
+                // Something the manifest names went away after it was
+                // checked (spec 25.8 5b (b), (h)8): nothing is refused, the
+                // receipt and the refs it made stay, and the sender delivers
+                // again from `blob_verify`.
+                return Err(ApiError::input_missing(
+                    source_id_of_ci(&gone.source)
+                        .map_or_else(|| gone.source.clone(), |id| id.to_string()),
+                    gone.missing.clone(),
+                    format!("source {source}: {gone}"),
+                ));
+            }
             if !input_fault(&e) {
                 // (the store could not be written, Git could not be asked:
                 // everything stays, and the next request tries again)

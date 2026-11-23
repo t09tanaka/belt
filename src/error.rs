@@ -82,6 +82,13 @@ pub enum ErrorCode {
     /// many requests wait, or its database was busy. The same request may be
     /// sent again. Unlike `SOURCE_BUSY` this says nothing about the input.
     Overloaded,
+    /// The input a request needs is not in the worker's source store (spec
+    /// 25.8 5b (b)): a new `submit_attempt` whose source is not there, or a
+    /// publication whose blobs or snapshot refs went away. Nothing of the
+    /// request was stored; the parent delivers the source again and then
+    /// sends the same request. Sent only to a peer that agreed
+    /// `input_missing_v1` (an older peer cannot read the code).
+    InputMissing,
 }
 
 /// Why a task is blocked (accompanies `ErrorCode::Blocked`).
@@ -146,7 +153,7 @@ pub enum OverloadedReason {
 
 impl ErrorCode {
     /// Every code.
-    pub const ALL: [ErrorCode; 16] = [
+    pub const ALL: [ErrorCode; 17] = [
         ErrorCode::NotImplemented,
         ErrorCode::InvalidInput,
         ErrorCode::SourceBusy,
@@ -163,6 +170,7 @@ impl ErrorCode {
         ErrorCode::Retired,
         ErrorCode::LeaseNotRenewable,
         ErrorCode::Overloaded,
+        ErrorCode::InputMissing,
     ];
 
     /// The wire string, identical to the serde form.
@@ -184,6 +192,7 @@ impl ErrorCode {
             ErrorCode::Retired => "RETIRED",
             ErrorCode::LeaseNotRenewable => "LEASE_NOT_RENEWABLE",
             ErrorCode::Overloaded => "OVERLOADED",
+            ErrorCode::InputMissing => "INPUT_MISSING",
         }
     }
 
@@ -208,7 +217,7 @@ impl ErrorCode {
             // Both are "the addressed attempt no longer accepts this", the
             // same family as a payload conflict; the JSON code tells them apart.
             ErrorCode::Retired | ErrorCode::LeaseNotRenewable => exit::CONFLICT,
-            ErrorCode::Overloaded => exit::OVERLOADED,
+            ErrorCode::Overloaded | ErrorCode::InputMissing => exit::OVERLOADED,
         }
     }
 
@@ -256,6 +265,20 @@ pub struct ApiError {
     /// May be set when `code` is `OVERLOADED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overloaded_reason: Option<OverloadedReason>,
+    /// Set when `code` is `INPUT_MISSING`: which source is missing, and at
+    /// a publication the blobs that are not in the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_missing: Option<InputMissing>,
+}
+
+/// What an `INPUT_MISSING` refusal names (spec 25.8 5b (b)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputMissing {
+    /// The source that is not in the store (as the request named it).
+    pub source_id: String,
+    /// At a publication: the blobs (`sha256:` digests) that are not there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
 }
 
 /// Why a member refused another member's group proof. The connection is
@@ -292,6 +315,22 @@ impl ApiError {
             conflict_reason: None,
             group_refusal: None,
             overloaded_reason: None,
+            input_missing: None,
+        }
+    }
+
+    /// `INPUT_MISSING` for `source_id`, with the blobs that are missing.
+    pub fn input_missing(
+        source_id: impl Into<String>,
+        missing: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        ApiError {
+            input_missing: Some(InputMissing {
+                source_id: source_id.into(),
+                missing,
+            }),
+            ..ApiError::new(ErrorCode::InputMissing, message)
         }
     }
 
@@ -318,6 +357,7 @@ impl ApiError {
             blocked_reason: None,
             group_refusal: None,
             overloaded_reason: None,
+            input_missing: None,
             conflict_reason: Some(reason),
         }
     }
@@ -329,6 +369,7 @@ impl ApiError {
             blocked_reason: Some(reason),
             group_refusal: None,
             overloaded_reason: None,
+            input_missing: None,
             conflict_reason: None,
         }
     }

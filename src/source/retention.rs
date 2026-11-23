@@ -4961,6 +4961,28 @@ mod tests {
         assert!(receiver.retention.fill_bytes(1000).unwrap());
         assert_eq!(receiver.store_bytes().unwrap().unwrap(), expected);
     }
+    /// Spec 25.8 5b (b): a publication whose blob is not in the store is
+    /// refused as gone (`INPUT_MISSING`, the blobs named), not as `corrupt`;
+    /// once the blobs are there it publishes.
+    #[test]
+    fn a_publication_whose_blob_is_gone_names_it() {
+        let f = Fixture::new();
+        let (receiver, m, want, _bytes) = received_fixture(&f);
+        let e = receiver.publish_received(&m, None).unwrap_err();
+        let gone = crate::source::store::input_gone(&e).unwrap_or_else(|| panic!("{e:#}"));
+        assert_eq!(gone.source, m.source_id);
+        assert!(gone.missing.contains(&want.hash), "{gone:?}");
+        for entry in &m.object_manifest.entries {
+            let w = super::super::diff::BlobWant {
+                hash: entry.hash.clone(),
+                size: entry.size,
+            };
+            let bytes = f.store.read_blob(&entry.hash).unwrap();
+            receiver.ingest_blob(&w, &mut &bytes[..]).unwrap();
+        }
+        receiver.publish_received(&m, None).unwrap();
+    }
+
     #[test]
     fn publication_records_used_time_and_the_clone_refs_of_its_graph() {
         let f = Fixture::new();
