@@ -1087,6 +1087,54 @@ fn capture_detail(counts: &UnjudgedCaptures) -> (Level, String) {
     (Level::Notice, detail)
 }
 
+/// The runs whose pruning began and has not reached its end (spec 25.5):
+/// usually none outside a pass. A run stays here while a reader holds its
+/// results, while a file of it cannot be proven ours, or while the source
+/// store is busy; nothing of it that cannot be proven is deleted, and every
+/// pass tries again. Read-only.
+pub fn pruning_checks(spec: &Spec) -> Vec<Check> {
+    if !spec.state_dir.join("coordinator.db").is_file() {
+        return Vec::new();
+    }
+    let check = |level, detail: String| Check::new("parent", "run_pruning", level, detail);
+    let Ok(store) = super::bootstrap::read_only_store(spec) else {
+        return Vec::new();
+    };
+    let gate = crate::source::retention::Gate::closed_read_only(&spec.state_dir)
+        .ok()
+        .flatten();
+    pruning_report(store.marked_run_count().ok(), gate)
+        .map(|(level, detail)| vec![check(level, detail)])
+        .unwrap_or_default()
+}
+
+/// What [`pruning_checks`] says for a count of marked runs (`None`: the
+/// count could not be read). Nothing for no run.
+/// `gate` is the gate of the source store that holds the deletion of their
+/// inputs, if one does.
+fn pruning_report(
+    runs: Option<u64>,
+    gate: Option<crate::source::retention::Gate>,
+) -> Option<(Level, String)> {
+    match runs {
+        Some(0) => None,
+        Some(runs) => Some((
+            Level::Notice,
+            format!(
+                "{runs} run(s) past their retention are being deleted; they are no longer shown, and what is left of them (kept while a reader holds it or while it cannot be proven to be belt's) is tried again every minute{}",
+                match gate {
+                    Some(gate) => format!("; their inputs wait for the source store (gate={})", gate.as_str()),
+                    None => String::new(),
+                }
+            ),
+        )),
+        None => Some((
+            Level::NotChecked,
+            "the runs being deleted cannot be counted".into(),
+        )),
+    }
+}
+
 /// What [`capture_checks`] counts.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnjudgedCaptures {
@@ -1218,6 +1266,7 @@ pub fn run(
     checks.extend(evaluate("parent", &local));
     checks.extend(direct_checks(env, &local.worker_scope));
     checks.extend(capture_checks(spec));
+    checks.extend(pruning_checks(spec));
     let leftover = super::leftover_temporaries(env);
     if leftover > 0 {
         checks.push(Check::new(

@@ -6,9 +6,13 @@ mod foreground;
 mod import_owner;
 pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{inspect_corrupt_held, inspect_owners, CaptureOwner, CaptureVerdict};
+#[cfg(test)]
+pub use deletion::set_prune_fault;
 pub use deletion::ImportReleaseReport;
 pub(in crate::source) use deletion::Reserved;
-pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
+pub use deletion::{
+    AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, Gate, PruneBudget, PruneInputs,
+};
 pub(crate) use foreground::ForegroundBusy;
 pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
@@ -157,7 +161,8 @@ impl Index {
         let mut db = self.connect().context("connect source index")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
-            return self.ensure_capture_owner_table(&mut db);
+            self.ensure_capture_owner_table(&mut db)?;
+            return self.ensure_import_session_index(&db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
@@ -181,6 +186,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS vault_delete_claim(run_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,binding_digest TEXT NOT NULL,claim_json TEXT NOT NULL,done INTEGER NOT NULL CHECK(done IN (0,1)));
           CREATE INDEX IF NOT EXISTS vault_delete_pending ON vault_delete_claim(done,run_id);
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
+          CREATE INDEX IF NOT EXISTS import_session_run ON import_session(run_id);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
         tx.execute_batch(capture_owner::TABLE)?;

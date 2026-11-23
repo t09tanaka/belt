@@ -340,7 +340,7 @@ impl Reader {
             else {
                 return Err(Error::new(
                     crate::error::ErrorCode::NotFound,
-                    format!("run {run_id} not found"),
+                    format!("run {run_id} not found ({})", crate::storage::RUN_RETENTION),
                 ));
             };
             let Response::Tasks { page: tasks } = self

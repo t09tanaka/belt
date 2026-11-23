@@ -41,13 +41,9 @@ impl Index {
             let rows = s.query_map([], |r| r.get(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        let quiet = |c: &Connection| -> Result<bool> {
-            Ok(!c.query_row(
-                "SELECT IFNULL((SELECT value FROM meta WHERE key='legacy_registration')<>'done',1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",
-                [],
-                |r| r.get::<_, bool>(0),
-            )?)
-        };
+        // the gates of every other deletion (legacy registration, a root
+        // of unknown membership, an unfinished graph)
+        let quiet = |c: &Connection| -> Result<bool> { Ok(Gate::closed(c)?.is_none()) };
         if !replay.is_empty() {
             if !quiet(&c)? {
                 report.stopped = true;

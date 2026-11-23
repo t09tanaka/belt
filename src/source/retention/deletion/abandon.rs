@@ -57,6 +57,8 @@ pub struct AbandonReport {
     /// their content: kept, for `doctor`.
     pub corrupt_held: u32,
     pub errors: Vec<String>,
+    /// The gate that held the deletion of the objects, if one did.
+    pub gate: Option<super::Gate>,
 }
 
 /// Where the last pass stopped inside one root, so that members that cannot
@@ -67,9 +69,10 @@ pub struct AbandonCursor {
     object: String,
 }
 
-struct Budget {
-    paths: u32,
-    bytes: u64,
+#[derive(Debug)]
+pub(super) struct Budget {
+    pub(super) paths: u32,
+    pub(super) bytes: u64,
 }
 
 enum Outcome {
@@ -78,7 +81,7 @@ enum Outcome {
     Continuing,
 }
 
-fn would_block(error: &anyhow::Error) -> bool {
+pub(super) fn would_block(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
@@ -123,7 +126,7 @@ impl Index {
             Err(error) => Err(error.into()),
         }
     }
-    fn unlink_run_file(&self, directory: &str, private: bool, name: &str) -> Result<()> {
+    pub(super) fn unlink_run_file(&self, directory: &str, private: bool, name: &str) -> Result<()> {
         match self.run_directory(directory, private)? {
             Some(dir) => unlink_owned(&dir, name),
             None => Ok(()),
@@ -269,7 +272,14 @@ impl SourceStore {
         fault("abandon_after_rows")?;
         // 2. The Vault bundle, by the Vault's own claim, unlink and
         // completion, and then the completed claim.
-        if !self.abandon_vault(owner, vault, c, &run, &mut budget.bytes)? {
+        if !self.abandon_vault(
+            owner,
+            vault,
+            c,
+            &run,
+            &mut budget.bytes,
+            "capture_abandoned",
+        )? {
             return Ok(Some(Outcome::Continuing));
         }
         fault("abandon_after_vault")?;
@@ -304,13 +314,14 @@ impl SourceStore {
 
     /// False when the Vault is busy: nothing was done, a later pass tries
     /// again.
-    fn abandon_vault(
+    pub(super) fn abandon_vault(
         &self,
         owner: &crate::storage::CoordinatorStore,
         vault: &Vault,
         c: &Connection,
         run: &RunId,
         bytes: &mut u64,
+        reason: &str,
     ) -> Result<bool> {
         ensure!(
             vault.matches_source(&self.retention.path),
@@ -349,8 +360,8 @@ impl SourceStore {
                 // The claim of a run that never had a row names no source
                 // binding: the run ID alone names the bundle.
                 c.execute(
-                    "INSERT INTO vault_delete_claim(run_id,source_id,binding_digest,claim_json,done) VALUES(?1,'','capture_abandoned',?2,0)",
-                    params![run.as_str(), serde_json::to_string(&claim)?],
+                    "INSERT INTO vault_delete_claim(run_id,source_id,binding_digest,claim_json,done) VALUES(?1,'',?3,?2,0)",
+                    params![run.as_str(), serde_json::to_string(&claim)?, reason],
                 )?;
                 crate::secrets::vault::retention_fault("after_claim")?;
                 Some((registration, claim))
@@ -373,7 +384,7 @@ impl SourceStore {
     }
 
     /// True when neither root is left.
-    fn abandon_roots(
+    pub(super) fn abandon_roots(
         &self,
         c: &mut Connection,
         run: &RunId,
@@ -412,12 +423,8 @@ impl SourceStore {
             // The gates of every other deletion of an object: nothing is
             // unlinked while an unindexed manifest, a root of unknown
             // membership or an unfinished graph could need it.
-            let held: bool = c.query_row(
-                "SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",
-                [],
-                |r| r.get(0),
-            )?;
-            if held {
+            if let Some(gate) = super::Gate::closed(c)? {
+                report.gate = Some(gate);
                 return Ok(false);
             }
             // A claim of this deletion that a crash left is finished first.
