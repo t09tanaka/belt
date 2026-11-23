@@ -1269,13 +1269,20 @@ fn a_consumer_waiting_for_an_install_holds_the_root_before_the_builder_lets_go()
     let root = f.plan().root().to_path_buf();
     let identity = root.file_name().unwrap().to_str().unwrap().to_string();
     let db = rusqlite::Connection::open(f.dir.path().join("state/worker.db")).unwrap();
-    let holders: Vec<(String, String)> = db
-        .prepare("SELECT kind, holder FROM toolchain_ref WHERE identity = ?1")
-        .unwrap()
-        .query_map([&identity], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
+    let holders_now = || -> Vec<(String, String)> {
+        db.prepare("SELECT kind, holder FROM toolchain_ref WHERE identity = ?1")
+            .unwrap()
+            .query_map([&identity], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    // The builder removes its directory first and its reference rows after
+    // (src/setup/builder/roots.rs): wait for the rows too.
+    wait_until(&f, "builder released its root references", || {
+        holders_now().iter().all(|(kind, _)| kind != "builder")
+    });
+    let holders = holders_now();
     assert_eq!(
         holders,
         vec![("warmup".to_string(), a.to_string())],
