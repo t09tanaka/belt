@@ -2450,7 +2450,7 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 - `tool-bin/<digest>/` は、指す先の `bin/<digest>/` と一緒に消す。
 - `bin/.resident.<pid>`・`bin/.current.<pid>` は、段階1の名前の規則に移し、切替の完了かrollbackで消す。
 
-**実装の読み。** 名指すものは、linkの指す先と、journalとserviceの定義の本文に版のdigestが現れるかで判定する（現れれば名指す。広めに残す）。system userのworkerが固定した版は、そのworkerの `worker-service.json` の `binary_sha256` で、同じ本文の検査に入る（system userのworkerの起動は、自分のconfigの中でこのpassを行う）。番人、builder、supervisorは、居る間はpassを丸ごと見送る。builderは、lockを取るかわりに `setup/builders/` にdirectoryが1つでもあれば見送る（directoryは、builderとそれが起動したものの停止を確かめた後にだけ消える。25.7の (b)）。版のdirectoryを置くcommand（`init`、`worker-service install`・`upgrade`）は、`init.lock` か `worker-service.lock` を、directoryを作る前からjournalが名指すまで持つので、passはその2つを待たずに取り、取れなければ何も消さない。最初の `init` は `init.lock` を作る前に版を置くので、作られて10分以内のdirectoryも残す。1回のpassで消す版は8個まで。読めないjournalや定義があれば何も消さない。`doctor` は、`bin/current`・`bin/resident` の指す先以外に残っている版の数を示す。
+**実装の読み。** 名指すものは、linkの指す先と、journalとserviceの定義の本文に版のdigestが現れるかで判定する（現れれば名指す。広めに残す）。system userのworkerが固定した版は、そのworkerの `worker-service.json` の `binary_sha256` で、同じ本文の検査に入る（system userのworkerの起動は、自分のconfigの中でこのpassを行う）。番人、builder、supervisorは、居る間はpassを丸ごと見送る。builderは、lockを取るかわりに `setup/builders/` にdirectoryが1つでもあれば見送る（directoryは、builderとそれが起動したものの停止を確かめた後にだけ消える。25.7の (b)）。版のdirectoryを置くcommand（`init`、`worker-service install`・`upgrade`）は、`init.lock` か `worker-service.lock` を、directoryを作る前からjournalが名指すまで持つので、passはその2つを待たずに取り、取れなければ何も消さない。`init` は `init.lock` を作って取ってから版を置く。ただしpassは、`init.lock` が無ければ作らずに進む（`init` を行ったことの無いhostに作らない）ので、passが見た後に最初の `init` が `init.lock` を作って版を置くことは防げない。そのため、作られて10分以内のdirectoryも残す。1回のpassで消す版は8個まで。読めないjournalや定義（1 MiBを超えるものを含む）があれば何も消さない。`doctor` は、passを止めている読めないものの種類を示し（pathは出さない）、そのfileが読めるようになれば出なくなる。`worker-service upgrade` とresidentの更新は、自分で作った版のdirectoryを版の検査（`compatible`、`identity_checked`）で断ったとき、`bin/current`・`bin/resident` が指していなければ、その場で消す。`doctor` は、`bin/current`・`bin/resident` の指す先以外に残っている版の数を示す。
 
 動いているprocessの実行fileをunlinkしても、そのprocessは動き続ける。害になるのは、pathで実行し直す経路（supervisorの起動、`tool-bin` のlink）だけで、表はその経路をすべて挙げている。
 
@@ -2480,6 +2480,16 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 **確かめた結果（段階4）。** builderは自分のsupervisorを `setsid` で別のsessionに起動し（`src/supervisor/process.rs` の `spawn_detached`）、helperはそのsupervisorのnodeとして、supervisorが記録するprocess groupで動く（builderのdirectoryの `worker.db` の起動の記録）。builderのdirectoryが消えるのは、supervisorが `SETTLED`（起動したものの停止を確かめた）で終わったときか、supervisorのlockを取ったうえで、supervisorの回復（`settle_in_process`。記録したgroupを止め、確かめられなければ `unresolved`）が済んだときだけで、確かめられなければdirectoryを残し（`leftover`）、`reap` と次の起動の `settle_old` がやり直す。したがって、新しい確認は足さず、**builderの参照は、builderのdirectoryがある間残す**: directoryが消えたら外す（`run_tool_builder` の最後と、tickの受け皿）。
 
 削除の時点で、参照の表にbuilderが無く（したがって、そのhelperのgroupも無い）、古い版のbuilderとそのhelperも居ない（上）。削除を行うのは今のagentで、(3) と同時には動かない。したがって、開くprocessは残っていない。lockはrootと一緒に消える。
+
+**レビュー後の実装（段階4）。**
+
+- worker DBを開けなければ、それを覚えず、次に使うときに開き直す。開けない間は、bindも導入もせず（`poll_tool` は待ちを返す）、passも何も消さない。
+- 導入を終えたbuilderは、自分の参照を外す前に、待っている消費者のbindを1つのtransactionで行う。導入とその消費者の次のpollの間に、passがrootを取ることは無い（時間の猶予は使わない）。
+- setup builderとtemplateの参照は、どのrootも `live` であることを同じtransactionで確かめて足す。1つでも `evicting` か行が無ければ参照を足さず、builderは失敗し、templateは残さない。setup builderは、自分のdirectoryを作った後に参照を足す（directoryがあって参照の無い間は、passが見送る）。
+- 削除が `install.lock` の使用中以外の理由で失敗したら（別のdevice、安全でないdirectory、renameの拒否など）、同じtransactionで行を `live` に戻し、最後に使った時刻を今にし、失敗の数を数える。`install.lock` の使用中だけは、claimを残して次のpassがやり直す。
+- bytesは、測っていないrootのうち、最後に測った（測ろうとした）時刻の古いものを1回に1つ測る。失敗しても時刻を記録する。`install.lock` を導入が持っているrootは測らない。
+- rootの位置の比較は、stateのdirectoryを正規化した `toolchains` で行い、bindingのpathも正規化して比べる（stateの途中にlinkがあっても同じ場所と分かる）。
+- `doctor` は、passが同じ理由で1時間以上止まっていれば、その理由を示す。理由と、それが消える時点: 試用中（commitかrollback）、段階4より前のattempt（そのattemptがterminalになる）、識別できないbuilder（次の起動でそれを片付ける）、参照の無いbuilderのdirectory（そのbuilderが終わりdirectoryが消える）、DBが読めない（読めるようになる）。削除の失敗の数も示し、これは次に削除が成功したときに0に戻る。`setup/builders/` が無いことは、builderが居ないこととする。
 
 **安全の証明。** rootを読む・書くのは、bindしたattempt、builder、ウォームアップ、templateの適用である。どれも参照を持つ。参照を足すtransactionと、claimを書くtransactionは、同じDBの書き込みとして直列になるので、「参照なしを確かめてからrenameするまでの間にbindされる」ことは無い: bindが先なら参照があり、claimが先ならbindは `evicting` を見る。
 
