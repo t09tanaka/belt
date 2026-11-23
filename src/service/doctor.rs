@@ -1137,6 +1137,12 @@ fn capture_detail(counts: &UnjudgedCaptures) -> (Level, String) {
             counts.corrupt_held
         ));
     }
+    if counts.retry_failing != (0, 0) {
+        detail.push_str(&format!(
+            "; {} manifest(s) of the legacy registration and {} received source(s) of the clone ref fill failed to be read 8 times or more (belt keeps retrying them)",
+            counts.retry_failing.0, counts.retry_failing.1
+        ));
+    }
     (Level::Notice, detail)
 }
 
@@ -1202,6 +1208,9 @@ pub(crate) struct UnjudgedCaptures {
     /// Files with wrong content that a deletion kept because another root
     /// holds them.
     pub(crate) corrupt_held: usize,
+    /// Legacy manifests and `clone_ref` fill roots that failed to be read
+    /// 8 times or more (they are still retried).
+    pub(crate) retry_failing: (usize, usize),
 }
 
 /// One `readdir` of `sources/runs/` and of `in-place/`, and one lookup by
@@ -1252,6 +1261,11 @@ pub(crate) fn unjudged_captures(
     counts.bindings = bindings;
     counts.corrupt_held = usize::try_from(crate::source::retention::inspect_corrupt_held(state)?)
         .unwrap_or(usize::MAX);
+    let (legacy, refs) = crate::source::retention::inspect_retry_failing(state)?;
+    counts.retry_failing = (
+        usize::try_from(legacy).unwrap_or(usize::MAX),
+        usize::try_from(refs).unwrap_or(usize::MAX),
+    );
     Ok(Some(counts))
 }
 

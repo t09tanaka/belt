@@ -793,9 +793,12 @@ impl SourceStore {
         if self.retention.received_row(id)? {
             return Ok(true);
         }
-        if !self.retention.legacy_registration_pending()?
-            || self.retention.has_object(&format!("m:{id}"))?
-        {
+        if !self.retention.legacy_registration_pending()? {
+            return Ok(false);
+        }
+        // (a manifest the legacy registration has not finished may have its
+        // `m:` row already: its file decides, as before the registration)
+        if !self.retention.legacy_queued(id)? && self.retention.has_object(&format!("m:{id}"))? {
             return Ok(false);
         }
         Ok(self.inner.manifest_path(id).is_file())

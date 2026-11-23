@@ -242,6 +242,38 @@ pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
     Ok(found.and_then(|value| value.parse().ok()).unwrap_or(0))
 }
 
+/// How many legacy manifests and how many roots of the `clone_ref` fill
+/// have failed to be read at least 8 times (`legacy_retry`,
+/// `clone_ref_retry`, spec 25.8 5b (h)5, (e)); read like
+/// [`inspect_owners`]. Zero when there is no index or no such table.
+pub fn inspect_retry_failing(state: &Path) -> Result<(u64, u64)> {
+    let database = state.join("sources").join("retention.db");
+    if !database.is_file() {
+        return Ok((0, 0));
+    }
+    let c = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let count = |table: &str| -> Result<u64> {
+        match c.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE attempts>=8"),
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(n) => Ok(u64::try_from(n).unwrap_or(0)),
+            Err(rusqlite::Error::SqliteFailure(_, Some(text)))
+                if text.contains("no such table") =>
+            {
+                Ok(0)
+            }
+            Err(error) => Err(error.into()),
+        }
+    };
+    Ok((count("legacy_retry")?, count("clone_ref_retry")?))
+}
+
 impl SourceStore {
     /// The first durable write of a capture that will be submitted: this
     /// process owns the capture of `run`. Nothing of the capture may exist
