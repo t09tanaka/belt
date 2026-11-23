@@ -139,14 +139,6 @@ fn capture_of(
     _mutation
         .ensure_sdk_available()
         .map_err(|e| classify::api_error_of(&e))?;
-    // The store's bundle keyed by source is a file no row names: the capture
-    // of a run names the path of its bundle.
-    if !params.secret_files.is_empty() && params.secret_bundle.is_none() {
-        return Err(ApiError::new(
-            ErrorCode::Internal,
-            "a capture with secret files needs the path of its bundle",
-        ));
-    }
     let retention_root = store
         .capture_pending_root(run)
         .map_err(|e| classify::api_error_of(&e))?;

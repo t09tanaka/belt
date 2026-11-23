@@ -1166,64 +1166,64 @@ fn a_file_whose_install_was_cut_short_is_released_after_the_scratch_directory() 
     parts.assert_nothing_left(&run);
 }
 
-/// An install that stops part-way (a file with other content is at one
-/// destination) fails the capture. The capture gives back every reservation
-/// but those of the files it created, so the abandonment deletes exactly
-/// those, finishes, and leaves the file that was there as it was.
+/// An install that stops part-way fails the capture: here a file that is not
+/// this manifest is at the manifest's destination, and the manifest is
+/// installed last. The capture gives back every reservation but those of the
+/// files it created, so the abandonment deletes exactly those, finishes, and
+/// leaves the file that was there as it was.
 #[test]
 fn an_install_that_stops_part_way_keeps_only_what_it_created_reserved() {
-    // The name of one object of the input, from a store of its own.
-    let name = {
+    let capture = |parts: &Parts, run: &RunId| {
+        let key = crate::secrets::key::load(&parts.root.path().join("key")).unwrap();
+        capture_run(
+            &BTreeMap::new(),
+            &parts.sources,
+            &parts.vault,
+            &SecretInputs {
+                key: &key,
+                declared: &[],
+            },
+            run,
+            &SourceRequest::Directory {
+                dir: parts.input.clone(),
+            },
+            &CaptureParams::default(),
+        )
+    };
+    // The name of the manifest of the input, from a store of its own.
+    let id = {
         let other = Parts::new();
-        other.capture_of(&RunId::generate(), &other.input);
-        stored_names(&other)
-            .into_iter()
-            .filter(|name| name.starts_with("objects"))
-            .nth(FILES / 2)
+        capture(&other, &RunId::generate())
             .unwrap()
+            .manifest
+            .ci_source_id
     };
     let parts = Parts::new();
-    let planted = parts.state.join("sources").join(&name);
+    let planted = parts
+        .state
+        .join("sources/manifests")
+        .join(format!("{id}.json"));
     std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
-    std::fs::write(&planted, b"not this object").unwrap();
+    std::fs::write(&planted, b"not this manifest").unwrap();
     let run = RunId::generate();
     parts.sources.own_capture_as(&run, &gone()).unwrap();
-    let key = crate::secrets::key::load(&parts.root.path().join("key")).unwrap();
-    capture_run(
-        &BTreeMap::new(),
-        &parts.sources,
-        &parts.vault,
-        &SecretInputs {
-            key: &key,
-            declared: &[],
-        },
-        &run,
-        &SourceRequest::Directory {
-            dir: parts.input.clone(),
-        },
-        &CaptureParams::default(),
-    )
-    .unwrap_err();
-    assert_eq!(std::fs::read(&planted).unwrap(), b"not this object");
+    capture(&parts, &run).unwrap_err();
+    assert_eq!(std::fs::read(&planted).unwrap(), b"not this manifest");
     assert_eq!(parts.scratch_dirs(), Vec::<PathBuf>::new());
-    let installed = parts.stored_files().len() - 1;
-    assert!(installed > 0 && installed < FILES, "{installed}");
+    // Every object (the files and the unsent `.env`) was installed before
+    // the manifest stopped the install.
+    let objects = FILES + 1;
+    assert_eq!(parts.stored_files().len(), objects + 1);
     // Reserved: what the install created, and nothing else.
     assert_eq!(
-        parts.count("SELECT count(*) FROM member") as usize,
-        installed
+        parts.count("SELECT count(*) FROM member WHERE object LIKE 'b:%'") as usize,
+        objects
     );
-    let key_of_planted = format!("b:{}", name.file_name().unwrap().to_str().unwrap());
-    assert_eq!(
-        parts.count(&format!(
-            "SELECT count(*) FROM member WHERE object='{key_of_planted}'"
-        )),
-        0
-    );
+    assert_eq!(parts.count("SELECT count(*) FROM member") as usize, objects);
     let report = parts.passes();
     assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
     assert_eq!(parts.stored_files(), vec![planted.clone()]);
-    assert_eq!(std::fs::read(&planted).unwrap(), b"not this object");
+    assert_eq!(std::fs::read(&planted).unwrap(), b"not this manifest");
     assert_eq!(parts.index_rows(), 0);
 }
 
@@ -1395,6 +1395,8 @@ fn the_removal_of_a_scratch_directory_follows_no_link_and_takes_none_in_use() {
 
     let root = parts.sources.capture_pending_root(None).unwrap();
     let scratch = index.create_scratch(&root).unwrap();
+    // A name that exists is not used a second time.
+    assert!(index.create_scratch(&root).is_err());
     std::fs::create_dir(scratch.join("deep")).unwrap();
     std::os::unix::fs::symlink(&outside, scratch.join("deep/link")).unwrap();
     std::os::unix::fs::symlink(outside.join("kept"), scratch.join("file-link")).unwrap();
@@ -1428,35 +1430,6 @@ fn the_removal_of_a_scratch_directory_follows_no_link_and_takes_none_in_use() {
     assert!(outside.join("kept").is_file());
 }
 
-/// A capture with secret files and no path for their bundle would write the
-/// store's bundle keyed by source, which no row names: it is refused before
-/// anything is written.
-#[test]
-fn a_capture_with_secret_files_and_no_bundle_path_is_refused() {
-    let parts = Parts::new();
-    let before = parts.index_rows();
-    let error = crate::source::capture(
-        &BTreeMap::new(),
-        &parts.sources,
-        &SourceRequest::Directory {
-            dir: parts.input.clone(),
-        },
-        &CaptureParams {
-            secret_files: vec![local_ci::source::SecretSpec {
-                glob: ".env".into(),
-                required: true,
-            }],
-            secret_key: vec![7; 32],
-            ..Default::default()
-        },
-    )
-    .unwrap_err();
-    assert_eq!(error.code, crate::error::ErrorCode::Internal);
-    assert_eq!(parts.index_rows(), before);
-    assert_eq!(parts.stored_files(), Vec::<PathBuf>::new());
-    assert_eq!(parts.scratch_dirs(), Vec::<PathBuf>::new());
-}
-
 /// The capture removes its scratch directory before it returns, and a
 /// capture that cannot does not succeed: after the hand-over no row would
 /// name the directory. The failed capture is given up, and the abandonment
@@ -1464,6 +1437,9 @@ fn a_capture_with_secret_files_and_no_bundle_path_is_refused() {
 #[test]
 fn a_capture_that_cannot_remove_its_scratch_directory_fails() {
     use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return; // permissions do not bind root
+    }
     let parts = Parts::new();
     let run = RunId::generate();
     parts.sources.own_capture_as(&run, &gone()).unwrap();
@@ -1517,5 +1493,175 @@ fn a_capture_that_cannot_remove_its_scratch_directory_fails() {
     .unwrap();
     let report = parts.passes();
     assert_eq!((report.finished, report.unknown), (1, 0), "{report:?}");
+    parts.assert_nothing_left(&run);
+}
+
+/// What a reservation refuses, and that a refusal reserves nothing: a root
+/// that is not a pending root without a source, a digest or a source ID that
+/// is none, a destination that is not where the index puts that object, and
+/// an object whose deletion is claimed. A secret bundle keyed by source is no
+/// object of the index and is passed over.
+#[test]
+fn a_reservation_is_all_or_nothing_and_only_of_what_the_index_names() {
+    use local_ci::source::{Intent, IntentKind};
+    let parts = Parts::new();
+    let index = &parts.sources.retention;
+    let store = parts.state.join("sources");
+    let object = |hash: &str| Intent {
+        kind: IntentKind::Object {
+            hash: hash.into(),
+            size: 1,
+        },
+        staged: store.join("staging/x/objects").join(hash),
+        destination: store.join("objects").join(&hash[..2]).join(hash),
+    };
+    let (one, two) = ("a".repeat(64), "b".repeat(64));
+    let id = format!("src-{}", "c".repeat(32));
+    let manifest = Intent {
+        kind: IntentKind::Manifest {
+            source_id: id.clone(),
+            digest: "sha256:0".into(),
+        },
+        staged: store.join("staging/x/manifests/m.json"),
+        destination: store.join("manifests").join(format!("{id}.json")),
+    };
+    let bundle = Intent {
+        kind: IntentKind::SecretBundle {
+            source_id: id.clone(),
+        },
+        staged: store.join("staging/x/secrets/s.json"),
+        destination: store.join("secrets").join(format!("{id}.json")),
+    };
+    let members = || parts.count("SELECT count(*) FROM member");
+    let root = parts.sources.capture_pending_root(None).unwrap();
+
+    // No such root, and a root that already has its source.
+    assert!(index
+        .reserve_capture("capture:01ARZ3NDEKTSV4RRFFQ69G5FAV", &[object(&one)])
+        .is_err());
+    let done = parts.captured(&me());
+    let before = members();
+    assert!(index
+        .reserve_capture(done.as_str(), &[object(&one)])
+        .is_err());
+    // A digest and a source ID that are none.
+    let bad = Intent {
+        kind: IntentKind::Object {
+            hash: "../../outside".into(),
+            size: 1,
+        },
+        ..object(&one)
+    };
+    assert!(index.reserve_capture(&root, &[object(&two), bad]).is_err());
+    let bad = Intent {
+        kind: IntentKind::Manifest {
+            source_id: "../outside".into(),
+            digest: "sha256:0".into(),
+        },
+        ..manifest.clone()
+    };
+    assert!(index.reserve_capture(&root, &[object(&two), bad]).is_err());
+    // A destination that is not the object's place.
+    let bad = Intent {
+        destination: parts.root.path().join("outside").join(&one),
+        ..object(&one)
+    };
+    assert!(index.reserve_capture(&root, &[object(&two), bad]).is_err());
+    // An object whose deletion is claimed: the ones before it in the list
+    // are not reserved either.
+    index
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO publication VALUES(?1,1,'claimed')",
+            [format!("b:{one}")],
+        )
+        .unwrap();
+    assert!(index
+        .reserve_capture(&root, &[object(&two), object(&one)])
+        .is_err());
+    assert_eq!(members(), before);
+    // What is reserved: the objects and the manifest, not the bundle.
+    let reserved = index
+        .reserve_capture(&root, &[object(&two), bundle, manifest])
+        .unwrap();
+    let keys: Vec<&str> = reserved.iter().map(|(_, key)| key.as_str()).collect();
+    assert_eq!(keys, vec![format!("b:{two}"), format!("m:{id}")]);
+    assert_eq!(members(), before + 2);
+    // Given back: only the named ones, only of this root.
+    index
+        .unreserve_capture(&root, &[&format!("b:{two}")])
+        .unwrap();
+    assert_eq!(members(), before + 1);
+    assert!(index.unreserve_capture(done.as_str(), &[]).is_err());
+}
+
+/// "Not there" is said of a reservation only: of a root that never got its
+/// source, and of a name that provably does not exist. A registered root
+/// whose file is missing keeps its membership as before, and so does a
+/// reservation whose place cannot be looked at (a link where a directory of
+/// the store should be).
+#[test]
+fn a_missing_file_releases_a_reservation_and_nothing_else() {
+    let rounds = |parts: &Parts| {
+        let mut last = parts.pass();
+        for _ in 0..8 {
+            last = parts.pass();
+        }
+        last
+    };
+    // A registered root: the capture was whole, then one object went missing.
+    let parts = Parts::new();
+    let run = parts.captured(&gone());
+    let lost = parts
+        .stored_files()
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("/objects/"))
+        .unwrap();
+    std::fs::remove_file(&lost).unwrap();
+    let report = rounds(&parts);
+    assert_eq!(report.finished, 0, "{report:?}");
+    assert_eq!(parts.count("SELECT count(*) FROM capture_owner"), 1);
+    assert_eq!(parts.count("SELECT count(*) FROM member"), 1);
+    assert_eq!(parts.stored_files(), Vec::<PathBuf>::new());
+    let _ = run;
+
+    // A reservation whose place cannot be looked at.
+    let parts = Parts::new();
+    let run = killed_at(&parts, "reserved");
+    let outside = parts.root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let key: String = parts
+        .sources
+        .retention
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT object FROM member WHERE object LIKE 'b:%' ORDER BY object LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let shard = &key[2..4];
+    let objects = parts.state.join("sources/objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::os::unix::fs::symlink(&outside, objects.join(shard)).unwrap();
+    let held = parts.count(&format!(
+        "SELECT count(*) FROM member WHERE object LIKE 'b:{shard}%'"
+    ));
+    assert!(held > 0);
+    let report = rounds(&parts);
+    assert_eq!(report.finished, 0, "{report:?}");
+    assert_eq!(parts.count("SELECT count(*) FROM capture_owner"), 1);
+    assert_eq!(parts.count("SELECT count(*) FROM member"), held);
+    assert!(objects
+        .join(shard)
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    // Once the place can be looked at, the rest goes.
+    std::fs::remove_file(objects.join(shard)).unwrap();
+    assert_eq!(parts.passes().finished, 1);
     parts.assert_nothing_left(&run);
 }

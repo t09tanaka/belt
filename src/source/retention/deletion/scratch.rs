@@ -90,8 +90,12 @@ impl Index {
 
     /// Record everything a capture is about to install as members of its
     /// pending root, in one transaction, before the first file is installed.
-    /// A secret bundle keyed by source has no class in the index and is
-    /// refused: the capture names the path of its bundle.
+    /// A secret bundle keyed by source (`secrets/<source>.json`) is not
+    /// reserved: it is no object of the index, and it has a rule of its own
+    /// (it lives until its caller adopts it, and what a crash leaves is
+    /// removed by `secrets::capture::sweep_store_copies`, under the lock of
+    /// the captures that write one). The capture of a run never makes one: it
+    /// names the path of its bundle.
     pub(in crate::source) fn reserve_capture(
         &self,
         root: &str,
@@ -120,9 +124,7 @@ impl Index {
                         format!("manifests/{source_id}.json"),
                     )
                 }
-                IntentKind::SecretBundle { .. } => {
-                    anyhow::bail!("a secret bundle keyed by source cannot be reserved")
-                }
+                IntentKind::SecretBundle { .. } => continue,
             };
             ensure!(
                 intent.destination.ends_with(&path),
