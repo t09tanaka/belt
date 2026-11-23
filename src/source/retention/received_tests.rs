@@ -16,6 +16,9 @@ struct Env {
     parent: SourceStore,
     receiver: SourceStore,
     n: usize,
+    /// Step 4's calls, and whether the clone's import lock is busy.
+    refs: RefCell<Vec<String>>,
+    refs_busy: std::cell::Cell<bool>,
 }
 
 impl Env {
@@ -28,6 +31,8 @@ impl Env {
             parent,
             receiver,
             n: 0,
+            refs: RefCell::new(Vec::new()),
+            refs_busy: std::cell::Cell::new(true),
         };
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
@@ -119,6 +124,10 @@ impl Env {
             cap_bytes: cap,
             uses,
             stop: &|| false,
+            refs: &|clone, source| {
+                self.refs.borrow_mut().push(format!("{clone}:{source}"));
+                Ok(!self.refs_busy.get())
+            },
         })
     }
     fn pass(&self) -> ReceivedPassReport {
@@ -764,6 +773,7 @@ fn a_stopped_pass_runs_no_section() {
             cap_bytes: u64::MAX,
             uses: &|_, _| Ok(SourceUse::Ended(None)),
             stop: &|| true,
+            refs: &|_, _| Ok(true),
         })
         .unwrap();
     assert_eq!(report.sections, 0, "{report:?}");
@@ -934,4 +944,35 @@ fn the_tick_leaves_unshared_token_files_to_the_pass() {
     let report = env.pass();
     assert_eq!(report.unlinked, 1, "{report:?}");
     assert!(!fa.exists());
+}
+
+/// (e) step 4, (g)18, (g)29: a `ref_drop:` row removes the refs once the
+/// clone's import lock is free; a busy lock keeps the row for a later
+/// section; a source received again keeps its refs and only the row goes.
+#[test]
+fn step_4_removes_orphaned_refs_unless_received_again() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.sql(&format!(
+        "INSERT INTO clone_ref(clone,source,root) VALUES('c1','{old}','receive:{old}');
+         INSERT INTO meta(key,value) VALUES('ref_drop:c2:again','');
+         INSERT INTO clone_ref(clone,source,root) VALUES('c2','again','receive:again')"
+    ));
+    env.trust_clock();
+    // busy: the orphan's row stays; the re-received one goes uncalled
+    let report = env.pass();
+    assert_eq!(report.detached, 1, "{report:?}");
+    let key = format!("SELECT count(*) FROM meta WHERE key='ref_drop:c1:{old}'");
+    assert_eq!(env.count(&key), 1);
+    assert_eq!(
+        env.count("SELECT count(*) FROM meta WHERE key='ref_drop:c2:again'"),
+        0
+    );
+    assert!(!env.refs.borrow().iter().any(|r| r == "c2:again"));
+    // free: removed
+    env.refs_busy.set(false);
+    let report = env.pass();
+    assert_eq!(report.refs, 1, "{report:?}");
+    assert_eq!(env.count(&key), 0);
+    assert_eq!(env.refs.borrow().last().unwrap(), &format!("c1:{old}"));
 }

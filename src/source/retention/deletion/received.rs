@@ -6,7 +6,11 @@
 //! step 1 is the gate; steps 2 and 3 pick the oldest unreferenced received
 //! source the rules of (c) allow and detach it to a `drop:` root, whose
 //! members the next sections release; step 4's `ref_drop:` rows record the
-//! clone refs the detach orphaned (their removal is a later change).
+//! clone refs the detach orphaned, removed under the clone's import lock
+//! taken without waiting. Step 0 also claims the files only an abandoned
+//! import token holds (the agent tick takes no exclusive lock), and a blob
+//! larger than half a section is claimed under the lock and hashed with it
+//! let go.
 //!
 //! The worker agent runs it on a thread of its own, at most once a minute
 //! and back to back while it makes progress (`Agent::received_passes`,
@@ -50,6 +54,10 @@ pub struct ReceivedPassInputs<'a> {
     /// without detaching anything (the agent is stopping, or a version is
     /// on trial, spec 25.1 8).
     pub stop: &'a dyn Fn() -> bool,
+    /// Step 4 (spec (e)): remove the refs of `source` (CI id) on the clone
+    /// `clone` under its import lock taken without waiting; `Ok(false)` when
+    /// that lock is busy (the row waits for a later section).
+    pub refs: &'a dyn Fn(&str, &str) -> Result<bool>,
 }
 
 /// What one pass did.
@@ -77,6 +85,9 @@ pub struct ReceivedPassReport {
     pub clock_held: bool,
     /// A claim could not be drained: the pass stopped (the next one replays).
     pub stuck: bool,
+    /// `ref_drop:` rows done (step 4): the refs went, or the source was
+    /// received again and they stay.
+    pub refs: usize,
     /// The pass stopped at its section bound with progress made: the caller
     /// may start the next one at once.
     pub again: bool,
@@ -258,6 +269,8 @@ impl SourceStore {
                     }
                 }
             }
+            // Step 4's rows left by earlier detaches, after step 0.
+            self.retention.drop_refs(&c, inputs, &mut report)?;
             if !detaching {
                 return Ok(report);
             }
@@ -278,6 +291,8 @@ impl SourceStore {
                 &mut after,
                 &mut report,
             )?;
+            // Step 4: the refs this section's detaches orphaned.
+            self.retention.drop_refs(&c, inputs, &mut report)?;
             if detached.is_none() {
                 detaching = false;
             }
@@ -347,6 +362,42 @@ impl Index {
         self.unclaim(c, claim)?;
         retry_root(c, root, now)?;
         Ok(Some(false))
+    }
+
+    /// Step 4 (spec (e)): up to [`CANDIDATES`] `ref_drop:<clone>:<source>`
+    /// rows (at most one per ref a detach orphaned). A `(clone, source)`
+    /// that has a `clone_ref` row again (received again) keeps its refs and
+    /// loses only the row; otherwise the refs are removed and the row goes.
+    /// A busy import lock or a failure keeps the row (not a change).
+    fn drop_refs(
+        &self,
+        c: &Connection,
+        inputs: &ReceivedPassInputs,
+        report: &mut ReceivedPassReport,
+    ) -> Result<()> {
+        let rows: Vec<String> = {
+            let mut s = c.prepare(
+                "SELECT key FROM meta WHERE key>='ref_drop:' AND key<'ref_drop;' ORDER BY key LIMIT ?1",
+            )?;
+            let rows = s.query_map([CANDIDATES as i64], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for key in rows {
+            let Some((clone, source)) = key["ref_drop:".len()..].split_once(':') else {
+                continue;
+            };
+            let held: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+                params![clone, source],
+                |r| r.get(0),
+            )?;
+            if !held && !matches!((inputs.refs)(clone, source), Ok(true)) {
+                continue;
+            }
+            c.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+            report.refs += 1;
+        }
+        Ok(())
     }
 
     /// The trusted now of the expiry, `None` while the clock holds.

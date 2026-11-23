@@ -207,6 +207,41 @@ impl Workspaces {
         open_lock(&root.join(format!("{name}.import.lock")))
     }
 
+    /// Step 4 of the received pass (spec 25.8 5b (e)): remove the refs
+    /// belt's receiving put on the clone `clone` (a name `r-<16 hex>`) for
+    /// `source` (local-ci's `remove_imported_refs`: the snapshot and index
+    /// refs), under the clone's import lock taken without waiting. `false`:
+    /// the lock is busy (an import is running), nothing was done. A clone
+    /// that is not there has no ref to remove.
+    pub fn drop_imported_refs(&self, clone: &str, source: &str) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            clone.len() == 18
+                && clone.starts_with("r-")
+                && clone[2..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "not a clone name"
+        );
+        let root = self.clones_root();
+        let dir = root.join(clone);
+        if std::fs::symlink_metadata(&dir).is_err() {
+            return Ok(true);
+        }
+        let lock = open_lock(&root.join(format!("{clone}.import.lock")))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        local_ci::source::remove_imported_refs(
+            &local_ci::ExecContext::new(self.env.clone()),
+            &dir,
+            source,
+        )?;
+        Ok(true)
+    }
+
     /// A scratch repository to try a bundle in before it touches the clone
     /// of `repository_id`: it has the refs of the clone and borrows its
     /// objects (nothing is copied, and nothing is written to the clone), or

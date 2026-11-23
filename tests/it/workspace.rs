@@ -1833,3 +1833,38 @@ fn a_registry_that_cannot_be_read_still_lets_the_gone_worktrees_branch_be_cleare
     assert!(branches(&f, repo.dir()).is_empty());
     assert_eq!(worktrees(&f, repo.dir()).len(), 1);
 }
+
+/// Spec 25.8 5b (e) step 4, (g)8: the refs of a detached source go from
+/// the clone only under its import lock taken without waiting; while an
+/// import holds it, nothing is removed. The clone directory stays ((g)19).
+#[test]
+fn imported_refs_go_only_under_a_free_import_lock() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    f.git(repo.dir(), &["fetch", "-q", f.dir.to_str().unwrap(), &head]);
+    let source = format!("src-{}", "a".repeat(32));
+    let snapshot = format!("refs/local-ci/snapshots/{source}");
+    f.git(repo.dir(), &["update-ref", &snapshot, &head]);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let held = ws.import_lock("github:example/repo").unwrap();
+    held.lock().unwrap();
+    assert!(!ws.drop_imported_refs(&clone, &source).unwrap());
+    assert_eq!(f.git(repo.dir(), &["rev-parse", &snapshot]), head);
+    drop(held);
+    assert!(ws.drop_imported_refs(&clone, &source).unwrap());
+    assert!(f
+        .git(repo.dir(), &["for-each-ref", "refs/local-ci/"])
+        .is_empty());
+    assert!(repo.dir().is_dir());
+    // a name that is not a clone's is refused
+    assert!(ws.drop_imported_refs("../x", &source).is_err());
+}
