@@ -242,14 +242,27 @@ async fn it_refuses_existing_state_and_a_resident_worker_and_changes_nothing() {
     // A resident worker's journal: the role must not exist beside it.
     let config = fx.home().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
+    let refused = |why: &'static str| async move {
+        let out = tokio::time::timeout(T, fx.command(&[]).spawn().unwrap().wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(why), "{stderr}");
+        assert!(!fx.state().exists());
+    };
     std::fs::write(config.join("worker-service.json"), "{}").unwrap();
-    let out = tokio::time::timeout(T, fx.command(&[]).spawn().unwrap().wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("persistent worker is installed"));
-    assert!(!fx.state().exists());
+    refused("persistent worker is installed").await;
+    // The combined `init` resident runs a worker on the same state.
+    std::fs::remove_file(config.join("worker-service.json")).unwrap();
+    std::fs::write(config.join("init.json"), "{}").unwrap();
+    refused("persistent worker is installed").await;
+    // A journal that cannot be looked at may be there: only "not found"
+    // means that there is none.
+    std::fs::remove_dir_all(&config).unwrap();
+    std::fs::write(&config, "not a directory").unwrap();
+    refused("cannot tell whether a persistent worker is installed").await;
 }
 
 /// Spec 25.4 (d), (i) without a command: a worker that was killed leaves its
@@ -266,6 +279,9 @@ async fn a_killed_worker_leaves_state_that_the_next_start_clears_by_itself() {
     assert_eq!(marker["pid"], pid);
     assert_eq!(marker["start"], start.as_str());
     assert_eq!(marker["boot"], belt::platform::boot_id().unwrap().as_str());
+    // What the worker itself saw of the directory it made (proof 2).
+    assert_eq!(marker["filesystem"]["local"], true);
+    assert!(marker["filesystem"]["kind"].is_string());
     assert_eq!(
         first,
         format!(
