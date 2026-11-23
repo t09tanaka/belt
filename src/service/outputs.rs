@@ -1075,4 +1075,31 @@ mod tests {
             ErrorCode::NotFound
         );
     }
+
+    /// Spec 25.3 (b). `outputs` of a run that is being pruned is refused:
+    /// its pin is not handed out, and an export that is asked for it writes
+    /// nothing.
+    #[tokio::test]
+    async fn outputs_of_a_run_that_is_being_pruned_are_not_found() {
+        let f = Fixture::new();
+        f.db.mark_pruning_for_test(&f.run);
+        let reader = CoordinatorStore::open_read_only(f.dir.path()).unwrap();
+        for (target, attempt) in [
+            (Target::Run(f.run.clone()), None),
+            (Target::Task(f.task.clone()), None),
+            (Target::Task(f.task.clone()), Some(f.attempt.clone())),
+        ] {
+            let pin = reader.result_read_pin(&target, attempt.as_ref());
+            let refused = pin.err().unwrap();
+            assert_eq!(refused.code(), ErrorCode::NotFound);
+            assert!(refused.to_string().contains(crate::storage::RUN_PRUNED));
+            let error = f
+                .exporter(target, attempt)
+                .export(true, &mut Vec::new(), &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::NotFound);
+        }
+        assert!(!f.dir.path().join("out").join(f.run.as_str()).exists());
+    }
 }

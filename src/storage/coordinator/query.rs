@@ -318,9 +318,12 @@ mod monitor_command_tests {
 impl CoordinatorStore {
     pub(crate) fn monitor_tasks(&self) -> Result<Vec<MonitorTask>> {
         let cancel = self.task_cancel;
+        let pruning = self.pruning;
         self.db.call(move |c| {
             let boundary = current_boundary(c)?;
             let uncancelled = if cancel { "t.cancel_requested_at_ms IS NULL" } else { "1" };
+            // A run that is being pruned is not shown (spec 25.3 (b)).
+            let unmarked = unmarked("r", pruning);
             let sql = format!("SELECT t.task_id, t.run_id,
                 coalesce(json_extract(t.spec_json,'$.ci.task.task_id'), json_extract(t.spec_json,'$.commands[0].node_id')),
                 a.worker_id, coalesce(a.state, CASE WHEN json_extract(t.spec_json,'$.ci.hold') THEN 'held' ELSE 'queued' END),
@@ -328,7 +331,7 @@ impl CoordinatorStore {
                 FROM task t JOIN run r ON r.run_id=t.run_id
                 LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
                     WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1)
-                WHERE a.state <> 'terminal' OR (a.attempt_id IS NULL AND r.closed_at_ms IS NULL AND {uncancelled})
+                WHERE {unmarked} AND (a.state <> 'terminal' OR (a.attempt_id IS NULL AND r.closed_at_ms IS NULL AND {uncancelled}))
                 ORDER BY t.created_at_ms, t.task_id");
             let mut query = c.prepare(&sql)?;
             let mut rows = query.query([])?;
@@ -380,9 +383,11 @@ impl CoordinatorStore {
     pub fn query_runs(&self, n: u32, after: Option<RunId>) -> Result<Page<Run>> {
         let bound = limit(n)?;
         let (cancel, collections) = (self.task_cancel, self.collections);
+        // A run that is being pruned is not listed (spec 25.3 (b)).
+        let unmarked = unmarked("r", self.pruning);
         self.db.call(move |c| {
             let c=c.unchecked_transaction()?;
-            let mut q=c.prepare("SELECT r.run_id,r.created_at_ms,r.closed_at_ms,(SELECT count(*) FROM task t WHERE t.run_id=r.run_id) FROM run r WHERE r.run_id > coalesce(?1,'') ORDER BY r.run_id LIMIT ?2")?;
+            let mut q=c.prepare(&format!("SELECT r.run_id,r.created_at_ms,r.closed_at_ms,(SELECT count(*) FROM task t WHERE t.run_id=r.run_id) FROM run r WHERE r.run_id > coalesce(?1,'') AND {unmarked} ORDER BY r.run_id LIMIT ?2"))?;
             let raw=q.query_map(params![after.map(String::from),bound],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
             let items=raw.into_iter().map(|(rid,created,closed,count)|Ok(Run{github_status:None,facts:run_facts(&c,&rid,cancel,collections)?,run_id:id("run",RunId::parse(&rid))?,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).collect::<Result<Vec<_>>>()?;
             Ok(page(items,n,|r|r.run_id.to_string()))
@@ -390,16 +395,22 @@ impl CoordinatorStore {
     }
     pub fn query_run(&self, run: RunId) -> Result<Option<Run>> {
         let (cancel, collections) = (self.task_cancel, self.collections);
+        // A run that is being pruned is not found; the mark and the facts
+        // of the answer are one snapshot (spec 25.3 (b)).
+        let unmarked = unmarked("run", self.pruning);
         self.db.call(move |c| {
             let c=c.unchecked_transaction()?;
-            let raw=c.query_row("SELECT created_at_ms,closed_at_ms,(SELECT count(*) FROM task WHERE run_id=?1) FROM run WHERE run_id=?1",[run.as_str()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,i64>(2)?))).optional()?;
+            let raw=c.query_row(&format!("SELECT created_at_ms,closed_at_ms,(SELECT count(*) FROM task WHERE run_id=?1) FROM run WHERE run_id=?1 AND {unmarked}"),[run.as_str()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,i64>(2)?))).optional()?;
             raw.map(|(created,closed,count)|Ok(Run{github_status:super::ci::github_status(&c,run.as_str())?,facts:run_facts(&c,run.as_str(),cancel,collections)?,run_id:run,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).transpose()
         })
     }
     pub fn query_tasks(&self, run: RunId, n: u32, after: Option<TaskId>) -> Result<Page<Task>> {
         let bound = limit(n)?;
         let cancel = self.task_cancel;
+        let pruning = self.pruning;
         self.db.call(move |c| {
+            let c=&c.unchecked_transaction()?;
+            if run_marked(c,run.as_str(),pruning)? { return Err(run_pruned(run.as_str())); }
             if !c.query_row("SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",[run.as_str()],|r|r.get::<_,bool>(0))? { return Err(not_found(format!("run {run}"))); }
             let cancel=if cancel {"cancel_requested_at_ms"}else{"NULL"};
             let mut q=c.prepare(&format!("SELECT task_id,created_at_ms,{cancel} FROM task WHERE run_id=?1 AND task_id>coalesce(?2,'') ORDER BY task_id LIMIT ?3"))?;
@@ -410,7 +421,9 @@ impl CoordinatorStore {
     }
     pub fn query_task(&self, task: TaskId) -> Result<Option<Task>> {
         let cancel = self.task_cancel;
+        let pruning = self.pruning;
         self.db.call(move |c| {
+            let c = &c.unchecked_transaction()?;
             let cancel = if cancel {
                 "cancel_requested_at_ms"
             } else {
@@ -429,6 +442,11 @@ impl CoordinatorStore {
                     },
                 )
                 .optional()?;
+            // A task of a run that is being pruned is not found.
+            let raw = match raw {
+                Some((run, ..)) if run_marked(c, &run, pruning)? => None,
+                raw => raw,
+            };
             raw.map(|(run, created, cancel)| {
                 Ok(Task {
                     unrunnable: unrunnable(c, task.as_str())?,
@@ -456,7 +474,10 @@ impl CoordinatorStore {
         after: Option<Generation>,
     ) -> Result<Page<AttemptRecord>> {
         let bound = limit(n)?;
+        let pruning = self.pruning;
         self.db.call(move |c| {
+            let c=&c.unchecked_transaction()?;
+            if pruning { refuse_pruned_task(c,task.as_str())?; }
             if !c.query_row("SELECT EXISTS(SELECT 1 FROM task WHERE task_id=?1)",[task.as_str()],|r|r.get::<_,bool>(0))? { return Err(not_found(format!("task {task}"))); }
             let mut q=c.prepare(&format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id=?1 AND (?2 IS NULL OR generation>?2) ORDER BY generation LIMIT ?3"))?;
             let mut rows=q.query(params![task.as_str(),after.map(|g|to_i64(g.0)).transpose()?,bound])?;

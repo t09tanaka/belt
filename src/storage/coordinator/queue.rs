@@ -22,7 +22,15 @@ use std::collections::BTreeSet;
 /// The most tasks one `enqueue` accepts.
 pub const MAX_TASKS_PER_RUN: usize = 10_000;
 
+/// A task that may be placed. A task of a run that carries the mark of a
+/// pruned run (spec 25.3 (b)) is never one.
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
+    AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL AND r.pruning_at_ms IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))
+    AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
+
+/// [`QUEUED`] for a file from before the mark, read as it is.
+const QUEUED_V2: &str = "t.cancel_requested_at_ms IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))
     AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
@@ -237,6 +245,10 @@ impl CoordinatorStore {
         // Like create_run, publish the persistent pin inode durably before
         // the database can expose this run to read-only CLI invocations.
         // Coordinator::enqueue already invokes this method in its blocking job.
+        // The pin is made for a new run only (spec 25.5): the pin of a run
+        // that is being pruned is not made again.
+        let known = run_id.to_string();
+        self.db.call(move |c| super::refuse_pruned(c, &known))?;
         crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
@@ -246,6 +258,7 @@ impl CoordinatorStore {
             .map(|(t, spec)| (t.to_string(), spec.to_string()))
             .collect();
         self.db.write(move |tx| {
+            super::refuse_pruned(tx, &run)?;
             tx.execute(
                 "INSERT INTO run (run_id, source_id, spec_json, created_at_ms) VALUES (?1,?2,?3,?4)",
                 params![run, source, run_spec, to_i64(at_ms)?],
@@ -294,8 +307,10 @@ impl CoordinatorStore {
     /// Whether the task is one a placement may take now: the predicate of
     /// [`Self::queued_tasks`] for one task. A read.
     pub(crate) fn estimate_queued(&self, task: &TaskId) -> Result<bool> {
-        let queued = if self.retry_boundaries {
+        let queued = if self.pruning {
             QUEUED
+        } else if self.retry_boundaries {
+            QUEUED_V2
         } else if self.task_cancel {
             QUEUED_V1_CANCEL
         } else {
@@ -359,8 +374,10 @@ impl CoordinatorStore {
         after: Option<InputCursor>,
     ) -> Result<Vec<QueuedTask>> {
         use rusqlite::types::Value as Sql;
-        let queued = if self.retry_boundaries {
+        let queued = if self.pruning {
             QUEUED
+        } else if self.retry_boundaries {
+            QUEUED_V2
         } else if self.task_cancel {
             QUEUED_V1_CANCEL
         } else {
@@ -450,7 +467,13 @@ impl CoordinatorStore {
         } else {
             format!(
                 "{} AND ?4 IS NULL",
-                if self.task_cancel { QUEUED } else { QUEUED_V1 }
+                if self.pruning {
+                    QUEUED
+                } else if self.task_cancel {
+                    QUEUED_V2
+                } else {
+                    QUEUED_V1
+                }
             )
         };
         let (created, rowid) = after.unwrap_or((0, 0));
@@ -471,7 +494,13 @@ impl CoordinatorStore {
     pub fn input_need(&self, run: &RunId, worker: &WorkerId) -> Result<(bool, bool)> {
         let run = run.to_string();
         let worker = worker.to_string();
-        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        let queued = if self.pruning {
+            QUEUED
+        } else if self.task_cancel {
+            QUEUED_V2
+        } else {
+            QUEUED_V1
+        };
         self.db.call(move |c| Ok(c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND ({queued})),EXISTS(SELECT 1 FROM attempt a JOIN task t ON t.task_id=a.task_id WHERE t.run_id=?1 AND a.worker_id=?2 AND a.state <> 'terminal' AND a.retired=0)"),params![run,worker],|r|Ok((r.get(0)?,r.get(1)?)))?))
     }
 

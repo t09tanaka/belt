@@ -57,6 +57,9 @@ pub fn page(
                 ..Default::default()
             })
         }
+        // The run was pruned, or is being pruned, since the cursor named it:
+        // its position is dropped and the next page reads the next run.
+        Err(crate::storage::StorageError::NotFound { .. }) => return Ok(PageReport::default()),
         Err(e) => return Err(e.into()),
     };
     let claim = store.claim_result_page(

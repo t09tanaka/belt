@@ -110,6 +110,7 @@ impl CoordinatorStore {
                 after,
                 limit,
             } => {
+                self.refuse_pruned_task_read(&task_id)?;
                 let a = self.get_attempt(&attempt_id)?.ok_or_else(|| {
                     crate::storage::StorageError::NotFound {
                         what: "attempt".into(),
@@ -368,5 +369,56 @@ impl super::resident::Client {
         Reader::Connected(self.clone())
             .show(id, limit, cursor)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    /// Spec 25.3 (b). `show` of a run that is being pruned, and of a task of
+    /// it, answers "not found" with all its rows and with a part of them;
+    /// `ls` does not list it. A run without the mark is shown as before.
+    #[tokio::test]
+    async fn show_and_ls_do_not_find_a_run_that_is_being_pruned() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+        let (run, first, second) = (RunId::generate(), TaskId::generate(), TaskId::generate());
+        let spec = serde_json::json!({});
+        store.create_run(&run, None, None, &spec, 1).unwrap();
+        store.create_task(&first, &run, &spec, 1).unwrap();
+        store.create_task(&second, &run, &spec, 1).unwrap();
+        let reader = Reader::Offline(std::sync::Arc::new(
+            CoordinatorStore::open_read_only(dir.path()).unwrap(),
+        ));
+        async fn listed(reader: &Reader) -> usize {
+            let query = Query::Runs {
+                limit: 10,
+                after: None,
+            };
+            match reader.query(query).await.unwrap() {
+                Response::Runs { page } => page.items.len(),
+                _ => unreachable!(),
+            }
+        }
+        assert!(matches!(
+            reader.show(run.as_str(), 10, None).await.unwrap(),
+            Show::Run { tasks, .. } if tasks.items.len() == 2
+        ));
+        assert!(reader.show(first.as_str(), 10, None).await.is_ok());
+        assert_eq!(listed(&reader).await, 1);
+
+        store.mark_pruning_for_test(&run);
+        for delete in [None, Some(&second)] {
+            if let Some(task) = delete {
+                store.delete_task_for_test(task);
+            }
+            for id in [run.as_str(), first.as_str()] {
+                let error = reader.show(id, 10, None).await.err().unwrap();
+                assert_eq!(error.code, ErrorCode::NotFound, "{}", error.message);
+            }
+            assert_eq!(listed(&reader).await, 0);
+        }
     }
 }

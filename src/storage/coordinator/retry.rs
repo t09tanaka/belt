@@ -1,5 +1,5 @@
 //! Retry preflight releases the DB thread; commit rechecks a bounded metadata scan.
-use super::control::{control_receipt, resolve, revision};
+use super::control::{control_receipt, refuse_pruned_target, resolve, revision};
 use super::*;
 use crate::service::completion::{RetryReceipt, Target};
 use crate::state::Outcome;
@@ -112,6 +112,7 @@ impl CoordinatorStore {
         let (probe_target, probe_request) = (target.clone(), request_id.clone());
         let candidates = match self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
+            refuse_pruned_target(&tx, &probe_target)?;
             if let Some(receipt) =
                 control_receipt(&tx, &probe_target, expected, &probe_request, "retry")?
             {
@@ -127,6 +128,7 @@ impl CoordinatorStore {
         let evidence = Evidence::read(&state_dir, candidates);
         let preparation=self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
+            refuse_pruned_target(&tx, &target)?;
             if let Some(receipt) = control_receipt(&tx, &target, expected, &request_id, "retry")? {
                 return Ok(RetryPreparation::Replay(receipt));
             }
@@ -198,6 +200,9 @@ impl CoordinatorStore {
         let _source = source;
 
         self.db.write(move |tx| {
+            // The mark is read in the transaction that authorizes the retry,
+            // and before the receipt of a retransmission (spec 25.3 (b)).
+            refuse_pruned_target(tx, &prepared.target)?;
             if let Some(receipt) = control_receipt(tx, &prepared.target, prepared.expected, &prepared.request_id, "retry")? {
                 return Ok(receipt);
             }

@@ -444,3 +444,92 @@ async fn a_run_that_is_running_cancelled_or_not_a_ci_run_is_refused_and_posts_no
     assert_eq!(kept["reason"], "the run is cancelled", "{view}");
     shutdown(&p.spec).await;
 }
+
+/// Spec 25.3 (b). A run that carries the mark of a pruned run (written here
+/// directly: nothing writes it yet) is not found by any command, with all
+/// its rows and with a part of them deleted; it is not listed, nothing is
+/// written to it, and no status of it is posted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_is_being_pruned_is_not_found_by_any_command_and_posts_nothing() {
+    let p = project("true");
+    let (run, _) = p.ci(&[]);
+    let out = p.repo.parent().unwrap().join("exported");
+    let out = out.to_str().unwrap();
+    // Without the mark every command finds the run.
+    for args in [
+        &["show", &run][..],
+        &["logs", &run],
+        &["outputs", &run, "--dir", out],
+        &["ci", "status", &run],
+        &["ci", "status", &run, "--post"],
+    ] {
+        let mut all = vec!["--json"];
+        all.extend_from_slice(args);
+        let output = p.belt(&all).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?} {output:?}");
+    }
+    let (_, listed) = p.json(&["ls"]);
+    assert!(listed.to_string().contains(&run), "{listed}");
+    let posted = p.calls().len();
+    let files = tree(&p.spec.state_dir.join("results"));
+
+    let db = rusqlite::Connection::open(p.spec.state_dir.join("coordinator.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let marked = db
+        .execute("UPDATE run SET pruning_at_ms=1 WHERE run_id=?1", [&run])
+        .unwrap();
+    assert_eq!(marked, 1);
+    let not_found = belt::error::ErrorCode::NotFound.exit_code();
+    for half in [false, true] {
+        if half {
+            // The rows that name the task stay: a run of which a part is gone.
+            db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            let gone = db
+                .execute(
+                    "DELETE FROM task WHERE task_id=(SELECT task_id FROM task WHERE run_id=?1 ORDER BY rowid DESC LIMIT 1)",
+                    [&run],
+                )
+                .unwrap();
+            assert_eq!(gone, 1);
+        }
+        for args in [
+            &["show", &run][..],
+            &["logs", &run],
+            &["outputs", &run, "--dir", out],
+            &["ci", "status", &run],
+            &["ci", "status", &run, "--post"],
+            &["cancel", &run],
+            &["retry", &run],
+        ] {
+            let mut all = vec!["--json"];
+            all.extend_from_slice(args);
+            let output = p.belt(&all).output().unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                output.status.code(),
+                Some(not_found),
+                "{args:?} (half deleted: {half}) {output:?}"
+            );
+            assert!(text.contains("NOT_FOUND"), "{args:?} {text}");
+        }
+        let (code, listed) = p.json(&["ls"]);
+        assert_eq!(code, Some(0), "{listed}");
+        assert!(!listed.to_string().contains(&run), "{listed}");
+        assert_eq!(p.calls().len(), posted, "nothing was posted");
+    }
+    assert_eq!(
+        tree(&p.spec.state_dir.join("results")),
+        files,
+        "no command touched the results"
+    );
+    let revision: i64 = db
+        .query_row(
+            "SELECT control_revision FROM run WHERE run_id=?1",
+            [&run],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 0, "neither the cancel nor the retry was accepted");
+    drop(db);
+    shutdown(&p.spec).await;
+}

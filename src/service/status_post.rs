@@ -112,12 +112,51 @@ struct Standing {
     jobs: Vec<ci_run::JobLine>,
 }
 
+/// A run that is being pruned has no status: it is not found (spec 25.3
+/// (b)), whatever is left of its rows and files.
+fn refuse_pruned(store: &crate::storage::CoordinatorStore, run: &RunId) -> Result<(), ApiError> {
+    match store.run_is_pruned(run) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ApiError::new(
+            ErrorCode::NotFound,
+            format!("run {run} not found ({})", crate::storage::RUN_PRUNED),
+        )),
+        Err(e) => Err(ApiError::new(ErrorCode::Internal, e.to_string())),
+    }
+}
+
 fn read(context: &Context, run: &RunId) -> Result<Standing, ApiError> {
-    let spec = &context.bootstrap;
+    let store = super::bootstrap::read_only_store(&context.bootstrap)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    read_from(&store, &context.bootstrap.state_dir, run)
+}
+
+/// The standing is put together from several reads of the rows and of the
+/// result files. The mark is read before the first and after the last of
+/// them: it is never cleared and nothing of a run is deleted before it, so a
+/// run without it after the last read was whole at every read. With it, the
+/// answer is "not found", and never a verdict on rows or files that were
+/// being deleted (a job that "left no result", a status that "cannot be
+/// decided").
+fn read_from(
+    store: &crate::storage::CoordinatorStore,
+    state_dir: &std::path::Path,
+    run: &RunId,
+) -> Result<Standing, ApiError> {
+    refuse_pruned(store, run)?;
+    let standing = read_rows(store, state_dir, run);
+    refuse_pruned(store, run)?;
+    standing
+}
+
+fn read_rows(
+    store: &crate::storage::CoordinatorStore,
+    state_dir: &std::path::Path,
+    run: &RunId,
+) -> Result<Standing, ApiError> {
     let internal = |why: String| ApiError::new(ErrorCode::Internal, why);
-    let store = super::bootstrap::read_only_store(spec).map_err(|e| internal(e.to_string()))?;
-    let results = spec.state_dir.join("results");
-    let (expected, jobs) = ci_run::strict_report(&store, &spec.state_dir, &results, run)
+    let results = state_dir.join("results");
+    let (expected, jobs) = ci_run::strict_report(store, state_dir, &results, run)
         .map_err(|why| invalid(format!("the status of {run} cannot be decided: {why}")))?;
     if expected.is_empty() {
         return Err(ApiError::new(
@@ -309,5 +348,37 @@ mod tests {
             posted.render(),
             "previous: none recorded\nstatus: local-ci=success posted to 0123456\n"
         );
+    }
+
+    /// Spec 25.3 (b). A run that is being pruned has no status to show or
+    /// to post: it is not found, also when rows of it are already gone, and
+    /// never judged from what is left. The post is decided from this read
+    /// alone, so nothing is posted.
+    #[test]
+    fn a_run_that_is_being_pruned_has_no_status_whatever_is_left_of_its_rows() {
+        use crate::ids::TaskId;
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = crate::storage::CoordinatorStore::open(dir.path(), 1).unwrap();
+        let (run, first, second) = (RunId::generate(), TaskId::generate(), TaskId::generate());
+        let spec = serde_json::json!({});
+        store.create_run(&run, None, None, &spec, 1).unwrap();
+        store.create_task(&first, &run, &spec, 1).unwrap();
+        store.create_task(&second, &run, &spec, 1).unwrap();
+        let reader = crate::storage::CoordinatorStore::open_read_only(dir.path()).unwrap();
+        let read = || read_from(&reader, dir.path(), &run).err().unwrap();
+        // Without the mark the run is read, and judged by what it is.
+        assert!(!read().message.contains(crate::storage::RUN_PRUNED));
+        store.mark_pruning_for_test(&run);
+        for delete in [None, Some(&second)] {
+            if let Some(task) = delete {
+                store.delete_task_for_test(task);
+            }
+            let error = read();
+            assert_eq!(error.code, ErrorCode::NotFound);
+            assert!(
+                error.message.contains(crate::storage::RUN_PRUNED),
+                "{error:?}"
+            );
+        }
     }
 }

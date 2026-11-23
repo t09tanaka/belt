@@ -145,10 +145,27 @@ impl CoordinatorStore {
     }
 
     /// One durable run pin backfill, bounded by the caller's keyset run page.
+    ///
+    /// This makes the pin file, so it answers "not found" and touches no
+    /// pin for a run that has no row or carries the mark of a pruned run
+    /// (spec 25.5): the collection of results never makes the pin of such a
+    /// run again, and its caller goes on to the next run.
     pub fn result_gc_guard(&self, run: &RunId) -> Result<RunPin> {
         if self._lock.is_none() {
             return Err(StorageError::Invalid("read-only owner".into()));
         }
+        let id = run.to_string();
+        self.db.call(move |c| {
+            let known: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if !known {
+                return Err(not_found(format!("run {id}")));
+            }
+            refuse_pruned(c, &id)
+        })?;
         RunPin::ensure(&self.state_dir, run)?;
         Ok(RunPin::exclusive(&self.state_dir, run)?)
     }
