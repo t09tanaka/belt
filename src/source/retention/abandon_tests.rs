@@ -1403,8 +1403,10 @@ fn the_removal_of_a_scratch_directory_follows_no_link_and_takes_none_in_use() {
     held.try_lock().unwrap();
     assert!(index.remove_scratch(&root).is_err());
     assert!(scratch.join("deep/link").symlink_metadata().is_ok());
+    // The capture that made it does not ask for the lock: it held it, and
+    // a copy of its descriptor may outlive the capture in a forked child.
+    index.remove_own_scratch(&root).unwrap();
     drop(held);
-    index.remove_scratch(&root).unwrap();
     assert!(scratch.symlink_metadata().is_err());
     assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"not ours");
     // Removing it again, or one that never was, is success.
@@ -1476,7 +1478,7 @@ fn a_capture_that_cannot_remove_its_scratch_directory_fails() {
                 std::fs::create_dir(scratch.join("closed"))?;
                 std::fs::set_permissions(
                     scratch.join("closed"),
-                    std::fs::Permissions::from_mode(0),
+                    std::fs::Permissions::from_mode(0o000),
                 )?;
             }
             Ok(())

@@ -1891,6 +1891,8 @@ version 0.1.0 への変更、`cargo publish`、tag、Release は、実機試験�
 
 未決（仕様の25.16）: 常駐workerの退役させたidentityの記録を消す時点。親のGit領域とcloneの `refs/local-ci/*` を消す、local-ciのライブラリの関数。段階5b。組み込んだライブラリ（task-traffic-controller、fast-worktree、portool）の自動保持は、各ライブラリの版の採用時に、beltが呼ぶ関数を仕様の25.10の表に書き足す。
 
+2026-11-23 追記: 25.16にあった「memberになる前のobjectとmanifest」は、local-ci 0.19.0の段階を分けた取り込みの採用で閉じた（仕様の25.4の (b)「取り込みのscratch directoryと予約」）。取り込みは `sources/staging/<ulid>/` に書き、入れる前にpending rootのmemberとして予約する。放棄の処理は、scratch directoryを先に消してから予約を解く。残るのは、親のGit領域のobjectとrefと、以前の版が残した名指すものの無いfileである（25.16）。
+
 この計画は、第25章の最初の版（PR #141の最初のcommit）へのレビューを受けて書き直した。最初の版は、retire済みのattemptを持つrunが刈り取れない、workerの側の消去が戻ったメンバーの二重実行を許す、cloneでの `git gc --prune=now` が実行中のjobのobjectを消し得る、などの問題があり、実装の根拠にしない。2回目のレビューでは、取り込みのcrashの各時点、行の無いrunへのcancel、解放済みの記録を消す条件、段階より前に作られた行とroot、lockを開く経路の一覧を、コードの該当行と突き合わせて直した。
 
 最初の2つの実装PRの範囲: (1) 段階0。`src/storage/coordinator/retention.rs` の終点の式（残りは、attemptの無いtask）、`schema.rs` の `run.pruning_at_ms`、`control.rs`・`retry.rs` の「印が先、受領が後」、`coordinator.rs` のpinの後の確かめ直し、各読み手の同じsnapshotでの確認。試験は仕様の25.3の (a) の7つと (b) の6つ。(2) 段階1の (b)。`capture_owner` を最初に書くこと、`given_up`、放棄の処理（Bのpageの起点の追加を含む）、行の無いrunへのcancelの断り、schemaの3つの変更とmigration。試験は仕様の25.4の (b) の13個で、(i) は取り込みの9つの時点ごとに1つ。

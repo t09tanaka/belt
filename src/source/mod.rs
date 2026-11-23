@@ -216,9 +216,11 @@ fn capture_of(
             // for the abandonment to release.
             if let Some(part) = error.downcast_ref::<StagedInstallError>() {
                 let rows = reserved.lock().unwrap_or_else(|e| e.into_inner());
+                let installed: std::collections::HashSet<&PathBuf> =
+                    part.installed.iter().collect();
                 let keys: Vec<&str> = rows
                     .iter()
-                    .filter(|(to, _)| !part.installed.contains(to))
+                    .filter(|(to, _)| !installed.contains(to))
                     .map(|(_, key)| key.as_str())
                     .collect();
                 // best effort, on the way out of an error: a reservation
@@ -291,7 +293,7 @@ impl Scratch {
     }
     fn remove(mut self) -> anyhow::Result<()> {
         self.removed = true;
-        self.index.remove_scratch(&self.root)
+        self.index.remove_own_scratch(&self.root)
     }
 }
 
@@ -299,7 +301,7 @@ impl Drop for Scratch {
     /// The way out of an error, which this must not replace.
     fn drop(&mut self) {
         if !self.removed {
-            let _ = self.index.remove_scratch(&self.root);
+            let _ = self.index.remove_own_scratch(&self.root);
         }
     }
 }

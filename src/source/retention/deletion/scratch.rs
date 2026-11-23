@@ -66,12 +66,24 @@ impl Index {
     /// removal with an error and stay. A name with a second link is only
     /// dropped here (an installed file keeps its name in the store).
     pub(in crate::source) fn remove_scratch(&self, root: &str) -> Result<()> {
+        self.remove_scratch_of(root, Top::Probed)
+    }
+
+    /// [`Index::remove_scratch`] by the capture that made the directory,
+    /// after local-ci returned and released its lock. The lock is not asked
+    /// for: a process another thread forked may still hold a copy of
+    /// local-ci's descriptor until it executes, and with it the lock.
+    pub(in crate::source) fn remove_own_scratch(&self, root: &str) -> Result<()> {
+        self.remove_scratch_of(root, Top::Own)
+    }
+
+    fn remove_scratch_of(&self, root: &str, top: Top) -> Result<()> {
         let name = name_of(root)?;
         let Some(staging) = self.staging()? else {
             return Ok(());
         };
         let device = rustix::fs::fstat(&staging)?.st_dev;
-        remove_entry(&staging, name.as_ref(), device, true)?;
+        remove_entry(&staging, name.as_ref(), device, Some(top))?;
         staging.sync_all()?;
         Ok(())
     }
@@ -198,16 +210,13 @@ fn is_ours<D: PartialEq>(entry: (D, u32), here: (D, u32)) -> bool {
     entry.0 == here.0 && entry.1 == here.1
 }
 
-#[cfg(test)]
-mod tests {
-    /// Another user's file cannot be made without root, and a mount not at
-    /// all: the rule is checked on what `lstat` would say of them.
-    #[test]
-    fn an_entry_of_another_user_or_on_another_file_system_is_not_ours() {
-        assert!(super::is_ours((7u64, 501), (7, 501)));
-        assert!(!super::is_ours((7u64, 0), (7, 501)));
-        assert!(!super::is_ours((8u64, 501), (7, 501)));
-    }
+/// How the scratch directory itself is taken.
+#[derive(Clone, Copy, PartialEq)]
+enum Top {
+    /// By the capture that made it.
+    Own,
+    /// By anyone else: only when no capture holds its lock.
+    Probed,
 }
 
 fn names_in(dir: &File) -> Result<Vec<std::ffi::CString>> {
@@ -226,7 +235,7 @@ fn remove_entry(
     dir: &File,
     name: &std::ffi::OsStr,
     device: rustix::fs::Dev,
-    top: bool,
+    top: Option<Top>,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -242,7 +251,10 @@ fn remove_entry(
         "an entry of a capture's scratch directory is not provably ours"
     );
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-        ensure!(!top, "a capture's scratch directory is not a directory");
+        ensure!(
+            top.is_none(),
+            "a capture's scratch directory is not a directory"
+        );
         rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
         return Ok(());
     }
@@ -252,7 +264,7 @@ fn remove_entry(
         (opened.st_dev, opened.st_ino) == (stat.st_dev, stat.st_ino),
         "a capture's scratch directory changed while it was removed"
     );
-    if top {
+    if top == Some(Top::Probed) {
         // The capture that stages here holds this lock until it returns.
         match below.try_lock() {
             Ok(()) => {}
@@ -267,9 +279,21 @@ fn remove_entry(
             &below,
             std::ffi::OsStr::from_bytes(child.to_bytes()),
             device,
-            false,
+            None,
         )?;
     }
     rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Another user's file cannot be made without root, and a mount not at
+    /// all: the rule is checked on what `lstat` would say of them.
+    #[test]
+    fn an_entry_of_another_user_or_on_another_file_system_is_not_ours() {
+        assert!(super::is_ours((7u64, 501), (7, 501)));
+        assert!(!super::is_ours((7u64, 0), (7, 501)));
+        assert!(!super::is_ours((8u64, 501), (7, 501)));
+    }
 }
