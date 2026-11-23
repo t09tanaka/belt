@@ -760,6 +760,17 @@ async fn managed_journal_rejects_a_second_worker_path_even_when_input_agrees() {
         .contains("init paths changed"));
 }
 
+/// An ephemeral worker looks for this resident's journal where the
+/// resident keeps it (spec 25.4 (d), proof 3).
+#[test]
+fn the_journal_is_where_an_ephemeral_worker_looks_for_it() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    let looked_at = super::super::worker_service::Paths::resident_journals(&context.env).unwrap();
+    assert_eq!(looked_at[1], paths.journal);
+    assert_eq!(looked_at[0].parent(), paths.journal.parent());
+}
+
 #[tokio::test]
 async fn malformed_worker_enrollment_is_refused_without_init_writes() {
     let (_root, context) = fixture();

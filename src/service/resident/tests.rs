@@ -501,6 +501,69 @@ async fn collection_shutdown_fixture(
     }
 }
 
+/// Spec 25.4 (d): the combined resident runs a worker on the worker state.
+/// One that an ephemeral worker made is refused before anything is created,
+/// in it or in the parent's own state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_state_of_an_ephemeral_worker_is_refused_before_anything_is_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = crate::test_tmp::prefixed("belt-resident-ephemeral-").unwrap();
+    crate::secrets::key::init(&root.path().join("key")).unwrap();
+    let config = crate::config::resolve(&crate::config::Inputs {
+        overlay: &crate::config::Overlay::default(),
+        project: None,
+        legacy: None,
+        user: None,
+    })
+    .unwrap();
+    let worker = root.path().join("worker");
+    std::fs::create_dir(&worker).unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(worker.join("ephemeral.json"), "{}").unwrap();
+    let inputs = || Inputs {
+        state_dir: root.path().join("parent"),
+        worker: WorkerInputs {
+            state_dir: worker.clone(),
+            worker_id: WorkerId::parse("local").unwrap(),
+            boot_id: WorkerBootId::parse("boot-ephemeral-test").unwrap(),
+            supervisor_exe: "/bin/false".into(),
+            cluster_key_path: root.path().join("key"),
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("HOME".into(), root.path().display().to_string()),
+            ]),
+        },
+        collection_interval: Duration::from_millis(20),
+        collection: Default::default(),
+    };
+    let listing = |dir: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let error = match StartupParts::prepare(config.clone(), inputs(), None) {
+        Ok(_) => panic!("prepared on an ephemeral worker's state"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+    assert_eq!(listing(&worker), ["ephemeral.json"]);
+    assert!(!root.path().join("parent").exists());
+    // The whole start says the same.
+    let error = match Resident::start(&config, inputs()).await {
+        Ok(_) => panic!("started on an ephemeral worker's state"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+    assert_eq!(listing(&worker), ["ephemeral.json"]);
+    // Without the marker the same inputs are prepared.
+    std::fs::remove_file(worker.join("ephemeral.json")).unwrap();
+    assert!(StartupParts::prepare(config, inputs(), None).is_ok());
+    assert!(!listing(&worker).is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     let root = crate::test_tmp::prefixed("belt-stop-source-").unwrap();

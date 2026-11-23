@@ -125,19 +125,25 @@ fn only_the_listed_local_filesystems_are_local() {
     assert!(!local_filesystem(&Filesystem::Unknown));
 }
 
+fn seen_local() -> Recorded {
+    recorded(&apfs())
+}
+
 #[test]
 fn a_state_left_behind_is_examined_by_marker_then_filesystem_then_resident() {
-    assert_eq!(examined(&Marker::Ephemeral, &apfs(), false), Ok(()));
+    let local = seen_local();
+    let local = Some(&local);
+    assert_eq!(examined(&Marker::Ephemeral, local, &apfs(), false), Ok(()));
     assert_eq!(
-        examined(&Marker::Ephemeral, &Filesystem::Magic(0xEF53), false),
+        examined(&Marker::Ephemeral, local, &Filesystem::Magic(0xEF53), false),
         Ok(())
     );
-    let absent = examined(&Marker::Absent, &apfs(), false).unwrap_err();
+    let absent = examined(&Marker::Absent, local, &apfs(), false).unwrap_err();
     assert!(absent.contains("no ephemeral.json"), "{absent}");
     assert!(absent.contains("starts clean"), "{absent}");
-    let unreadable = examined(&Marker::Unreadable, &apfs(), false).unwrap_err();
+    let unreadable = examined(&Marker::Unreadable, local, &apfs(), false).unwrap_err();
     assert!(unreadable.contains("cannot be read"), "{unreadable}");
-    let other = examined(&Marker::OtherKind, &apfs(), false).unwrap_err();
+    let other = examined(&Marker::OtherKind, local, &apfs(), false).unwrap_err();
     assert!(
         other.contains("not of the ephemeral worker kind"),
         "{other}"
@@ -147,19 +153,55 @@ fn a_state_left_behind_is_examined_by_marker_then_filesystem_then_resident() {
         Filesystem::Name("nfs".into()),
         Filesystem::Unknown,
     ] {
-        let remote = examined(&Marker::Ephemeral, &filesystem, false).unwrap_err();
+        let remote = examined(&Marker::Ephemeral, local, &filesystem, false).unwrap_err();
         assert!(remote.contains("not on a local filesystem"), "{remote}");
     }
-    let resident = examined(&Marker::Ephemeral, &apfs(), true).unwrap_err();
+    let resident = examined(&Marker::Ephemeral, local, &apfs(), true).unwrap_err();
     assert!(
         resident.contains("persistent worker is installed"),
         "{resident}"
     );
     // The first condition that fails is the one named.
-    let first = examined(&Marker::Absent, &Filesystem::Unknown, true).unwrap_err();
+    let first = examined(&Marker::Absent, None, &Filesystem::Unknown, true).unwrap_err();
     assert!(first.contains("no ephemeral.json"), "{first}");
-    let second = examined(&Marker::Ephemeral, &Filesystem::Unknown, true).unwrap_err();
-    assert!(second.contains("not on a local filesystem"), "{second}");
+    let second = examined(&Marker::Ephemeral, None, &Filesystem::Unknown, true).unwrap_err();
+    assert!(second.contains("does not record"), "{second}");
+    let third = examined(&Marker::Ephemeral, local, &Filesystem::Unknown, true).unwrap_err();
+    assert!(third.contains("not on a local filesystem"), "{third}");
+}
+
+/// The creator and the start that clears can see the same directory through
+/// different filesystems (a container's bind mount of its host's directory):
+/// both must have seen a local one.
+#[test]
+fn a_state_its_creator_did_not_see_as_local_is_never_proven() {
+    for seen in [
+        Filesystem::Name("virtiofs".into()),
+        Filesystem::Magic(0x6573_5546),
+        Filesystem::Magic(0x6969),
+        Filesystem::Unknown,
+    ] {
+        let record = recorded(&seen);
+        assert!(!record.local, "{record:?}");
+        let error = examined(&Marker::Ephemeral, Some(&record), &apfs(), false).unwrap_err();
+        assert!(
+            error.contains("the worker that created it did not see it on a local filesystem"),
+            "{error}"
+        );
+        assert!(error.contains(&record.kind), "{error}");
+    }
+    assert_eq!(recorded(&Filesystem::Magic(0x6969)).kind, "0x6969");
+    assert_eq!(recorded(&Filesystem::Unknown).kind, "unknown");
+    assert_eq!(
+        recorded(&apfs()),
+        Recorded {
+            local: true,
+            kind: "apfs".into()
+        }
+    );
+    // A marker without the record proves nothing, wherever it is now.
+    let error = examined(&Marker::Ephemeral, None, &apfs(), false).unwrap_err();
+    assert!(error.contains("does not record the filesystem"), "{error}");
 }
 
 #[test]

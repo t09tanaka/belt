@@ -48,7 +48,12 @@ fn marker() -> MarkerFile {
         pid: Some(4242),
         start: Some("start-1".into()),
         instance: Some(INSTANCE.into()),
+        filesystem: Some(plan::recorded(&plan::Filesystem::Name("apfs".into()))),
     }
+}
+
+fn marker_kind(state: &Path) -> plan::Marker {
+    read_marker(&File::open(state).unwrap()).kind
 }
 
 fn local(_: &File) -> plan::Filesystem {
@@ -76,7 +81,7 @@ fn tree(dir: &Path) -> Vec<(PathBuf, u64)> {
 
 fn refused(state: &Path, resident: bool, filesystem: fn(&File) -> plan::Filesystem) -> String {
     let before = tree(state);
-    let error = reclaim(state, resident, filesystem)
+    let error = reclaim(state, resident, filesystem, &nowhere)
         .unwrap_err()
         .to_string();
     assert_eq!(tree(state), before, "a refusal changed the state: {error}");
@@ -88,7 +93,7 @@ fn refused(state: &Path, resident: bool, filesystem: fn(&File) -> plan::Filesyst
 fn a_state_nobody_uses_is_cleared_whole() {
     let fx = Fx::new();
     let state = fx.left_behind();
-    reclaim(&state, false, local).unwrap();
+    reclaim(&state, false, local, &nowhere).unwrap();
     assert!(std::fs::symlink_metadata(&state).is_err());
     assert_eq!(tree(fx.root.path()), []);
 }
@@ -100,7 +105,7 @@ fn the_real_filesystem_of_a_test_directory_is_a_local_one() {
     let dir = File::open(&state).unwrap();
     let kind = filesystem_of(&dir);
     assert!(plan::local_filesystem(&kind), "{kind:?}");
-    reclaim(&state, false, filesystem_of).unwrap();
+    reclaim(&state, false, filesystem_of, &nowhere).unwrap();
     assert!(!state.exists());
 }
 
@@ -110,7 +115,7 @@ fn a_start_killed_before_its_locks_existed_is_cleared_too() {
     let state = fx.left_behind();
     std::fs::remove_file(state.join(LOCK)).unwrap();
     std::fs::remove_file(state.join(AGENT_LOCK)).unwrap();
-    reclaim(&state, false, local).unwrap();
+    reclaim(&state, false, local, &nowhere).unwrap();
     assert!(!state.exists());
 }
 
@@ -209,7 +214,9 @@ fn a_state_that_is_a_link_or_open_to_others_is_kept() {
     std::fs::rename(&real, &elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, fx.state()).unwrap();
     let before = tree(&elsewhere);
-    let error = reclaim(&fx.state(), false, local).unwrap_err().to_string();
+    let error = reclaim(&fx.state(), false, local, &nowhere)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("not a private directory"), "{error}");
     assert_eq!(tree(&elsewhere), before);
     assert!(fx.state().is_symlink());
@@ -232,11 +239,11 @@ fn a_clearing_that_fails_midway_leaves_the_marker_for_the_next_start() {
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }
-    assert!(reclaim(&state, false, local).is_err());
-    assert_eq!(read_marker(&state).0, plan::Marker::Ephemeral);
+    assert!(reclaim(&state, false, local, &nowhere).is_err());
+    assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
     assert!(state.join(LOCK).exists());
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
-    reclaim(&state, false, local).unwrap();
+    reclaim(&state, false, local, &nowhere).unwrap();
     assert!(!state.exists());
 }
 
@@ -244,17 +251,25 @@ fn a_clearing_that_fails_midway_leaves_the_marker_for_the_next_start() {
 fn a_new_state_starts_with_the_marker_and_holds_an_inheritable_shared_lock() {
     let fx = Fx::new();
     let state = fx.state();
-    let (created, alive) = create_state(&state, &marker()).unwrap();
+    let (created, alive) = create_state(&state, &marker(), local, &nowhere).unwrap();
     assert_eq!(created.path, state);
-    let (kind, written) = read_marker(&state);
-    assert_eq!(kind, plan::Marker::Ephemeral);
-    let written = written.unwrap();
+    let read = read_marker(&File::open(&state).unwrap());
+    assert_eq!(read.kind, plan::Marker::Ephemeral);
+    let written = read.file.unwrap();
     assert_eq!(written.schema, 1);
     assert_eq!(written.kind, "ephemeral_worker");
     assert_eq!(written.boot.as_deref(), Some("boot-1"));
     assert_eq!(written.pid, Some(4242));
     assert_eq!(written.start.as_deref(), Some("start-1"));
     assert_eq!(written.instance.as_deref(), Some(INSTANCE));
+    // What this process saw of the directory it made.
+    assert_eq!(
+        written.filesystem,
+        Some(plan::Recorded {
+            local: true,
+            kind: "apfs".into()
+        })
+    );
     assert_eq!(
         tree(&state)
             .into_iter()
@@ -274,8 +289,8 @@ fn a_new_state_starts_with_the_marker_and_holds_an_inheritable_shared_lock() {
     let error = refused(&state, false, local);
     assert!(error.contains("ephemeral.lock is held"), "{error}");
     // The directory is never adopted: a second creation fails.
-    assert!(create_state(&state, &marker()).is_err());
-    assert_eq!(read_marker(&state).0, plan::Marker::Ephemeral);
+    assert!(create_state(&state, &marker(), local, &nowhere).is_err());
+    assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
     drop(alive);
 }
 
@@ -291,7 +306,7 @@ fn a_new_start_never_writes_into_a_directory_that_already_exists() {
     let clearing = File::open(state.join(LOCK)).unwrap();
     clearing.try_lock().unwrap();
     // The directory exists, so creation fails before anything is written.
-    assert!(create_state(&state, &marker()).is_err());
+    assert!(create_state(&state, &marker(), local, &nowhere).is_err());
     assert!(!state.join(MARKER).exists());
 }
 
@@ -306,4 +321,285 @@ fn only_a_state_with_the_marker_is_marked() {
     // A marker that cannot be read still marks the state.
     std::os::unix::fs::symlink("nowhere", state.join(MARKER)).unwrap();
     assert!(marked(&state));
+}
+
+/// Spec 25.4 (d), proof 2: the worker that lives in a state and the start
+/// that clears it can see the same directory through different filesystems
+/// (a container's bind mount of a directory of its host). What the creator
+/// saw is in the marker, and it must be local too.
+#[test]
+fn a_state_its_creator_saw_on_a_shared_filesystem_is_kept_even_where_it_is_local_now() {
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    std::fs::remove_file(state.join(LOCK)).unwrap();
+    for seen in [
+        plan::Filesystem::Name("virtiofs".into()),
+        plan::Filesystem::Magic(0x6573_5546),
+        plan::Filesystem::Unknown,
+    ] {
+        let mut shared = marker();
+        shared.filesystem = Some(plan::recorded(&seen));
+        private(&state.join(MARKER), &serde_json::to_vec(&shared).unwrap());
+        let error = refused(&state, false, local);
+        assert!(
+            error.contains("the worker that created it did not see it on a local filesystem"),
+            "{error}"
+        );
+        // The real verdict of this directory, local as well, changes nothing.
+        refused(&state, false, filesystem_of);
+    }
+    // A marker that records nothing proves nothing.
+    let mut silent = marker();
+    silent.filesystem = None;
+    private(&state.join(MARKER), &serde_json::to_vec(&silent).unwrap());
+    let error = refused(&state, false, local);
+    assert!(error.contains("does not record the filesystem"), "{error}");
+    private(
+        &state.join(MARKER),
+        br#"{"schema":1,"kind":"ephemeral_worker"}"#,
+    );
+    let error = refused(&state, false, local);
+    assert!(error.contains("does not record the filesystem"), "{error}");
+}
+
+/// Creating a state on a filesystem that is not listed stays allowed; the
+/// marker says what was seen, and that alone keeps every later start from
+/// clearing it.
+#[test]
+fn a_state_created_on_a_shared_filesystem_records_it_and_is_never_cleared() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let shared = |_: &File| plan::Filesystem::Name("virtiofs".into());
+    let (_, alive) = create_state(&state, &marker(), shared, &nowhere).unwrap();
+    let written = read_marker(&File::open(&state).unwrap()).file.unwrap();
+    assert_eq!(
+        written.filesystem,
+        Some(plan::Recorded {
+            local: false,
+            kind: "virtiofs".into()
+        })
+    );
+    // Its owner is gone and both locks are free: still kept.
+    drop(alive);
+    let error = refused(&state, false, local);
+    assert!(
+        error.contains("did not see it on a local filesystem (it saw virtiofs"),
+        "{error}"
+    );
+}
+
+/// The marker exists only once its writer holds `ephemeral.lock`: a start
+/// that clears, at any moment of a creation, either finds no marker (and
+/// touches nothing) or finds the lock held.
+#[test]
+fn a_clearing_start_never_meets_a_marked_state_whose_owner_does_not_hold_the_lock() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let (_, alive) = create_state(&state, &marker(), local, &|step| {
+        seen.borrow_mut().push(step);
+        assert_eq!(marker_kind(&state), plan::Marker::Absent, "{step:?}");
+        assert_eq!(
+            state.join(LOCK).exists(),
+            step == Step::Locked,
+            "{step:?}: the lock comes before the marker"
+        );
+        let error = refused(&state, false, local);
+        assert!(error.contains("no ephemeral.json"), "{step:?}: {error}");
+    })
+    .unwrap();
+    assert_eq!(*seen.borrow(), [Step::Directory, Step::Locked]);
+    // Complete: the marker is there, and so is the hold on the lock.
+    assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
+    assert!(!state.join(MARKER_PART).exists());
+    let error = refused(&state, false, local);
+    assert!(error.contains("ephemeral.lock is held"), "{error}");
+    drop(alive);
+    reclaim(&state, false, local, &nowhere).unwrap();
+    assert!(!state.exists());
+}
+
+/// "There is a marker" counts only for the marker read again under the
+/// exclusive lock: the file that was examined, with the bytes it had.
+#[test]
+fn a_marker_that_changes_while_the_state_is_examined_is_not_a_proof() {
+    for same_bytes in [true, false] {
+        let fx = Fx::new();
+        let state = fx.left_behind();
+        let mut other = marker();
+        if !same_bytes {
+            other.instance = Some("another-start".into());
+        }
+        let error = reclaim(&state, false, local, &|step| {
+            if step == Step::Examined {
+                // Another file under the same name, as a start that came in
+                // between would have written it.
+                // (Made while the examined one still exists, so it is
+                // certainly not the same inode.)
+                private(&state.join("new"), &serde_json::to_vec(&other).unwrap());
+                std::fs::rename(state.join("new"), state.join(MARKER)).unwrap();
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("is kept"), "{error}");
+        assert!(
+            error.contains("ephemeral.json changed while it was examined"),
+            "{error}"
+        );
+        assert!(state.join("worker.db").exists());
+        assert!(state.join("attempts/a1/workspace/file").exists());
+        assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
+    }
+    // And one that is gone by then.
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    let error = reclaim(&state, false, local, &|step| {
+        if step == Step::Examined {
+            std::fs::remove_file(state.join(MARKER)).unwrap();
+        }
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("changed while it was examined"), "{error}");
+    assert!(state.join("worker.db").exists());
+}
+
+/// One start clears at a time: the directory itself is locked for it.
+#[test]
+fn a_state_another_start_is_clearing_is_left_to_it() {
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    std::fs::remove_file(state.join(LOCK)).unwrap();
+    let clearing = File::open(&state).unwrap();
+    clearing.try_lock().unwrap();
+    // Nothing is created either: no lock file of a second clearing.
+    let error = refused(&state, false, local);
+    assert!(
+        error.contains("another ephemeral start is clearing it"),
+        "{error}"
+    );
+    drop(clearing);
+    reclaim(&state, false, local, &nowhere).unwrap();
+    assert!(!state.exists());
+}
+
+/// What is removed is reached from the descriptor of the directory that was
+/// examined. A path that is something else by then costs that something
+/// nothing.
+#[test]
+fn a_state_swapped_for_a_link_after_the_proof_costs_nothing_outside_it() {
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    let victim = fx.root.path().join("victim");
+    std::fs::create_dir_all(victim.join("attempts/keep")).unwrap();
+    std::fs::write(victim.join("attempts/keep/file"), "precious").unwrap();
+    std::fs::write(victim.join("worker.db"), "precious").unwrap();
+    std::fs::write(victim.join(MARKER), "precious").unwrap();
+    let before = tree(&victim);
+    let aside = fx.root.path().join("aside");
+    let error = reclaim(&state, false, local, &|step| {
+        if step == Step::Proven {
+            std::fs::rename(&state, &aside).unwrap();
+            std::os::unix::fs::symlink(&victim, &state).unwrap();
+        }
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("replaced while it was cleared"), "{error}");
+    assert_eq!(tree(&victim), before);
+    assert!(state.is_symlink());
+    // The directory that was proven unused is the one that was emptied; its
+    // name was no longer the state's, so it stays.
+    assert_eq!(tree(&aside), []);
+}
+
+/// A link inside the state is removed as a link, whatever it points at.
+#[test]
+fn links_inside_a_state_are_removed_and_never_followed() {
+    let fx = Fx::new();
+    let state = fx.left_behind();
+    let victim = fx.root.path().join("victim");
+    std::fs::create_dir_all(victim.join("deep")).unwrap();
+    std::fs::write(victim.join("deep/file"), "precious").unwrap();
+    let before = tree(&victim);
+    std::os::unix::fs::symlink(&victim, state.join("attempts/a1/out")).unwrap();
+    std::os::unix::fs::symlink(victim.join("deep/file"), state.join("linked-file")).unwrap();
+    reclaim(&state, false, local, &nowhere).unwrap();
+    assert!(!state.exists());
+    assert_eq!(tree(&victim), before);
+}
+
+/// Only a kill leaves a state without its marker: a creation that fails
+/// takes back what it made.
+#[test]
+fn a_creation_that_fails_leaves_nothing_behind() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let result = create_state(&state, &marker(), local, &|step| {
+        if step == Step::Locked {
+            // The marker cannot be written: its place is taken.
+            private(&state.join(MARKER_PART), b"in the way");
+        }
+    });
+    assert!(result.is_err());
+    assert!(std::fs::symlink_metadata(&state).is_err());
+    assert_eq!(tree(fx.root.path()), []);
+}
+
+/// Spec 25.4 (d), proof 3: the worker service's journal or the `init`
+/// resident's, and only "not found" means that neither is there.
+#[test]
+fn only_journals_that_are_clearly_absent_mean_that_no_persistent_worker_is_installed() {
+    let fx = Fx::new();
+    let config = fx.root.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    let journals = [config.join("worker-service.json"), config.join("init.json")];
+    assert!(!resident_installed(&journals).unwrap());
+    for journal in &journals {
+        std::fs::write(journal, "{}").unwrap();
+        assert!(resident_installed(&journals).unwrap(), "{journal:?}");
+        std::fs::remove_file(journal).unwrap();
+        // Whatever sits at the name counts, readable or not.
+        std::os::unix::fs::symlink("nowhere", journal).unwrap();
+        assert!(resident_installed(&journals).unwrap(), "{journal:?}");
+        std::fs::remove_file(journal).unwrap();
+    }
+    // ENOTDIR: the configuration directory is not a directory.
+    let file = fx.root.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    for at in [0, 1] {
+        let mut odd = journals.clone();
+        odd[at] = file.join("journal.json");
+        let error = resident_installed(&odd).unwrap_err().to_string();
+        assert!(error.contains("cannot be examined"), "{error}");
+        assert!(error.contains("journal.json"), "{error}");
+        assert!(
+            error.contains("cannot tell whether a persistent worker is installed"),
+            "{error}"
+        );
+    }
+    // EACCES: the directory cannot be searched.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = std::fs::symlink_metadata(&journals[0])
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    let result = resident_installed(&journals);
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A user that file modes do not stop sees a plain "not found" instead.
+    if denied {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("cannot be examined"), "{error}");
+        assert!(error.contains("worker-service.json"), "{error}");
+    }
+}
+
+#[test]
+fn the_refusal_of_a_marked_state_names_it_and_the_way_out() {
+    let fx = Fx::new();
+    refuse_marked(&fx.state()).unwrap();
+    let state = fx.left_behind();
+    let error = refuse_marked(&state).unwrap_err().to_string();
+    assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+    assert!(error.contains("belt worker --ephemeral"), "{error}");
+    assert!(error.contains(&state.display().to_string()), "{error}");
 }

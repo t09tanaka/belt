@@ -373,6 +373,68 @@ fn start_boots_a_stopped_service_and_drops_a_stale_cancel_request() {
     assert_eq!(h.launchctl_calls().len(), 3);
 }
 
+/// Every entry below `dir` with its content, so "nothing changed" also
+/// means "nothing was created".
+fn everything(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                found.push((entry.path(), Vec::new()));
+                pending.push(entry.path());
+            } else {
+                found.push((entry.path(), fs::read(entry.path()).unwrap_or_default()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Spec 25.4 (d): a persistent worker never takes over an ephemeral
+/// worker's state. `install` and `start` say so themselves, before their
+/// first write, not only the service once it runs.
+#[test]
+fn install_and_start_refuse_an_ephemeral_workers_state_before_writing_anything() {
+    let mark = |h: &Host| {
+        let state = h.paths().state;
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(state.join("ephemeral.json"), "{}").unwrap();
+    };
+    let h = Host::new();
+    mark(&h);
+    let before = everything(&h.root);
+    let error = h.install().unwrap_err().to_string();
+    assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+    assert!(error.contains("belt worker --ephemeral"), "{error}");
+    assert_eq!(everything(&h.root), before);
+    assert!(h.launchctl_calls().is_empty());
+
+    // An installed, stopped service whose state an ephemeral worker has
+    // taken since: `start` leaves the control file and the service alone.
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    control::write(&h.paths().state, Control::cancelling()).unwrap();
+    mark(&h);
+    let before = everything(&h.root);
+    let calls = h.launchctl_calls();
+    let error = start(&h.env, h.fake.clone(), Duration::from_secs(2))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("belongs to an ephemeral worker"), "{error}");
+    assert_eq!(everything(&h.root), before);
+    assert_eq!(h.launchctl_calls(), calls);
+    assert_eq!(
+        control::read(&h.paths().state).unwrap(),
+        Control::cancelling()
+    );
+}
+
 #[test]
 fn a_changed_service_file_blocks_start() {
     let h = Host::new();
@@ -964,6 +1026,19 @@ fn the_journal_is_where_every_service_manager_keeps_it() {
             .journal,
         want
     );
+    // The `init` resident keeps its journal beside it.
+    assert_eq!(
+        Paths::resident_journals(&x).unwrap(),
+        [want, PathBuf::from("/x/belt/init.json")]
+    );
+    assert_eq!(
+        Paths::resident_journals(&e).unwrap(),
+        [
+            PathBuf::from("/h/.config/belt/worker-service.json"),
+            PathBuf::from("/h/.config/belt/init.json")
+        ]
+    );
+    assert!(Paths::resident_journals(&env(&[])).is_err());
     // An unusable home is an error, not "no journal".
     assert!(Paths::journal_path(&env(&[])).is_err());
     assert!(Paths::journal_path(&env(&[("HOME", "relative")])).is_err());

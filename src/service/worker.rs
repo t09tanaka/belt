@@ -390,12 +390,9 @@ async fn run(
 ) -> anyhow::Result<()> {
     let ephemeral = boot_id.is_some();
     // Before anything is created or locked in it.
-    anyhow::ensure!(
-        ephemeral || !ephemeral::marked(&spec.state_dir),
-        "worker state {} belongs to an ephemeral worker (it has ephemeral.json); a persistent worker never takes it over. \
-         Start `belt worker --ephemeral` once to clear it, or remove the directory",
-        spec.state_dir.display()
-    );
+    if !ephemeral {
+        ephemeral::refuse_marked(&spec.state_dir)?;
+    }
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.

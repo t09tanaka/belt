@@ -20,7 +20,8 @@ pub struct Host<'a> {
     pub os_boot: &'a str,
     /// Fresh per start; never reused.
     pub instance: &'a str,
-    /// A persistent worker's service journal exists on this host.
+    /// A persistent worker's journal exists on this host: the worker
+    /// service's, or the combined `init` resident's.
     pub resident_journal: bool,
 }
 
@@ -130,12 +131,42 @@ pub fn local_filesystem(filesystem: &Filesystem) -> bool {
     }
 }
 
+/// What the worker that created a state saw of the filesystem under it,
+/// as it wrote it into `ephemeral.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recorded {
+    /// The writer's own `local_filesystem` verdict.
+    pub local: bool,
+    /// The kind it saw, for the person reading a refusal.
+    pub kind: String,
+}
+
+/// The record a worker creating a state on `filesystem` writes.
+pub fn recorded(filesystem: &Filesystem) -> Recorded {
+    Recorded {
+        local: local_filesystem(filesystem),
+        kind: match filesystem {
+            Filesystem::Magic(magic) => format!("{magic:#x}"),
+            Filesystem::Name(name) => name.clone(),
+            Filesystem::Unknown => "unknown".into(),
+        },
+    }
+}
+
 /// Proofs 1 to 3 that a state left behind may be cleared by the next
 /// ephemeral start: what can be read without writing anything. `Err` names
 /// the condition that failed; then nothing is opened for writing, nothing is
 /// locked and nothing is removed.
+///
+/// Proof 2 has two halves. The same directory can be a local filesystem to
+/// the start that clears it and a shared one to the worker that lives in it
+/// (a container's bind mount of a directory of its host; an NFS server and
+/// its client), and a lock taken on one side need not reach the other. So
+/// both the creator's recorded verdict and the one seen now must be local; a
+/// marker that records none proves nothing.
 pub fn examined(
     marker: &Marker,
+    recorded: Option<&Recorded>,
     filesystem: &Filesystem,
     resident_journal: bool,
 ) -> Result<(), String> {
@@ -151,6 +182,20 @@ pub fn examined(
         }
         Marker::OtherKind => {
             return Err("its ephemeral.json is not of the ephemeral worker kind".into())
+        }
+    }
+    match recorded {
+        Some(recorded) if recorded.local => {}
+        Some(recorded) => {
+            return Err(format!(
+                "the worker that created it did not see it on a local filesystem (it saw {}; a lock taken here does not show that no process on that side uses it)",
+                recorded.kind
+            ))
+        }
+        None => {
+            return Err(
+                "its ephemeral.json does not record the filesystem its creator saw it on".into(),
+            )
         }
     }
     if !local_filesystem(filesystem) {
