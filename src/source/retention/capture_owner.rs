@@ -175,11 +175,26 @@ impl SourceStore {
             .context("this process cannot be recorded as the owner of a capture")?;
         self.own_capture_as(run, &owner)
     }
+    /// A command that captures the same run again (the capture of a run is
+    /// made once and reused) keeps its row. A run that another process owns,
+    /// or that its owner gave up, is not taken over.
     pub(crate) fn own_capture_as(&self, run: &RunId, owner: &OwnerRecord) -> Result<()> {
-        self.retention.connect_for_import()?.execute(
-            "INSERT INTO capture_owner(run_id,state,root,place,pid,start) VALUES(?1,'capturing',NULL,?2,?3,?4)",
+        let mut c = self.retention.connect_for_import()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO capture_owner(run_id,state,root,place,pid,start) VALUES(?1,'capturing',NULL,?2,?3,?4)",
             params![run.as_str(), owner.place, i64::from(owner.pid), owner.start],
         )?;
+        let mine: bool = tx.query_row(
+            "SELECT state='capturing' AND place=?2 AND pid=?3 AND start=?4 FROM capture_owner WHERE run_id=?1",
+            params![run.as_str(), owner.place, i64::from(owner.pid), owner.start],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            mine,
+            "the capture of this run has another owner, or was given up"
+        );
+        tx.commit()?;
         Ok(())
     }
     /// The owner will not submit this capture (its capture failed, its

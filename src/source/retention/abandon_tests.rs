@@ -388,7 +388,20 @@ fn the_owner_row_exists_before_anything_of_the_capture_and_names_the_pending_roo
         parts.sources.capture_owner(&run).unwrap().unwrap().root,
         Some(pending)
     );
-    // One owner per run: a second command cannot take a capture over.
+    // The same command may capture its run again; nobody else takes the
+    // capture over, and a capture that was given up is not claimed again.
+    parts.sources.own_capture_as(&run, &me()).unwrap();
+    assert!(parts.sources.own_capture_as(&run, &gone()).is_err());
+    assert_eq!(
+        parts
+            .sources
+            .capture_owner(&run)
+            .unwrap()
+            .unwrap()
+            .verdict(),
+        CaptureVerdict::InProgress
+    );
+    parts.sources.give_up_capture(&run).unwrap();
     assert!(parts.sources.own_capture_as(&run, &me()).is_err());
 }
 

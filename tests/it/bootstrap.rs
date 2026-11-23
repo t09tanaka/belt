@@ -1540,14 +1540,28 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
     )
     .await
     .unwrap();
+    // An interrupt before the command owns a capture (spec 25.4 (b)):
+    // nothing exists, so no cancel is sent and nothing is recorded.
+    assert_eq!(report.state, "not_submitted");
+    assert_eq!(report.cli_exit_code, 130);
+    assert!(!report.cancel_acknowledged && report.snapshot.is_none());
+    // An interrupt while the capture is in progress: the owner row is
+    // there, the cancel is accepted and durable, and the enqueue that
+    // arrives late is a run that never starts.
+    let run = belt::ids::RunId::generate();
+    let task = belt::ids::TaskId::generate();
+    open_sources(&spec.state_dir).own_capture(&run).unwrap();
+    let report = control::cancel_and_stop(
+        &spec,
+        Target::Run(run.clone()),
+        &mut signals,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(report.state, "stop_confirmed");
     assert_eq!(report.cli_exit_code, 130);
     assert!(report.cancel_acknowledged);
     assert!(!report.snapshot.as_ref().unwrap().accepted);
-    let Target::Run(run) = report.target else {
-        panic!("exec must bind a run")
-    };
-    let task = report.task_id.unwrap();
     belt::service::submit::command_with_ids(
         context.clone(),
         vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
@@ -1603,10 +1617,14 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
         .output()
         .await
         .unwrap();
-    assert!(receipt.status.success());
-    let value: serde_json::Value = serde_json::from_slice(&receipt.stdout).unwrap();
-    assert_eq!(value["result"]["cancel_acknowledged"], true);
-    assert_eq!(value["result"]["snapshot"]["accepted"], false);
+    // A run ID that nobody is capturing is not found, like a task ID that
+    // does not exist (spec 25.4 (b)): nothing is recorded for it.
+    assert_eq!(
+        receipt.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&receipt.stdout)
+    );
     shutdown(&load(&spec)).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
