@@ -31,6 +31,7 @@ mod retry_dependents_tests;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod toolchain_roots;
 mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
@@ -48,6 +49,7 @@ pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPag
 pub use coordinator::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use db::Db;
 pub use lock::ProcessLock;
+pub use toolchain_roots::{Bind, RootRow, RootsStatus};
 pub(crate) use worker::MembershipImage;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,

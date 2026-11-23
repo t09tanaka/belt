@@ -402,6 +402,8 @@ async fn run(
     let socket = spec.state_dir.join("agent.sock");
     // Spec 25.4 (a): under `agent.lock`, what a killed process left beside the state files.
     crate::platform::owned_temp::sweep_files(&spec.state_dir);
+    // Spec 25.7 (a): the versions a commit could not remove.
+    super::old_binaries::sweep_at_start(&spec.env);
     // Enrollment is checked before any recorded old listener can be removed.
     bind(&spec)?;
     reconcile_socket(

@@ -69,7 +69,10 @@ impl Undo {
             paths.services.clone(),
             binary_dir.clone(),
         ];
-        for path in [binary, binary_dir, paths.config.join("init.lock")] {
+        // `init.lock` is not one of them: a pass over old versions may have
+        // made it, and a lock file unlinked while another process holds it
+        // leaves two inodes (belt is unreleased: no older binary locks it).
+        for path in [binary, binary_dir] {
             if !path.try_exists()? {
                 roots.push(path);
             }
@@ -374,5 +377,22 @@ mod tests {
             assert_eq!(fs::read_link(&link).ok(), old.map(PathBuf::from));
             assert!(fs::symlink_metadata(stage).is_err());
         }
+    }
+
+    /// A pass over old versions may have made `init.lock` (and a first `init`
+    /// makes it): unlinking it on rollback would leave two inodes for a
+    /// holder and a waiter.
+    #[test]
+    fn rollback_keeps_an_init_lock_that_was_not_there_when_it_began() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let env = BTreeMap::from([("HOME".into(), dir.path().to_str().unwrap().into())]);
+        let paths = Paths::resolve(&env).unwrap();
+        private_dir(&paths.config).unwrap();
+        private_dir(&paths.config.join("bin")).unwrap();
+        let undo = Undo::prepare(&paths, "new-digest").unwrap();
+        let lock = paths.config.join("init.lock");
+        fs::write(&lock, b"").unwrap();
+        undo.restore(&paths).unwrap();
+        assert!(lock.is_file());
     }
 }

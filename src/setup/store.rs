@@ -148,12 +148,22 @@ impl TemplateStore {
         })
     }
 
-    fn name_of(&self, key: &str) -> String {
+    pub(crate) fn name_of(&self, key: &str) -> String {
         // `sha256:<hex>`; the key is made by the worker, but is still not
         // trusted to be one path component.
         key.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_for_test(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether the template of this name is in the store.
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        self.root.join(name).join("receipt.json").is_file()
     }
 
     fn used_path(&self, name: &str) -> PathBuf {

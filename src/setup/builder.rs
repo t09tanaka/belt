@@ -247,6 +247,12 @@ struct Flight {
     /// The last reference went: no new consumer joins, and the builder is
     /// cancelled.
     stop: bool,
+    /// The identity of the root a tool install made, once it has (the
+    /// consumers waiting here are bound to it, spec 25.7 (b)).
+    root: Option<String>,
+    /// The builder's references are let go: no new consumer joins (one that
+    /// came later is bound by its own next poll).
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -315,6 +321,21 @@ pub struct Setups {
     leftover: Mutex<BTreeSet<AttemptId>>,
     /// Where the builders found unsettled at the start are.
     leftover_dirs: Mutex<HashMap<AttemptId, PathBuf>>,
+    /// The worker DB, for the references to the toolchain roots (25.7 (b)).
+    /// Opened at the first use, not at `open`: a legacy start opens the
+    /// host before it holds the enrollment gate, and must create nothing.
+    /// A failed open is not kept: the next use opens again.
+    roots: std::sync::OnceLock<WorkerStore>,
+    /// Held while the worker DB is opened, so the start of the roots (which
+    /// lets go of the warm-ups of an earlier start) runs once.
+    roots_opening: Mutex<()>,
+    /// When the agent's tick last ran a pass over the roots.
+    last_roots_pass: AtomicU64,
+    /// A pass over the roots is running.
+    roots_passing: std::sync::atomic::AtomicBool,
+    /// Since when (monotonic ms) the worker DB could not be opened, for a
+    /// tool preparation that waits for it.
+    roots_unopened_since: Mutex<Option<u64>>,
 }
 
 impl Setups {
@@ -339,6 +360,11 @@ impl Setups {
             started: AtomicU64::new(0),
             leftover: Mutex::new(BTreeSet::new()),
             leftover_dirs: Mutex::new(HashMap::new()),
+            roots: std::sync::OnceLock::new(),
+            roots_opening: Mutex::new(()),
+            last_roots_pass: AtomicU64::new(0),
+            roots_passing: std::sync::atomic::AtomicBool::new(false),
+            roots_unopened_since: Mutex::new(None),
         };
         s.recover();
         // What a clear renamed aside and did not get to remove. An installer
@@ -543,11 +569,32 @@ impl Setups {
         }
         let root = self.private_tool_root()?;
         let plan = request.plan(&root).map_err(invalid)?;
+        // Spec 25.7 (b): without the worker DB no root is bound or installed
+        // into; the next poll asks again.
+        if self.db().is_none() {
+            return Ok(match self.database_wait(platform::monotonic_ms()) {
+                Some(why) => ToolPreparationPoll::Failed(PreparationFailure(why)),
+                None => ToolPreparationPoll::Pending,
+            });
+        }
+        *lock(&self.roots_unopened_since) = None;
         self.poll_tool_checked(attempt, request, &plan, |receipt| match receipt {
-            Some(receipt) => match receipt.validate(&plan) {
-                Ok(()) => ToolPreparationPoll::Installed(receipt),
-                Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
+            // Spec 25.7 (b): the root is bound before it is used. Without
+            // the worker DB nothing is used; the next poll asks again.
+            Some(receipt) => match self.bind_root(attempt, plan.root()) {
+                roots::RootBind::Bound => match receipt.validate(&plan) {
+                    Ok(()) => ToolPreparationPoll::Installed(receipt),
+                    Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
+                },
+                roots::RootBind::NoDatabase => ToolPreparationPoll::Pending,
+                roots::RootBind::Absent => ToolPreparationPoll::Failed(PreparationFailure(
+                    "the installed toolchain root was removed; ask again".into(),
+                )),
             },
+            // No live row (none yet, or being removed): installed again.
+            None if self.bind_root(attempt, plan.root()) != roots::RootBind::Bound => {
+                ToolPreparationPoll::Pending
+            }
             None => match adapters::detect(&plan) {
                 Availability::Installed(receipt) => ToolPreparationPoll::Installed(receipt),
                 // An installer failed or was stopped in this root and none
@@ -695,6 +742,8 @@ impl Setups {
                 refs: BTreeSet::from([consumer.clone()]),
                 end: None,
                 stop: false,
+                root: None,
+                closed: false,
                 kind: BuilderKind::ToolInstall,
             },
         );
@@ -717,7 +766,7 @@ impl Setups {
             return false;
         };
         let f = inner.flights.get_mut(&id).expect("listed builder exists");
-        if !f.stop {
+        if !f.stop && !f.closed {
             policy::join(&mut f.refs, consumer);
             inner
                 .consumers
@@ -774,6 +823,9 @@ impl Setups {
             if self.wanted(id).0 == 0 {
                 return Err("tool preparation cancelled".into());
             }
+            // Spec 25.7 (b): referenced before the helper can write in it.
+            let root = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
+            self.hold_root_for_install(id, root.root())?;
             let exe = std::fs::canonicalize(&self.cfg.supervisor_exe).map_err(|e| e.to_string())?;
             let node = preparation::helper_node(&exe, &dir, request)?;
             self.write_nodes(&dir, attempt, vec![node], Vec::new())?;
@@ -790,7 +842,13 @@ impl Setups {
             // is not there) is not what the helper said: not remembered.
             let plan = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
             match adapters::detect(&plan) {
-                Availability::Installed(receipt) => Ok(*receipt),
+                Availability::Installed(receipt) => {
+                    self.root_installed(plan.root());
+                    // The waiting consumers hold the root before the
+                    // builder's reference goes (below).
+                    self.hand_off_root(id, plan.root());
+                    Ok(*receipt)
+                }
                 Availability::Unknown(e) | Availability::ManualRequired(e) => Err(e.into()),
                 Availability::Missing => Err("installer ended without receipt".into()),
             }
@@ -817,8 +875,8 @@ impl Setups {
             }
             Err(_) => {}
         }
-        if !lock(&self.leftover).contains(attempt) {
-            let _ = remove_tree(&dir);
+        if !lock(&self.leftover).contains(attempt) && remove_tree(&dir).is_ok() {
+            self.release_tool_roots(id);
         }
         result
     }
@@ -944,6 +1002,8 @@ impl Setups {
                                 end: None,
                                 kind: BuilderKind::WorkspaceSetup,
                                 stop: false,
+                                root: None,
+                                closed: false,
                             },
                         );
                         inner.by_key.insert(key.clone(), id.clone());
@@ -1035,6 +1095,11 @@ impl Setups {
                 }
             }
         }
+        drop(inner);
+        // A warm-up's references to roots go with it (an attempt's go when
+        // it is terminal), after it left `consumers`: a hand-off under
+        // `inner` either saw it gone or is undone here.
+        self.release_warmup_roots(attempt);
     }
 
     fn drop_ref(inner: &mut Inner, id: &BuilderId, consumer: &str) {
@@ -1340,8 +1405,8 @@ impl Setups {
         }
         // unless its processes could not be confirmed stopped: then the
         // next start's recovery needs what it recorded
-        if !lock(&self.leftover).contains(attempt) {
-            let _ = remove_tree(&dir);
+        if !lock(&self.leftover).contains(attempt) && remove_tree(&dir).is_ok() {
+            self.release_builder_roots(id);
         }
         end
     }
@@ -1363,6 +1428,19 @@ impl Setups {
             |what: &str, e: &dyn std::fmt::Display| BuildEnd::Crashed(format!("{what}: {e}"));
         if let Err(e) = private_dir(dir) {
             return crashed("builder directory", &e);
+        }
+        // Spec 25.7 (b): the roots its steps run from, while its directory is
+        // there (after it is made: a pass drops the references of a builder
+        // without one). Each must be `live`, or the steps would run from a
+        // root being removed.
+        let roots = binding
+            .map(|b| roots::roots_of(b, &self.toolchains()))
+            .unwrap_or_default();
+        if !self.add_root_refs(roots, "builder", id.as_str()) {
+            return BuildEnd::Crashed(
+                "a toolchain root of the setup is being removed or cannot be referenced; ask again"
+                    .into(),
+            );
         }
         let meta = Meta {
             kind: BuilderKind::WorkspaceSetup,
@@ -1421,6 +1499,20 @@ impl Setups {
             .publish(key, &receipt, &ws.root, run.as_deref(), now)
         {
             Ok(template) => {
+                // Spec 25.7 (b): a template made on roots references them (the
+                // builder's references hold them live until here). A template
+                // that cannot reference them is not kept.
+                let roots = binding
+                    .map(|b| roots::roots_of(b, &self.toolchains()))
+                    .unwrap_or_default();
+                if !self.add_root_refs(roots, "template", &self.store.name_of(key)) {
+                    if template.receipt.builder_id == *id {
+                        let digest = template.receipt.digest.clone();
+                        drop(template);
+                        self.store.discard(key, &digest);
+                    }
+                    return crashed("the template", &"its toolchain roots cannot be referenced");
+                }
                 // Publication can legitimately retain an older pinned template.
                 // Its success is not proof of this builder's completed artifact.
                 if template.receipt.builder_id == *id
@@ -2139,6 +2231,8 @@ mod tool_validation_tests {
                 refs: BTreeSet::from([consumer_key]),
                 end: None,
                 stop: false,
+                root: None,
+                closed: false,
                 kind,
             },
         );
@@ -2178,6 +2272,8 @@ mod tool_validation_tests {
                         refs: BTreeSet::from([consumer_key]),
                         end: Some(BuilderResult::Tool(Ok(Box::new(receipt)))),
                         stop: false,
+                        root: None,
+                        closed: false,
                         kind: BuilderKind::ToolInstall,
                     },
                 );
@@ -2569,3 +2665,5 @@ mod tool_validation_tests {
 }
 
 mod probe;
+mod roots;
+pub(crate) use roots::doctor_notices as toolchain_doctor_notices;
