@@ -19,8 +19,8 @@ Each feature also exists as a standalone tool. belt links all four, so you do no
 |---|---|
 | Local CI | [local-ci](https://github.com/t09tanaka/local-ci) |
 | Resource admission | [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) |
-| Fast worktrees | fast-worktree |
-| Per-worktree ports | portool |
+| Fast worktrees | [fast-worktree](https://github.com/t09tanaka/fast-worktree) |
+| Per-worktree ports | [portool](https://github.com/t09tanaka/portool) |
 
 Workspace hooks and commands can call `fast-worktree` and `portool` directly. `belt workers diff` shows the version of each linked tool. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
 
