@@ -569,7 +569,7 @@ fn a_capture_killed_while_registering_loses_what_its_root_names_and_only_that() 
             &pending,
             "pending",
             &got.manifest.ci_source_id,
-            1,
+            crate::source::retention::Step::pages(1),
             &mut None,
             u64::MAX
         )
@@ -616,7 +616,7 @@ fn an_abandoned_root_that_stays_holds_no_other_page() {
             &pending,
             "pending",
             &got.manifest.ci_source_id,
-            1,
+            crate::source::retention::Step::pages(1),
             &mut None,
             u64::MAX
         )
@@ -1328,8 +1328,11 @@ fn a_file_only_another_reservation_holds_is_kept() {
         .unwrap();
     let other = "capture:01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let c = parts.sources.retention.connect().unwrap();
-    c.execute("INSERT INTO root VALUES(?1,'abandoned',NULL)", [other])
-        .unwrap();
+    c.execute(
+        "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',NULL)",
+        [other],
+    )
+    .unwrap();
     c.execute("INSERT INTO member VALUES(?1,?2)", [other, key.as_str()])
         .unwrap();
     let report = parts.passes();

@@ -1698,10 +1698,12 @@ impl Incoming {
             let info = &st.manifests[&id];
             let name = staged_name(SourceBlobKind::Manifest, &info.hex, info.size, true);
             let m = read_manifest(&dir.join(name), limits)?;
-            let Err(e) =
-                self.store
-                    .publish_received_one(&m, carried.contains(&id), objects.as_ref())
-            else {
+            let Err(e) = self.store.publish_received_one(
+                &m,
+                carried.contains(&id),
+                id == root_id,
+                objects.as_ref(),
+            ) else {
                 continue;
             };
             if !input_fault(&e) {
@@ -1962,6 +1964,11 @@ impl BlobSink for Incoming {
         // What a dropped or finished source's token still holds (spec 25.8,
         // 3): a pass that waits for no lock.
         let _ = self.store.release_abandoned_imports();
+        // The stage 5b fills of the rows made before it, and the claim rows
+        // an older version kept, a bounded page each per tick (spec 25.8 5b
+        // (c), (e), (h)3, (h)5): rows left from before need no restart.
+        let _ = self.store.fill_retention_pages();
+        let _ = self.store.forget_completed_claims();
     }
 
     fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {

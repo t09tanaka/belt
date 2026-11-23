@@ -524,6 +524,16 @@ CREATE INDEX worker_attempt_waiting ON worker_attempt(terminal_uptime_ms)
     WHERE state = 'terminal' AND acked_at_ms IS NULL;
 ";
 
+/// Stage 5b (spec 25.8 5b (a), 25.13): the source an attempt names, as its
+/// payload spells it (`src_<ulid>`), so that the deletion pass finds the live
+/// attempts of a source with one index lookup. Only the live rows are filled
+/// from `spec_json`; a terminal row never protects a source.
+const WORKER_V6: &str = "
+ALTER TABLE worker_attempt ADD COLUMN source_id TEXT;
+UPDATE worker_attempt SET source_id = json_extract(spec_json, '$.source_id') WHERE state <> 'terminal';
+CREATE INDEX worker_attempt_source ON worker_attempt(source_id) WHERE state <> 'terminal';
+";
+
 /// What must hold before step `to` of a `kind` database runs, checked in the
 /// step's own transaction. Worker step 4 drops every attempt row, so it is
 /// refused while one is live, and while one has ended with a result nobody
@@ -785,7 +795,7 @@ CREATE INDEX ci_test_timing_written ON ci_test_timing(written_at_ms);"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
-        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_TOOLCHAIN_ROOTS.to_string(), WORKER_V5.to_string()],
+        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_TOOLCHAIN_ROOTS.to_string(), WORKER_V5.to_string(), WORKER_V6.to_string()],
     }
 }
 

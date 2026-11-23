@@ -5,7 +5,9 @@ mod deletion;
 mod foreground;
 mod import_owner;
 pub(crate) use capture_owner::stop_point;
-pub use capture_owner::{inspect_corrupt_held, inspect_owners, CaptureOwner, CaptureVerdict};
+pub use capture_owner::{
+    inspect_corrupt_held, inspect_owners, inspect_retry_failing, CaptureOwner, CaptureVerdict,
+};
 #[cfg(test)]
 pub use deletion::set_prune_fault;
 pub(in crate::source) use deletion::Reserved;
@@ -55,6 +57,8 @@ pub(crate) struct Index {
     /// their pending root is named by that row or is not created. One entry
     /// for each capture a command owns.
     owned: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// When this process last started a recount of `store_bytes`.
+    recounted: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     #[cfg(test)]
     reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -136,6 +140,7 @@ impl Index {
                     .into(),
             ),
             owned: Default::default(),
+            recounted: Default::default(),
             #[cfg(test)]
             reads: Default::default(),
             #[cfg(test)]
@@ -162,7 +167,8 @@ impl Index {
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
             self.ensure_capture_owner_table(&mut db)?;
-            return self.ensure_import_session_index(&db);
+            self.ensure_import_session_index(&db)?;
+            return Self::ensure_size_accounting(&mut db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
@@ -192,7 +198,612 @@ impl Index {
         tx.execute_batch(capture_owner::TABLE)?;
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
+        Self::ensure_size_accounting(&mut db)
+    }
+    /// Stage 5b (spec 25.13): the table `object_bytes` with the total
+    /// `store_bytes`, `root.used_ms` and its index, the index `graph(source,
+    /// root)` and the tables `clone_ref` and `legacy_queue`. Additive tables
+    /// only, so the version stays 1 and an older binary still opens and
+    /// writes the index: no column is added to a table an older binary
+    /// inserts into positionally (`object` is one; `root` is always written
+    /// with its columns named). Everything is created idempotently on every
+    /// open; the write lock is taken only when something is missing. The
+    /// rows that were there before are filled by the worker's passes:
+    /// `bytes_fill` and `clone_ref_fill` hold their cursors (`done` at the
+    /// end).
+    fn ensure_size_accounting(db: &mut Connection) -> Result<()> {
+        const CHECK: &str = "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')
+            AND EXISTS(SELECT 1 FROM pragma_table_info('root') WHERE name='used_ms')
+            AND (SELECT count(*) FROM sqlite_master WHERE name IN ('object_bytes','clone_ref','legacy_queue','legacy_retry','clone_ref_retry','bytes_retry','root_used','graph_source','clone_ref_root'))=9
+            AND (SELECT count(*) FROM meta WHERE key IN ('store_bytes','bytes_fill','clone_ref_fill'))=3";
+        let ready: bool = db.query_row(CHECK, [], |r| r.get(0))?;
+        if ready {
+            return Ok(());
+        }
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let used: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('root') WHERE name='used_ms')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !used {
+            tx.execute_batch("ALTER TABLE root ADD COLUMN used_ms INTEGER;")?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS object_bytes(id TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS root_used ON root(kind,used_ms);
+             CREATE INDEX IF NOT EXISTS graph_source ON graph(source,root);
+             CREATE TABLE IF NOT EXISTS clone_ref(clone TEXT NOT NULL,source TEXT NOT NULL,root TEXT NOT NULL,PRIMARY KEY(clone,source,root));
+             CREATE INDEX IF NOT EXISTS clone_ref_root ON clone_ref(root);
+             CREATE TABLE IF NOT EXISTS legacy_queue(name TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS legacy_retry(name TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS clone_ref_retry(root TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS bytes_retry(id TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_ms INTEGER NOT NULL);
+             INSERT OR IGNORE INTO meta VALUES('store_bytes','0');
+             INSERT OR IGNORE INTO meta VALUES('bytes_fill','');
+             INSERT OR IGNORE INTO meta VALUES('clone_ref_fill','');",
+        )?;
+        // An index an earlier build of this change made has the column
+        // `object.bytes`, which an older binary's positional insert into
+        // `object` cannot fill: its counted sizes move to `object_bytes` and
+        // the column goes.
+        let column: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if column {
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO object_bytes SELECT id,bytes FROM object WHERE bytes IS NOT NULL;
+                 ALTER TABLE object DROP COLUMN bytes;",
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+    /// Record that `object`'s file is placed with `bytes` bytes: only the
+    /// change from no `object_bytes` row to one adds to `store_bytes` (spec
+    /// 25.8 5b (c)). Call inside the caller's transaction.
+    pub(super) fn record_bytes(c: &Connection, object: &str, bytes: u64) -> Result<()> {
+        let changed = c.execute(
+            "INSERT OR IGNORE INTO object_bytes(id,bytes) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM object WHERE id=?1)",
+            params![object, i64::try_from(bytes)?],
+        )?;
+        if changed == 1 {
+            Self::add_store_bytes(c, object, i64::try_from(bytes)?)?;
+        }
+        Ok(())
+    }
+    /// Add `delta` to `store_bytes` while it holds a non-negative integer
+    /// (anything else is invalid and waits for the recount), and to the
+    /// running sum of a recount that has already passed `object`.
+    fn add_store_bytes(c: &Connection, object: &str, delta: i64) -> Result<()> {
+        c.execute(
+            "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+?1 AS TEXT) WHERE key='store_bytes' AND value<>'' AND value NOT GLOB '*[^0-9]*'",
+            [delta],
+        )?;
+        c.execute(
+            "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+?1 AS TEXT) WHERE key='bytes_recount_sum' AND EXISTS(SELECT 1 FROM meta WHERE key='bytes_recount' AND ?2<=value)",
+            params![delta, object],
+        )?;
+        Ok(())
+    }
+    /// Delete `object`'s row when `condition` (SQL over `?1`) holds, with
+    /// its `object_bytes` row, taking its counted bytes off `store_bytes` in
+    /// the same transaction.
+    pub(super) fn forget_object(c: &Connection, object: &str, condition: &str) -> Result<()> {
+        let gone: Option<String> = c
+            .query_row(
+                &format!("DELETE FROM object WHERE id=?1 AND {condition} RETURNING id"),
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if gone.is_none() {
+            return Ok(());
+        }
+        let bytes: Option<i64> = c
+            .query_row(
+                "DELETE FROM object_bytes WHERE id=?1 RETURNING bytes",
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = bytes {
+            Self::add_store_bytes(c, object, -bytes)?;
+        }
+        Ok(())
+    }
+    /// The size of `path` (relative to the store) when it is a regular file
+    /// there, from a stat; `None` when there is no file (or no regular one)
+    /// at that name. Any other failure (`EACCES`, `EIO`…) is an error: it
+    /// says nothing about the file, and the caller tries again later.
+    fn stat_bytes(&self, path: &str) -> Result<Option<u64>> {
+        match rustix::fs::statat(&*self.root, path, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => Ok((rustix::fs::FileType::from_raw_mode(st.st_mode)
+                == rustix::fs::FileType::RegularFile)
+                .then_some(st.st_size as u64)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => Ok(None),
+            Err(error) => Err(anyhow::Error::from(error).context(format!("stat {path}"))),
+        }
+    }
+    fn record_stat(&self, c: &Connection, object: &str, path: &str) -> Result<()> {
+        if let Some(bytes) = self.stat_bytes(path)? {
+            Self::record_bytes(c, object, bytes)?;
+        }
+        Ok(())
+    }
+    /// The import placed `object`'s file with `bytes` bytes: the size row
+    /// and the total are written in one transaction.
+    pub(crate) fn placed(&self, object: &str, bytes: u64) -> Result<()> {
+        let mut c = self.connect_for_import()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::record_bytes(&tx, object, bytes)?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// One page of the fill of the rows with no size (spec 25.8 5b (c),
+    /// 25.13): up to `limit` object rows, first those of `bytes_retry` that
+    /// are due and then those in id order from the cursor `meta.bytes_fill`,
+    /// are stat-ed and counted when not counted yet; a row with no file
+    /// stays uncounted and is counted when its file is placed. A stat that
+    /// fails for another reason (`EACCES`…) gets a row in `bytes_retry`
+    /// (tried again after the delay of [`Self::defer`]) and the page goes
+    /// on, so one object never blocks the rest; the row goes when the
+    /// object is counted or gone. The fill is finished (`done`) when the
+    /// cursor has reached the end and `bytes_retry` is empty; each recount
+    /// starts it again from the start (rows an older binary added after a
+    /// rollback have no size). Returns `true` once it is finished.
+    pub(crate) fn fill_bytes(&self, limit: u32) -> Result<bool> {
+        let mut c = self.connect()?;
+        let now = crate::platform::clock::wall_ms() as i64;
+        let cursor = Self::fill_cursor(&c, "bytes_fill")?;
+        let due: Vec<(String, Option<String>, bool)> = {
+            let mut s = c.prepare("SELECT r.id,o.path,EXISTS(SELECT 1 FROM object_bytes b WHERE b.id=r.id) FROM bytes_retry r LEFT JOIN object o ON o.id=r.id WHERE r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY r.id LIMIT ?2")?;
+            let rows = s.query_map(params![now, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let fresh: Vec<(String, String, bool)> = match &cursor {
+            Some(cursor) => {
+                let mut s = c.prepare("SELECT o.id,o.path,EXISTS(SELECT 1 FROM object_bytes b WHERE b.id=o.id) FROM object o WHERE o.id>?1 ORDER BY o.id LIMIT ?2")?;
+                let rows = s.query_map(params![cursor, limit], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                rows.collect::<std::result::Result<_, _>>()?
+            }
+            None => Vec::new(),
+        };
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = due
+            .iter()
+            .map(|(id, path, counted)| (id, path.as_deref(), *counted))
+            .chain(
+                fresh
+                    .iter()
+                    .map(|(id, path, counted)| (id, Some(path.as_str()), *counted)),
+            );
+        for (id, path, counted) in rows {
+            let outcome = match path {
+                Some(path) if !counted => self.record_stat(&tx, id, path),
+                _ => Ok(()),
+            };
+            match outcome {
+                Ok(()) => {
+                    tx.execute("DELETE FROM bytes_retry WHERE id=?1", [id])?;
+                }
+                Err(e) => {
+                    eprintln!("source store size fill of {id}: {e:#}");
+                    Self::defer(&tx, "bytes_retry", "id", id, now)?;
+                }
+            }
+        }
+        if cursor.is_some() {
+            let next = if fresh.len() < limit as usize {
+                "done"
+            } else {
+                &fresh.last().unwrap().0
+            };
+            tx.execute("UPDATE meta SET value=?1 WHERE key='bytes_fill'", [next])?;
+        }
+        let finished = Self::fill_cursor(&tx, "bytes_fill")?.is_none()
+            && !tx.query_row("SELECT EXISTS(SELECT 1 FROM bytes_retry)", [], |r| {
+                r.get::<_, bool>(0)
+            })?;
+        tx.commit()?;
+        Ok(finished)
+    }
+    fn meta_value(c: &Connection, key: &str) -> Result<Option<String>> {
+        Ok(
+            c.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+                .optional()?,
+        )
+    }
+    /// One page of the recount of `store_bytes` (spec 25.8 5b (c)). After a
+    /// rollback an older binary deletes `object` rows without their sizes,
+    /// adds rows without sizes, and completes `received` roots without
+    /// `used_ms` and `clone_ref` rows. A recount starts when the fills are
+    /// finished: at the first page of this process, then once an hour, and
+    /// at once whenever `store_bytes` is not a non-negative integer. It first
+    /// sets the cursors of both fills back to the start
+    /// (`meta.bytes_recount_wait`), waits until both are finished again
+    /// (they touch only rows with no size and roots with no `used_ms`, so
+    /// doing them again counts nothing twice), and then walks `object_bytes`
+    /// in id order, `limit` rows a page, deletes the rows with no `object`
+    /// row and sums the rest (`meta.bytes_recount` is its cursor,
+    /// `bytes_recount_sum` its sum; a change to a row the cursor has passed
+    /// also changes the sum); at the end the sum becomes `store_bytes`. The
+    /// state is read first without a transaction; the write lock is taken
+    /// only when there is work. Returns `true` when no recount is left in
+    /// progress.
+    pub(crate) fn recount_bytes(&self, limit: u32) -> Result<bool> {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+        let mut c = self.connect()?;
+        let fills_done = || -> Result<bool> {
+            Ok(Self::fill_cursor(&c, "bytes_fill")?.is_none()
+                && Self::fill_cursor(&c, "clone_ref_fill")?.is_none()
+                && !c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM clone_ref_retry) OR EXISTS(SELECT 1 FROM bytes_retry)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?)
+        };
+        let waiting = Self::meta_value(&c, "bytes_recount_wait")?.is_some();
+        let cursor = Self::meta_value(&c, "bytes_recount")?;
+        if waiting {
+            if !fills_done()? {
+                return Ok(false);
+            }
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                "DELETE FROM meta WHERE key='bytes_recount_wait';
+                 INSERT OR REPLACE INTO meta VALUES('bytes_recount','');
+                 INSERT OR REPLACE INTO meta VALUES('bytes_recount_sum','0');",
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        let Some(cursor) = cursor else {
+            let due = self
+                .recounted
+                .lock()
+                .unwrap()
+                .is_none_or(|at| at.elapsed() >= EVERY)
+                || self.store_bytes()?.is_none();
+            if !due || !fills_done()? {
+                return Ok(true);
+            }
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                "UPDATE meta SET value='' WHERE key IN ('bytes_fill','clone_ref_fill');
+                 INSERT OR REPLACE INTO meta VALUES('bytes_recount_wait','1');",
+            )?;
+            tx.commit()?;
+            *self.recounted.lock().unwrap() = Some(std::time::Instant::now());
+            return Ok(false);
+        };
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, i64, bool)> = {
+            let mut s = tx.prepare("SELECT b.id,b.bytes,EXISTS(SELECT 1 FROM object o WHERE o.id=b.id) FROM object_bytes b WHERE b.id>?1 ORDER BY b.id LIMIT ?2")?;
+            let rows = s.query_map(params![cursor, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut sum = 0i64;
+        for (id, bytes, kept) in &rows {
+            if *kept {
+                sum += bytes;
+            } else {
+                tx.execute("DELETE FROM object_bytes WHERE id=?1", [id])?;
+            }
+        }
+        tx.execute(
+            "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+?1 AS TEXT) WHERE key='bytes_recount_sum'",
+            [sum],
+        )?;
+        let finished = rows.len() < limit as usize;
+        if finished {
+            tx.execute_batch(
+                "UPDATE meta SET value=(SELECT value FROM meta WHERE key='bytes_recount_sum') WHERE key='store_bytes';
+                 DELETE FROM meta WHERE key IN ('bytes_recount','bytes_recount_sum');",
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE meta SET value=?1 WHERE key='bytes_recount'",
+                [&rows.last().unwrap().0],
+            )?;
+        }
+        tx.commit()?;
+        Ok(finished)
+    }
+    /// Record a failure of `key` that may pass (spec 25.8 5b (h)5, (e)):
+    /// the row in `table` counts the attempts and is tried again after a
+    /// delay that doubles from 10 s up to 1 hour. The time is the wall
+    /// clock, because a row outlives the process; a `next_ms` more than an
+    /// hour ahead (the clock went back) counts as due.
+    fn defer(c: &Connection, table: &str, column: &str, key: &str, now: i64) -> Result<()> {
+        c.execute(
+            &format!(
+                "INSERT INTO {table}({column},attempts,next_ms) VALUES(?1,1,?2+10000)
+                 ON CONFLICT({column}) DO UPDATE SET attempts=attempts+1,next_ms=?2+min(10000<<min(attempts,9),3600000)"
+            ),
+            params![key, now],
+        )?;
+        Ok(())
+    }
+    /// One page of the `clone_ref` migration (spec 25.8 5b (e)): for up to
+    /// `limit` `received` roots, first those of `clone_ref_retry` that are
+    /// due and then those from the cursor `meta.clone_ref_fill`, reading at
+    /// most `budget` bytes of manifests (at least one manifest), a row for
+    /// each of the root's graph rows, in the clone of the root's manifest's
+    /// `repository_id` (where the code before 5b put the refs). A root whose
+    /// manifest is not valid gets no rows; one that cannot be read now (any
+    /// other error) gets a row in `clone_ref_retry` and the page goes on
+    /// (the row goes when the root is done or gone, so the table is never
+    /// bigger than the roots). The same page gives a root with no `used_ms`
+    /// the time of the fill (spec 25.8 5b (c)). `true` once the cursor is at
+    /// the end and no retry row is left. Only roots with no `used_ms` are
+    /// selected (a root an older binary completed never gets one, and a
+    /// marked root is skipped without its manifest being read, so a recount
+    /// reads the manifests of the unmarked roots only); a retry row of a
+    /// root that was marked meanwhile is dropped.
+    pub(crate) fn fill_clone_refs(&self, limit: u32, budget: u64) -> Result<bool> {
+        let mut c = self.connect()?;
+        let now = crate::platform::clock::wall_ms() as i64;
+        let cursor = Self::fill_cursor(&c, "clone_ref_fill")?;
+        let due: Vec<(String, Option<String>)> = {
+            let mut s = c.prepare("SELECT r.root,o.source FROM clone_ref_retry r LEFT JOIN root o ON o.id=r.root AND o.kind='received' AND o.used_ms IS NULL WHERE r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY r.root LIMIT ?2")?;
+            let rows = s.query_map(params![now, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let fresh: Vec<(String, Option<String>)> = match &cursor {
+            Some(cursor) => {
+                let mut s = c.prepare("SELECT id,source FROM root WHERE kind='received' AND used_ms IS NULL AND id>?1 AND source IS NOT NULL ORDER BY id LIMIT ?2")?;
+                let rows = s.query_map(params![cursor, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            }
+            None => Vec::new(),
+        };
+        enum Outcome {
+            Done(Option<String>),
+            Gone,
+            Retry,
+        }
+        let manifest_limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
+        let mut outcomes: Vec<(&str, Outcome, bool)> = Vec::new();
+        let mut read = 0u64;
+        let mut stopped = false;
+        let mut fresh_seen = 0;
+        for (root, source, is_fresh) in due
+            .iter()
+            .map(|(r, s)| (r, s, false))
+            .chain(fresh.iter().map(|(r, s)| (r, s, true)))
+        {
+            let Some(source) = source else {
+                outcomes.push((root, Outcome::Gone, is_fresh));
+                continue;
+            };
+            // (the first manifest of a page is read whatever its size)
+            let left = if read == 0 {
+                manifest_limit
+            } else {
+                manifest_limit.min(budget.saturating_sub(read))
+            };
+            let outcome = match self.load_validated(source, left) {
+                Ok(v) => {
+                    read += v.metadata.as_ref().map_or(0, |m| m.len()).max(1);
+                    Outcome::Done(v.manifest.repository_id.clone())
+                }
+                Err(e) if left < manifest_limit && e.is::<ManifestLimit>() => {
+                    stopped = true;
+                    break;
+                }
+                Err(e) if manifest_invalid(&e) => Outcome::Done(None),
+                Err(e) => {
+                    eprintln!("source store clone_ref fill of {root}: {e:#}");
+                    Outcome::Retry
+                }
+            };
+            if is_fresh {
+                fresh_seen += 1;
+            }
+            outcomes.push((root, outcome, is_fresh));
+        }
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (root, outcome, _) in &outcomes {
+            match outcome {
+                Outcome::Done(repository) => {
+                    if let Some(repository) = repository {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
+                            params![root, crate::workspace::plan::clone_dir_name(repository)],
+                        )?;
+                    }
+                    tx.execute(
+                        "UPDATE root SET used_ms=?2 WHERE id=?1 AND used_ms IS NULL",
+                        params![root, now],
+                    )?;
+                    tx.execute("DELETE FROM clone_ref_retry WHERE root=?1", [root])?;
+                }
+                Outcome::Gone => {
+                    tx.execute("DELETE FROM clone_ref_retry WHERE root=?1", [root])?;
+                }
+                Outcome::Retry => Self::defer(&tx, "clone_ref_retry", "root", root, now)?,
+            }
+        }
+        if cursor.is_some() {
+            let next = if !stopped && fresh_seen == fresh.len() && fresh.len() < limit as usize {
+                Some("done")
+            } else {
+                outcomes
+                    .iter()
+                    .rev()
+                    .find(|(_, _, is_fresh)| *is_fresh)
+                    .map(|(root, _, _)| *root)
+            };
+            if let Some(next) = next {
+                tx.execute(
+                    "UPDATE meta SET value=?1 WHERE key='clone_ref_fill'",
+                    [next],
+                )?;
+            }
+        }
+        let finished = Self::fill_cursor(&tx, "clone_ref_fill")?.is_none()
+            && !tx.query_row("SELECT EXISTS(SELECT 1 FROM clone_ref_retry)", [], |r| {
+                r.get::<_, bool>(0)
+            })?;
+        tx.commit()?;
+        Ok(finished)
+    }
+    fn fill_cursor(c: &Connection, key: &str) -> Result<Option<String>> {
+        let v: Option<String> = c
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?;
+        Ok(v.filter(|v| v != "done"))
+    }
+    /// Whether the legacy registration may still register `id` (spec 25.8
+    /// 5b (h)5): `id` is still queued, and its `m:` row may exist before its
+    /// root is complete. (Before the manifests are listed no registration
+    /// has begun, and an `m:` row is a publication's, which has not
+    /// finished.)
+    pub(crate) fn legacy_queued(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_queue WHERE name=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+    /// One step of the registration of the manifests received before stage
+    /// 5a, which have no `receive:<id>` root (spec 25.8 5b (h)5). The first
+    /// call lists `manifests/` once into `legacy_queue` (one row per
+    /// manifest there then, without its root); each call then works on the
+    /// first queued manifest that is not waiting in `legacy_retry`, at most
+    /// one manifest read and 992 (31 pages of 32) entries, and the next call
+    /// goes on from where the graph rows stopped. A manifest that is not
+    /// valid (its JSON, identity or seal, a missing manifest of its own or
+    /// of a child, or the size limit) leaves its root `abandoned` with no
+    /// source and no graph rows, and its row leaves the queue; its members,
+    /// the `m:` row among them, stay on the abandoned root, whose release
+    /// (5a's abandonment, 5b's step 0) deletes what it can prove. Any other
+    /// error keeps the queue row and records it in `legacy_retry` (tried
+    /// again after a doubling delay, [`Self::defer`]), so that the next call
+    /// goes on with the next manifest; it is never abandoned for that.
+    /// Nothing is done in a store with a parent's root. `true` once the
+    /// queue is empty (`legacy_retry` holds only queued names). The marker
+    /// `legacy_registration` is left as it is: turning it `done` opens the
+    /// gate of the deleting passes and is part of the change that brings
+    /// them, which may do so only while neither table has a row.
+    pub(crate) fn register_legacy(&self) -> Result<bool> {
+        if !self.legacy_registration_pending()? || self.holds_parent_roots()? {
+            return Ok(true);
+        }
+        let mut c = self.connect()?;
+        let listed: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_queue')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !listed {
+            let fd = rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty());
+            let mut names = Vec::new();
+            match fd {
+                Ok(fd) => {
+                    for entry in rustix::fs::Dir::read_from(&fd)? {
+                        let entry = entry?;
+                        let Ok(name) = entry.file_name().to_str() else {
+                            continue;
+                        };
+                        if let Some(id) = name.strip_suffix(".json") {
+                            if super::classify::source_id_of_ci(id).is_some() {
+                                names.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &names {
+                tx.execute(
+                    "INSERT OR IGNORE INTO legacy_queue SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND source=?1)",
+                    [id],
+                )?;
+            }
+            tx.execute("INSERT INTO meta VALUES('legacy_queue','listed')", [])?;
+            tx.commit()?;
+        }
+        let now = crate::platform::clock::wall_ms() as i64;
+        let Some(id): Option<String> = c
+            .query_row(
+                "SELECT q.name FROM legacy_queue q LEFT JOIN legacy_retry r ON r.name=q.name
+                 WHERE r.name IS NULL OR r.next_ms<=?1 OR r.next_ms>?1+3600000 ORDER BY q.name LIMIT 1",
+                [now],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM legacy_queue)", [], |r| {
+                r.get::<_, bool>(0)
+            })?);
+        };
+        let manifest_limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
+        let root = format!("receive:{id}");
+        let step = (|| -> Result<bool> {
+            // (registered meanwhile, by a receipt or through no queue row)
+            if self.received_row(&id)? {
+                return Ok(true);
+            }
+            self.pending(&root)?;
+            let mut cache = None;
+            let options = Step {
+                pages: 31,
+                loads: 1,
+                mark: true,
+            };
+            self.register_step(&root, "received", &id, options, &mut cache, manifest_limit)
+        })();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match step {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(error) if manifest_invalid(&error) => {
+                let changed = tx.execute(
+                    "UPDATE root SET kind='abandoned',source=NULL WHERE id=?1 AND source IS NULL",
+                    [&root],
+                )?;
+                if changed == 1 {
+                    tx.execute("DELETE FROM graph WHERE root=?1", [&root])?;
+                }
+            }
+            Err(error) => {
+                Self::defer(&tx, "legacy_retry", "name", &id, now)?;
+                tx.commit()?;
+                return Err(error.context(format!("legacy registration of {id}")));
+            }
+        }
+        tx.execute("DELETE FROM legacy_queue WHERE name=?1", [&id])?;
+        tx.execute("DELETE FROM legacy_retry WHERE name=?1", [&id])?;
+        let empty: bool =
+            tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM legacy_queue)", [], |r| {
+                r.get(0)
+            })?;
+        tx.commit()?;
+        Ok(empty)
+    }
+    /// The total of the counted object files (`meta.store_bytes`), or
+    /// `None` while it is not a non-negative integer (it waits for the
+    /// recount, [`Self::recount_bytes`]).
+    pub(crate) fn store_bytes(&self) -> Result<Option<u64>> {
+        let v: Option<String> = self
+            .connect()?
+            .query_row("SELECT value FROM meta WHERE key='store_bytes'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -464,10 +1075,22 @@ impl Index {
     fn load_validated(&self, id: &str, limit: u64) -> Result<Validated> {
         ensure!(
             super::classify::source_id_of_ci(id).is_some(),
-            "invalid source manifest identity"
+            InvalidManifest("invalid source manifest identity".into())
         );
+        // (a manifest that is not there, or is a link, is invalid; any other
+        // failure to open it says nothing about the manifest)
+        let absent = |e: rustix::io::Errno| -> anyhow::Error {
+            match e {
+                rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                    InvalidManifest(format!("source manifest {id}: {e}")).into()
+                }
+                e => e.into(),
+            }
+        };
         let directory: File =
-            rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty())?.into();
+            rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty())
+                .map_err(absent)?
+                .into();
         let file: File = rustix::fs::openat(
             &directory,
             format!("{id}.json"),
@@ -476,10 +1099,14 @@ impl Index {
                 | rustix::fs::OFlags::NONBLOCK
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
-        )?
+        )
+        .map_err(absent)?
         .into();
         let metadata = file.metadata()?;
-        ensure!(metadata.is_file(), "source manifest is not regular");
+        ensure!(
+            metadata.is_file(),
+            InvalidManifest("source manifest is not regular".into())
+        );
         if metadata.len() > limit {
             return Err(ManifestLimit {
                 source_id: id.into(),
@@ -493,12 +1120,13 @@ impl Index {
         // Exactly the opened file's measured size plus one: growth cannot turn
         // a bounded background load into an unbounded serde stream.
         let manifest: local_ci::source::SourceManifest =
-            serde_json::from_reader((&file).take(metadata.len().saturating_add(1)))?;
+            serde_json::from_reader((&file).take(metadata.len().saturating_add(1)))
+                .map_err(|e| InvalidManifest(format!("source manifest {id}: {e}")))?;
         ensure!(
             manifest.source_id == id,
-            "source manifest identity mismatch"
+            InvalidManifest("source manifest identity mismatch".into())
         );
-        super::store::verify_manifest(&manifest)?;
+        super::store::verify_manifest(&manifest).map_err(|e| InvalidManifest(format!("{e:#}")))?;
         #[cfg(test)]
         self.verifications
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -517,7 +1145,33 @@ impl Index {
         kind: &str,
         manifest: Arc<local_ci::source::SourceManifest>,
     ) -> Result<()> {
+        self.register_held_marked(root, kind, manifest, false)
+    }
+    /// [`Self::register_held`] for a `received` root that is published (the
+    /// requested source of a receipt, not a submodule's source it carries):
+    /// the root records the time and its `clone_ref` rows (spec 25.8 5b (c),
+    /// (e)), also when it is published again after it was complete.
+    pub(crate) fn register_published(
+        &self,
+        root: &str,
+        manifest: Arc<local_ci::source::SourceManifest>,
+    ) -> Result<()> {
+        self.register_held_marked(root, "received", manifest, true)
+    }
+    fn register_held_marked(
+        &self,
+        root: &str,
+        kind: &str,
+        manifest: Arc<local_ci::source::SourceManifest>,
+        mark: bool,
+    ) -> Result<()> {
         if self.complete(root, &manifest.source_id)? {
+            if mark {
+                let mut c = self.connect()?;
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::mark_published(&tx, root, manifest.repository_id.as_deref())?;
+                tx.commit()?;
+            }
             return Ok(());
         }
         super::store::verify_manifest(&manifest)?;
@@ -531,7 +1185,11 @@ impl Index {
             directory: None,
             metadata: None,
         });
-        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {
+        let options = Step {
+            mark,
+            ..Step::pages(32)
+        };
+        while !self.register_step(root, kind, &id, options, &mut cache, u64::MAX)? {
             stop_point("registering");
         }
         Ok(())
@@ -600,7 +1258,24 @@ impl Index {
             return Ok(());
         }
         let mut cache = None;
-        while !self.register_step(root, kind, id, 32, &mut cache, u64::MAX)? {}
+        while !self.register_step(root, kind, id, Step::pages(32), &mut cache, u64::MAX)? {}
+        Ok(())
+    }
+    /// The time and the `clone_ref` rows of a published `received` root
+    /// (spec 25.8 5b (c), (e)): one row for each of its graph rows, in the
+    /// clone of its manifest's `repository_id`, where the receipt put the
+    /// refs of all of them.
+    fn mark_published(c: &Connection, root: &str, repository: Option<&str>) -> Result<()> {
+        c.execute(
+            "UPDATE root SET used_ms=?2 WHERE id=?1",
+            params![root, crate::platform::clock::wall_ms() as i64],
+        )?;
+        if let Some(repository) = repository {
+            c.execute(
+                "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
+                params![root, crate::workspace::plan::clone_dir_name(repository)],
+            )?;
+        }
         Ok(())
     }
     fn register_step(
@@ -608,10 +1283,11 @@ impl Index {
         root: &str,
         kind: &str,
         id: &str,
-        limit: u32,
+        options: Step,
         cache: &mut Option<Validated>,
         manifest_limit: u64,
     ) -> Result<bool> {
+        let mut loads = options.loads;
         let mut c = self.connect()?;
         let old: Option<Option<String>> = c
             .query_row("SELECT source FROM root WHERE id=?1", [root], |r| r.get(0))
@@ -628,7 +1304,7 @@ impl Index {
             "INSERT OR IGNORE INTO graph(root,source) VALUES(?1,?2)",
             params![root, id],
         )?;
-        for _ in 0..limit {
+        for _ in 0..options.pages {
             // Finish the current manifest before newly discovered children,
             // including children whose source IDs sort before their parent.
             let preferred = cache
@@ -646,10 +1322,40 @@ impl Index {
             };
             let next=match current {Some(current)=>Some(current),None=>c.query_row("SELECT source,position FROM graph WHERE root=?1 AND done=0 ORDER BY source LIMIT 1",[root],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?))).optional()?};
             let Some((next, position)) = next else {
-                c.execute(
+                if !options.mark {
+                    c.execute(
+                        "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
+                        params![root, id, kind],
+                    )?;
+                    *cache = None;
+                    return Ok(true);
+                }
+                // A published root records when it was last used and, in the
+                // same transaction as its completion, which refs its source
+                // and the sources of its graph have in the clone of its
+                // repository (spec 25.8 5b (c), (e)).
+                let repository = match cache.as_ref() {
+                    Some(cached) if cached.manifest.source_id == id => {
+                        cached.manifest.repository_id.clone()
+                    }
+                    _ => {
+                        if loads == 0 {
+                            return Ok(false);
+                        }
+                        // (the last read of this call)
+                        self.load_validated(id, manifest_limit)?
+                            .manifest
+                            .repository_id
+                            .clone()
+                    }
+                };
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
                     "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
                     params![root, id, kind],
                 )?;
+                Self::mark_published(&tx, root, repository.as_deref())?;
+                tx.commit()?;
                 *cache = None;
                 return Ok(true);
             };
@@ -659,6 +1365,10 @@ impl Index {
                 .as_ref()
                 .is_none_or(|cached| cached.manifest.source_id != next)
             {
+                if loads == 0 {
+                    return Ok(false);
+                }
+                loads -= 1;
                 *cache = Some(self.load_validated(&next, manifest_limit)?);
             }
             let cached = cache.as_ref().unwrap();
@@ -680,6 +1390,7 @@ impl Index {
                 "INSERT OR IGNORE INTO member VALUES(?1,?2)",
                 params![root, key],
             )?;
+            self.record_stat(&tx, &key, &path)?;
             let total = m.object_manifest.entries.len() + m.submodules.len();
             let end = (position as usize + 32).min(total);
             for position in position as usize..end {
@@ -700,6 +1411,7 @@ impl Index {
                         "INSERT OR IGNORE INTO member VALUES(?1,?2)",
                         params![root, key],
                     )?;
+                    self.record_stat(&tx, &key, &path)?;
                 } else if let Some(child) =
                     &m.submodules[position - m.object_manifest.entries.len()].source_id
                 {
@@ -1088,6 +1800,35 @@ impl SourceStore {
     }
 }
 
+/// How far one call of `register_step` goes: `pages` pages of 32 entries
+/// and `loads` manifest reads; `mark` says the root is a published
+/// `received` root (time and `clone_ref` rows at its completion).
+#[derive(Clone, Copy, Debug)]
+struct Step {
+    pages: u32,
+    loads: u32,
+    mark: bool,
+}
+impl Step {
+    fn pages(pages: u32) -> Self {
+        Self {
+            pages,
+            loads: u32::MAX,
+            mark: false,
+        }
+    }
+}
+/// A manifest that can never be registered as it is: not there, not a
+/// regular file, not JSON, not its source's, not sealed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct InvalidManifest(String);
+/// Whether `e` says the manifest itself is invalid (or over the size
+/// limit), not that it could not be read now.
+fn manifest_invalid(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.is::<InvalidManifest>() || c.is::<ManifestLimit>())
+}
 #[derive(Debug, thiserror::Error)]
 #[error("manifest {source_id} has {bytes} bytes; background registration limit is {limit}; increase PreviewCursor.manifest_byte_limit to register it")]
 pub struct ManifestLimit {
@@ -1249,7 +1990,7 @@ impl SourceStore {
                     &format!("legacy:{id}"),
                     "legacy",
                     &id,
-                    1,
+                    Step::pages(1),
                     &mut cursor.validated,
                     limit,
                 ) {
@@ -2064,6 +2805,7 @@ mod tests {
                 ),
                 path,
                 owned: Default::default(),
+                recounted: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
@@ -2113,6 +2855,7 @@ mod tests {
                 ),
                 path,
                 owned: Default::default(),
+                recounted: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
@@ -2454,7 +3197,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(store.retention.verifications.load(SeqCst), 1);
         let c = store.retention.connect().unwrap();
         let root_id = format!("legacy:{}", capture.manifest.source_id);
@@ -2549,7 +3298,13 @@ mod tests {
         assert_eq!(diagnostic.source_id, capture.manifest.source_id);
         assert_eq!(diagnostic.limit, 1);
         assert!(diagnostic.bytes > 1);
-        assert_eq!(store.retention.reads.load(SeqCst), 0);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         cursor.manifest_byte_limit = Some(diagnostic.bytes);
         for n in 2..7 {
             store
@@ -2563,7 +3318,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(
+            store
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(store.retention.verifications.load(SeqCst), 1);
         assert!(store
             .manifest(&capture.manifest.source_id)
@@ -2649,7 +3410,10 @@ mod tests {
             )
             .unwrap();
         }
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         f.store.retention.verifications.store(0, SeqCst);
         f.store
             .retention
@@ -2661,7 +3425,10 @@ mod tests {
             "held parent was evicted and reread"
         );
         assert_eq!(f.store.retention.verifications.load(SeqCst), 66);
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         f.store.retention.verifications.store(0, SeqCst);
         let mut cache = None;
         let mut completed = false;
@@ -2672,7 +3439,7 @@ mod tests {
                     "legacy-parent",
                     "legacy",
                     &parent.source_id,
-                    1,
+                    Step::pages(1),
                     &mut cache,
                     64 << 20,
                 )
@@ -2831,7 +3598,7 @@ mod tests {
         let c = f.store.retention.connect().unwrap();
         for root in ["producer", "destination"] {
             c.execute(
-                "INSERT INTO root VALUES(?1,'pending','src-00000000000000000000000000000000')",
+                "INSERT INTO root(id,kind,source) VALUES(?1,'pending','src-00000000000000000000000000000000')",
                 [root],
             )
             .unwrap();
@@ -2915,7 +3682,7 @@ mod tests {
             }
         }
         let c = f.store.retention.connect().unwrap();
-        c.execute("INSERT INTO root VALUES('published','received','src-00000000000000000000000000000000')",[]).unwrap();
+        c.execute("INSERT INTO root(id,kind,source) VALUES('published','received','src-00000000000000000000000000000000')",[]).unwrap();
         c.execute(
             "INSERT INTO member SELECT 'published',object FROM member WHERE root=?1 AND object<>?2",
             params![a.root(), format!("b:{:064x}", 64)],
@@ -3770,7 +4537,10 @@ mod tests {
                 [],
             )
             .unwrap();
-        f.store.retention.reads.store(0, SeqCst);
+        f.store
+            .retention
+            .reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         let mut cursor = deletion::RetentionCursor::default();
         assert!(
             f.store
@@ -4092,6 +4862,729 @@ mod tests {
             )
             .optional()
             .unwrap()
+    }
+    /// The sum of the sizes of the object files the index has a row for.
+    fn files_on_disk(store: &SourceStore) -> u64 {
+        let c = store.retention.connect().unwrap();
+        let mut s = c.prepare("SELECT path FROM object").unwrap();
+        let paths: Vec<String> = s
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        paths
+            .iter()
+            .filter_map(|p| std::fs::symlink_metadata(store.root().join(p)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+    #[test]
+    fn store_bytes_counts_each_placed_file_once_and_drops_it_with_the_file() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        // (g)13: the import counts the blob once it is placed, registration
+        // counts the manifest from a stat, and a second publication of the
+        // same source adds nothing (only the change from empty counts)
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        assert_eq!(receiver.store_bytes().unwrap().unwrap(), want.size);
+        receiver.publish_received(&m, None).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let total = receiver.store_bytes().unwrap().unwrap();
+        assert!(total > want.size);
+        assert_eq!(total, files_on_disk(&receiver));
+        // a failed receipt's own blob goes with its token's release, and
+        // its bytes with it (the gate is open once registration is done)
+        let other = SourceStore::open(&f._root.path().join("other")).unwrap();
+        other
+            .retention
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+                [],
+            )
+            .unwrap();
+        let token = other.begin_import().unwrap();
+        other
+            .ingest_blob_with_token(&token, &want, &mut &bytes[..])
+            .unwrap();
+        assert_eq!(other.store_bytes().unwrap().unwrap(), want.size);
+        other
+            .release_import(SourceStore::import_token_id(&token))
+            .unwrap();
+        assert!(!other
+            .root()
+            .join(format!("objects/{}/{}", &want.hash[..2], want.hash))
+            .exists());
+        assert_eq!(other.store_bytes().unwrap().unwrap(), 0);
+        assert_eq!(files_on_disk(&other), 0);
+    }
+    #[test]
+    fn the_bytes_fill_counts_rows_made_before_it_and_skips_missing_files() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let expected = receiver.store_bytes().unwrap().unwrap();
+        // as the migration leaves an index made before 5b, plus a row whose
+        // file was never placed
+        let c = receiver.retention.connect().unwrap();
+        c.execute_batch(
+            "DELETE FROM object_bytes; UPDATE meta SET value='0' WHERE key='store_bytes';
+             UPDATE meta SET value='' WHERE key='bytes_fill';
+             INSERT INTO object(id,path) VALUES('b:0000','objects/00/0000');",
+        )
+        .unwrap();
+        assert!(!receiver.retention.fill_bytes(1).unwrap());
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(receiver.store_bytes().unwrap().unwrap(), expected);
+        let missing: Option<i64> = c
+            .query_row(
+                "SELECT bytes FROM object_bytes WHERE id='b:0000'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(missing, None);
+        // done: a later page reads nothing
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(receiver.store_bytes().unwrap().unwrap(), expected);
+    }
+    #[test]
+    fn publication_records_used_time_and_the_clone_refs_of_its_graph() {
+        let f = Fixture::new();
+        let (receiver, mut m, want, bytes) = received_fixture(&f);
+        m.repository_id = Some("github:example/repo".into());
+        let m = local_ci::source::seal_manifest(m);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let before = crate::platform::clock::wall_ms() as i64;
+        receiver.publish_received(&m, None).unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let used: Option<i64> = c
+            .query_row(
+                "SELECT used_ms FROM root WHERE id='receive:'||?1",
+                [&m.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(used.unwrap() >= before);
+        let refs = |c: &Connection| -> Vec<(String, String)> {
+            let mut s = c
+                .prepare(
+                    "SELECT clone,source FROM clone_ref WHERE root='receive:'||?1 ORDER BY source",
+                )
+                .unwrap();
+            s.query_map([&m.source_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let expected: Vec<(String, String)> = m
+            .repository_id
+            .iter()
+            .map(|r| {
+                (
+                    crate::workspace::plan::clone_dir_name(r),
+                    m.source_id.clone(),
+                )
+            })
+            .collect();
+        assert!(!expected.is_empty(), "the fixture names its repository");
+        assert_eq!(refs(&c), expected);
+        // the migration fills the same rows for a root made before 5b
+        c.execute_batch(
+            "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(refs(&c), expected);
+    }
+    #[test]
+    fn legacy_manifests_are_registered_from_the_queue_and_unregistrable_ones_abandoned() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        // (h)5: a manifest received before 5a (a file and no `m:` row) and
+        // one whose blob is not readable as a manifest
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let broken = "src-00000000000000000000000000000001";
+        std::fs::write(path.with_file_name(format!("{broken}.json")), b"{").unwrap();
+        while !receiver.retention.register_legacy().unwrap() {}
+        let c = receiver.retention.connect().unwrap();
+        let root = |id: &str| -> Option<(String, Option<String>)> {
+            c.query_row(
+                "SELECT kind,source FROM root WHERE id='receive:'||?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(root(&id), Some(("received".into(), Some(id.clone()))));
+        assert!(receiver.retention.has_object(&format!("m:{id}")).unwrap());
+        assert_eq!(root(broken), Some(("abandoned".into(), None)));
+        let queued: i64 = c
+            .query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        // the marker that opens deletion is not turned here
+        assert!(receiver.retention.legacy_registration_pending().unwrap());
+        // a store with a parent's root is left as it is (g)35
+        let parent = SourceStore::open(&f._root.path().join("parent")).unwrap();
+        let pc = parent.retention.connect().unwrap();
+        pc.execute(
+            "INSERT INTO root(id,kind,source) VALUES('run:x','run','s')",
+            [],
+        )
+        .unwrap();
+        assert!(parent.retention.register_legacy().unwrap());
+        let listed: bool = pc
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_queue')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!listed);
+    }
+    /// A parent source with one submodule source, the parent's id sorting
+    /// before the child's, both naming a repository.
+    fn family(
+        f: &Fixture,
+    ) -> (
+        SourceStore,
+        local_ci::source::SourceManifest,
+        local_ci::source::SourceManifest,
+        super::super::diff::BlobWant,
+        Vec<u8>,
+    ) {
+        let (receiver, m, want, bytes) = received_fixture(f);
+        for n in 0.. {
+            let mut child = m.clone();
+            child.branch = Some(format!("child{n}"));
+            child.repository_id = Some("github:example/child".into());
+            let child = local_ci::source::seal_manifest(child);
+            let mut parent = m.clone();
+            parent.repository_id = Some("github:example/parent".into());
+            parent.submodules = vec![local_ci::source::SubmoduleRef {
+                path: local_ci::source::RelPath(b"sub".to_vec()),
+                revision: "0".repeat(40),
+                source_id: Some(child.source_id.clone()),
+                dirty: true,
+            }];
+            let parent = local_ci::source::seal_manifest(parent);
+            if parent.source_id < child.source_id {
+                return (receiver, parent, child, want, bytes);
+            }
+        }
+        unreachable!()
+    }
+    fn write_manifest(store: &SourceStore, m: &local_ci::source::SourceManifest) {
+        let path = store.object_store().unwrap().manifest_path(&m.source_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(m).unwrap()).unwrap();
+    }
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[test]
+    fn the_object_table_keeps_the_columns_an_older_binary_inserts() {
+        let f = Fixture::new();
+        let path = f._root.path().join("receiver");
+        let store = SourceStore::open(&path).unwrap();
+        let c = store.retention.connect().unwrap();
+        // the insert of the code before 5b, positional with two values
+        c.execute("INSERT INTO object VALUES('b:old','objects/ol/old')", [])
+            .unwrap();
+        // an index an earlier build of 5b made: the column goes, its counted
+        // size moves to `object_bytes`, and what is missing is made again
+        c.execute_batch(
+            "ALTER TABLE object ADD COLUMN bytes INTEGER; UPDATE object SET bytes=7 WHERE id='b:old';
+             DELETE FROM object_bytes; DROP TABLE clone_ref; DELETE FROM meta WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        drop(c);
+        drop(store);
+        let store = SourceStore::open(&path).unwrap();
+        let c = store.retention.connect().unwrap();
+        let column: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!column);
+        let moved: i64 = c
+            .query_row("SELECT bytes FROM object_bytes WHERE id='b:old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(moved, 7);
+        c.execute("INSERT INTO clone_ref VALUES('c','s','r')", [])
+            .unwrap();
+        c.execute("INSERT INTO object VALUES('b:new','objects/ne/new')", [])
+            .unwrap();
+    }
+    #[test]
+    fn the_recount_drops_sizes_an_older_binary_left_and_repairs_an_invalid_total() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let total = receiver.store_bytes().unwrap().unwrap();
+        // the first recount of the process runs once the fill is done
+        while !receiver.retention.fill_bytes(1000).unwrap() {}
+        while !(receiver.retention.fill_bytes(1000).unwrap()
+            & receiver.retention.fill_clone_refs(32, 64 << 20).unwrap()
+            & receiver.retention.recount_bytes(1).unwrap())
+        {}
+        assert_eq!(receiver.store_bytes().unwrap(), Some(total));
+        // an older binary deletes the blob's object row and not its size
+        let c = receiver.retention.connect().unwrap();
+        c.execute("DELETE FROM object WHERE id='b:'||?1", [&want.hash])
+            .unwrap();
+        // a total that is not a number is not read as 0 and not added to
+        c.execute("UPDATE meta SET value='x' WHERE key='store_bytes'", [])
+            .unwrap();
+        assert_eq!(receiver.store_bytes().unwrap(), None);
+        c.execute(
+            "INSERT INTO object VALUES('b:extra','objects/ex/extra')",
+            [],
+        )
+        .unwrap();
+        receiver.retention.placed("b:extra", 5).unwrap();
+        assert_eq!(receiver.store_bytes().unwrap(), None);
+        // (an invalid total starts a recount at once)
+        while !(receiver.retention.fill_bytes(1000).unwrap()
+            & receiver.retention.fill_clone_refs(32, 64 << 20).unwrap()
+            & receiver.retention.recount_bytes(1).unwrap())
+        {}
+        assert_eq!(receiver.store_bytes().unwrap(), Some(total - want.size + 5));
+        let left: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM object_bytes WHERE id='b:'||?1)",
+                [&want.hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!left);
+        // within the hour no new recount starts
+        c.execute("UPDATE meta SET value='0' WHERE key='store_bytes'", [])
+            .unwrap();
+        assert!(receiver.retention.recount_bytes(1).unwrap());
+        assert_eq!(receiver.store_bytes().unwrap(), Some(0));
+    }
+    #[test]
+    fn legacy_registration_retries_transient_errors_and_goes_a_bounded_step_at_a_time() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        write_manifest(&receiver, &parent);
+        write_manifest(&receiver, &child);
+        // a parent whose child's manifest is missing
+        let mut orphan = parent.clone();
+        orphan.branch = Some("orphan".into());
+        orphan.submodules[0].source_id = Some("src-ffffffffffffffffffffffffffffffff".into());
+        let orphan = local_ci::source::seal_manifest(orphan);
+        write_manifest(&receiver, &orphan);
+        let broken = "src-00000000000000000000000000000001";
+        let dir = receiver.root().join("manifests");
+        std::fs::write(dir.join(format!("{broken}.json")), b"{").unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let queued = || -> i64 {
+            c.query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
+                .unwrap()
+        };
+        // the broken one sorts first and is abandoned
+        assert!(!receiver.retention.register_legacy().unwrap());
+        assert_eq!(queued(), 3);
+        // a manifest directory that cannot be read now abandons nothing
+        set_mode(&dir, 0o000);
+        let refused = receiver.retention.register_legacy();
+        set_mode(&dir, 0o755);
+        assert!(refused.is_err());
+        assert_eq!(queued(), 3);
+        // (M-c) the failed one waits in `legacy_retry` and does not block
+        // the next one
+        let (waiting, attempts): (String, i64) = c
+            .query_row("SELECT name,attempts FROM legacy_retry", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(attempts, 1);
+        c.execute("UPDATE legacy_retry SET attempts=8", []).unwrap();
+        assert!(receiver.retention.register_legacy().is_ok());
+        let attempts: i64 = c
+            .query_row(
+                "SELECT attempts FROM legacy_retry WHERE name=?1",
+                [&waiting],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 8,
+            "a waiting manifest is not tried before it is due"
+        );
+        c.execute("UPDATE legacy_retry SET next_ms=0", []).unwrap();
+        // one manifest read per call: some calls end without a row leaving
+        let mut partial = false;
+        for _ in 0..100 {
+            let before = queued();
+            let done = receiver.retention.register_legacy().unwrap();
+            partial |= queued() == before;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(queued(), 0);
+        let retried: i64 = c
+            .query_row("SELECT count(*) FROM legacy_retry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(retried, 0);
+        assert!(partial, "a step stopped at its budget");
+        let root = |id: &str| -> Option<(String, Option<String>)> {
+            c.query_row(
+                "SELECT kind,source FROM root WHERE id='receive:'||?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        for m in [&parent, &child] {
+            assert_eq!(
+                root(&m.source_id),
+                Some(("received".into(), Some(m.source_id.clone())))
+            );
+        }
+        assert_eq!(root(&orphan.source_id), Some(("abandoned".into(), None)));
+        // the abandoned root keeps its manifest member for its release
+        let held: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM member WHERE root='receive:'||?1 AND object='m:'||?1)",
+                [&orphan.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(held);
+    }
+    #[test]
+    fn the_clone_ref_fill_keeps_its_budget_and_its_place_on_a_transient_error() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        c.execute_batch(
+            "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        let cursor = || -> String {
+            c.query_row(
+                "SELECT value FROM meta WHERE key='clone_ref_fill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let dir = receiver.root().join("manifests");
+        set_mode(&dir, 0o000);
+        let refused = receiver.retention.fill_clone_refs(32, 64 << 20);
+        set_mode(&dir, 0o755);
+        // (M-c) the page goes on past roots it cannot read now; they wait
+        // in `clone_ref_retry` and the fill is not done while they do
+        assert!(!refused.unwrap());
+        assert_eq!(cursor(), "done");
+        let retried: i64 = c
+            .query_row("SELECT count(*) FROM clone_ref_retry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(retried, 2);
+        assert!(!receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        c.execute("UPDATE clone_ref_retry SET attempts=8,next_ms=0", [])
+            .unwrap();
+        let state = f._root.path().join("state");
+        std::fs::create_dir_all(state.join("sources")).unwrap();
+        std::fs::copy(
+            receiver.root().join("retention.db"),
+            state.join("sources").join("retention.db"),
+        )
+        .unwrap();
+        assert_eq!(inspect_retry_failing(&state).unwrap(), (0, 2, 0));
+        // a budget of one byte reads one manifest a page
+        assert!(!receiver.retention.fill_clone_refs(32, 1).unwrap());
+        assert!(receiver.retention.fill_clone_refs(32, 1).unwrap());
+        let unused: i64 = c
+            .query_row(
+                "SELECT count(*) FROM root WHERE kind='received' AND used_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unused, 0);
+        let refs: i64 = c
+            .query_row(
+                "SELECT count(*) FROM clone_ref WHERE root='receive:'||?1",
+                [&parent.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(refs, 2);
+    }
+    #[test]
+    fn only_the_requested_root_is_marked_and_a_republication_marks_it_again() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let used = |id: &str| -> Option<i64> {
+            c.query_row(
+                "SELECT used_ms FROM root WHERE id='receive:'||?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let refs = |root: &str| -> Vec<(String, String)> {
+            let mut s = c
+                .prepare(
+                    "SELECT clone,source FROM clone_ref WHERE root='receive:'||?1 ORDER BY source",
+                )
+                .unwrap();
+            s.query_map([root], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        // (c) and (e): the child's root reached as a member has neither
+        assert_eq!(used(&child.source_id), None);
+        assert!(refs(&child.source_id).is_empty());
+        assert!(used(&parent.source_id).is_some());
+        let clone = crate::workspace::plan::clone_dir_name("github:example/parent");
+        assert_eq!(
+            refs(&parent.source_id),
+            vec![
+                (clone.clone(), parent.source_id.clone()),
+                (clone, child.source_id.clone())
+            ]
+        );
+        // (g)12: publishing the complete source again records the time
+        c.execute(
+            "UPDATE root SET used_ms=1 WHERE id='receive:'||?1",
+            [&parent.source_id],
+        )
+        .unwrap();
+        receiver.publish_received(&parent, None).unwrap();
+        assert!(used(&parent.source_id).unwrap() > 1);
+    }
+    #[test]
+    fn a_recount_fills_again_what_an_older_binary_left_without_sizes_or_times() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let step = |r: &SourceStore| {
+            for _ in 0..100 {
+                let a = r.retention.fill_bytes(1000).unwrap();
+                let b = r.retention.fill_clone_refs(32, 64 << 20).unwrap();
+                if r.retention.recount_bytes(1000).unwrap() && a && b {
+                    return;
+                }
+            }
+            panic!("the fills and the recount did not finish");
+        };
+        step(&receiver);
+        let total = receiver.store_bytes().unwrap().unwrap();
+        // after a rollback: an older binary's rows with no size, a root it
+        // completed with no time and no refs (both fills are `done`)
+        let c = receiver.retention.connect().unwrap();
+        c.execute_batch(
+            "DELETE FROM object_bytes; UPDATE root SET used_ms=NULL; DELETE FROM clone_ref;",
+        )
+        .unwrap();
+        // the next recount (here: the total is invalid) runs the fills again
+        c.execute("UPDATE meta SET value='x' WHERE key='store_bytes'", [])
+            .unwrap();
+        step(&receiver);
+        assert_eq!(receiver.store_bytes().unwrap(), Some(total));
+        let unused: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM root WHERE kind='received' AND used_ms IS NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!unused);
+    }
+    #[test]
+    fn a_stat_that_fails_for_another_reason_is_retried_and_never_blocks_the_bytes_fill() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let c = receiver.retention.connect().unwrap();
+        c.execute_batch(
+            "DELETE FROM object_bytes; UPDATE meta SET value='' WHERE key='bytes_fill';",
+        )
+        .unwrap();
+        let cursor = || -> String {
+            c.query_row("SELECT value FROM meta WHERE key='bytes_fill'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let retried = || -> i64 {
+            c.query_row("SELECT count(*) FROM bytes_retry", [], |r| r.get(0))
+                .unwrap()
+        };
+        let dir = receiver.root().join("objects");
+        set_mode(&dir, 0o000);
+        let refused = receiver.retention.fill_bytes(1000);
+        // the cursor passed the object (no head-of-line block); the fill is
+        // not done while a retry row is left
+        let first = refused.unwrap();
+        assert!(!first);
+        assert_eq!(cursor(), "done");
+        assert!(retried() >= 1);
+        // not due yet: the fill stays open
+        let again = receiver.retention.fill_bytes(1000).unwrap();
+        assert!(!again);
+        c.execute("UPDATE bytes_retry SET attempts=8,next_ms=0", [])
+            .unwrap();
+        let state = f._root.path().join("state");
+        std::fs::create_dir_all(state.join("sources")).unwrap();
+        std::fs::copy(
+            receiver.root().join("retention.db"),
+            state.join("sources").join("retention.db"),
+        )
+        .unwrap();
+        let failing = inspect_retry_failing(&state).unwrap();
+        // still unreadable when due: the row stays
+        let due = receiver.retention.fill_bytes(1000).unwrap();
+        set_mode(&dir, 0o755);
+        assert!(!due);
+        assert!(failing.2 >= 1);
+        c.execute("UPDATE bytes_retry SET next_ms=0", []).unwrap();
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        let counted: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM object_bytes WHERE id='b:'||?1)",
+                [&want.hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(counted);
+        assert_eq!(retried(), 0);
+        // a retry row of an object that is gone goes too
+        c.execute("INSERT INTO bytes_retry VALUES('b:gone',1,0)", [])
+            .unwrap();
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(retried(), 0);
+    }
+    #[test]
+    fn a_recount_reads_no_manifest_of_a_root_that_has_its_time() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        write_manifest(&receiver, &parent);
+        write_manifest(&receiver, &child);
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let restart = || {
+            c.execute("UPDATE meta SET value='' WHERE key='clone_ref_fill'", [])
+                .unwrap();
+            receiver
+                .retention
+                .reads
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        };
+        // the first pass marks the roots a publication does not (a carried one)
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        // every root is marked: the recount's pass reads no manifest
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(
+            receiver
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // a root an older binary completed has no time and no refs: only
+        // its manifest is read, and it is filled
+        c.execute("DELETE FROM clone_ref", []).unwrap();
+        c.execute(
+            "UPDATE root SET used_ms=NULL WHERE id='receive:'||?1",
+            [&parent.source_id],
+        )
+        .unwrap();
+        restart();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(
+            receiver
+                .retention
+                .reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let unused: i64 = c
+            .query_row(
+                "SELECT count(*) FROM root WHERE kind='received' AND used_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unused, 0);
+        let refs: i64 = c
+            .query_row(
+                "SELECT count(*) FROM clone_ref WHERE root='receive:'||?1",
+                [&parent.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(refs >= 1);
+    }
+    #[test]
+    fn a_manifest_the_legacy_registration_is_working_on_counts_as_received() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        write_manifest(&receiver, &parent);
+        write_manifest(&receiver, &child);
+        let mut seen_partial = false;
+        for _ in 0..20 {
+            let done = receiver.retention.register_legacy().unwrap();
+            let guard = receiver.mutation_guard().unwrap();
+            for m in [&parent, &child] {
+                assert!(
+                    receiver.received(&guard, &m.source_id).unwrap(),
+                    "{} across a tick",
+                    m.source_id
+                );
+            }
+            seen_partial |= receiver
+                .retention
+                .has_object(&format!("m:{}", child.source_id))
+                .unwrap()
+                && !receiver.retention.received_row(&child.source_id).unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(seen_partial, "a tick ended with the child's m: row only");
     }
     #[test]
     fn refused_publication_leaves_no_empty_receive_root() {

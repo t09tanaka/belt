@@ -206,7 +206,7 @@ fn a_worker_database_with_an_uncollected_result_is_refused_until_it_is_collected
     collected(&previous, "att_done2");
     drop(previous);
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "6");
+    assert_eq!(version(dir.path()), "7");
     // What was dropped is listed for the agent, in bounded pages, until the
     // agent says its directory is gone.
     assert_eq!(
@@ -245,7 +245,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     drop(old);
 
     let store = WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "6");
+    assert_eq!(version(dir.path()), "7");
     assert_eq!(store.worker_id(), &worker());
     for table in [
         "worker_attempt",
@@ -295,7 +295,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     // Opening again changes nothing.
     drop((store, member));
     WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "6");
+    assert_eq!(version(dir.path()), "7");
 }
 
 struct Two {
@@ -975,4 +975,75 @@ fn the_tombstone_limit_leaves_nothing_and_a_newer_epoch_makes_room_first() {
     assert_eq!(t.a.retire(&over, CoordinatorEpoch(4), 3).unwrap(), None);
     assert_eq!(t.a.count_undelivered_tombstones().unwrap(), 1);
     assert_eq!(t.a.max_coordinator_epoch().unwrap(), CoordinatorEpoch(4));
+}
+
+#[test]
+fn an_accepted_attempt_records_its_source_and_the_migration_fills_live_rows_only() {
+    // spec 25.8 5b (a), 25.13: the deletion pass finds a source's live
+    // attempts by the column, so a new row has it from its insert...
+    let t = two();
+    let x = AttemptId::generate();
+    let mut new = acceptance(&x, &TaskId::generate(), 'a', 1);
+    new.spec = json!({"cmd": "true", "source_id": "src_01JABCDEFGHJKMNPQRSTVWXYZ0"});
+    t.a.submit(new, 5).unwrap();
+    assert_eq!(
+        count(
+            &t.own.db,
+            "SELECT count(*) FROM worker_attempt WHERE source_id='src_01JABCDEFGHJKMNPQRSTVWXYZ0'"
+        ),
+        1
+    );
+    // ...and the migration fills it from `spec_json` for the live rows of
+    // a database made before it, not for the terminal ones
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let steps = schema::steps(DbKind::Worker);
+    let db = db::open_with(
+        &dir.path().join("worker.db"),
+        "worker",
+        &steps[..6],
+        schema::compat(6),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    db.write(|tx| {
+        for (id, state) in [("live", "accepted"), ("done", "terminal")] {
+            tx.execute(
+                "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation, payload_hash,
+                    coordinator_epoch, spec_json, state, termination_json, receipts_json,
+                    accepted_at_ms, terminal_at_ms, coordinator_id)
+                 VALUES (?1, 'run_x', ?1, 1, 'h', 9, '{\"source_id\":\"src_s\"}', ?2, ?3, '{}', 1, ?4, 'c')",
+                rusqlite::params![
+                    id,
+                    state,
+                    (state == "terminal").then_some("{}"),
+                    (state == "terminal").then_some(5_i64)
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+    let db = db::open_with(
+        &dir.path().join("worker.db"),
+        "worker",
+        &steps,
+        schema::compat(steps.len()),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM worker_attempt WHERE attempt_id='live' AND source_id='src_s'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM worker_attempt WHERE attempt_id='done' AND source_id IS NULL"
+        ),
+        1
+    );
 }

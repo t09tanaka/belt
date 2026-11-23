@@ -673,6 +673,8 @@ impl SourceStore {
         if stored != want.hash {
             bail!("the store named {stored}, not {}", want.hash);
         }
+        // the file is placed: count it (spec 25.8 5b (c))
+        self.retention.placed(&format!("b:{}", want.hash), n)?;
         Ok(())
     }
 
@@ -686,6 +688,17 @@ impl SourceStore {
     /// stops earlier leaves nothing visible and can be resumed with the same
     /// plan.
     pub fn publish_received(&self, m: &CiManifest, objects: Option<&ObjectsRepo>) -> Result<()> {
+        self.publish_received_as(m, objects, true)
+    }
+    /// `published` says `m` is the requested source of its receipt, not a
+    /// submodule's source the receipt carries: only such a root records the
+    /// time and the `clone_ref` rows (spec 25.8 5b (c), (e)).
+    fn publish_received_as(
+        &self,
+        m: &CiManifest,
+        objects: Option<&ObjectsRepo>,
+        published: bool,
+    ) -> Result<()> {
         verify_manifest(m)?;
         if m.execution_commit.is_some() {
             match objects {
@@ -698,7 +711,7 @@ impl SourceStore {
                 }
             }
         }
-        self.publish_checked(m)
+        self.publish_checked(m, published)
     }
 
     /// `publish_received` for the sources of a transfer, in plan order (leaf
@@ -724,11 +737,13 @@ impl SourceStore {
                 }
             }
         }
+        let last = manifests.last().map(|m| m.source_id.as_str());
         for m in manifests {
+            let published = Some(m.source_id.as_str()) == last;
             if carried.contains(m.source_id.as_str()) {
-                self.publish_received(m, objects)?;
+                self.publish_received_as(m, objects, published)?;
             } else {
-                self.publish_checked(m)?;
+                self.publish_checked(m, published)?;
             }
         }
         Ok(())
@@ -736,17 +751,19 @@ impl SourceStore {
 
     /// One step of [`Self::publish_received_all`], for a caller that holds
     /// one manifest at a time: `carried` says whether the bundle carries the
-    /// commit of `m` (the requested source, or a dirty submodule's capture).
+    /// commit of `m` (the requested source, or a dirty submodule's capture);
+    /// `requested` says `m` is the requested source.
     pub fn publish_received_one(
         &self,
         m: &CiManifest,
         carried: bool,
+        requested: bool,
         objects: Option<&ObjectsRepo>,
     ) -> Result<()> {
         if carried {
-            self.publish_received(m, objects)
+            self.publish_received_as(m, objects, requested)
         } else {
-            self.publish_checked(m)
+            self.publish_checked(m, requested)
         }
     }
 
@@ -764,7 +781,7 @@ impl SourceStore {
                 .context("no receiving objects to hold execution commit")?
                 .check_reachable(m)?;
         }
-        self.publish_checked_root(m, &root)?;
+        self.publish_checked_root(m, &root, true)?;
         self.finish_import(token, &m.source_id)
     }
     /// Whether source `id` is in the store: the index has the root
@@ -776,9 +793,12 @@ impl SourceStore {
         if self.retention.received_row(id)? {
             return Ok(true);
         }
-        if !self.retention.legacy_registration_pending()?
-            || self.retention.has_object(&format!("m:{id}"))?
-        {
+        if !self.retention.legacy_registration_pending()? {
+            return Ok(false);
+        }
+        // (a manifest the legacy registration has not finished may have its
+        // `m:` row already: its file decides, as before the registration)
+        if !self.retention.legacy_queued(id)? && self.retention.has_object(&format!("m:{id}"))? {
             return Ok(false);
         }
         Ok(self.inner.manifest_path(id).is_file())
@@ -791,6 +811,36 @@ impl SourceStore {
         let _held = self.mutation_guard()?;
         let gone = self.retention.forget_completed_claims(1000, CLAIM_PAGES)?;
         Ok(gone < 1000 * u64::from(CLAIM_PAGES))
+    }
+    /// The worker's periodic pages of the stage 5b fills (spec 25.8 5b (c),
+    /// (e), (h)5), under the shared lock taken without waiting (a busy store
+    /// leaves them for the next tick): 1,000 object rows of `bytes`, 32
+    /// roots of `clone_ref`, 32 manifests of the legacy registration.
+    /// Returns whether all three are finished.
+    pub fn fill_retention_pages(&self) -> Result<bool> {
+        let _held = self.mutation_guard()?;
+        // (each fill goes on its own: one that fails is logged, and the
+        // others still run)
+        let page = |what: &str, done: Result<bool>| match done {
+            Ok(done) => done,
+            Err(error) => {
+                eprintln!("source store {what} page: {error:#}");
+                false
+            }
+        };
+        let bytes = page("bytes fill", self.retention.fill_bytes(1000));
+        let recount = page("bytes recount", self.retention.recount_bytes(1000));
+        let refs = page(
+            "clone_ref fill",
+            self.retention.fill_clone_refs(32, 64 << 20),
+        );
+        let legacy = page("legacy registration", self.retention.register_legacy());
+        Ok(bytes && recount && refs && legacy)
+    }
+    /// The total of the counted object files (spec 25.8 5b (c)), `None`
+    /// while it waits for the recount.
+    pub fn store_bytes(&self) -> Result<Option<u64>> {
+        self.retention.store_bytes()
     }
     /// At the worker's start, under `agent.lock` and before anything is
     /// received (spec 25.8 5b (h)1 (ii)): the `receive:%` roots with no
@@ -837,7 +887,7 @@ impl SourceStore {
                 // the settlement or the start-up cleanup after it)
                 let proven = self.settled_manifest(&exclusive, id).is_some_and(|m| {
                     self.retention
-                        .register_held(&root, "received", std::sync::Arc::new(m))
+                        .register_published(&root, std::sync::Arc::new(m))
                         .is_ok()
                 });
                 if proven {
@@ -880,10 +930,10 @@ impl SourceStore {
     pub fn manifest_file_present(&self, id: &str) -> bool {
         std::fs::symlink_metadata(self.inner.manifest_path(id)).is_ok_and(|m| m.is_file())
     }
-    fn publish_checked(&self, m: &CiManifest) -> Result<()> {
-        self.publish_checked_root(m, &format!("receive:{}", m.source_id))
+    fn publish_checked(&self, m: &CiManifest, published: bool) -> Result<()> {
+        self.publish_checked_root(m, &format!("receive:{}", m.source_id), published)
     }
-    fn publish_checked_root(&self, m: &CiManifest, root: &str) -> Result<()> {
+    fn publish_checked_root(&self, m: &CiManifest, root: &str, published: bool) -> Result<()> {
         let mutation = self.mutation_guard()?;
         mutation.ensure_sdk_available()?;
         mutation.ensure_source_available(&m.source_id)?;
@@ -932,8 +982,12 @@ impl SourceStore {
         tmp.as_file().sync_all()?;
         tmp.persist(self.inner.manifest_path(&m.source_id))
             .map_err(|e| e.error)?;
-        self.retention
-            .register_held(root, "received", std::sync::Arc::new(m.clone()))?;
+        let m = std::sync::Arc::new(m.clone());
+        if published {
+            self.retention.register_published(root, m)?;
+        } else {
+            self.retention.register_held(root, "received", m)?;
+        }
         Ok(())
     }
 

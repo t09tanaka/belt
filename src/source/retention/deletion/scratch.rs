@@ -179,10 +179,7 @@ impl Index {
             // The rows the reservation alone made go with it (the rule of
             // the abandonment): no member and no claim of any kind is left.
             let unheld = "NOT EXISTS(SELECT 1 FROM member WHERE object=?1) AND NOT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1)";
-            tx.execute(
-                &format!("DELETE FROM object WHERE id=?1 AND {unheld}"),
-                [key],
-            )?;
+            crate::source::retention::Index::forget_object(&tx, key, unheld)?;
             tx.execute(
                 &format!("DELETE FROM publication WHERE object=?1 AND {unheld}"),
                 [key],

@@ -354,5 +354,5 @@ pub fn publish_as_received(store: &belt::source::SourceStore, ci_source_id: &str
     // (its commit, if any, was made in this store by the capture: the
     // publication's reachability check of a delivered bundle is not asked)
     let m = store.manifest(ci_source_id).unwrap().unwrap();
-    store.publish_received_one(&m, false, None).unwrap();
+    store.publish_received_one(&m, false, true, None).unwrap();
 }

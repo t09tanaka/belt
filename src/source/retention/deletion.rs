@@ -411,6 +411,9 @@ impl Index {
         let tx = c.transaction()?;
         let changed=tx.execute("UPDATE publication SET state='live',incarnation=incarnation+1 WHERE object=?1 AND incarnation=?2 AND state='claimed'",params![claim.object,claim.incarnation])?;
         ensure!(changed == 1, "source claim completion changed");
+        // The file is gone: so is its object row, and its bytes leave the
+        // total (spec 25.8 5b (c)). A later import inserts the row again.
+        super::Index::forget_object(&tx, &claim.object, "1")?;
         // The completed claim row is deleted, not kept as `done=1`: the
         // generation lives on in `publication.incarnation`, which this same
         // transaction advanced, so a stale claim or reader is still refused.

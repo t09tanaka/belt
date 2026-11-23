@@ -1972,7 +1972,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
     }
 }
 

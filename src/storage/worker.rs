@@ -892,8 +892,8 @@ impl WorkerStore {
                         tx.execute(
                             "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation,
                             payload_hash, coordinator_epoch, spec_json, state, receipts_json,
-                            accepted_at_ms, coordinator_id)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9,?10)",
+                            accepted_at_ms, coordinator_id, source_id)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9,?10,?11)",
                             params![
                                 aid,
                                 new.run_id.as_str(),
@@ -904,7 +904,8 @@ impl WorkerStore {
                                 new.spec.to_string(),
                                 json(&receipts),
                                 to_i64(at_ms)?,
-                                o
+                                o,
+                                new.spec.get("source_id").and_then(|v| v.as_str())
                             ],
                         )?;
                         common::append_event_owned(
