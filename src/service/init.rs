@@ -497,7 +497,13 @@ fn sweep_abandoned_stages(j: &Journal, paths: &Paths) {
     if j.pending.is_some() {
         return;
     }
-    let binary_dir = j.spec.executable.parent();
+    // The journal is read from disk: its binary is looked for only where
+    // `init` puts one, below this configuration directory's `bin/`.
+    let binary_dir = j
+        .spec
+        .executable
+        .parent()
+        .filter(|dir| dir.parent() == Some(paths.config.join("bin").as_path()));
     for dir in [Some(paths.config.as_path()), binary_dir, Some(&paths.state)]
         .into_iter()
         .flatten()

@@ -1573,6 +1573,13 @@ async fn init_removes_the_unjournaled_stages_of_a_killed_init() {
     pending.pending = None;
     sweep_abandoned_stages(&pending, &p);
     assert!(!again.exists());
+    // a binary the journal places outside `bin/` is not followed
+    let outside = p.config.join("upgrade/elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    pending.spec.executable = outside.join("belt");
+    let not_ours = put(stage_of_a_killed_init(&pending.spec.executable));
+    sweep_abandoned_stages(&pending, &p);
+    assert!(not_ours.exists());
 }
 
 /// The database is prepared in a stage too: `init` journals its path.

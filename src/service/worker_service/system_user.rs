@@ -280,8 +280,27 @@ impl ManagedFiles for ServiceFiles {
 /// already been committed. During an unfinished switch the drain is kept.
 pub(crate) fn start(input: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
-    let config = input.parent().context("worker input directory missing")?;
     let (name, home) = passwd(euid())?;
+    let paths = input_paths(input, home, HostLauncher::native().backend())?;
+    let pinned = check_boot(&paths, &name, &std::env::current_exe()?)?;
+    // macOS current_exe preserves the invocation symlink. Enter the pinned
+    // version directly, so the foreground worker and its supervisor retain
+    // an immutable path even across a later replacement of bin/current.
+    Err(std::process::Command::new(&pinned)
+        .args(["worker", "--input"])
+        .arg(input)
+        .exec())
+    .with_context(|| format!("start pinned worker {}", pinned.display()))
+}
+
+/// The paths of the worker whose input is `input`, for the account whose
+/// home is `home`. The configuration directory is the one the input is in
+/// (the administrator chose it; the environment of a system service does not
+/// name it). Spec 25.4 (a): this is the start of that worker, so the
+/// temporary files a killed command left in its directories are cleared
+/// here.
+fn input_paths(input: &Path, home: String, backend: policy::Backend) -> anyhow::Result<Paths> {
+    let config = input.parent().context("worker input directory missing")?;
     let env = BTreeMap::from([
         ("HOME".into(), home),
         (
@@ -294,20 +313,10 @@ pub(crate) fn start(input: &Path) -> anyhow::Result<()> {
                 .to_owned(),
         ),
     ]);
-    let paths = Paths::resolve_for(&env, HostLauncher::native().backend())?;
+    let paths = Paths::resolve_for(&env, backend)?;
     ensure!(paths.input == input, "unexpected system worker input path");
-    // The start of this worker: its directories are those of the input it
-    // was given, which the environment of a system service does not name.
     sweep_written_directories(&paths);
-    let pinned = check_boot(&paths, &name, &std::env::current_exe()?)?;
-    // macOS current_exe preserves the invocation symlink. Enter the pinned
-    // version directly, so the foreground worker and its supervisor retain
-    // an immutable path even across a later replacement of bin/current.
-    Err(std::process::Command::new(&pinned)
-        .args(["worker", "--input"])
-        .arg(input)
-        .exec())
-    .with_context(|| format!("start pinned worker {}", pinned.display()))
+    Ok(paths)
 }
 
 pub(super) fn check_boot(
@@ -344,6 +353,52 @@ pub(super) fn check_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The start of a system user's worker clears the temporary files of a
+    /// gone owner in the directory its input is in, which is not the default
+    /// configuration directory, and refuses an input that is somewhere else.
+    #[test]
+    fn the_start_sweeps_the_directory_of_the_input_it_was_given() {
+        use crate::platform::owned_temp::testing::{dead_name, live_name};
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = fs::canonicalize(root.path()).unwrap();
+        let config = home.join("chosen/belt");
+        let default_config = home.join(".config/belt");
+        for dir in [&config, &config.join("bin"), &default_config] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let gone = [
+            config.join(dead_name("jjjjjjjjjjj1")),
+            config.join("bin").join(dead_name("jjjjjjjjjjj2")),
+        ];
+        let kept = [
+            config.join(live_name("kkkkkkkkkkk1")),
+            default_config.join(dead_name("kkkkkkkkkkk2")),
+        ];
+        for file in gone.iter().chain(&kept) {
+            fs::write(file, b"x").unwrap();
+        }
+        let home_text = home.to_str().unwrap().to_string();
+        let paths = input_paths(
+            &config.join("worker.json"),
+            home_text.clone(),
+            policy::Backend::Launchd,
+        )
+        .unwrap();
+        assert_eq!(paths.config, config);
+        for file in &gone {
+            assert!(!file.exists(), "{file:?}");
+        }
+        for file in &kept {
+            assert!(file.exists(), "{file:?}");
+        }
+        assert!(input_paths(
+            &config.join("other.json"),
+            home_text,
+            policy::Backend::Launchd
+        )
+        .is_err());
+    }
 
     #[test]
     fn config_under_home_accepts_valid_path() {

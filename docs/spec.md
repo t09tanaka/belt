@@ -2029,7 +2029,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | workerのstate直下 | `.s*/`（socketの準備）、`worker-socket.json` などの一時file、`removed-members.json` の一時file | workerの起動（`agent.lock` の下） |
 | workerの `clones/`・`workspaces/` | 展開と作成の作業用directory（`.clone.*`・`.staging.*`） | workerの起動（既存の孤児の走査）。`agent.lock` の下で、どの作成よりも前に走るので、書き手は居ない。markerのあるものは持ち主の規則に従い、markerの無いもの（古い版が作ったもの、作ったprocessが自分の場所か開始identityを読めなかったもの）は、書き手が居ないことを根拠に消す。markerがあって読めないものは残す |
 | workerの `setup/builders/<id>/`、`attempts/<attempt>/`、親の `results/<attempt>/` | builderの一時file、準備の観測の一時file、CIのartifactの受け渡しの作業用 | 持ち主のdirectoryと一緒に消える（既存）。持ち主のdirectoryの外（state直下）に書くものは、workerの起動 |
-| system userのworkerの入力のdirectory（管理者が決めたconfig directory） | 入力・journalの一時file、`bin/` の切替の途中のlink | そのworkerの入力を書くcommand（`worker-service` の `install`・`upgrade`）の開始と、そのworkerの起動。どちらも、自分が書く先として解決したdirectoryを走査する |
+| system userのworkerの入力のdirectory（管理者が決めたconfig directory） | 入力・journalの一時file、`bin/` の切替の途中のlink | そのworkerの入力を書くcommand（`worker-service`）の開始と、そのworkerの起動。`install` と起動は、自分が解決したdirectory（起動は、渡された入力のあるdirectory）を走査する。`worker-service` のほかのactionは、同じ環境変数（`HOME`・`XDG_CONFIG_HOME`）から同じdirectoryを解決する、commandの開始の走査による |
 | config directory | `init.json`・`membership-undo.json`・`worker-service.json`・鍵・設定の一時file | `init`・`group`・`workers` の各commandの開始、residentとworkerの起動 |
 | `<config>/upgrade/` | `record.json` と退避した設定の一時file | `upgrade` の開始、serviceの入口 |
 | `<config>/bin/` | `.resident.<pid>`、`.current.<pid>`（切替の途中のlink） | `upgrade`・`init` の開始、residentとworkerの起動 |
@@ -2038,7 +2038,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` で始まる名前だけを見る。一時fileの名前は `.plist`・`.service` で終わらせない（service managerが読み込まない）。
 
-**安全の証明。** 一時fileを読むのは作ったprocessだけである（公開はrename）。そのprocessが居ないことを、場所・pid・開始identityの一致で確かめる。pidが使い回されていても、開始identityが違えば別のprocessである。場所が違うfile（別のhost、またはhostを特定できない）は消さない。
+**安全の証明。** 一時fileを読むのは作ったprocessだけである（公開はrename）。そのprocessが居ないことを、場所・boot・pid・開始identityで確かめる。場所が同じでbootが違えば、そのbootのprocessは1つも残っていない。bootも同じなら、pidが使い回されていても、開始identityが違えば別のprocessである。場所が違うfile（別のhost、またはhostを特定できない）は消さない。
 
 **受け入れ試験。** 表の各場所について: (i) 一時fileを作ったprocessをSIGKILLし、次の契機でそのfileが消える。(ii) 生きているprocessの一時fileは消えない。(iii) pidが同じで開始identityが違うものは消える。(iv) 名前が合わないfile、他のuidのfile、link数が2のfileには触れない。(v) LaunchAgentsのdirectoryにある他の製品のfileに触れない。(vi) `src/` に、この規則を通らない `tempfile` の呼び出しが無いこと（testを除く）を、固定の検査で確かめる。検査は、`#[cfg(test)]` の付いた項目だけを、その項目の終わり（`;` か、対応する閉じ括弧）まで除き、`tempfile` をpathの一部として使う行と、`use tempfile as …` のような別名を見つける。文字列と `/* */` の中は解釈しない。 (vii) journalが名指すstageは、作った `init` が居なくなった後の各commandの開始の走査で消えず、次の `init` が公開を済ませる。 (viii) 場所が同じでbootが違う名前のfileは消え、場所が違う名前のfileは消えない。
 
