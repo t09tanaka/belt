@@ -87,6 +87,16 @@ pub struct ImportRef {
     pub commit: Option<String>,
 }
 
+impl ImportRef {
+    /// The source the ref is of: the one whose snapshot it is, or whose
+    /// index it is.
+    pub fn source(&self) -> Option<&str> {
+        self.snapshot_of
+            .as_deref()
+            .or_else(|| self.name.strip_prefix(INDEXES))
+    }
+}
+
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
