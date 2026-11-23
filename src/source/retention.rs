@@ -358,7 +358,7 @@ impl Index {
     pub(crate) fn empty_receive_roots(&self, limit: u32) -> Result<Vec<String>> {
         let c = self.connect()?;
         let mut s = c.prepare(
-            "SELECT id FROM root WHERE source IS NULL AND id LIKE 'receive:%' ORDER BY id LIMIT ?1",
+            "SELECT id FROM root WHERE kind='pending' AND source IS NULL AND id LIKE 'receive:%' ORDER BY id LIMIT ?1",
         )?;
         let rows = s.query_map([limit], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -378,7 +378,7 @@ impl Index {
         let mut c = self.connect_for_import()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
-            "UPDATE root SET kind='abandoned' WHERE id=?1 AND source IS NULL",
+            "UPDATE root SET kind='abandoned' WHERE id=?1 AND kind='pending' AND source IS NULL",
             [root],
         )?;
         if changed == 1 {
@@ -387,12 +387,21 @@ impl Index {
         tx.commit()?;
         Ok(changed == 1)
     }
-    pub(crate) fn registered_elsewhere(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM member m JOIN root r ON r.id=m.root WHERE m.object='m:'||?1 AND r.source IS NOT NULL)",
-            [id],
-            |r| r.get(0),
-        )?)
+    /// Completed claim rows an older version kept (`done=1`): inert, they
+    /// only kept their object's publication row. Deleted a page of
+    /// `limit` at a time; returns how many went.
+    pub(crate) fn forget_completed_claims(&self, limit: u32) -> Result<u64> {
+        let mut gone = 0;
+        loop {
+            let n = self.connect()?.execute(
+                "DELETE FROM source_delete_claim WHERE rowid IN (SELECT rowid FROM source_delete_claim WHERE done=1 LIMIT ?1)",
+                [limit],
+            )?;
+            gone += n as u64;
+            if n < limit as usize {
+                return Ok(gone);
+            }
+        }
     }
     pub(crate) fn received_row(&self, id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(
@@ -937,6 +946,21 @@ impl SourceStore {
     /// doubling up to 50 ms, and gives up after 120 s with the error the
     /// nonblocking lock gives. Acceptance never calls this (it answers
     /// `OVERLOADED` without waiting); call it on a blocking thread.
+    /// Tests only: the legacy registration is done, or `id` has its
+    /// `receive:` row, or its root is `abandoned`.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, sql: &str, id: &str) {
+        self.retention
+            .connect()
+            .unwrap()
+            .execute(sql, [id])
+            .unwrap();
+    }
+    /// The exclusive lock, as a deleting pass's step holds it (tests only).
+    #[cfg(test)]
+    pub(crate) fn exclusive_step_for_test(&self) -> Guard {
+        self.retention.guard(true).unwrap()
+    }
     pub fn mutation_guard_waiting(&self) -> Result<Guard> {
         self.retention
             .guard_waiting(std::time::Duration::from_secs(120))
@@ -3075,6 +3099,29 @@ mod tests {
         assert!(f.store.retention.guard(true).is_ok());
     }
     #[test]
+    fn an_attempts_sdk_view_waits_per_call_and_holds_no_lock_between_calls() {
+        let f = Fixture::new();
+        let view = f.store.object_store_per_call();
+        // a call waits for a step that is under way
+        let exclusive = f.store.retention.guard(true).unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(exclusive);
+        });
+        let started = std::time::Instant::now();
+        view.with_sdk(|_| {
+            // and the task's reads hold no lock: a step can run among them
+            assert!(f.store.retention.guard(true).is_ok());
+            Ok(())
+        })
+        .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        holder.join().unwrap();
+        // the next call after another step goes on
+        drop(f.store.retention.guard(true).unwrap());
+        view.with_sdk(|_| Ok(())).unwrap();
+    }
+    #[test]
     fn guarded_sdk_view_retains_shared_ownership_and_claim_fences_its_callback() {
         let f = Fixture::new();
         let view = f.store.object_store().unwrap();
@@ -4233,6 +4280,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receiver.settle_empty_receive_roots().unwrap(), None);
+    }
+    #[test]
+    fn abandoned_receive_roots_are_not_settled_again_and_do_not_hide_a_new_one() {
+        let f = Fixture::new();
+        let (receiver, _m, _want, _bytes) = received_fixture(&f);
+        let c = receiver.retention.connect().unwrap();
+        for i in 0..1001u32 {
+            c.execute(
+                "INSERT INTO root(id,kind) VALUES(?1,'abandoned')",
+                [format!("receive:{i:064x}")],
+            )
+            .unwrap();
+        }
+        // only abandoned roots: nothing to settle, the start does not wait
+        let _shared = receiver.mutation_guard().unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), None);
+        drop(_shared);
+        // a new cut publication after 1,001 abandoned ones is settled
+        let fresh = format!("receive:{}", "f".repeat(64));
+        receiver.retention.pending(&fresh).unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), Some((0, 1)));
+        let kind: String = c
+            .query_row("SELECT kind FROM root WHERE id=?1", [&fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "abandoned");
+    }
+    #[test]
+    fn a_root_whose_registration_fails_is_abandoned_and_the_rest_settled() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let root = format!("receive:{id}");
+        receiver.retention.pending(&root).unwrap();
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        // the cut registration had found a child whose manifest is gone
+        let c = receiver.retention.connect().unwrap();
+        c.execute(
+            "INSERT INTO graph(root,source) VALUES(?1,?2)",
+            [&root, &"e".repeat(64)],
+        )
+        .unwrap();
+        let lost = format!("receive:{}", "0".repeat(64));
+        receiver.retention.pending(&lost).unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), Some((0, 2)));
+        for r in [&root, &lost] {
+            let kind: String = c
+                .query_row("SELECT kind FROM root WHERE id=?1", [r], |x| x.get(0))
+                .unwrap();
+            assert_eq!(kind, "abandoned");
+        }
+        let graph: i64 = c
+            .query_row("SELECT count(*) FROM graph WHERE root=?1", [&root], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(graph, 0);
+    }
+    #[test]
+    fn completed_claim_rows_of_an_older_version_are_deleted_in_pages() {
+        let f = Fixture::new();
+        let c = f.store.retention.connect().unwrap();
+        for i in 0..5 {
+            c.execute(
+                "INSERT INTO source_delete_claim VALUES(?1,1,'{}',1)",
+                [format!("b:{i:064x}")],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO source_delete_claim VALUES('b:live',1,'{}',0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(f.store.retention.forget_completed_claims(2).unwrap(), 5);
+        let left: Vec<String> = c
+            .prepare("SELECT object FROM source_delete_claim")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["b:live"]);
     }
     mod vault_cases {
         use super::*;

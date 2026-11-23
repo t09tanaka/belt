@@ -29,12 +29,11 @@ impl SourcePins {
     /// when the source is not in the store.
     pub fn pin(&self, store: &SourceStore, source: &str) -> Result<Pin> {
         let held = store.mutation_guard_waiting()?;
-        // (the `receive:` row, or the manifest file: a source an
-        // attempt names may be in the store by another root, as the parent's
-        // local worker and a captured source are; the deleting pass only
-        // considers `receive:` roots, so this is the same proof for it)
+        // (the one predicate of spec 25.8 5b (b): a file under an abandoned
+        // or pending root, or one left after the legacy registration, is
+        // not a source here, and pinning it would not keep its files)
         ensure!(
-            store.received(&held, source)? || store.manifest_file_present(source),
+            store.received(&held, source)?,
             "source {source} is not in this worker's store"
         );
         *self.lock().entry(source.to_string()).or_insert(0) += 1;
@@ -82,6 +81,22 @@ mod tests {
         let path = store.object_store().unwrap().manifest_path(&id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{}").unwrap();
+        // (h)1 (iii): once the legacy registration is done, a file alone (a
+        // leftover, or one under an abandoned or pending root) is no source
+        store.set_for_test(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration' AND ?1<>''",
+            &id,
+        );
+        assert!(pins.pin(&store, &id).is_err());
+        store.set_for_test(
+            "INSERT INTO root(id,kind) VALUES('receive:'||?1,'abandoned')",
+            &id,
+        );
+        assert!(pins.pin(&store, &id).is_err());
+        store.set_for_test(
+            "UPDATE root SET kind='received',source=?1 WHERE id='receive:'||?1",
+            &id,
+        );
         let first = pins.pin(&store, &id).unwrap();
         let second = pins.pin(&store, &id).unwrap();
         drop(first);

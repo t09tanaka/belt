@@ -382,7 +382,9 @@ impl Seek for SourceReader {
 /// Scoped SDK access. No Deref/Clone exposes an unleased ObjectStore.
 pub struct GuardedObjectStore<'a> {
     store: &'a SourceStore,
-    guard: super::retention::Guard,
+    /// `None` for an accepted attempt's supervisor: each call waits for its
+    /// own shared lock instead of one lock held for the task's life.
+    guard: Option<super::retention::Guard>,
 }
 impl GuardedObjectStore<'_> {
     pub fn object_path(&self, hash: &str) -> PathBuf {
@@ -397,7 +399,18 @@ impl GuardedObjectStore<'_> {
         &self,
         use_store: impl FnOnce(&ObjectStore) -> Result<T>,
     ) -> Result<T> {
-        self.guard.ensure_sdk_available()?;
+        match &self.guard {
+            Some(guard) => guard.ensure_sdk_available()?,
+            // (spec 25.8 5b (a): the check waits for a deleting pass's step
+            // and the lock goes with it; the task's reads after it need no
+            // lock, since its source is referenced by its attempt's
+            // non-terminal row, which the deleting pass reads, and a blob
+            // it shares with another source is kept by that membership)
+            None => self
+                .store
+                .mutation_guard_waiting()?
+                .ensure_sdk_available()?,
+        }
         use_store(&self.store.inner)
     }
 }
@@ -455,8 +468,18 @@ impl SourceStore {
     pub fn object_store(&self) -> Result<GuardedObjectStore<'_>> {
         Ok(GuardedObjectStore {
             store: self,
-            guard: self.mutation_guard()?,
+            guard: Some(self.mutation_guard()?),
         })
+    }
+
+    /// The SDK view of an accepted attempt's supervisor: no lock is held
+    /// between its calls; each [`GuardedObjectStore::with_sdk`] waits for
+    /// the shared lock for its check (spec 25.8 5b (a)).
+    pub fn object_store_per_call(&self) -> GuardedObjectStore<'_> {
+        GuardedObjectStore {
+            store: self,
+            guard: None,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -751,18 +774,19 @@ impl SourceStore {
         if self.retention.received_row(id)? {
             return Ok(true);
         }
-        // A source a finished registration of another root holds (a
-        // capture, a run's source in a store shared with a parent): its
-        // `m:` membership belongs to a root whose source is set.
-        if self.retention.registered_elsewhere(id)? {
-            return Ok(true);
-        }
         if !self.retention.legacy_registration_pending()?
             || self.retention.has_object(&format!("m:{id}"))?
         {
             return Ok(false);
         }
         Ok(self.inner.manifest_path(id).is_file())
+    }
+    /// At the worker's start: the completed claim rows an older version kept
+    /// (`done=1`) are deleted, a page of 1,000 per transaction (spec 25.8
+    /// 5b (h)3). They are inert, so the shared lock is enough.
+    pub fn forget_completed_claims(&self) -> Result<u64> {
+        let _held = self.mutation_guard()?;
+        self.retention.forget_completed_claims(1000)
     }
     /// At the worker's start, under `agent.lock` and before anything is
     /// received (spec 25.8 5b (h)1 (ii)): the `receive:%` roots with no
@@ -782,7 +806,7 @@ impl SourceStore {
         {
             return Ok(None);
         }
-        let Some(_exclusive) = self
+        let Some(exclusive) = self
             .retention
             .guard_exclusive_waiting(std::time::Duration::from_secs(120))?
         else {
@@ -804,17 +828,18 @@ impl SourceStore {
             }
             for root in fresh {
                 let id = root.trim_start_matches("receive:");
-                match self.settled_manifest(id) {
-                    Some(m) => {
-                        self.retention
-                            .register_held(&root, "received", std::sync::Arc::new(m))?;
-                        registered += 1;
-                    }
-                    None => {
-                        if self.retention.abandon_empty_receive_root(&root)? {
-                            abandoned += 1;
-                        }
-                    }
+                // (a registration that fails, e.g. on a grandchild manifest
+                // gone since, abandons that root only: one root never stops
+                // the settlement or the start-up cleanup after it)
+                let proven = self.settled_manifest(&exclusive, id).is_some_and(|m| {
+                    self.retention
+                        .register_held(&root, "received", std::sync::Arc::new(m))
+                        .is_ok()
+                });
+                if proven {
+                    registered += 1;
+                } else if self.retention.abandon_empty_receive_root(&root)? {
+                    abandoned += 1;
                 }
             }
         }
@@ -824,10 +849,12 @@ impl SourceStore {
     /// file is that source's valid manifest, its blobs are here with their
     /// sizes, and its children are published. Read under the caller's
     /// exclusive lock (no other guard is taken).
-    fn settled_manifest(&self, id: &str) -> Option<CiManifest> {
+    fn settled_manifest(&self, held: &super::retention::Guard, id: &str) -> Option<CiManifest> {
         let path = self.inner.manifest_path(id);
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() > 64 << 20 {
+        // (the limit a receipt takes a manifest under)
+        let limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
+        if !meta.is_file() || meta.len() > limit {
             return None;
         }
         let m: CiManifest = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
@@ -839,7 +866,8 @@ impl SourceStore {
                 .is_ok_and(|b| b.is_file() && b.len() == e.size)
         });
         let children = m.submodules.iter().all(|s| match &s.source_id {
-            Some(child) => self.retention.received_row(child).unwrap_or(false),
+            // (the predicate publication uses, spec 25.8 5b (b))
+            Some(child) => self.received(held, child).unwrap_or(false),
             None => true,
         });
         (blobs && children).then_some(m)

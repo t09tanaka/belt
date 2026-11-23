@@ -132,9 +132,8 @@ pub(crate) fn execute_selected(
     paths: TaskPaths,
     executor: Arc<dyn StepExecutor>,
 ) -> Result<TaskResult, ExecuteError> {
-    let view = store
-        .object_store()
-        .map_err(|e| ExecuteError::Binding(e.to_string()))?;
+    // (an attempt's task holds no lock for its life: spec 25.8 5b (a))
+    let view = store.object_store_per_call();
     let ran = view.with_sdk(|objects| {
         let mut ctx = ExecContext::new(paths.env.clone());
         // The handle the host holds, not one of the context's own.

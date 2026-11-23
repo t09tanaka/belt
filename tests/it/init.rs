@@ -684,13 +684,25 @@ async fn initialized_worker_bridge_shares_local_database_and_admission_window() 
     let source = f.root.path().join("source");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("input"), "snapshot").unwrap();
+    // (a worker's store holds only what it received: the capture is
+    // published the way a delivery publishes it, spec 25.8 5b (b))
+    let worker_sources = belt::source::SourceStore::open(&spec.worker_state_dir).unwrap();
     let captured = belt::source::capture(
         &spec.env,
-        &belt::source::SourceStore::open(&spec.worker_state_dir).unwrap(),
+        &worker_sources,
         &belt::source::SourceRequest::Directory { dir: source },
         &belt::source::CaptureParams::default(),
     )
     .unwrap();
+    worker_sources
+        .publish_received(
+            &worker_sources
+                .manifest(&captured.manifest.ci_source_id)
+                .unwrap()
+                .unwrap(),
+            None,
+        )
+        .unwrap();
     let release = f.root.path().join("release");
     let payload = AttemptPayload {
         ci_task: None,

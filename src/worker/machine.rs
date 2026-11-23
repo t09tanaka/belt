@@ -92,11 +92,13 @@ impl Machine {
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
         let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
             .map_err(|e| internal("stored payload", e))?;
-        self.manifest_of(&payload)
+        manifest_in(&self.store, &payload, Wait::Yes)
     }
 
+    /// `manifest` at acceptance, which never waits (spec 25.8 5b (a)): a
+    /// busy store gives today's answer.
     fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
-        manifest_in(&self.store, payload)
+        manifest_in(&self.store, payload, Wait::No)
     }
 
     /// Prepare the setup steps of attempts once per worker (spec chapter 8):
@@ -203,9 +205,37 @@ pub fn check_toolchain_source(
         .map_err(|e| invalid(&e))
 }
 
+/// [`check_toolchain_source`] for an accepted attempt: under one waited
+/// shared lock, so its blob reads (which only try the lock) wait for a
+/// deleting pass's step too (spec 25.8 5b (a)) instead of failing as an
+/// invalid bundle.
+fn check_toolchain_waiting(
+    store: &SourceStore,
+    state_dir: &Path,
+    m: &CiManifest,
+    payload: &AttemptPayload,
+) -> Result<(), ApiError> {
+    let _held = store
+        .mutation_guard_waiting()
+        .map_err(|e| internal("source store", format!("{e:#}")))?;
+    check_toolchain_source(store, state_dir, m, payload)
+}
+
+/// Whether a reader waits for a deleting pass's step (an accepted attempt's
+/// reader) or not (acceptance).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    Yes,
+    No,
+}
+
 /// The manifest of the source the payload names, and only if it is the
 /// manifest the payload names.
-fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
+fn manifest_in(
+    store: &SourceStore,
+    payload: &AttemptPayload,
+    wait: Wait,
+) -> Result<CiManifest, ApiError> {
     let missing = || {
         ApiError::new(
             ErrorCode::NotFound,
@@ -215,9 +245,15 @@ fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManife
     let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
     // An accepted attempt's reader waits for a deleting pass's step instead
     // of failing (spec 25.8 5b (a)); the read below shares this lock.
-    let _held = store
-        .mutation_guard_waiting()
-        .map_err(|e| internal("source store", format!("{e:#}")))?;
+    // Acceptance only tries it (inside `store.manifest`).
+    let _held = match wait {
+        Wait::Yes => Some(
+            store
+                .mutation_guard_waiting()
+                .map_err(|e| internal("source store", format!("{e:#}")))?,
+        ),
+        Wait::No => None,
+    };
     let m = store
         .manifest(&source)
         .map_err(|e| internal("source store", format!("{e:#}")))?
@@ -250,7 +286,7 @@ struct BuilderWs {
 
 impl BuilderWorkspaces for BuilderWs {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
-        let m = manifest_in(&self.store, payload)?;
+        let m = manifest_in(&self.store, payload, Wait::Yes)?;
         // (the builder's thread is not joined by the attempt's release: it
         // pins the source for as long as it makes the workspace)
         let _pin = pin(&self.pins, &self.store, &m)?;
@@ -419,7 +455,10 @@ impl Host for Machine {
         // (the `prepare` thread reads on after a waiter gives up: it pins
         // the source until the workspace is made)
         let _pin = pin(&self.pins, &self.store, &m)?;
-        check_toolchain_source(&self.store, &self.state_dir, &m, payload)?;
+        // (its blob reads only try the shared lock: one waited lock held
+        // around them makes them wait for a deleting pass's step too, spec
+        // 25.8 5b (a), instead of failing as an invalid bundle)
+        check_toolchain_waiting(&self.store, &self.state_dir, &m, payload)?;
 
         if payload.in_place {
             let root = self.original(payload)?;
@@ -546,5 +585,76 @@ impl Host for Machine {
             Some(ws) if ws.root.exists() => self.workspaces.remove(ws),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{Digest, Generation, RunId, SourceId, TaskId};
+    use std::time::{Duration, Instant};
+
+    fn payload() -> AttemptPayload {
+        let d = Digest::of_bytes(b"x");
+        AttemptPayload {
+            ci_task: None,
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            run_id: RunId::generate(),
+            task_id: TaskId::generate(),
+            generation: Generation(1),
+            source_id: SourceId::generate(),
+            plan_digest: d.clone(),
+            manifest_digest: d,
+            permit_id: None,
+            commands: Vec::new(),
+            lease_ms: 60_000,
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// One exclusive step, held for `ms` on another thread.
+    fn step(store: &SourceStore, ms: u64) -> std::thread::JoinHandle<()> {
+        let exclusive = store.exclusive_step_for_test();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            drop(exclusive);
+        })
+    }
+
+    #[test]
+    fn acceptance_does_not_wait_for_a_step_and_an_attempt_reader_does() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let p = payload();
+        let holder = step(&store, 600);
+        let started = Instant::now();
+        assert!(manifest_in(&store, &p, Wait::No).is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        holder.join().unwrap();
+        let holder = step(&store, 300);
+        let started = Instant::now();
+        let e = manifest_in(&store, &p, Wait::Yes).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn the_toolchain_check_of_prepare_waits_for_a_step() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let p = payload();
+        let holder = step(&f.store, 300);
+        let started = Instant::now();
+        check_toolchain_waiting(&f.store, f.area.as_path(), &f.manifest, &p).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
     }
 }

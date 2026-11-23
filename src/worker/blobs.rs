@@ -1985,12 +1985,15 @@ impl BlobSink for Incoming {
         }
         // (first the publications a crash cut before their registration:
         // spec 25.8 5b (h)1 (ii); a busy store leaves them for later, and
-        // its gate stays closed meanwhile)
-        self.store
-            .settle_empty_receive_roots()
-            .map_err(|e| internal("source store", format!("{e:#}")))?;
-        self.store
-            .forget_unowned_imports(&owned)
+        // its gate stays closed meanwhile; its failure is reported after
+        // the 5a cleanup below, which runs in any case)
+        let settled = self.store.settle_empty_receive_roots();
+        // (and the claim rows an older version kept, (h)3; a busy store
+        // leaves them for the next start)
+        let _ = self.store.forget_completed_claims();
+        let forgotten = self.store.forget_unowned_imports(&owned);
+        settled.map_err(|e| internal("source store", format!("{e:#}")))?;
+        forgotten
             .map(Some)
             .map_err(|e| internal("source store", format!("{e:#}")))
     }
