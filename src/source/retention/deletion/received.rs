@@ -8,8 +8,10 @@
 //! members the next sections release; step 4's `ref_drop:` rows record the
 //! clone refs the detach orphaned (their removal is a later change).
 //!
-//! This module is reached only from tests and from a caller that has
-//! checked the trial and the store's owner; nothing schedules it yet.
+//! The worker agent runs it on a thread of its own, at most once a minute
+//! and back to back while it makes progress (`Agent::received_passes`,
+//! spec 25.8 5b (h)6), never on trial. Until `legacy_registration` is
+//! `done` its gate keeps every pass from changing anything.
 use super::import_release::forget_member;
 use super::*;
 

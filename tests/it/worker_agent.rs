@@ -3249,6 +3249,12 @@ impl Host for RealButCore {
     fn source_ended(&self, s: &SourceId) {
         self.0.source_ended(s)
     }
+    fn received_pass(
+        &self,
+        attempts: &belt::worker::host::SourceAttempts,
+    ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
+        self.0.received_pass(attempts)
+    }
     fn secret_paths(
         &self,
         p: &AttemptPayload,
@@ -6193,4 +6199,60 @@ async fn a57_the_upgrade_hold_refuses_new_attempts_and_resume_does_not_lift_it()
     assert!(!inspect_draining(&c).await);
     submit(&c, &a, &payload("exit 0")).await;
     agent.shutdown();
+}
+
+/// Spec 25.8 5b (d), (h)6, (g)22: the deleting passes of the received
+/// sources leave a store that holds a parent's roots alone and say so once
+/// a process; none runs while a version is on trial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn received_passes_leave_a_parent_store_alone_and_wait_out_a_trial() {
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    use belt::worker::control;
+    let f = fx();
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("x.txt"), "x\n").unwrap();
+    // (a capture for a run: the store holds a parent's `run` root)
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &RunId::generate(),
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let id = captured.manifest.ci_source_id.clone();
+    let machine =
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+
+    assert_eq!(agent.received_passes(), 1);
+    assert_eq!(agent.received_passes(), 1);
+    let shared: i64 = rusqlite::Connection::open(state.join("worker.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM event WHERE kind='source_store_shared'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared, 1);
+    assert!(store.manifest(&id).unwrap().is_some());
+
+    control::begin_trial(&state).unwrap();
+    assert_eq!(agent.received_passes(), 0);
+    control::end_trial(&state).unwrap();
 }

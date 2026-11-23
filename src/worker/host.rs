@@ -14,6 +14,11 @@ use crate::storage::AcceptedAttempt;
 use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
+/// For each source, across every member: whether a non-terminal attempt
+/// names it, and the newest `terminal_at_ms` of those that did.
+pub type SourceAttempts<'a> =
+    dyn Fn(&crate::ids::SourceId) -> anyhow::Result<(bool, Option<i64>)> + 'a;
+
 pub trait Host: Send + Sync {
     /// Existing worker-local setup owner; access never initializes it.
     fn setup_owner(&self) -> Option<&crate::setup::builder::Setups> {
@@ -87,6 +92,18 @@ pub trait Host: Send + Sync {
     /// root gets the time (spec 25.8 5b (c)), under the shared lock taken
     /// without waiting; a busy store skips the record. Best effort.
     fn source_ended(&self, _source: &crate::ids::SourceId) {}
+    /// One deleting pass of the received sources (spec 25.8 5b (d)), on
+    /// the agent's own thread for it ((h)6). `attempts` answers, for every
+    /// member, whether a non-terminal attempt names the source and the
+    /// newest `terminal_at_ms` of those that did
+    /// ([`crate::storage::WorkerStore::source_use`]); the host adds its
+    /// in-process pins ((h)7). `None`: this host has no source store.
+    fn received_pass(
+        &self,
+        _attempts: &SourceAttempts,
+    ) -> Option<anyhow::Result<crate::source::retention::ReceivedPassReport>> {
+        None
+    }
     /// Is the payload's source in the store (spec 25.8 5b (b), the
     /// `received` root)? Asked by a new attempt's acceptance under the lock
     /// of [`Self::hold_source`]. A host without a source store, and a source
