@@ -487,16 +487,28 @@ fn is_stage_name(name: &str) -> bool {
 }
 /// Remove the stages that an `init` which was killed before it journaled
 /// them left in the directories that only this journal governs: the
-/// configuration directory, the directory of the binary and the parent's
-/// state directory. Only after [`recover`] returned with no stage pending
-/// and under `init.lock`: then no journal names a stage whose owner is gone.
+/// configuration directory, the directory of the binary and, once this
+/// journal owns the database in it, the parent's state directory. Only after
+/// [`recover`] returned with no stage pending and under `init.lock`: then no
+/// journal names a stage whose owner is gone.
+///
+/// The state directory is not found through the configuration directory
+/// (`XDG_STATE_HOME`), so the `init` of another configuration directory, with
+/// its own lock and journal, may look at the same one. Its journal may name a
+/// database stage there, and this `init` cannot read that journal. So the
+/// state directory is swept only by the journal that owns `coordinator.db`
+/// in it ([`owns_database`]): while that file stands, a stage that another
+/// journal names there can never be published (the publication never
+/// replaces, and a recovery accepts a standing target only when it is the
+/// very file its stage was), so removing it takes nothing from anybody.
 /// The directory of the service definitions is shared with other
-/// installations of this user (another configuration directory, another
-/// journal), so a stage there is left alone.
+/// installations in the same way and has no such owner, so a stage there is
+/// left alone.
 fn sweep_abandoned_stages(j: &Journal, paths: &Paths) {
     if j.pending.is_some() {
         return;
     }
+    let state = owns_database(j, paths).then_some(paths.state.as_path());
     // The journal is read from disk: its binary is looked for only where
     // `init` puts one, below this configuration directory's `bin/`.
     let binary_dir = j
@@ -504,12 +516,21 @@ fn sweep_abandoned_stages(j: &Journal, paths: &Paths) {
         .executable
         .parent()
         .filter(|dir| dir.parent() == Some(paths.config.join("bin").as_path()));
-    for dir in [Some(paths.config.as_path()), binary_dir, Some(&paths.state)]
+    for dir in [Some(paths.config.as_path()), binary_dir, state]
         .into_iter()
         .flatten()
     {
         crate::platform::owned_temp::sweep_stages(dir);
     }
+}
+/// Whether the journal `j` has published the database of this state
+/// directory and that very file still stands there.
+fn owns_database(j: &Journal, paths: &Paths) -> bool {
+    let database = paths.state.join("coordinator.db");
+    j.database
+        .iter()
+        .chain(&j.files)
+        .any(|proof| proof.path == database && proof.verify_inode().is_ok())
 }
 fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     resident::validate_components(path)?;
@@ -890,6 +911,10 @@ async fn initialize_prepared<L: Launcher>(
             },
         )?;
     }
+    // The database is this journal's from here on: what an `init` that was
+    // killed while it prepared one left in the state directory goes now, not
+    // at an `init` that may never be run again.
+    sweep_abandoned_stages(&j, &paths);
     if !owned(&j, &paths.input)? {
         let stage = stage_path(&paths.input);
         bootstrap::write_input(&stage, &j.spec)?;

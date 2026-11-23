@@ -1582,6 +1582,103 @@ async fn init_removes_the_unjournaled_stages_of_a_killed_init() {
     assert!(not_ours.exists());
 }
 
+/// The state directory is not below the configuration directory: the `init`
+/// of another configuration directory (its own lock, its own journal with
+/// nothing pending) looks at the same one. It must leave a database stage
+/// there alone, which the first installation's journal names: otherwise that
+/// installation never recovers.
+#[tokio::test]
+async fn another_configuration_directory_leaves_the_stages_of_a_shared_state() {
+    let (t, a) = fixture();
+    let p = Paths::resolve(&a.env).unwrap();
+    assert!(initialize(a.clone(), &mut Unknown).await.is_err());
+    let mut j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+    let mut jf = JournalFile {
+        path: p.journal.clone(),
+        proof: Some(Proof::read(&p.journal).unwrap()),
+    };
+    // the first installation was killed after it journaled its database stage
+    let target = p.state.join("coordinator.db");
+    let stage = stage_of_a_killed_init(&target);
+    fs::rename(&target, &stage).unwrap();
+    j.database = None;
+    j.pending = Some(Pending {
+        staged: Proof::read(&stage).unwrap(),
+        target: target.clone(),
+    });
+    jf.save(&j).unwrap();
+    // one that nobody journaled lies beside it
+    let abandoned = stage_of_a_killed_init(&target);
+    fs::write(&abandoned, b"left").unwrap();
+
+    let mut b = a.clone();
+    b.env.insert(
+        "XDG_CONFIG_HOME".into(),
+        t.path().join("other-config").to_str().unwrap().into(),
+    );
+    let other = Paths::resolve(&b.env).unwrap();
+    assert_eq!(other.state, p.state);
+    assert_ne!(other.config, p.config);
+    assert!(initialize(b, &mut Unknown).await.is_err());
+    let theirs: Journal = serde_json::from_slice(&fs::read(&other.journal).unwrap()).unwrap();
+    assert!(theirs.pending.is_none() && !owns_database(&theirs, &other));
+    assert!(stage.exists(), "another configuration took a journaled stage");
+    assert!(abandoned.exists());
+    sweep_abandoned_stages(&theirs, &other);
+    assert!(stage.exists() && abandoned.exists());
+
+    // the first installation recovers, and then the state is its own to sweep
+    assert!(initialize(a, &mut Unknown)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unknown"));
+    let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+    assert!(j.pending.is_none() && target.exists() && !stage.exists());
+    assert!(owns_database(&j, &p));
+    assert!(!abandoned.exists());
+    // a database that is not the one the journal published is not owned
+    let moved = p.state.join("moved");
+    fs::copy(&target, &moved).unwrap();
+    fs::rename(&moved, &target).unwrap();
+    assert!(!owns_database(&j, &p));
+}
+
+/// An `init` that was killed while it prepared its first database left a
+/// stage that no journal names. The next `init` publishes a database and
+/// removes that stage in the same run: only then is the state its own.
+#[tokio::test]
+async fn the_stage_of_a_first_database_goes_when_the_next_init_owns_one() {
+    let (_t, c) = fixture();
+    let p = Paths::resolve(&c.env).unwrap();
+    assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+    let mut j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+    let mut jf = JournalFile {
+        path: p.journal.clone(),
+        proof: Some(Proof::read(&p.journal).unwrap()),
+    };
+    let target = p.state.join("coordinator.db");
+    fs::remove_file(&target).unwrap();
+    j.database = None;
+    j.files.retain(|f| f.path != target);
+    jf.save(&j).unwrap();
+    let abandoned = stage_of_a_killed_init(&target);
+    fs::write(&abandoned, b"left").unwrap();
+    let beside = abandoned.with_file_name(format!(
+        "{}.init-lock",
+        abandoned.file_name().unwrap().to_str().unwrap()
+    ));
+    fs::write(&beside, b"").unwrap();
+    assert!(!owns_database(&j, &p));
+    assert!(initialize(c, &mut Unknown)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unknown"));
+    assert!(target.exists());
+    assert!(!abandoned.exists() && !beside.exists());
+}
+
 /// The database is prepared in a stage too: `init` journals its path.
 #[test]
 fn the_database_is_prepared_in_a_stage() {
