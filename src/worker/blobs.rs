@@ -100,6 +100,11 @@ const RESERVED_TMP: &str = "reserved.tmp";
 /// its publication takes (spec 25.8, 1): the directory owns the token.
 const IMPORT_TOKEN: &str = "import-token";
 const IMPORT_TOKEN_TMP: &str = "import-token.tmp";
+/// The refs an unpacked bundle of the source made in its clone, recorded
+/// until the source is published: a directory thrown away before that drops
+/// them the way a refusal does (spec 25.8, 3).
+const MADE_REFS: &str = "made-refs";
+const MADE_REFS_TMP: &str = "made-refs.tmp";
 /// Where the files of a source wait: part-way, and whole.
 const PARTS: &str = "parts";
 const FILES: &str = "files";
@@ -452,6 +457,44 @@ fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// The record of [`MADE_REFS`]: the repository, then one ref a line
+/// (`name`, the source it is the snapshot of or `-`, its commit or `-`).
+fn made_refs_text(repository_id: &str, refs: &[ImportRef]) -> String {
+    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
+    let mut out = format!("{repository_id}\n");
+    for r in refs {
+        out.push_str(&format!(
+            "{} {} {}\n",
+            r.name,
+            dash(&r.snapshot_of),
+            dash(&r.commit)
+        ));
+    }
+    out
+}
+
+/// `None` when there is no record or it is not one this module wrote.
+fn read_made_refs(dir: &Path) -> Option<(String, Vec<ImportRef>)> {
+    let text = fs::read_to_string(dir.join(MADE_REFS)).ok()?;
+    let mut lines = text.lines();
+    let repository_id = lines.next()?.to_string();
+    let some = |v: &str| (v != "-").then(|| v.to_string());
+    let mut refs = vec![];
+    for line in lines {
+        let mut parts = line.split(' ');
+        let (name, of, commit) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() || !name.starts_with("refs/") {
+            return None;
+        }
+        refs.push(ImportRef {
+            name: name.to_string(),
+            snapshot_of: some(of),
+            commit: some(commit),
+        });
+    }
+    Some((repository_id, refs))
+}
+
 fn staged_bytes(dir: &Path) -> u64 {
     let mut sum = 0u64;
     for d in [dir.to_path_buf(), dir.join(PARTS), dir.join(FILES)] {
@@ -614,6 +657,18 @@ impl Incoming {
         if let Ok(Some(id)) = recorded_token(&dir) {
             let _ = self.store.release_import(&id);
         }
+        // Not published: the refs its bundle made go, but for the snapshots
+        // of captures that are published by now (as a refusal does).
+        if let Some((repository_id, made)) = read_made_refs(&dir) {
+            if let Some(repo) = self.objects(&repository_id) {
+                Self::drop_refs(&repo, &made, |r| match &r.snapshot_of {
+                    Some(id) => self.published(id).unwrap_or(true),
+                    None => false,
+                });
+            }
+        }
+        remove_staged(&dir.join(MADE_REFS_TMP));
+        remove_staged(&dir.join(MADE_REFS));
         remove_staged(&dir.join(IMPORT_TOKEN_TMP));
         remove_staged(&dir.join(IMPORT_TOKEN));
         for sub in [dir.join(PARTS), dir.join(FILES), dir.clone()] {
@@ -783,6 +838,31 @@ impl Incoming {
         fs::write(&tmp, SourceStore::import_token_id(&token)).map_err(io_err)?;
         fs::rename(&tmp, dir.join(IMPORT_TOKEN)).map_err(io_err)?;
         Ok(token)
+    }
+
+    /// Add `made` to what the directory records its bundles made (an
+    /// unpack after a restart finds the refs there and makes none).
+    fn record_made_refs(
+        &self,
+        dir: &Path,
+        repository_id: &str,
+        made: &[ImportRef],
+    ) -> Result<(), ApiError> {
+        let mut all = match read_made_refs(dir) {
+            Some((id, refs)) if id == repository_id => refs,
+            _ => vec![],
+        };
+        for r in made {
+            if all.iter().all(|a| a.name != r.name) {
+                all.push(r.clone());
+            }
+        }
+        if all.is_empty() {
+            return Ok(());
+        }
+        let tmp = dir.join(MADE_REFS_TMP);
+        fs::write(&tmp, made_refs_text(repository_id, &all)).map_err(io_err)?;
+        fs::rename(&tmp, dir.join(MADE_REFS)).map_err(io_err)
     }
 
     /// Let the source take `total` bytes in all ([`source_total`]) and
@@ -1454,6 +1534,7 @@ impl Incoming {
                 Some(bundle) => {
                     let u = self.unpack(limits, &bundle, repository_id, root_id, st)?;
                     let repo = u.repo.clone();
+                    self.record_made_refs(&dir, repository_id, &u.made)?;
                     unpacked = Some((u, repository_id.clone()));
                     repo
                 }
@@ -1525,6 +1606,15 @@ impl Incoming {
             // Refused after its bundle was unpacked: the refs the bundle
             // made go again, but for the snapshots of the captures that are
             // published by now (their manifests name those commits).
+            if let Some((repository_id, made)) = read_made_refs(&dir) {
+                if let Some(repo) = self.objects(&repository_id) {
+                    Self::drop_refs(&repo, &made, |r| match &r.snapshot_of {
+                        Some(id) => self.published(id).unwrap_or(true),
+                        None => false,
+                    });
+                }
+            }
+            remove_staged(&dir.join(MADE_REFS));
             if let Some((u, repository_id)) = &unpacked {
                 Self::drop_refs(&u.repo, &u.made, |r| match &r.snapshot_of {
                     Some(id) => self.published(id).unwrap_or(true),
@@ -1536,6 +1626,8 @@ impl Incoming {
             }
             return Err(invalid(format!("the source is refused: {e:#}")));
         }
+        // published: the refs are the source's now
+        remove_staged(&dir.join(MADE_REFS));
         self.discard(source.as_str());
         Ok(true)
     }
@@ -1757,6 +1849,9 @@ impl BlobSink for Incoming {
         if all.try_lock().is_ok() {
             let _ = self.drop_stale_locked(limits, None);
         }
+        // What a dropped or finished source's token still holds (spec 25.8,
+        // 3): a pass that waits for no lock.
+        let _ = self.store.release_abandoned_imports();
     }
 
     fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {

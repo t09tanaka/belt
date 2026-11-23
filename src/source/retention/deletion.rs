@@ -6,8 +6,10 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 mod abandon;
+mod import_release;
 mod scratch;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+pub use import_release::ImportReleaseReport;
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
 pub(super) use scratch::STAGING;
@@ -270,7 +272,7 @@ impl Index {
             current == Some(claim.incarnation),
             "stale source deletion incarnation"
         );
-        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
         ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
@@ -502,7 +504,7 @@ impl SourceStore {
                 ..Default::default()
             });
         };
-        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
         if unknown {
             return Ok(RetentionPage {
                 held: true,

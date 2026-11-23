@@ -2474,7 +2474,15 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 
 ### 5a: 取り込みのpending rootの持ち主
 
-**今の挙動。** `SourceStore::ingest_blob` は、blobを1つ受け取るたびに `begin_import` を呼び、`sources/retention.db` に `import_session` の行（`pending`）と `root(kind='pending')` の行を作る。workerの受け取り（`src/worker/blobs.rs`）はこの経路だけを使い、公開はtokenを持たない `publish_received_one` で行うので、`finish_import` も `release_import_page` も呼ばれない。pending rootは解放されず、`import_session`・`root`・`member` の行は、受け取ったblobの数だけ増え続ける。親では、`GuardedObjectStore::put_bytes`（`src/source/store.rs`）が同じ形で、呼び出しごとに `import_session` とpending rootを作るが、製品の経路にこれを呼ぶものは無い（呼ぶのはtestだけである）。公開済みのsourceのobjectは、別に `receive:<source>` のroot（種類 `received`）が保護している。`import_session` の行を消す処理は無い（親の、runに結び付いた行も残る）。
+**実装済み（段階5a）。** tokenの記録は `incoming/<source>/import-token`、解放は `SourceStore::release_import`、起動時の削除は `forget_unowned_imports`（agentの起動の段 `IncomingImports`）。扱うのは worker の形の行（`state='pending'`、sourceもrunも無い）だけで、ほかの形の行は残して数える。記録を読めない作業directoryが1つでもあれば、起動時には何も消さない。試用中（25.1の8）はどちらも行わない。
+
+**tokenのroot（種類 `receipt`）。** `begin_import` が作るrootの種類は `receipt` である。membershipは正確である（`import_blob` が、claimを確かめるのと同じtransactionで、fileを書く前にobjectとmemberの行を書く）。したがって、「membershipの分からないroot」を見る全体の検査（`drain_claim`、`retention_page`、Vault、放棄、previewの `source IS NULL AND kind NOT IN ('abandoned','receipt')`）は、進行中の受け取りで止まらない。親の `pending`（captureの途中）は今まで通りすべてを止める。
+
+**tokenの解放。** 3と4の「消す」は、索引の行を消すだけではない。(1) 共有のmutation lockの下で、tokenのrootを `abandoned` にする（このrootは保護を続けるが、membershipの分からないrootとは数えない）。(2) 待たない排他のmutation lockの下で、各memberを `release_member` で外す: ほかのrootが持つobjectはmemberだけを消し、このtokenだけが持つfile（失敗した受け取りが入れたもの）は、claimを先に書いてからunlinkする。fileが書かれる前のmember（`destination_absent`）は、claimなしで行を消す。claimを書くのは、同じ排他の区間でdrainできるとき（legacyの登録が済み、membershipの分からないrootも未完のgraphも無い）だけで、drainできないclaimを残さない。drainに失敗したclaimは、次のpassが最初にやり直す。(3) memberが残らなければ、root・`import_session` の行を消す。排他を取れないとき、ほかのrootが止めるとき、証明できないfileは、残して次のpass（agentの毎tick、`release_abandoned_imports`、1回1,000 member・64 MiBまで）に回す。workerのstoreは、legacyの登録（preview）を行わないので、今は `legacy_registration` が `done` にならず、tokenだけが持つfileはunlinkされずに残る（行とmemberは残り、`doctor` に数えられる）。workerで登録を行う変更は段階5bに含める。
+
+**作業directoryを捨てるとき。** 公開の前に捨てるときは、そのsourceのbundleがcloneに作ったref（作業directoryの `made-refs` に記録する）も、拒否のときと同じ形で消す（公開済みのcaptureのsnapshotのrefは残す）。公開が済んだときは記録を先に消し、refは残す。
+
+**段階5aより前の挙動。** `SourceStore::ingest_blob` は、blobを1つ受け取るたびに `begin_import` を呼び、`sources/retention.db` に `import_session` の行（`pending`）と `root(kind='pending')` の行を作る。workerの受け取り（`src/worker/blobs.rs`）はこの経路だけを使い、公開はtokenを持たない `publish_received_one` で行うので、`finish_import` も `release_import_page` も呼ばれない。pending rootは解放されず、`import_session`・`root`・`member` の行は、受け取ったblobの数だけ増え続ける。親では、`GuardedObjectStore::put_bytes`（`src/source/store.rs`）が同じ形で、呼び出しごとに `import_session` とpending rootを作るが、製品の経路にこれを呼ぶものは無い（呼ぶのはtestだけである）。公開済みのsourceのobjectは、別に `receive:<source>` のroot（種類 `received`）が保護している。`import_session` の行を消す処理は無い（親の、runに結び付いた行も残る）。
 
 **規則。** 次の4つを不変条件とする。
 
@@ -2485,7 +2493,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 
 親の側: runに結び付いた `import_session` の行（`bound`）は、runの刈り取りの段5で消す（25.5）。放棄された取り込みの行は、25.4の (b) がpending rootと一緒に消す。`GuardedObjectStore::put_bytes` は、製品の呼び出し元が無いので、今は行を作らない。呼び出し元を足すときの条件は25.9の8に書く。
 
-**安全の証明。** pending rootの役目は、公開の前のobjectを削除から守ることである。workerでsourceのstoreへ書くのはagentだけで（`agent.lock`）、進行中の公開のtokenは作業directoryに記録されている。記録の無いpending rootは、進行中の公開のものではない。公開済みのsourceのobjectは `receive:<source>` のrootが保護しているので、tokenのrootを消しても、公開済みのsourceは欠けない。3の順序（`receive:<source>` への登録が先、tokenの解放が後）により、公開の途中のどの時点でも、objectはどちらかのrootに入っている。どのrootにも属さなくなったobjectは、公開に失敗した受け取りの残りである。段階5aは、objectのfileを消さない（消すのは索引の行だけ。fileは段階5bが扱う）。
+**安全の証明。** pending rootの役目は、公開の前のobjectを削除から守ることである。workerでsourceのstoreへ書くのはagentだけで（`agent.lock`）、進行中の公開のtokenは作業directoryに記録されている。記録の無いpending rootは、進行中の公開のものではない。公開済みのsourceのobjectは `receive:<source>` のrootが保護しているので、tokenのrootを消しても、公開済みのsourceは欠けない。3の順序（`receive:<source>` への登録が先、tokenの解放が後）により、公開の途中のどの時点でも、objectはどちらかのrootに入っている。tokenだけが持つobjectは、公開に失敗した受け取りの残りであり、tokenの解放が `release_member` で消す（上の「tokenの解放」）。どのrootにも属さないobjectのfileは、作らない。
 
 **受け入れ試験。** (i) 100個のblobを持つsourceを受け取った後、`import_session` と `root(kind='pending')` の行が残らず、`receive:<source>` のrootがすべてのobjectを持つ。(ii) 同じsourceを2回受け取っても、rootの行が増えない。(iii) blobを入れた後、公開の前にagentをSIGKILLし、再起動後に同じ受け取りが続き、終わると (i) と同じになる。(iv) 作業directoryを捨てると、そのtokenの行が消える。(v) 起動時に、記録の無い古い行が消え、公開済みのsourceの検証（`blob_verify`）が `ready` のままである。(vi) submoduleを持つsource（manifestが複数）で (i) が成り立つ。(vii) `incoming/<source>/` が、24時間進まなければ、16個に達していなくても消える。
 
@@ -2514,9 +2522,9 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 6. cloneのdirectoryごとの削除と、cloneのlock。lockがcloneの中にあるので、cloneを消すとlockも消える。25.1の (A) か (B) を示す必要がある（開く経路は、そのcloneのworkspaceを作る・消すagentの処理。古い版のprocessが開く経路があるか）。
 7. 量の上限。setup templateと同じ14日・20 GiBを置く案だが、sourceごとのbytesを索引で持つ方法（objectは複数のsourceが共有する）が決まっていない。
 8. 親の `GuardedObjectStore::put_bytes`（`src/source/store.rs`。計画のSDKがobjectを書くために用意された経路。以前の版のこの章は `SdkView::put_bytes` と書いていたが、その名前の関数は無い）。呼び出しごとに `import_session` とpending rootを作り、解放する処理が無い。**製品の経路に呼び出し元は無く（testだけが呼ぶ）、今は行もobjectも作られない。** したがって、今増え続けているものは無い。規範として決まっているのは次の1つだけである: この関数の呼び出し元を製品の経路に足す変更は、同じ変更の中で、pending rootの持ち主（計画のprocessか、その計画を使うrunか）、解放する出来事、書いたobjectを計画の後に保護するもの（FrozenPlanが名指すのか、runの取り込みが引き継ぐのか）を定める。定めないまま呼び出し元を足してはならない。使う予定が無いなら、関数を消す。
-9. 公開に失敗した受け取りが残した、どのrootにも属さないobjectのfile。5aは索引の行だけを消す。
+9. 公開に失敗した受け取りが残したfileは、5aがtokenの解放で `release_member` を通して消す（どのrootにも属さないfileは作らない）。ただしworkerのstoreでは `legacy_registration` が済まないので、5bでworkerの登録を入れるまでは残る。
 
-**それまでの扱い。** 段階5bが入るまで、workerの `sources/`・`clones/` は増え続ける。25.10の表は、これを「今の挙動」として書く。`incoming/<source>/` の「24時間進まなかったものを消す」は、今は16件の上限に達したときだけ働く。これを毎tickに行う変更は、sourceのstoreに触れないので、段階5aと一緒に入れてよい。
+**それまでの扱い。** 段階5bが入るまで、workerの `sources/`・`clones/` は増え続ける。25.10の表は、これを「今の挙動」として書く。`incoming/<source>/` の「24時間進まなかったものを消す」は、段階5aで毎tick（agentの監視の周期）に行うようにした。
 
 ## 25.10 場所ごとの一覧
 
@@ -2573,9 +2581,9 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 消さない。全部を走査する | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
 | secretの配置 | workspaceの中、`secret-index/<attempt>.json`、`.secrets.tmp-*`、`secrets/` | attemptのcommand | terminalで消す | 同じ | 既存 | terminal |
 | 受け取ったsource | `sources/manifests/`、`sources/objects/` | `blob_verify`、workspaceの準備 | 消さない | 未確定（25.9） | 5b | なし |
-| workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | `import_session`・`root(kind='pending')`・`member` が、受け取ったblobごとに増える | 公開か放棄で消す | 5a | 25.8 |
+| workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | 公開1回にtoken 1つ。公開か作業directoryを捨てるときに解放し、記録の無い行は起動時に消す（段階5aで実装済み） | 公開か放棄で消す | 5a | 25.8 |
 | clone | `clones/<repo>` | bundleの展開、workspaceの準備 | 消さない。refは、受け取りを拒否したときだけ消す | 未確定（25.9） | 5b | なし |
-| 受け取り途中 | `incoming/<source>/` | 送り手の再開 | 16個、合計64 GiB、1つ32 GiB。24時間進まなかったものは、16個に達したときだけ消す | 24時間進まなければ、tickで消す | 5a | 進んでいないこと |
+| 受け取り途中 | `incoming/<source>/` | 送り手の再開 | 16個、合計64 GiB、1つ32 GiB。24時間進まなかったものは、agentの毎回の監視の周期で消す（段階5aで実装済み） | 24時間進まなければ、tickで消す | 5a | 進んでいないこと |
 | 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残るものは、workerの起動（`agent.lock` の下）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | `agent.lock` と持ち主 |
 | setup template | `setup/templates/<key>/` と、最後に使った時刻のstamp `<key>.used` | setupの適用 | 20 GiB、14日、run scopeは1時間。stampは、templateの無いものを片付けのときに消す | 同じ | 既存 | copy中でないこと、pin |
 | setup builder | `setup/builders/<id>/` | そのbuilder | 終了時と起動時に消す | 同じ | 既存 | 持ち主のprocessが居ないこと |
@@ -2693,7 +2701,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | 第23章 | reader-pinsのinodeはparent stateとともに保持し、unlinkしない | 2 | runの刈り取りの最後にunlinkする |
 | 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
 | 第23章 | Git・bundleの片付けは後続の作業 | 2 | 25.5の段4 |
-| 第23章 | Future expiry of received roots also requires per-import pending ownership | 5a | 25.8が持ち主を定める。受け取ったrootの期限切れそのものは未確定（25.9） |
+| 第23章 | Future expiry of received roots also requires per-import pending ownership | 5a（実装済み） | 25.8が持ち主を定める。受け取ったrootの期限切れそのものは未確定（25.9） |
 | 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 実装済み: 名前（`.belt-tmp.…`）で所有を証明し、排他leaseの下で消す。解釈できない名前は残す |
 | 24.4 | 受理したattemptのtombstoneは消さない | 3 | 重複防止の記録に置き換える |
 | 24.8 | 試用中のworkerとcoordinatorが行わないことの一覧 | 3 | `release_attempt` を足す |

@@ -254,7 +254,9 @@ exec "{real}" "$@"
         for d in [dir.clone(), dir.join("parts"), dir.join("files")] {
             for e in std::fs::read_dir(d).into_iter().flatten() {
                 let name = e.unwrap().file_name().into_string().unwrap();
-                if !["parts", "files", "reserved", "import-token"].contains(&name.as_str()) {
+                if !["parts", "files", "reserved", "import-token", "made-refs"]
+                    .contains(&name.as_str())
+                {
                     out.insert(name);
                 }
             }
@@ -3422,7 +3424,7 @@ fn a_publication_cut_after_its_files_resumes_with_its_one_token() {
     let m = f.machine();
     let sink = m.blobs().unwrap();
     let swept = sink.forget_unowned().unwrap().unwrap();
-    assert_eq!((swept.removed, swept.kept), (0, 0));
+    assert_eq!((swept.abandoned, swept.kept), (0, 0));
     assert_eq!(index_rows(&f, &format!("import:{recorded}")).0, 1);
     put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
     assert!(verify(sink, &l, &p.source, p.refs()).ready);
@@ -3510,10 +3512,61 @@ fn a_source_nobody_added_to_goes_at_the_next_pass_with_its_token() {
     f.agents.lock().unwrap().push(agent.clone());
     // (the start kept the recorded token)
     assert_eq!(index_rows(&f, "").0, 1);
+    assert!(p.blobs.keys().all(|h| f.worker_store().has_blob(h)));
+    // (a store whose old manifests are all indexed: a file only the token
+    // held may go; a worker's store does not run that indexing yet)
+    rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
     std::fs::write(f.incoming(&fresh.source).join("touch"), "now").unwrap();
     agent.supervise();
     assert!(!f.incoming(&p.source).exists());
+    // the token's rows went, and with them what that failed receipt put
+    // into the store
     assert_eq!(index_rows(&f, "").0, 0);
+    assert!(p.blobs.keys().all(|h| !f.worker_store().has_blob(h)));
     // a source written to within the limit stays
     assert!(f.incoming(&fresh.source).exists());
+}
+
+#[test]
+fn files_cut_part_way_into_the_store_go_on_with_the_recorded_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let p = f.directory("cut", 44);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let hashes: Vec<&String> = p.blobs.keys().collect();
+    assert!(hashes.len() >= 3);
+    let (first, last) = (hashes[0], hashes[hashes.len() - 1]);
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    for (h, b) in &p.blobs {
+        if h != first {
+            put_all(sink, &l, &p.source, Content, b).unwrap();
+        }
+    }
+    // The files go into the store in the order of their hashes: the last
+    // one cannot be read, after the others went in.
+    let blocked = f.incoming(&p.source).join("files").join(staged_name(
+        Content,
+        last,
+        p.blobs[last].len() as u64,
+        true,
+    ));
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let e = put_all(sink, &l, &p.source, Content, &p.blobs[first]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+    assert_eq!(index_rows(&f, "").0, 1);
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Another process goes on with the token the directory records.
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    assert_eq!(index_rows(&f, "").0, 0);
+    assert_eq!(index_rows(&f, "").1, 0);
 }

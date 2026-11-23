@@ -413,7 +413,7 @@ impl SourceStore {
             // unlinked while an unindexed manifest, a root of unknown
             // membership or an unfinished graph could need it.
             let held: bool = c.query_row(
-                "SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",
+                "SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",
                 [],
                 |r| r.get(0),
             )?;
