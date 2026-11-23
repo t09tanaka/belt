@@ -715,13 +715,18 @@ fn a_child_that_inherited_the_lock_keeps_the_state_from_being_cleared() {
         .unwrap();
     // The worker is gone; only the child holds the lock now.
     drop(alive);
-    let error = refused(&state, false, local);
+    // Nothing is asserted before the child is gone again.
+    let before = tree(&state);
+    let outcome = reclaim(&state, false, local, &nowhere);
+    let after = tree(&state);
     let pid = child.id();
-    assert!(pid > 1);
     // Only the child this test started.
-    assert!(crate::platform::signal_pid(pid, libc::SIGKILL));
+    let killed = pid > 1 && crate::platform::signal_pid(pid, libc::SIGKILL);
     child.wait().unwrap();
+    assert!(killed);
+    let error = outcome.unwrap_err().to_string();
     assert!(error.contains("ephemeral.lock is held"), "{error}");
+    assert_eq!(after, before, "a refusal changed the state");
     assert_eq!(
         reclaim(&state, false, local, &nowhere).unwrap(),
         Cleared::Left

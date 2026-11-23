@@ -89,7 +89,8 @@ pub const MARKER_KIND: &str = "ephemeral_worker";
 pub enum Marker {
     /// Readable, and written by an ephemeral worker.
     Ephemeral,
-    /// There is no marker: the state was not made by an ephemeral worker.
+    /// There is no marker: the state was not made by an ephemeral worker,
+    /// or by one that was killed before its marker existed (`unfinished`).
     Absent,
     /// It exists but could not be read safely or parsed.
     Unreadable,

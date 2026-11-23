@@ -986,7 +986,7 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 
 - **起動**: 利用者がノートブックから `belt worker --ephemeral` を起動する。LaunchAgentやsystemdへ登録せず、親からの導入・更新（`workers add --install`、`upgrade`）の対象にもしない。バイナリの配置は利用者が行う。
 - **接続**: 親は、利用者が用意したトンネルを指すSSH接続（ユーザー設定の `ephemeral = true` のworker）でつなぐ。独自の未認証ポートを開けない原則（第3章）は一時workerでも変えない。
-- **起動し直し**: killや電源断でstate（`~/.belt`）が残った場合、次の `belt worker --ephemeral` が、誰も使っていないことを証明できたときだけ自分で消して、新しいidentityで起動する。証明できなければ、何も消さず、何にもsignalを送らずに1で終わり、成り立たなかった条件を示す。常駐の `belt worker`（`init` のresident、`worker install`・`worker start` を含む）は、一時workerのstate（`ephemeral.json` があるもの）では断り、何も書かない。常駐workerが導入されているhost（workerのserviceのjournalか、`init` のjournalがある）では、一時workerは起動しない。規則と証明は25.4の (d) に書く。
+- **起動し直し**: killや電源断でstate（`~/.belt`）が残った場合、次の `belt worker --ephemeral` が、誰も使っていないことを証明できたときだけ自分で消して、新しいidentityで起動する。証明できなければ、何も消さず、何にもsignalを送らずに1で終わり、成り立たなかった条件を示す。作成の途中でkillされた起動が残したもの（markerが無く、`ephemeral.lock` と `ephemeral.json.part` の2つ以内）も、次の起動が消す。stateの中に別のfilesystemがmountされているときは、その先と親を残して1で終わる。常駐の `belt worker`（`init` そのもの、`init` のresident、`worker install`・`worker start` を含む）は、一時workerのstate（`ephemeral.json` があるもの）では断り、何も書かない。常駐workerが導入されているhost（workerのserviceのjournalか、`init` のjournalがある）では、一時workerは起動しない。規則と証明は25.4の (d) に書く。
 - **グループ**: 起動時にグループのIDと鍵を受け取るので、鍵を持つどのメンバーも使える。identityの退役と `workers forget` は、それを行ったメンバーの記録の中だけで働く（24.3）。鍵が更新されたら、新しい鍵で起動し直す。
 - **identity**: 起動ごとに新しいworker identityを発行する。以前のidentityの再接続として扱わない。親は最後に見たidentityを記録する。同じ名前で別のidentityが接続を試みた場合、利用者が旧identityを `workers forget` するまで新しい接続を拒否する。以前の起動のattemptを新しい起動へ送らない。
 - **到達不能**: 一時workerへ配置したattemptは、接続が切れてもunknownのまま保持する。時間の経過や推測で別workerへ再投入しない（第11章・第12章）。
