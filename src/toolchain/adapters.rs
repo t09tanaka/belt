@@ -1165,6 +1165,84 @@ pub fn sweep_trash(toolchains: &Path) {
     }
 }
 
+/// Spec 25.7 (b): remove the root `name` of `toolchains`, whose removal the
+/// caller has claimed in the worker DB (nothing references it, and no bind
+/// or builder starts on it while it is `evicting`). Its `install.lock` is
+/// taken without waiting (an installer of a version that records no
+/// reference may still work there: then nothing moves), the root is renamed
+/// into a trash directory beside it (22.2) and the trash is removed by
+/// descriptor. A root that is not there is already removed. A trash that
+/// cannot be removed now is left to [`sweep_trash`].
+pub fn evict_root(toolchains: &Path, name: &str) -> Result<()> {
+    if name.len() != 64 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("private_root_misplaced");
+    }
+    let dir = match open_dir_at(CWD, toolchains) {
+        Ok(dir) => dir,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(_) => return Err("private_directory_missing"),
+    };
+    let stat = owned_open_dir(&dir, toolchains)?;
+    let root = match open_dir_at(&dir, name) {
+        Ok(root) => root,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(_) => return Err("private_root_misplaced"),
+    };
+    let root_stat = owned_open_dir(&root, &toolchains.join(name))?;
+    if root_stat.st_dev != stat.st_dev {
+        return Err(OTHER_DEVICE);
+    }
+    let lock = match existing_lock(&root) {
+        Some(lock) => Some(lock),
+        None => Some(open_lock(&root)?),
+    };
+    if let Some(lock) = &lock {
+        lock.try_lock().map_err(|_| "install_lock_busy")?;
+    }
+    let trash = format!("{}{}", trash_prefix(name), ulid::Ulid::new());
+    renameat(&dir, name, &dir, trash.as_str()).map_err(|_| "root_evict_rename")?;
+    drop(root);
+    drop(lock);
+    let trash = CString::new(trash).map_err(|_| "root_evict_rename")?;
+    let _ = remove_at(dir.as_fd(), &trash, stat.st_dev);
+    Ok(())
+}
+
+/// Whether an installer holds the `install.lock` of the root `name` now
+/// (a root without one is not being installed into).
+pub fn root_install_busy(toolchains: &Path, name: &str) -> bool {
+    let Ok(dir) = open_dir_at(CWD, toolchains) else {
+        return false;
+    };
+    let Ok(root) = open_dir_at(&dir, name) else {
+        return false;
+    };
+    existing_lock(&root).is_some_and(|lock| lock.try_lock().is_err())
+}
+
+/// The bytes of the files below `root`, not following links and not
+/// entering another device. For the size limit of the roots.
+pub fn root_bytes(root: &Path) -> std::io::Result<u64> {
+    fn walk(dir: &Path, dev: u64, total: &mut u64) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = fs::symlink_metadata(entry.path())?;
+            if meta.is_dir() {
+                if meta.dev() == dev {
+                    walk(&entry.path(), dev, total)?;
+                }
+            } else {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(())
+    }
+    let dev = fs::symlink_metadata(root)?.dev();
+    let mut total = 0;
+    walk(root, dev, &mut total)?;
+    Ok(total)
+}
+
 /// The publication lock of an open root is a private regular file of this
 /// user with one name.
 fn checked_lock(lock: File) -> Result<File> {

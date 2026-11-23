@@ -111,6 +111,8 @@ pub trait Host: Send + Sync {
     /// gave up waiting). Its reference to the builder goes; the last one
     /// stops the builder. Idempotent.
     fn setup_release(&self, _attempt: &AttemptId) {}
+    /// Spec 25.7 (b): a pass over the toolchain roots (bounded, throttled).
+    fn toolchain_tick(&self) {}
     /// The paths (relative to the workspace root) of the secret files of the
     /// source the payload names: the declared ones and what
     /// `.worktreeinclude` matched. `None` while that source is not in this

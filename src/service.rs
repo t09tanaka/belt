@@ -14,6 +14,7 @@ pub mod input;
 pub mod logs;
 pub mod macos;
 mod manager_command;
+pub(crate) mod old_binaries;
 pub mod output_export;
 pub mod outputs;
 pub mod query;

@@ -286,6 +286,39 @@ CREATE INDEX blob_ref_locator ON blob_ref(locator);
 /// ([`precheck`]); the files the dropped references named are queued for
 /// deletion in the same transaction, and so are the ids of the dropped
 /// attempts, whose directories the agent removes at its next start.
+/// Spec 25.7 (b): the toolchain roots and who uses them. A reference and the
+/// claim of a removal (`evicting`) are each written in one transaction, so a
+/// root is never claimed while it is bound. A reference of an attempt goes in
+/// the transaction that makes the attempt terminal or removes it, whichever
+/// process writes it.
+const WORKER_TOOLCHAIN_ROOTS: &str = "
+CREATE TABLE toolchain_root (
+    identity     TEXT PRIMARY KEY,
+    state        TEXT NOT NULL CHECK (state IN ('live', 'evicting')),
+    last_used_ms INTEGER NOT NULL,
+    bytes        INTEGER,
+    measured_ms  INTEGER
+) WITHOUT ROWID;
+CREATE TABLE toolchain_ref (
+    identity       TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('attempt', 'builder', 'warmup', 'template')),
+    holder         TEXT NOT NULL,
+    coordinator_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (identity, kind, holder, coordinator_id)
+) WITHOUT ROWID;
+CREATE INDEX toolchain_ref_holder ON toolchain_ref(kind, holder);
+CREATE TRIGGER toolchain_ref_attempt_terminal AFTER UPDATE OF state ON worker_attempt
+WHEN NEW.state = 'terminal'
+BEGIN
+    DELETE FROM toolchain_ref WHERE kind = 'attempt' AND holder = NEW.attempt_id
+        AND coordinator_id = NEW.coordinator_id;
+END;
+CREATE TRIGGER toolchain_ref_attempt_gone AFTER DELETE ON worker_attempt
+BEGIN
+    DELETE FROM toolchain_ref WHERE kind = 'attempt' AND holder = OLD.attempt_id
+        AND coordinator_id = OLD.coordinator_id;
+END;
+";
 const WORKER_V4: &str = "
 INSERT OR IGNORE INTO pending_delete (locator, queued_at_ms) SELECT DISTINCT locator, 0 FROM blob_ref;
 -- The attempts this step dropped. Their directories (spec, supervisor
@@ -710,7 +743,7 @@ CREATE INDEX ci_test_timing_written ON ci_test_timing(written_at_ms);"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
-        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string()],
+        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_TOOLCHAIN_ROOTS.to_string()],
     }
 }
 

@@ -399,7 +399,7 @@ impl World {
         .unwrap()
     }
     /// The host serves `digest` with nothing left open: no drain, no recorded
-    /// switch, no saved database. The old binary is intact.
+    /// switch, no saved database. The old binary is removed by the commit or intact.
     fn assert_serving(&self, digest: &str) {
         let status = self.host();
         assert_eq!(not_serving(&status, digest), None);
@@ -410,10 +410,11 @@ impl World {
             fs::read_link(paths.current_link()).unwrap(),
             Path::new(digest)
         );
-        assert_eq!(
-            fs::read(paths.executable(&self.old)).unwrap(),
-            b"old version"
-        );
+        // Removed by the commit (spec 25.7 (a)), or intact.
+        match fs::read(paths.executable(&self.old)) {
+            Ok(bytes) => assert_eq!(bytes, b"old version"),
+            Err(_) => assert_ne!(digest, self.old, "the served version is there"),
+        }
     }
     fn actions(&self) -> Vec<&str> {
         self.remote.actions.iter().map(String::as_str).collect()

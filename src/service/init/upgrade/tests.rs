@@ -206,6 +206,11 @@ impl Host {
         assert!(running.contains(self.exe(&self.old).to_str().unwrap()));
         assert!(self.own_run_open(), "the parent database went back");
         assert_eq!(self.worker_attempts(), 1, "the worker database went back");
+        assert_eq!(
+            fs::read(self.exe(&self.old)).unwrap(),
+            b"test executable",
+            "a rollback never touches the old binary"
+        );
         self.assert_finished();
     }
     fn assert_finished(&self) {
@@ -221,8 +226,11 @@ impl Host {
         for name in [KEPT_JOURNAL, KEPT_INPUT, KEPT_PARENT_DB, KEPT_WORKER_DB] {
             assert!(!kept(&self.paths, name).exists(), "{name} kept");
         }
-        // The old binary is never touched by an upgrade or its rollback.
-        assert_eq!(fs::read(self.exe(&self.old)).unwrap(), b"test executable");
+        // The old binary is never touched by an upgrade; a commit removes it
+        // (spec 25.7 (a)), and a rollback leaves it as it was.
+        if let Ok(bytes) = fs::read(self.exe(&self.old)) {
+            assert_eq!(bytes, b"test executable");
+        }
     }
 }
 
@@ -905,4 +913,98 @@ async fn a57_ctrl_c_while_work_finishes_lifts_the_hold_and_switches_nothing() {
     assert!(!record_path(&h.paths).exists());
     assert!(!h.exe(&h.new).exists());
     assert_eq!(h.resident_link(), Path::new(&h.old));
+}
+
+/// Upgraded while a service definition names the previous version (so the
+/// commit kept it), and then that definition removed: only what a test adds
+/// names it.
+fn upgraded_recently(h: &Host) -> Fake {
+    let named = h.paths.services.join("names-the-old-version.plist");
+    fs::write(&named, h.exe(&h.old).display().to_string()).unwrap();
+    let mut fake = h.fake.clone();
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(h.exe(&h.old).exists());
+    fs::remove_file(&named).unwrap();
+    fake
+}
+
+/// Spec 25.7 (a) acceptance (i): after the commit the previous version and
+/// its tool link are gone, and the new version stays.
+#[tokio::test]
+async fn s25_7_the_commit_removes_the_previous_version_and_its_tool_link() {
+    let h = Host::new().await;
+    let tool = h.paths.worker.join("tool-bin").join("old");
+    fs::create_dir_all(&tool).unwrap();
+    std::os::unix::fs::symlink(h.exe(&h.old), tool.join("portool")).unwrap();
+    let mut fake = h.fake.clone();
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(!h.exe(&h.old).parent().unwrap().exists());
+    assert!(!tool.exists());
+    assert_eq!(fs::read(h.exe(&h.new)).unwrap(), b"new version");
+}
+
+/// Spec 25.7 (a) acceptance (ii), the guard registered with the service
+/// manager while its definition file is gone: the previous version stays.
+#[tokio::test]
+async fn s25_7_a_guard_left_registered_without_its_file_keeps_the_previous_version() {
+    let h = Host::new().await;
+    let mut fake = upgraded_recently(&h);
+    assert!(!guard_present(&h.paths.config, &mut fake).unwrap());
+    fake.0
+        .borrow_mut()
+        .loaded
+        .insert(h.guard.clone(), String::new());
+    assert!(guard_present(&h.paths.config, &mut fake).unwrap());
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(h.exe(&h.old).exists());
+    fake.0.borrow_mut().loaded.remove(&h.guard);
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(!h.exe(&h.old).exists());
+}
+
+/// Spec 25.7 (a) acceptance (ii), the guard's definition file left while
+/// the service manager no longer has it: the previous version stays.
+#[tokio::test]
+async fn s25_7_a_guard_definition_left_unregistered_keeps_the_previous_version() {
+    let h = Host::new().await;
+    let mut fake = upgraded_recently(&h);
+    let definition = h.paths.services.join(format!("{}.plist", h.guard));
+    fs::write(&definition, b"<plist/>").unwrap();
+    assert!(guard_present(&h.paths.config, &mut fake).unwrap());
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(h.exe(&h.old).exists());
+    fs::remove_file(&definition).unwrap();
+    sweep_old_versions(&h.paths, &mut fake);
+    assert!(!h.exe(&h.old).exists());
+}
+
+/// Review round 3: `init.lock` is made by a pass over old versions on a host
+/// where `init` never ran, so it does not say a resident is there.
+#[tokio::test]
+async fn upgrade_without_a_resident_journal_says_so_even_when_init_lock_is_there() {
+    let h = Host::new().await;
+    fs::write(h.paths.config.join("init.lock"), b"").unwrap();
+    fs::remove_file(h.paths.config.join("init.json")).unwrap();
+    let mut fake = h.fake.clone();
+    let error = match begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0) {
+        Err(e) => format!("{e:#}"),
+        Ok(_) => panic!("no resident"),
+    };
+    assert!(error.contains("no initialized resident"), "{error}");
 }

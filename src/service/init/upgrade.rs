@@ -467,8 +467,14 @@ pub fn begin<L: Launcher>(
     clock: &dyn Fn() -> u64,
 ) -> anyhow::Result<Trial> {
     let initial = Paths::resolve_for(env, launcher.backend())?;
+    // `init.lock` says nothing: a pass over old versions makes it on a host
+    // where `init` never ran. The resident's journal does.
+    ensure!(
+        initial.config.join("init.json").try_exists()?,
+        "this machine has no initialized resident; run belt init first"
+    );
     let init_lock = resident::secure_file(&initial.config.join("init.lock"), true)
-        .context("this machine has no initialized resident; run belt init first")?;
+        .context("init.lock cannot be opened")?;
     // One upgrade, init or membership change at a time on this machine.
     init_lock.lock()?;
     membership_undo::recover(&initial, launcher)?;
@@ -530,17 +536,30 @@ pub fn begin<L: Launcher>(
             );
             anyhow::bail!("{live} attempt(s) are still live after waiting; nothing was switched");
         }
+        let created = !paths.config.join("bin").join(&to).try_exists()?;
         let placed = ws::place_binary_with(
             &ws::Paths::resolve_for(env, paths.backend)?,
             &to,
             current_exe,
             0o700,
         )?;
-        ensure!(
-            placed == retargeted(&paths, &from, &to).spec.executable,
-            "the version directory is not where the resident's binaries are"
-        );
-        identity_checked(&paths, &from)?;
+        let checked = (|| -> anyhow::Result<()> {
+            ensure!(
+                placed == retargeted(&paths, &from, &to).spec.executable,
+                "the version directory is not where the resident's binaries are"
+            );
+            identity_checked(&paths, &from)
+        })();
+        if let Err(e) = checked {
+            // Spec 25.7 (a): a copy the version check refused goes at once.
+            crate::service::old_binaries::remove_refused(
+                &places_of(&paths),
+                &to,
+                created,
+                crate::service::old_binaries::Holds::Init,
+            );
+            return Err(e);
+        }
         ensure!(!interrupted(), "interrupted; nothing was switched");
         Ok(())
     })();
@@ -676,6 +695,7 @@ pub fn commit<L: Launcher>(trial: &Trial, launcher: &mut L) -> anyhow::Result<Up
         .context("service receipt missing")?;
     remove_guard(paths, &guard_plan(paths, &trial.from)?, &named, launcher)?;
     forget(paths)?;
+    sweep_old_versions(paths, launcher);
     let (from, to) = trial.versions();
     Ok(Upgraded {
         from: from.to_string(),
@@ -792,6 +812,58 @@ fn watch(config: &Path) -> anyhow::Result<Watch> {
         named,
         guard,
     })
+}
+
+/// Spec 25.7 (a): whether the upgrade guard can still run the previous
+/// version: its definition file is there, or the service manager has its
+/// label. Both are asked, because `commit` is final even when removing the
+/// guard failed. A host without a resident journal never had a guard.
+pub(crate) fn guard_present<L: Launcher>(config: &Path, launcher: &mut L) -> anyhow::Result<bool> {
+    if !config.join("init.json").try_exists()?
+        && !config.join("upgrade").join(KEPT_JOURNAL).try_exists()?
+    {
+        return Ok(false);
+    }
+    let Watch {
+        paths,
+        named,
+        guard,
+    } = watch(config)?;
+    Ok(paths.services.join(guard.filename()).try_exists()?
+        || launcher.loaded_state(&guard, &named) != LoadedState::Absent)
+}
+
+/// Whether `guard_present` can tell where the guard's definition is (for
+/// `doctor`): no resident journal, or one `watch` reads.
+pub(crate) fn guard_definition_known(config: &Path) -> bool {
+    let journal = config.join("init.json").try_exists().unwrap_or(true)
+        || config
+            .join("upgrade")
+            .join(KEPT_JOURNAL)
+            .try_exists()
+            .unwrap_or(true);
+    !journal || watch(config).is_ok()
+}
+
+fn places_of(paths: &Paths) -> crate::service::old_binaries::Places {
+    crate::service::old_binaries::Places {
+        config: paths.config.clone(),
+        worker_state: paths.worker.clone(),
+        parent_state: Some(paths.state.clone()),
+        services: vec![paths.services.clone()],
+    }
+}
+
+/// Remove the versions nothing names any more (spec 25.7 (a)), after the
+/// commit removed the guard.
+fn sweep_old_versions<L: Launcher>(paths: &Paths, launcher: &mut L) {
+    let places = places_of(paths);
+    let config = paths.config.clone();
+    let _ = crate::service::old_binaries::sweep(
+        &places,
+        &mut || guard_present(&config, launcher),
+        false,
+    );
 }
 
 /// A trial record that no guard watches: the CLI died after the record and

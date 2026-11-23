@@ -433,6 +433,8 @@ mod preparation_probe_tests {
                     end: None,
                     kind: BuilderKind::WorkspaceSetup,
                     stop: false,
+                    root: None,
+                    closed: false,
                 },
             );
             (id, attempt)
