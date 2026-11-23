@@ -52,7 +52,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod environment;
 mod warmup;
@@ -304,6 +304,12 @@ pub struct Agent {
     /// `attempt_release_v1`: the tick no longer continues (c2).
     old_acks: AtomicBool,
     ticking: AtomicBool,
+    /// A deleting pass of the received sources runs on its own thread
+    /// (spec 25.8 5b (h)6): at most one, apart from `ticking` (which the
+    /// tick drops when it returns).
+    deleting: AtomicBool,
+    /// When the last round of those passes started: at most one a minute.
+    deleted_at: Mutex<Option<Instant>>,
     /// Warm-ups in progress or just answered, by `sync_id`.
     warmups: Mutex<BTreeMap<String, warmup::Warmup>>,
     /// Directory enumeration continues across bounded terminal cleanup passes.
@@ -374,6 +380,11 @@ impl Drop for Driving {
         lock(&self.agent.driving).remove(self.attempt.as_str());
     }
 }
+
+/// At most one round of deleting passes of the received sources a minute
+/// (spec 25.8 5b (d)), and the pause between the passes of a round.
+const RECEIVED_PASS_EVERY: Duration = Duration::from_secs(60);
+const RECEIVED_PASS_PAUSE: Duration = Duration::from_millis(100);
 
 struct Ticking<'a>(&'a AtomicBool);
 
@@ -786,6 +797,8 @@ impl Agent {
             started_ms,
             old_acks: AtomicBool::new(false),
             ticking: AtomicBool::new(false),
+            deleting: AtomicBool::new(false),
+            deleted_at: Mutex::default(),
             warmups: Mutex::default(),
             cleanup_scan: Mutex::new(None),
         });
@@ -2273,6 +2286,7 @@ impl Agent {
         // init host only through this pass; each is bounded.
         self.retire_rows();
         self.drop_stale_incoming();
+        self.schedule_received_passes();
     }
 
     /// Sources nobody added to for 24 hours go, every pass and not only
@@ -2341,7 +2355,116 @@ impl Agent {
         self.clean_ended();
         self.retire_rows();
         self.drop_stale_incoming();
+        self.schedule_received_passes();
         self.collect_garbage();
+    }
+
+    /// Starts a round of deleting passes of the received sources on a
+    /// thread of its own (spec 25.8 5b (d), (h)6): not on this tick's
+    /// thread, at most one at a time, at most once a minute, not while a
+    /// version is on trial (25.1, 8).
+    fn schedule_received_passes(self: &Arc<Self>) {
+        if self.stopping() || super::control::in_trial(&self.cfg.state_dir) {
+            return;
+        }
+        if self
+            .deleted_at
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < RECEIVED_PASS_EVERY)
+        {
+            return;
+        }
+        if self.deleting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // (in `threads` like the attempts' threads, so `shutdown` joins it
+        // before the agent lock goes: a pass that outlived it could detach
+        // a source another process's agent pins in the meantime. The check
+        // of `stopping` is under the list's lock: `shutdown` sets it before
+        // it takes the list.)
+        let mut threads = lock(&self.threads);
+        if self.stopping() {
+            self.deleting.store(false, Ordering::SeqCst);
+            return;
+        }
+        let agent = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("belt-received-pass".into())
+            .spawn(move || {
+                let _running = Ticking(&agent.deleting);
+                agent.run_received_passes();
+            });
+        match spawned {
+            Ok(t) => {
+                threads.retain(|t| !t.is_finished());
+                threads.push(t);
+            }
+            Err(_) => self.deleting.store(false, Ordering::SeqCst),
+        }
+    }
+
+    /// One round: passes back to back while each made progress (spec
+    /// 25.8 5b (d): while step 0 has work or the store is over its cap, a
+    /// pass that ends is followed by the next, 100 ms apart); a pass that
+    /// changed nothing, a busy store, a closed gate, a parent's store or a
+    /// claim that did not drain ends the round. Returns the passes run.
+    ///
+    /// For the tests and [`Self::schedule_received_passes`]: it takes the
+    /// same flag as the scheduled round, so two rounds never run at once
+    /// (`0`: one is running).
+    pub fn received_passes(&self) -> usize {
+        if self.deleting.swap(true, Ordering::SeqCst) {
+            return 0;
+        }
+        let _running = Ticking(&self.deleting);
+        self.run_received_passes()
+    }
+
+    /// The round, with `deleting` held by the caller.
+    fn run_received_passes(&self) -> usize {
+        *self.deleted_at.lock().unwrap() = Some(Instant::now());
+        // (stop at the next section: the agent is stopping, or a version
+        // is on trial, spec 25.1 8)
+        let stop = || self.stopping() || super::control::in_trial(&self.cfg.state_dir);
+        let attempts = |source: &crate::ids::SourceId| -> anyhow::Result<(bool, Option<i64>)> {
+            Ok(self.store.source_use(source)?)
+        };
+        let mut passes = 0;
+        loop {
+            if stop() {
+                return passes;
+            }
+            let Some(result) = self.host.received_pass(&attempts, &stop) else {
+                return passes;
+            };
+            passes += 1;
+            let report = match result {
+                Ok(report) => report,
+                Err(e) => {
+                    self.note_global(
+                        "received_pass_failed",
+                        "",
+                        json!({ "message": format!("{e:#}") }),
+                    );
+                    return passes;
+                }
+            };
+            // (25.8 5b: a store that holds a parent's roots is left alone,
+            // and said so; the journal keeps one such event while nothing
+            // changes)
+            if report.parent {
+                self.note_global("source_store_shared", "", json!({}));
+            } else if !report.busy {
+                // (a later share is news again)
+                lock(&self.noted).remove("/source_store_shared/");
+            }
+            let progress = report.detached + report.unlinked + report.forgotten > 0;
+            if !progress || report.busy || report.parent || report.stuck || report.gate.is_some() {
+                return passes;
+            }
+            std::thread::sleep(RECEIVED_PASS_PAUSE);
+        }
     }
 
     /// One retention GC pass ([`Self::gc`]); a failure goes to the journal.

@@ -28,6 +28,32 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// The deleting pass's answer about one source (spec 25.8 5b (a), (h)7):
+/// a pin, or an id `worker.db` cannot name, keeps it; otherwise the
+/// attempts of every member decide. An error keeps it too (the pass reads
+/// it as referenced).
+fn source_use(
+    pinned: bool,
+    id: Option<&crate::ids::SourceId>,
+    attempts: &super::host::SourceAttempts,
+) -> anyhow::Result<crate::source::retention::SourceUse> {
+    use crate::source::retention::SourceUse;
+    let Some(id) = id.filter(|_| !pinned) else {
+        return Ok(SourceUse::Live);
+    };
+    let (live, ended) = attempts(id)?;
+    Ok(if live {
+        SourceUse::Live
+    } else {
+        SourceUse::Ended(ended)
+    })
+}
+
+/// A received source unused this long goes (spec 25.8 5b (c): 14 days).
+const RECEIVED_MAX_AGE_MS: u64 = 14 * 24 * 3600 * 1000;
+/// Above this many counted bytes the oldest go first (5b (c): 20 GiB).
+const RECEIVED_CAP_BYTES: u64 = 20 << 30;
+
 pub struct Machine {
     in_place: Option<(PathBuf, crate::ids::WorkerId)>,
     state_dir: PathBuf,
@@ -518,6 +544,26 @@ impl Host for Machine {
         }
     }
 
+    fn received_pass(
+        &self,
+        attempts: &super::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<anyhow::Result<crate::source::retention::ReceivedPassReport>> {
+        use crate::source::retention::ReceivedPassInputs;
+        let uses = |ci: &str, id: Option<&crate::ids::SourceId>| {
+            source_use(self.pins.pinned(ci), id, attempts)
+        };
+        Some(self.store.received_pass(&ReceivedPassInputs {
+            wall: crate::platform::clock::wall_ms(),
+            mono: crate::platform::clock::monotonic_ms(),
+            boot: crate::platform::boot_id(),
+            max_age_ms: RECEIVED_MAX_AGE_MS,
+            cap_bytes: RECEIVED_CAP_BYTES,
+            uses: &uses,
+            stop,
+        }))
+    }
+
     fn source_ended(&self, source: &crate::ids::SourceId) {
         let Some(id) = ci_id_of(source) else {
             return;
@@ -763,5 +809,34 @@ mod tests {
         check_toolchain_waiting(&f.store, f.area.as_path(), &f.manifest, &p).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(250));
         holder.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod received_pass_tests {
+    use super::source_use;
+    use crate::source::retention::SourceUse;
+
+    #[test]
+    fn a_pin_a_live_attempt_or_an_unnamed_id_keeps_the_source() {
+        let id = crate::ids::SourceId::generate();
+        let ended = |_: &crate::ids::SourceId| -> anyhow::Result<(bool, Option<i64>)> {
+            Ok((false, Some(7)))
+        };
+        let live =
+            |_: &crate::ids::SourceId| -> anyhow::Result<(bool, Option<i64>)> { Ok((true, None)) };
+        assert_eq!(
+            source_use(false, Some(&id), &ended).unwrap(),
+            SourceUse::Ended(Some(7))
+        );
+        assert_eq!(
+            source_use(true, Some(&id), &ended).unwrap(),
+            SourceUse::Live
+        );
+        assert_eq!(source_use(false, None, &ended).unwrap(), SourceUse::Live);
+        assert_eq!(
+            source_use(false, Some(&id), &live).unwrap(),
+            SourceUse::Live
+        );
     }
 }

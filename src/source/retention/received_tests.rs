@@ -32,6 +32,8 @@ impl Env {
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
         );
+        // (this process has started its recount, as the caller ensures)
+        *env.receiver.retention.recounted.lock().unwrap() = Some(std::time::Instant::now());
         env
     }
     fn sql(&self, s: &str) {
@@ -116,6 +118,7 @@ impl Env {
             max_age_ms: AGE,
             cap_bytes: cap,
             uses,
+            stop: &|| false,
         })
     }
     fn pass(&self) -> ReceivedPassReport {
@@ -639,4 +642,155 @@ fn the_pass_queries_follow_an_index() {
         assert!(!text.contains("TEMP B-TREE"), "{sql}\n{text}");
         assert!(!plan.iter().any(|l| l.starts_with("SCAN")), "{sql}\n{text}");
     }
+}
+
+/// Moves source `id`'s blob alone into an abandoned root `root`; `counted`
+/// keeps its `object_bytes` row. Returns the blob's path.
+fn abandon_blob(env: &Env, id: &str, root: &str, counted: bool) -> std::path::PathBuf {
+    let hash = env
+        .receiver
+        .manifest(id)
+        .unwrap()
+        .unwrap()
+        .object_manifest
+        .entries[0]
+        .hash
+        .clone();
+    env.sql(&format!(
+        "INSERT INTO root(id,kind,source) VALUES('{root}','abandoned',NULL);
+         DELETE FROM member WHERE root='receive:{id}' AND object<>'b:{hash}';
+         UPDATE member SET root='{root}' WHERE root='receive:{id}';
+         DELETE FROM root WHERE id='receive:{id}'"
+    ));
+    if !counted {
+        env.sql(&format!("DELETE FROM object_bytes WHERE id='b:{hash}'"));
+    }
+    let path: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT path FROM object WHERE id='b:'||?1", [&hash], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    env.receiver.root().join(path)
+}
+
+/// Review round 2 (b): before a member of unknown size, a section with less
+/// than half of its budget left ends, the cursor before that member.
+#[test]
+fn an_unknown_size_waits_for_half_a_section() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(200))], YOUNG);
+    let b = env.source(&[("f", &"b".repeat(100))], YOUNG);
+    let c = env.source(&[("f", &"c".repeat(10))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let fb = abandon_blob(&env, &b, "drop:b:1", true);
+    let fc = abandon_blob(&env, &c, "drop:c:1", false);
+    // 1,000: the two known files (200, then 100; each read twice, to
+    // claim and to drain) leave 400, under half
+    let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(report.unlinked, 2, "{report:?}");
+    assert!(!fa.exists() && !fb.exists());
+    assert!(fc.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:c:1'"),
+        1
+    );
+    // the next section takes it
+    let (_, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fc.exists());
+}
+
+/// Review round 2 (a): step 0 pages only roots with members; an empty
+/// abandoned `import:` root still goes, with its token's unused session.
+#[test]
+fn an_empty_import_root_goes_with_its_session() {
+    let env = Env::new();
+    env.sql(
+        "INSERT INTO root(id,kind,source) VALUES('import:t1','abandoned',NULL);
+         INSERT INTO import_session(token,state) VALUES('t1','pending')",
+    );
+    let (what, report) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(what, "progress", "{report:?}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id='import:t1'"),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM import_session WHERE token='t1'"),
+        0
+    );
+}
+
+/// Caller condition L5: nothing is detached before this process started
+/// its recount (the rewind of the fills).
+#[test]
+fn nothing_is_detached_before_the_process_recounts() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.trust_clock();
+    *env.receiver.retention.recounted.lock().unwrap() = None;
+    let report = env.pass();
+    assert_eq!(report.detached, 0, "{report:?}");
+    assert!(env.received(&old));
+    // the recount starts (and, the fills done again, ends)
+    while !env.receiver.retention.recount_bytes(1000).unwrap() {
+        env.sql("UPDATE meta SET value='done' WHERE key IN ('bytes_fill','clone_ref_fill')");
+    }
+    assert!(env.receiver.retention.recounted.lock().unwrap().is_some());
+    env.trust_clock();
+    let report = env.pass();
+    assert_eq!(report.detached, 1, "{report:?}");
+    assert!(!env.received(&old));
+}
+
+/// Review round 1 (M1, L1): a pass whose `stop` is true (the agent is
+/// stopping, or a version is on trial) runs no section and detaches nothing.
+#[test]
+fn a_stopped_pass_runs_no_section() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.trust_clock();
+    let report = env
+        .receiver
+        .received_pass(&ReceivedPassInputs {
+            wall: NOW,
+            mono: AGE,
+            boot: Some("b".into()),
+            max_age_ms: AGE,
+            cap_bytes: u64::MAX,
+            uses: &|_, _| Ok(SourceUse::Ended(None)),
+            stop: &|| true,
+        })
+        .unwrap();
+    assert_eq!(report.sections, 0, "{report:?}");
+    assert_eq!(report.detached, 0, "{report:?}");
+    assert!(env.received(&old));
+    // the same pass, not stopped, detaches it
+    assert_eq!(env.pass().detached, 1);
+}
+
+/// Review round 1 (L2): a section removes at most 64 empty roots.
+#[test]
+fn empty_roots_go_a_bounded_number_a_section() {
+    let env = Env::new();
+    let rows: String = (0..100)
+        .map(|i| format!("INSERT INTO root(id,kind,source) VALUES('drop:e:{i}','abandoned',NULL);"))
+        .collect();
+    env.sql(&rows);
+    let (what, _) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:e:%'"),
+        36
+    );
+    let (_, _) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:e:%'"),
+        0
+    );
 }
