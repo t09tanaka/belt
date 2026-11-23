@@ -534,8 +534,12 @@ impl CoordinatorStore {
     /// results and rows and unlink its pin file, and this function would
     /// make the file again and write results nothing deletes. So the same
     /// check is made again with the pin held. A writer that is refused
-    /// there lets go of the pin and unlinks the file it made, when it gets
-    /// the pin exclusively (otherwise the scan at start removes it).
+    /// there lets go of the pin and unlinks the pin file, when it gets the
+    /// pin exclusively (otherwise the scan at start removes it). It cannot
+    /// tell a file it made from one that was there, so it unlinks either:
+    /// a run that is marked but not pruned to its end yet can lose its pin
+    /// file here, and the pruning must take a missing pin file for "no
+    /// reader".
     pub(crate) fn result_writer_pin(
         &self,
         attempt: &AttemptId,
@@ -1222,6 +1226,7 @@ impl CoordinatorStore {
         let (aid, reason) = (attempt_id.to_string(), reason.to_string());
         let note = note.map(|(kind, payload)| (kind.to_string(), payload.clone()));
         self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, &aid)?;
             let worker: String = tx
                 .query_row(
                     "SELECT worker_id FROM attempt WHERE attempt_id = ?1",
@@ -1504,6 +1509,10 @@ impl CoordinatorStore {
         );
         let wanted = wanted.to_vec();
         self.db.write(move |tx| {
+            if let Some(run) = &r {
+                refuse_pruned(tx, run)?;
+            }
+            refuse_pruned_attempt(tx, &a)?;
             common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
         })
     }
@@ -1662,7 +1671,10 @@ impl CoordinatorStore {
 
     pub fn add_blob_ref(&self, r: &NewBlobRef, at_ms: u64) -> Result<()> {
         let r = r.clone();
-        self.db.write(move |tx| common::add_blob_ref(tx, &r, at_ms))
+        self.db.write(move |tx| {
+            refuse_pruned_attempt(tx, &r.attempt_id)?;
+            common::add_blob_ref(tx, &r, at_ms)
+        })
     }
 
     /// Mark a reference as in use (a cache entry another job reads).

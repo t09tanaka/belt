@@ -630,6 +630,15 @@ fn a_writer_of_results_overtaken_by_the_pruning_is_refused_and_leaves_no_pin() {
         );
         assert!(!pin_path(&f).exists(), "rows gone: {rows_gone}");
     }
+    // The mark alone, with the pin file where it was: the refused writer
+    // cannot tell that file from one it made, and unlinks it as well.
+    let f = fx();
+    drop(f.store.result_writer_pin(&f.attempt).unwrap());
+    refused(
+        f.store
+            .result_writer_pin_after(&f.attempt, || mark(&f.store, &f.run)),
+    );
+    assert!(!pin_path(&f).exists());
 }
 
 /// The writer that is refused with the pin held unlinks the file only when
@@ -808,6 +817,40 @@ fn no_row_of_a_run_that_is_being_pruned_is_written_by_any_writer() {
                 "workflow_download",
                 s.workflow_download(&f.run, "ci", &f.attempt, &digest, None, None)
                     .map(drop),
+            ),
+            (
+                "add_blob_ref",
+                s.add_blob_ref(
+                    &NewBlobRef {
+                        ref_id: "another-ref".into(),
+                        attempt_id: f.attempt.to_string(),
+                        kind: BlobKind::Result,
+                        locator: "results/another".into(),
+                    },
+                    20,
+                ),
+            ),
+            (
+                "append_events_unseen of an attempt alone",
+                s.append_events_unseen(
+                    None,
+                    &f.attempt,
+                    "submit_deferred",
+                    "answer",
+                    &[("busy".into(), json!({"answer": "busy"}))],
+                    20,
+                )
+                .map(drop),
+            ),
+            (
+                "begin_retire_noting",
+                s.begin_retire_noting(
+                    &f.attempt,
+                    "cannot",
+                    Some(("worker_excluded", &json!({}))),
+                    20,
+                )
+                .map(drop),
             ),
         ];
         let pruned = |answer: &Result<()>| {
