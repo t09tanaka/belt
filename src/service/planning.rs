@@ -16,7 +16,7 @@ pub struct Prepared {
     manifest: SourceManifest,
     store: SourceStore,
     run: RunId,
-    draft: tempfile::TempDir,
+    draft: crate::platform::owned_temp::OwnedTemp,
 }
 impl Prepared {
     pub fn plan(&self) -> &CiPlan {
@@ -38,6 +38,7 @@ impl Prepared {
             .map_err(|_| failure("cannot remove private planning draft"))
     }
 }
+const DRAFT_PREFIX: &str = "ci-plan-";
 fn failure(message: &'static str) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, message)
 }
@@ -164,9 +165,9 @@ pub fn stored(
 /// Capture once. The core reads only verified objects and owns its secret-free view.
 /// Missing filter metadata is rejected by core rather than inferred from live Git.
 pub fn prepare(context: Context, revision: Option<&str>) -> Result<Prepared, ApiError> {
-    let draft = tempfile::Builder::new()
-        .prefix("ci-plan-")
-        .tempdir_in(context.state_dir())
+    // What a planning that was killed left (spec 25.4 (a)): one `readdir`.
+    crate::platform::owned_temp::sweep(context.state_dir(), DRAFT_PREFIX);
+    let draft = crate::platform::owned_temp::OwnedTemp::new_in(context.state_dir(), DRAFT_PREFIX)
         .map_err(|_| failure("cannot create private planning draft"))?;
     let run = RunId::generate();
     super::input::capture_into(&context, &run, revision, draft.path())

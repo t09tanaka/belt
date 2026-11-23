@@ -223,9 +223,7 @@ pub fn store_bundle(
         ],
     )?;
     let private = super::outcome::artifacts_root(root, attempt);
-    let bundle = tempfile::Builder::new()
-        .prefix(".tmp-bundle-")
-        .tempfile_in(&private)?;
+    let bundle = crate::platform::owned_temp::file_in(&private)?;
     let mut archive = tar::Builder::new(bundle.as_file().try_clone()?);
     let max = plan.max_bytes.min(MAX_BUNDLE_BYTES);
     for (path, selected_meta) in selection.selected {

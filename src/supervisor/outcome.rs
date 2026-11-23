@@ -220,9 +220,7 @@ pub fn store_artifact(
         .chain(rel.parent().into_iter().flat_map(Path::iter))
         .collect();
     ensure_real_dirs(root, &comps)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".tmp")
-        .tempfile_in(parent)?;
+    let mut tmp = crate::platform::owned_temp::file_in(parent)?;
     let mut hasher = Sha256::new();
     let mut size = 0u64;
     let mut buf = vec![0u8; 64 << 10];

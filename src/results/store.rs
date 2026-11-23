@@ -628,7 +628,7 @@ impl ResultStore {
         let dir = self.attempt_dir(attempt);
         let tmp_dir = self.tmp_dir(attempt);
         dir_all(&tmp_dir)?;
-        let mut tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
+        let mut tmp = crate::platform::owned_temp::file_in(&tmp_dir)?;
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         tmp.persist(self.result_path(attempt))

@@ -15,7 +15,7 @@ fn path(paths: &Paths) -> PathBuf {
     paths.config.join("membership-undo.json")
 }
 fn replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("file parent")?)?;
+    let mut temp = crate::platform::owned_temp::file_in(path.parent().context("file parent")?)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;

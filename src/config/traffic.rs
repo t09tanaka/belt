@@ -325,7 +325,7 @@ pub fn record_hold(state_dir: &Path, hold: &Hold, now_ms: u64) -> std::io::Resul
         message: message.into(),
         checked_at_ms: now_ms,
     };
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
+    let mut tmp = crate::platform::owned_temp::file_in(state_dir)?;
     std::io::Write::write_all(&mut tmp, &serde_json::to_vec(&record)?)?;
     tmp.persist(&path).map_err(|e| e.error)?;
     Ok(())

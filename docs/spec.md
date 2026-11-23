@@ -1940,6 +1940,7 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 | `reader-pins/<run>.lock` | resident（作成とGC）と、CLIの `logs`・`outputs`。pinを開く処理（`RunPin::ensure`・`shared`・`exclusive`）は、すべて親DBを開いた後の `CoordinatorStore` の中にある | (B)。`src/results/pin.rs` の `checked` が最初からinodeを照合し、readerは作らない。作る側（3つ。25.5）は、runの行があって印が無いときだけ作る | runと一緒に消す（段階2） |
 | `sources/runs/<run>.lock` | そのrunを取り込むprocessだけ（`SourceStore::lock_run`。run IDは取り込むprocessが作る） | (A)。lockを作る前に持ち主の行（`capture_owner`）があり、runの行ができた後に、このlockを開く経路は無い。提出前は持ち主のprocessが生きていないことを示す（25.4） | runと一緒に消す（段階1・段階2） |
 | `supervisors/<attempt>.lock` | そのattemptのsupervisorの起動、agent（5か所）、別のscopeで動くsupervisorの照合（`config::traffic::foreign_supervisors`。`attempts/<attempt>/supervise.json` がある間）。一覧は25.6 | (A)。条件は25.6に書く。`SupervisorLock::try_acquire` はfileを作るので (B) は使えない | attemptのdirectoryと行の後に消す（段階3） |
+| `<DBのstage>.init-lock`（`init` がDBを準備するstageの横） | そのstageを作った `init` のprocessだけ（`CoordinatorStore::initialize_identity`。stageの名前は作ったprocessしか知らず、回復はstageをrenameするだけで、DBとして開かない） | (A)。作ったprocessがDBを閉じた後に自分で消す。killされて残ったものは、名前（stageの名前 + `.init-lock`）が持ち主を証明し、その持ち主が居ないことを確かめて消す（25.4の (a)） | stageと一緒に消す（段階1） |
 | `toolchains/<identity>/install.lock` | そのrootへ導入するsetup builder、builderが起動する導入のhelper process、workerの起動時のtrashの片付け | (A)。条件は25.7に書く | rootと一緒に消す（段階4） |
 | cloneのlock（`<clone>/.git` の中） | そのcloneのworkspaceを作る・消す処理 | 未確定（25.9） | 段階5が決まるまでunlinkしない |
 | 親: `startup.lock`、`coordinator.lock`、`init.lock`、`transfer.lock`、`coordinator.db.init-lock`、`upgrade/upgrade.lock`、sourceの変更lock（`sources/mutation.lock`）、`sources/secrets.lock`、Vaultのlock（`secrets/retention.lock`）。worker: `agent.lock`、`worker-owner.lock`、`worker-service.lock`、`worker.db.init-lock`、`group-rotation-key.lock`、`group-rotation-command.lock`、`incoming/locks/<0〜63>.lock` と `incoming/locks/all.lock`（受け取りのlock。source IDのhashを64で割った余りで割り振るので、65個で頭打ち）、sourceの変更lock、`ephemeral.lock`（一時workerのstateだけ。段階1） | どの版のどのcommandも開き得る | どちらも示せない | 固定。unlinkしない。個数は増えない |
@@ -2006,39 +2007,52 @@ beltがディスクに書き、書いたcommandの終了後も残るものを、
 
 ### (a) 一時fileと一時directory
 
-**今の挙動。** beltの一時fileの大半は `tempfile` の既定の名前（`.tmpXXXXXX`）で、作ったprocessがSIGKILLや電源断で終わると残る。受け皿があるのは、profileの検査用directory（`src/platform/owned_temp.rs` の所有marker）、鍵の一時file（600秒）、Vaultの一時file（数えるだけ）、`bin/.resident.<pid>` だけである。
+**今の挙動（段階1の (a) の実装後）。** 規則と、表の各場所の走査は入った（名前は `owned_temp::file_in`・`new_file_name`、走査は `sweep_files`、directoryは `OwnedTemp` と `sweep`、作りかけのdirectoryだけを見る `sweep_unfinished`。journalが名指すstageは `stage_in`・`new_stage_name` と、`init` だけが呼ぶ `sweep_stages`。`doctor` は残った件数を `leftover_temporaries` で示す）。規則の外に残るのは2つで、どちらも所有を証明する名前にしていない: 再開できる受け渡しの `incoming-*.part`（`worker/ci_task.rs`。名前が決まっていて、持ち主の `sweep_plans` が消す）と、`setup/store.rs` の `.tmp-<ulid>`（workerの起動時の `sweep` が、`agent.lock` の下で消す）。他のuidのfileに触れないことは、`lstat` の結果（種類・link数・uid）だけから決める関数（`Seen::is_own_file`・`is_own_directory`）に、別のuidを与えて確かめる（rootでなければ別のuidのfileを作れないので、fileそのものでは確かめない）。
 
 **規則。** beltが作る一時のfile・directoryは、例外なく次のどちらかにする。
 
 - **directory**は、所有marker（`platform::owned_temp`。場所・pid・processの開始identity）を持つ。
-- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所のhash>.<pid>.<開始identity>.<乱数>` とし、markerと同じ3つの事実を運ぶ。場所・pid・開始identityの定義は `owned_temp` と同じものを使う。
-- **場所は固定長のhashで運ぶ。** `owned_temp` の場所は、hostname・OSのboot・PID namespaceの3つで、hostnameだけで255 bytesになり得る。そのまま名前に入れると、file名の上限（`NAME_MAX`。255 bytes）を超える。名前に入れるのは、3つを区切りつきで並べたもののSHA-256の先頭16桁（hex）とする。pidは10進（10桁まで）、開始identityは10進（20桁まで）、乱数は英数字12字とする。名前は最長で `.belt-tmp.`（10）+ 16 + 1 + 10 + 1 + 20 + 1 + 12 = 71 bytesで、どのfilesystemの上限にも収まる。走査は、今の場所から同じhashを計算して比べる。hashが違えば「場所が違う」として触れない。directoryのmarkerは、fileの中身なので、今までどおり3つをそのまま持つ。
+- **markerの無いdirectoryを、その名前で見せない。** directoryは、単独のfileと同じ形の名前（`.belt-tmp.…`。下）で作り、中にmarkerを書いてfsyncしてから、置き換えをしないrenameで本来の名前（`<接頭辞><乱数6字>`）にする。途中でkillされたprocessが残すのは `.belt-tmp.…` の名前のdirectoryで、名前が持ち主を証明するので、directoryの走査（`sweep`・`sweep_unfinished`）と単独のfileの走査（`sweep_files`）の両方が、持ち主の居ないものを中身ごと消す。したがって、本来の名前のdirectoryのmarkerが空・途中までであることは、killでも電源断でも起きない。そういうmarkerは誰のものでもないものとして残す。持ち主を言えないprocess（下）は、今までどおり本来の名前で直接作り、markerを書かない。
+- **場所は、hostの名前ではなく、機械のidentityで決める。** 場所は、機械のidentity・PID namespace・OSのbootの3つである。機械のidentityは、macOSでは `gethostuuid` のhost UUID、Linuxでは `/etc/machine-id` で（`/var/lib/dbus/machine-id` は読まない: imageに焼き込まれていることが多く、同じimageのcontainerがどれも同じ値を持つ）、32桁のhex（全部0は不可）として読めたものだけを使う。hostnameは使わない: 同じ名前の2つのhostが1つのdirectoryを共有すると（NFSのhome、複製したVM、`hostname:` を固定してhostのPID namespaceを使うcontainer）、LinuxのPID namespaceの番号は最初のnamespaceならどのhostでも同じなので、片方の起動時の走査が、もう片方の生きている一時fileを「同じ場所の別のboot」と読んで消してしまう。hostnameを変えても場所は変わらないので、名前を変える前の残りも、同じ機械の走査が消す。markerには `machine:<32桁>` の行で書く。hostnameを書いた以前の版のmarker（5行で、4行目がhostname）は、機械を言っていないので、記録として扱わない（残す）。
+- **機械のidentityを共有する環境は対象外とする。** 同じ `/etc/machine-id` を持つVMの複製や、hostの `/etc/machine-id` を見せたcontainerどうしが、1つのdirectoryを共有し、PID namespaceの番号も同じ場合、互いを区別する手段が無い。この構成では、beltのstateとconfigを共有しないこと。
+- **単独のfile**（renameで公開する前のfile、切替の途中のlink）はmarkerを持てないので、**名前**が所有を証明する。名前は `.belt-tmp.<場所のhash>.<bootのhash>.<pid>.<開始identity>.<乱数>` とし、markerと同じ事実（場所・boot・pid・開始identity）を運ぶ。それぞれの定義は `owned_temp` と同じものを使う。
+- **場所とbootは、別々の固定長のhashで運ぶ。** `owned_temp` の場所は、機械のidentity・PID namespace・OSのbootの3つで、そのまま並べると長く、bootのIDの形はOSごとに違う。名前に入れるのは、機械のidentityとPID namespaceを区切りつきで並べたもののSHA-256の先頭16桁（hex。場所のhash）と、bootのIDのSHA-256の先頭8桁（hex。bootのhash）である。bootを場所のhashに混ぜない: 混ぜると、再起動の後は「別の場所」と区別できず、電源断で残った単独のfile（鍵の平文の写しを含む）を、どのprocessも二度と消せない。pidは10進（10桁まで）、開始identityは10進（20桁まで。0は使わない）、乱数は英数字12字とする。名前は最長で `.belt-tmp.`（10）+ 16 + 1 + 8 + 1 + 10 + 1 + 20 + 1 + 12 = 80 bytesで、どのfilesystemの上限にも収まる。走査は、今の場所から同じ2つのhashを計算して比べる。場所のhashが違えば「場所が違う」として触れない。場所のhashが同じでbootのhashが違えば、持ち主はそのbootと一緒に居なくなっている（markerの規則と同じ）。bootのhashも同じときだけ、pidと開始identityを見る。directoryのmarkerは、fileの中身なので、今までどおり3つをそのまま持つ。
+- **持ち主を言えないprocessの名前は、誰のものでもない。** 場所（機械のidentity・PID namespace・boot）か、自分の開始identityを読めないprocessは、2つのhashを全部0、開始identityを0にした名前を使い、directoryにはmarkerを書かない。開始identityが0の名前は解釈できない名前として扱い、走査は触れない（作ったprocessだけが消す）。本物の場所に、作り物の開始identityを組み合わせない: 読み手には「持ち主が居ない」と見えてしまう。
+- **journalに書いた名前のfileは、一時fileではない。** `init` は、公開の直前のfile（鍵・binary・DB・入力・serviceの定義）の名前を `init.json` の `pending` に書いてから公開し、途中で終わると、後の `init` がそのfileを使って公開を済ませる。後のprocessへ引き渡すfileなので、「読むのは作ったprocessだけ」という一時fileの前提が成り立たない。このfile（stage）は `.init-` で始まる名前にし、一時fileの走査は見ない。持ち主はjournalの回復である: 回復が公開を済ませる（renameで名前が消える）か、取り消しがjournalと一緒に消す。名前の残りは一時fileと同じ形（`.init-<場所のhash>.<bootのhash>.<pid>.<開始identity>.<乱数>`）にして、作ったprocessが分かるようにする。`init` は、`init.lock` の下で回復が済み、`pending` が空になった後に、そのjournalだけが扱うdirectory（config directory、binaryのdirectory）にある、持ち主の居ないstageを消す（journalに書く前に終わった `init` の残り。journalが名指していないことは、`pending` が空であることで分かる）。親のstateは、config directoryとは別に決まる（`XDG_STATE_HOME`）ので、別のconfig directoryの `init`（別の `init.lock` とjournal）が同じstateを見ることがあり、そのjournalがstateのDBのstageを名指しているかもしれない。そこで、親のstateのstageは、**自分のjournalがそのstateの `coordinator.db` を公開済みで、そのfileが今もそこにあるとき**（journalの証明とinodeが一致するとき）だけ消す。その間、別のjournalが名指すstageは決して公開できない（公開は置き換えをせず、回復が既にあるtargetを受け入れるのは、それがstageと同じfileのときだけである）ので、消しても誰の回復も妨げない。DBを公開した `init` は、公開の直後にもう一度この走査を行う（最初のDBの準備中にkillされた `init` の残りを、同じ実行の中で消す。3回目の `init` を待たない）。DBのstageの横には、SQLiteのjournal（`-wal`・`-shm`・`-journal`）と準備のlock（`.init-lock`）ができる。どれもstageの名前にこの4つの語尾を付けた名前なので、stageと同じ持ち主の証明で、同じ走査が消す。stageをDBとして開くのは作ったprocessだけ（回復はrenameするだけ）なので、作ったprocessは、DBを閉じた後、journalに名前を書く前に、この4つを自分で消す（lock fileの規則の (A)。25.1）。公開の後に横に残るものは無い。serviceの定義のdirectoryは、同じ利用者の別の導入（別のconfig directoryとjournal）と共有で、stateのような持ち主の印が無いので、そこのstageは消さない。古い版が書いた `.init-<ulid>` は、誰が作ったか分からないので消さないが、`pending` が名指すstageとしては、どちらの形も受け付ける（古いbinaryの書いたjournalを回復できる）。
 - 作った時点でunlinkできるもの（匿名で足りるもの）は、名前を持たせない。
 
-走査は、その場所で同じ種類の処理を始めるとき（下の表）に、そのdirectoryの `readdir` 1回で行う。消すのは、名前かmarkerが解釈でき、場所が今と同じで、そのpidのprocessが居ないか開始identityが違うものだけである。自分のuidの所有で、link数が1（fileのとき）で、symlinkをたどらない。解釈できないもの、場所が違うものには触れず、`doctor` が件数を示す。processにsignalは送らない。
+走査は、その場所で同じ種類の処理を始めるとき（下の表）に、そのdirectoryの `readdir` 1回で行う。消すのは、名前かmarkerが解釈でき、場所が今と同じで、bootが今と違うか、そのpidのprocessが居ないか開始identityが違うものだけである。自分のuidの所有で、link数が1（fileのとき）で、symlinkをたどらない。解釈できないもの、場所が違うものには触れず、`doctor` が件数を示す。processにsignalは送らない。
 
 | 場所 | 作るもの | 走査の契機 |
 | - | - | - |
-| 親のstate直下 | `ci-plan-*/`（計画の下書き）、`.init-*`（DBの準備）、`traffic-hold.json` などの固定fileの一時file | 計画の開始、`init`、residentの起動 |
+| 親のstate直下（`<state home>/belt/coordinator/`。workerのstateとは別のdirectory） | `ci-plan-*/`（計画の下書き）、`traffic-hold.json` などの固定fileの一時file。DBの準備の `.init-*` はstageで、一時fileではない（上の規則） | 計画の開始、`init`・`upgrade`・`group`・`workers` の各commandの開始、residentの起動 |
 | 親・workerの `sources/tmp/` | `.recv.*`、`.manifest.*`、`commit-<sha>-*/` | そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動時） |
 | 親の `results/<attempt>/tmp/` | `*.part` | 回収の続き（既存）。attemptの結果を消すときに一緒に消える |
 | 親の `secrets/` | `.<名前>.<ulid>.tmp` | Vaultの排他lockの下の保持driver（既存の `sweep_orphan_tmp`。所有を証明できる名前に変える） |
 | 親の `sources/secrets/` | `.secrets.tmp-*`（local-ciが書く、平文のsecretの束の一時file。名前はlocal-ciが決めるので、この規則の名前にできない） | 保持driverが `sources/secrets.lock` を待たずに排他で取れたpass。この一時fileを書く取り込みは、必ずこのlockを持つ（`src/secrets/capture.rs`）ので、lockを取れた時点の残りは、書き手の居ない残骸である。workerの側は、起動時の既存の片付け（`sweep_store_copies`）が同じ規則で消す |
 | workerのstate直下 | `.s*/`（socketの準備）、`worker-socket.json` などの一時file、`removed-members.json` の一時file | workerの起動（`agent.lock` の下） |
-| workerの `clones/`・`workspaces/` | 展開と作成の作業用directory | workerの起動（既存の孤児の走査） |
+| workerの `clones/`・`workspaces/` | 展開と作成の作業用directory（`.clone.*`・`.staging.*`） | workerの起動（既存の孤児の走査）。`agent.lock` の下で、どの作成よりも前に走るので、書き手は居ない。markerのあるものは持ち主の規則に従い、markerの無いもの（古い版が作ったもの、作ったprocessが自分の場所か開始identityを読めなかったもの）は、書き手が居ないことを根拠に消す。markerがあって読めないものは残す |
 | workerの `setup/builders/<id>/`、`attempts/<attempt>/`、親の `results/<attempt>/` | builderの一時file、準備の観測の一時file、CIのartifactの受け渡しの作業用 | 持ち主のdirectoryと一緒に消える（既存）。持ち主のdirectoryの外（state直下）に書くものは、workerの起動 |
-| system userのworkerの入力のdirectory | 入力の一時file | そのworkerのserviceを書くcommandの開始 |
+| workerの `attempts/<attempt>/ci/exchange/` | `.belt-xchg.*/`（artifactのstep 1つの作業用directory） | 同じattemptの次のartifactのstepの開始（`scratch_in`）。次のstepが無ければ、attemptのdirectoryと一緒に消える |
+| system userのworkerの入力のdirectory（管理者が決めたconfig directory） | 入力・journalの一時file、`bin/` の切替の途中のlink | そのworkerの入力を書くcommand（`worker-service`）の開始と、そのworkerの起動。`install` と起動は、自分が解決したdirectory（起動は、渡された入力のあるdirectory）を走査する。`worker-service` のほかのactionは、同じ環境変数（`HOME`・`XDG_CONFIG_HOME`）から同じdirectoryを解決する、commandの開始の走査による |
 | config directory | `init.json`・`membership-undo.json`・`worker-service.json`・鍵・設定の一時file | `init`・`group`・`workers` の各commandの開始、residentとworkerの起動 |
-| `<state>/upgrade/` | `record.json` の一時file | `upgrade` の開始、serviceの入口 |
+| `<config>/upgrade/` | `record.json` と退避した設定の一時file | `upgrade` の開始、serviceの入口 |
 | `<config>/bin/` | `.resident.<pid>`、`.current.<pid>`（切替の途中のlink） | `upgrade`・`init` の開始、residentとworkerの起動 |
 | LaunchAgentsのdirectory（macOS）、systemdのunitのdirectory | service定義の一時file | serviceの定義を書くcommandの開始 |
 | `$TMPDIR` | `belt-log-reader-*/`、profileの検査用directory | `logs` の開始、検査の開始 |
 
 LaunchAgentsとunitのdirectoryは他の製品と共有なので、`.belt-tmp.` で始まる名前だけを見る。一時fileの名前は `.plist`・`.service` で終わらせない（service managerが読み込まない）。
 
-**安全の証明。** 一時fileを読むのは作ったprocessだけである（公開はrename）。そのprocessが居ないことを、場所・pid・開始identityの一致で確かめる。pidが使い回されていても、開始identityが違えば別のprocessである。場所が違うfile（別のhost、またはhostを特定できない）は消さない。
+**安全の証明。** 一時fileを読むのは作ったprocessだけである（公開はrename）。そのprocessが居ないことを、場所・boot・pid・開始identityで確かめる。場所が同じでbootが違えば、そのbootのprocessは1つも残っていない。bootも同じなら、pidが使い回されていても、開始identityが違えば別のprocessである。場所が違うfile（別の機械、別のPID namespace、または機械を特定できない）は消さない。
 
-**受け入れ試験。** 表の各場所について: (i) 一時fileを作ったprocessをSIGKILLし、次の契機でそのfileが消える。(ii) 生きているprocessの一時fileは消えない。(iii) pidが同じで開始identityが違うものは消える。(iv) 名前が合わないfile、他のuidのfile、link数が2のfileには触れない。(v) LaunchAgentsのdirectoryにある他の製品のfileに触れない。(vi) `src/` に、この規則を通らない `tempfile` の呼び出しが無いこと（testを除く）を、固定の検査で確かめる。
+**前提と、証明できずに残るもの。** どれも、消せる根拠が無いので残す。`doctor` の `leftover_temporaries` は、config・state・serviceの定義のdirectoryにある `.belt-tmp.*` の件数を示す。
+
+- **processの読み取り。** 走査は「そのpidのprocessが居ない」というOSの答えを信じる。Linuxで `/proc` が `hidepid`（`hidepid=invisible`、systemdの `ProtectProc=invisible`）で他のprocessを隠していると、生きているagent（core dumpを止めているので、同じuidからも見えない）が「processなし」に見える。第15章の既知の制約と同じく、この構成は対象外とする。
+- **機械のidentityを読めない環境。** `/etc/machine-id` が無い・空のcontainer imageでは、どのprocessも持ち主を言えないので、名前は誰のものでもない形になり、directoryにmarkerは付かない。crashで残った単独の一時fileは、永続volumeの上に残り続ける（crash 1回につき、そのprocessがその時点で書いていた一時file。鍵・設定・journalの写しで、1つは数KBまで。sourceの受け取りの途中のfileはそのobjectの大きさ）。markerの無いdirectoryのうち、書き手が居ないことをlockで示せる場所のもの（workerの `clones/`・`workspaces/`）は、今までどおり起動時に消える。それ以外の場所のmarkerの無いdirectory（`sources/tmp/commit-*/`、`ci-plan-*/`、`.s*/`、`.belt-xchg.*/`、`belt-log-reader-*/`）は、crashで残ると残り続ける。大きいのは `commit-*/`（取り込むcommit 1つ分のtree）で、ほかは数KBから数MBである。`.belt-xchg.*/` はattemptのdirectoryと一緒に消える。消すには、imageに機械ごとのmachine-idを持たせる。
+- **作り直したcontainer。** containerを作り直す（または再起動する）とPID namespaceが新しくなり、その番号が変われば場所が変わる。前のcontainerが永続volumeに残した一時file・directoryは「別の場所」のものになり、消えない（量は上と同じで、crashの回数に比例する）。新しいcontainerからは、前のnamespaceが無くなったのか、同じvolumeを共有する別のcontainerとして今も動いているのかを区別できないので、証明が無い。hostのPID namespaceを使うcontainerでは起きない。
+- **以前の版のmarker。** hostnameを書いたmarkerと、markerを書く途中でkillされた以前の版のdirectory（markerが空・途中まで）は、記録として読めないので残る。workerの `clones/`・`workspaces/` でも「markerがあって読めないもの」として残る。増えるのは以前の版が動いていた間のcrashの分だけで、この版からは増えない。1つの大きさは場所による: `clones/.clone.*` はclone 1つ分、`workspaces/.staging.*` はworkspace 1つ分、`sources/tmp/commit-*/` はcommit 1つ分のtreeで、ほかは数KBから数MBである。以前の版をcrashさせたことのあるhostでは、更新の後にこれらを手で消す。
+
+**受け入れ試験。** 表の各場所について: (i) 一時fileを作ったprocessをSIGKILLし、次の契機でそのfileが消える。(ii) 生きているprocessの一時fileは消えない。(iii) pidが同じで開始identityが違うものは消える。(iv) 名前が合わないfile、他のuidのfile、link数が2のfileには触れない。(v) LaunchAgentsのdirectoryにある他の製品のfileに触れない。(vi) `src/` に、この規則を通らない `tempfile` の呼び出しが無いこと（testを除く）を、固定の検査で確かめる。検査は、`#[cfg(test)]` の付いた項目だけを、その項目の終わり（`;` か、対応する閉じ括弧）まで除き、`tempfile` をpathの一部として使う行と、`use tempfile as …` のような別名を見つける。文字列と `/* */` の中は解釈しない。 (vii) journalが名指すstageは、作った `init` が居なくなった後の各commandの開始の走査で消えず、次の `init` が公開を済ませる。 (viii) 場所が同じでbootが違う名前のfileは消え、場所が違う名前のfileは消えない。 (ix) 機械のidentityだけが違う場所（PID namespaceは同じ、bootは別、pidは空いている）の名前のfileとmarkerのdirectoryは消えない。hostnameを書いたmarkerは記録として読まれない。 (x) 別のconfig directoryの `init` が、共有するstateにある、他のjournalが名指すDBのstageを消さず、元の `init` が回復できる。最初のDBの準備中にkillされた `init` のstageは、次の `init` がDBを公開した実行の中で消える。 (xi) DBのstageの準備が済んだ時点で、stageの横に `-wal`・`-shm`・`-journal`・`.init-lock` が無い。killされた `init` のstageの横のこの4つは、stageの走査で消え、一時fileの走査では消えない。 (xii) `.belt-xchg.*/` は、持ち主の居ないものが次のstepの開始で消え、生きている持ち主のものは残る。 (xiii) markerのdirectoryは、本来の名前を得る時点でmarkerが完全で、その前には本来の名前のものが無い。作りかけ（`.belt-tmp.…` の名前のdirectory。中身は空・`d` だけ・途中までのmarker）は、持ち主が居なければ3つの走査のどれでも消え、生きている持ち主のもの、別の場所のもの、本来の名前で途中までのmarkerを持つものは残る。 (xiv) 他のuidのfile・directoryは、名前やmarkerが何を言っていても、調べる対象にならない（`lstat` の結果にuidを与えて確かめる）。
 
 ### (b) 提出されなかった取り込み
 
@@ -2505,19 +2519,19 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 入力（manifest・object） | `sources/manifests/`、`sources/objects/` | 配送、`retry`、workspaceの準備 | runが終わってから `retention_days` 日（終点は25.3の (a)） | 同じ | 既存 | 索引に参照が無いこと、排他lock |
 | 保持の索引 | `sources/retention.db`（`root`・`object`・`member`・`graph`・`publication`・`run_expiry`・`source_delete_claim`・`vault_delete_claim`・`import_session`・`capture_owner`・`meta`） | 上の削除と配送 | 行を消さない。`import_session` は取り込みごとに増える | runの行（runのrootとそのmember・graphを含む）は刈り取りで、放棄された取り込みの行は放棄の処理で消す。`capture_owner` は、進行中と放棄された取り込みの数だけ。`GuardedObjectStore::put_bytes` は製品の呼び出し元が無く、行を作らない（25.9の8） | 1（`capture_owner` と放棄）、2（runの行） | 指す先が無いこと |
 | runの取り込みの記録とlock | `sources/runs/<run>`、`<run>.lock` | `retry`、配送の検証 | 消さない | runが在る間。提出されなければ、持ち主のprocessの終了か `given_up` の後、residentの次の出来事かpassまで | 1（放棄）、2（刈り取り） | 25.1の (A) |
-| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る（親では、片付ける処理が呼ばれていない） | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
+| 平文のsecretの束 | `sources/secrets/<run>.json`、`.secrets.tmp-*` | その取り込み（Vaultへ移すまで） | 取り込みの中でVaultへ移して消す。途中で終わると残る。一時fileは、保持driverが `sources/secrets.lock` を待たずに排他で取れたpassと、workerの起動（`sweep_store_copies`）で消す | Vaultへ移すまで。放棄された取り込みのものは放棄の処理で、一時fileは `sources/secrets.lock` を取れたpassで消す | 既存、1 | 25.4の (a)・(b) |
 | bundle | `sources/bundles/<source>-<32hex>.bundle` | 進行中の配送（offsetからの再開） | sourceごとに4個まで。配送の成功時に消す。失敗・放棄では残る | 加えて、そのsourceを参照するrunが無くなったときに消す | 2 | 索引に参照するrunが無いこと |
 | 親のGit領域 | `sources/git/<key>.git`（`refs/local-ci/snapshots/<source>`・`index/<source>`・`heads/*` とGit object） | bundleの作成、次の取り込み | 消さない | refはsourceが在る間。objectはrefを消してから最長14日と24時間（25.5）。`heads/*` と、refを消す関数は未決（25.16） | 2（関数があれば） | refが無いこと、Gitの猶予 |
-| 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| 取り込みの作業領域 | `sources/tmp/` | 書いたprocessだけ | 正常終了で消える。crashで残るものは、そのstoreの変更lockを排他で取れたpass（親は保持driver、workerは起動）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | 共有の固定lock | `sources/secrets.lock`、sourceの変更lock | 取り込み | 固定 | unlinkしない | 既存 | 該当なし |
-| 計画の下書き | `ci-plan-*/` | 書いたcommandだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 同上 |
+| 計画の下書き | `ci-plan-*/` | 書いたcommandだけ | 正常終了で消える。crashで残るものは、計画の開始がmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 同上 |
 | 親Vault | `secrets/<run>.json`、`parent-retention.json`、lock | 配送、`retry` | runが終わった時点で消す。提出されなかったrunのものは残る | 加えて、放棄された取り込みのものを消す | 既存、1（放棄） | 第23章のC、25.4の (b) |
-| Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 所有を証明できないものは数えるだけで残す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| Vaultの一時file | `secrets/.<名前>.<ulid>.tmp` | 公開の続き | 名前（`.belt-tmp.…`）が所有を証明し、排他leaseの下で持ち主が居ないものを消す。名前を解釈できないものは数えるだけで残す（古い形の名前は、排他leaseの下で消す） | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | FrozenPlan | `ci-plans/<digest>` | CI runの進行 | 名指す待ちのtaskが無くなって `retention_days` 日 | 同じ | 既存 | 名指すtaskが無いこと |
 | in-placeのbinding | `in-place/<run>.json` | residentの再起動、`retry` | 提出を断ったときだけ消す | runが在る間 | 1（放棄）、2（刈り取り） | runの行が無いこと |
 | 実測 | `stats/costs-v1.sqlite`（`costs`・`preparation_namespaces`・`preparation_receipts`・`cost_eviction`） | 配置の見積 | `costs` 4,096行、`preparation_namespaces` 4,096 | 同じ | 既存 | 順位 |
 | 更新の試用 | `upgrade/`（`record.json`、退避したDBと設定） | rollback | 試用の間。同時に1つ | 同じ | 既存 | commitの記録 |
-| DBの準備の途中 | `.init-*` | `init` の続き | `init` とrollbackが片付ける | 加えて25.4の (a) | 1 | `init.json` に無いことと、持ち主 |
+| 公開の直前のstage（鍵・binary・DB・入力・serviceの定義） | `.init-*` | `init` の続き | journalが名指すものは、`init` の回復が公開を済ませ、取り消しが消す。一時fileの走査は見ない。journalに書く前に終わった `init` の残りは、次の `init` が、回復の後に持ち主の居ないものを消す（config directory、binaryのdirectory。親のstateは、自分のjournalがそこのDBを公開済みのときだけ。DBのstageの横の `-wal`・`-shm`・`-journal`・`.init-lock` も同じ走査で消す）。serviceの定義のdirectoryの残りと、古い形の `.init-<ulid>` は残る（1回のkillにつき高々1個。serviceの定義は数KB）。親のstateのDBのstageは、どの `init` もそこのDBを公開しない間は残る（同じく1回のkillにつき高々1個と、その横の4つ） | 同じ | 1 | `init.json` に無いことと、持ち主 |
 | 固定のfile | `coordinator.json`、`init.json`、`control.json`、`group-rotation.json`、`membership-undo.json`、`membership-restart`、`traffic-hold.json`、`upgrade-hold.json`、`request.sock`、`owner.token` | それぞれの操作と起動 | 各1個。上書きする | 同じ | 既存 | 各操作の規則 |
 | 固定のlock | 25.1の表の最後の行のうち、親のもの | すべてのcommand | 各1個 | unlinkしない | 既存 | 該当なし |
 
@@ -2532,7 +2546,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | メンバーごとの記録 | `worker.db` の `member_epoch`・`group_member`・`retired_identity` | 接続の検査 | メンバーごとに1行ずつ。消さない | `belt group forget` で消す | 3 | 利用者の操作 |
 | workerのevent（attemptに属さないもの） | `worker.db` | 親の `watch_events`、診断 | 消さない | `retention_days` 日 | 3 | 時刻 |
 | 捨てたattemptの一覧 | `worker.db` の `dropped_attempt` | agentの片付け | directoryを消した直後に消す | 同じ | 既存 | directoryが無いこと |
-| attemptのdirectory | `attempts/<attempt>/`（`supervise.json`・`execution-binding.json`・`cleanup-pending`・`ci/` を含む） | supervisor、回収、別のscopeのsupervisorの照合 | terminalか、ACKから7日。ACKが無ければterminalから7日 | ACKか `release_attempt` の受理でその場（行のcommitの直後、lockより先）。無ければterminalから7日 | 3 | 25.6 |
+| attemptのdirectory | `attempts/<attempt>/`（`supervise.json`・`execution-binding.json`・`cleanup-pending`・`ci/` を含む） | supervisor、回収、別のscopeのsupervisorの照合 | terminalか、ACKから7日。ACKが無ければterminalから7日。中の `ci/exchange/.belt-xchg.*/`（artifactのstepの作業用）は、killで残ったものを、同じattemptの次のartifactのstepの開始が、markerで所有を証明できたものだけ消す（25.4の (a)） | ACKか `release_attempt` の受理でその場（行のcommitの直後、lockより先）。無ければterminalから7日 | 3 | 25.6 |
 | workspace | `workspaces/<attempt>` | attemptのcommand | terminalで消す。32個まで | 同じ | 既存 | terminalと、supervisorのlock |
 | supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 消さない。全部を走査する | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
 | secretの配置 | workspaceの中、`secret-index/<attempt>.json`、`.secrets.tmp-*`、`secrets/` | attemptのcommand | terminalで消す | 同じ | 既存 | terminal |
@@ -2540,7 +2554,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | workerの保持の索引 | `sources/retention.db` | 受け取りの保護 | `import_session`・`root(kind='pending')`・`member` が、受け取ったblobごとに増える | 公開か放棄で消す | 5a | 25.8 |
 | clone | `clones/<repo>` | bundleの展開、workspaceの準備 | 消さない。refは、受け取りを拒否したときだけ消す | 未確定（25.9） | 5b | なし |
 | 受け取り途中 | `incoming/<source>/` | 送り手の再開 | 16個、合計64 GiB、1つ32 GiB。24時間進まなかったものは、16個に達したときだけ消す | 24時間進まなければ、tickで消す | 5a | 進んでいないこと |
-| 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | `agent.lock` と持ち主 |
+| 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残るものは、workerの起動（`agent.lock` の下）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | `agent.lock` と持ち主 |
 | setup template | `setup/templates/<key>/` と、最後に使った時刻のstamp `<key>.used` | setupの適用 | 20 GiB、14日、run scopeは1時間。stampは、templateの無いものを片付けのときに消す | 同じ | 既存 | copy中でないこと、pin |
 | setup builder | `setup/builders/<id>/` | そのbuilder | 終了時と起動時に消す | 同じ | 既存 | 持ち主のprocessが居ないこと |
 | toolchainのroot | `toolchains/<identity>/`（`install.lock`・`receipt.json` を含む） | attempt、setup、導入のhelper | 消さない | 14日、20 GiB。参照が無いとき。段階4より前のrootは、最初の起動で行を得る | 4 | 25.7の (b) |
@@ -2550,7 +2564,7 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 更新の試用 | `upgrade/`、`<config>/bin/<digest>/worker.db.saved` | rollback | 試用の間 | 同じ | 既存 | commitの記録 |
 | 一時workerのmarkerとlock | `ephemeral.json`、`ephemeral.lock` | 次の一時workerの起動 | 無い | stateと一緒 | 1 | 25.4の (d) |
 | 外したメンバー（workerだけのhost） | `removed-members.json` | 接続の拒否 | 1個。coordinator DBが無いhostでは正 | 同じ | 既存 | 利用者の操作 |
-| 固定のfile | `worker.json`、`boot_id`（起動の記録）、`control.json`、`upgrade-hold.json`、`traffic-hold.json`、`worker-service.json`、`worker-binding.json` とその更新の予定、`worker-socket.json`、`upgrade-trial*.json`、`agent.sock`、グループ鍵と次の鍵 | 起動、接続 | 各1個。上書きする。鍵の一時fileは600秒で消す | 同じ | 既存 | 各操作の規則 |
+| 固定のfile | `worker.json`、`boot_id`（起動の記録）、`control.json`、`upgrade-hold.json`、`traffic-hold.json`、`worker-service.json`、`worker-binding.json` とその更新の予定、`worker-socket.json`、`upgrade-trial*.json`、`agent.sock`、グループ鍵と次の鍵 | 起動、接続 | 各1個。上書きする。鍵の一時fileは、名前が所有を証明するので持ち主が居なければ次の起動で消す（古い名前は600秒） | 同じ | 既存 | 各操作の規則 |
 | 受け取りのlock | `incoming/locks/<0〜63>.lock`、`incoming/locks/all.lock` | sourceの受け取り | 65個で頭打ち（source IDのhashで割り振る） | unlinkしない | 既存 | 該当なし |
 | 固定のlock | 25.1の表の最後の行のうち、workerのもの | workerの処理 | 各1個 | unlinkしない | 既存 | 該当なし |
 
@@ -2570,10 +2584,10 @@ task-traffic-controllerの台帳と履歴の置き場は、製品では単独CLI
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
 | beltのbinary | `bin/<digest>/belt`、link `bin/current`・`bin/resident` | serviceの入口、supervisor、builder、番人 | 版ごとに1つ増え、消さない | 名指すものが無い版を消す | 4 | 25.7の (a) |
-| 切替の途中のlink | `bin/.resident.<pid>`、`bin/.current.<pid>` | 切替の処理 | `.resident.<pid>` は、pidのprocessが居なければ消す。`.current.<pid>` は、同じpidの次の切替が消す | 25.4の (a) の名前にする | 1 | 持ち主のprocessが居ないこと |
-| 設定と鍵 | `profiles.toml`、`cluster.key`、`worker-cluster.key`、次の鍵、ユーザー設定 | 起動 | 各1個。鍵の一時fileは600秒で消す | 同じ | 既存 | 各操作の規則 |
-| 設定とjournalの一時file | config directoryの中の `.tmp*` | 書いたcommandだけ | 正常終了で消える。crashで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
-| serviceの定義 | LaunchAgentのplist、systemdのunit（OSの置き場）と、その一時file | OS | hostごとに1つ。一時fileはcrashで残る | 定義は同じ。一時fileは25.4の (a) | 既存、1 | 利用者の操作、持ち主 |
+| 切替の途中のlink | `bin/.resident.<pid>`、`bin/.current.<pid>` | 切替の処理 | 名前が所有を証明し、`upgrade`・`init` の開始とresident・workerの起動が、持ち主の居ないものを消す | 25.4の (a) の名前にする | 1 | 持ち主のprocessが居ないこと |
+| 設定と鍵 | `profiles.toml`、`cluster.key`、`worker-cluster.key`、次の鍵、ユーザー設定 | 起動 | 各1個。鍵の一時fileは、名前が所有を証明するので持ち主が居なければ次の起動で消す（古い名前は600秒） | 同じ | 既存 | 各操作の規則 |
+| 設定とjournalの一時file | config directoryの中の `.belt-tmp.*` | 書いたcommandだけ | 正常終了で消える。crashで残るものは、各commandの開始が名前で所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| serviceの定義 | LaunchAgentのplist、systemdのunit（OSの置き場）と、その一時file | OS | hostごとに1つ。一時fileはcrashで残るものを、serviceの定義を書くcommandの開始が、`.belt-tmp.` で始まる名前だけ見て消す | 定義は同じ。一時fileは25.4の (a) | 既存、1 | 利用者の操作、持ち主 |
 
 ### 利用者のrepository
 
@@ -2583,7 +2597,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
-| `logs` のcursor | `$TMPDIR/belt-log-reader-*/` | その `logs` だけ | 正常終了で消える。killで残る | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
+| `logs` のcursor | `$TMPDIR/belt-log-reader-*/` | その `logs` だけ | 正常終了で消える。killで残るものは、`logs` の開始がmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
 | profileの検査 | `$TMPDIR/` の検査用directory | その検査だけ | 所有markerつき。次の検査の開始時に消す | 同じ | 既存 | 同上 |
 
 ### 開発用の道具
@@ -2657,7 +2671,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
 | 第23章 | Git・bundleの片付けは後続の作業 | 2 | 25.5の段4 |
 | 第23章 | Future expiry of received roots also requires per-import pending ownership | 5a | 25.8が持ち主を定める。受け取ったrootの期限切れそのものは未確定（25.9） |
-| 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 名前で所有を証明する |
+| 第23章 | Vaultの、所有を証明できない一時fileは残す | 1 | 実装済み: 名前（`.belt-tmp.…`）で所有を証明し、排他leaseの下で消す。解釈できない名前は残す |
 | 24.4 | 受理したattemptのtombstoneは消さない | 3 | 重複防止の記録に置き換える |
 | 24.8 | 試用中のworkerとcoordinatorが行わないことの一覧 | 3 | `release_attempt` を足す |
 

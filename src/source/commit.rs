@@ -106,7 +106,7 @@ pub(crate) struct Checkout {
     pub base: Option<String>,
     /// The directory itself: unique per call (another capture of the same
     /// commit, in this process or another, has its own), and removed with it.
-    _dir: tempfile::TempDir,
+    _dir: crate::platform::owned_temp::OwnedTemp,
 }
 
 /// The pinned commits of the submodules of `commit` (a Git directory), as
@@ -271,9 +271,10 @@ pub(crate) fn checkout(
 
     std::fs::create_dir_all(scratch_parent)?;
     // a name nobody else has: an existing directory is never touched
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("commit-{}-", &commit[..12]))
-        .tempdir_in(scratch_parent)?;
+    let dir = crate::platform::owned_temp::OwnedTemp::new_in(
+        scratch_parent,
+        &format!("commit-{}-", &commit[..12]),
+    )?;
     let root = dir.path().to_path_buf();
     let co = Checkout {
         cwd: root.join(&cwd_rel),

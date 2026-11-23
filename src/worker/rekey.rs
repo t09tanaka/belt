@@ -9,7 +9,7 @@ const INSTANCE: &str = "worker-instance";
 
 pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap();
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut file = crate::platform::owned_temp::file_in(parent)?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;

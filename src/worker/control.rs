@@ -74,7 +74,7 @@ pub fn read(state_dir: &Path) -> std::io::Result<Control> {
 
 /// Atomic replace with the directory synced, so an acknowledged request survives a crash.
 pub fn write(state_dir: &Path, control: Control) -> std::io::Result<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+    let mut temporary = crate::platform::owned_temp::file_in(state_dir)?;
     temporary
         .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -104,7 +104,7 @@ fn place_marker(state_dir: &Path, name: &str) -> std::io::Result<()> {
 }
 
 fn place_file(state_dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+    let mut temporary = crate::platform::owned_temp::file_in(state_dir)?;
     temporary
         .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
