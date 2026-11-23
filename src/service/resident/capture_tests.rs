@@ -411,10 +411,7 @@ async fn a_cancel_of_a_run_nobody_is_capturing_is_not_found_and_writes_nothing()
     assert!(not_found(&reply), "{reply:?}");
     // A capture owned somewhere this resident cannot see is not accepted
     // either, and is not deleted.
-    let other = OwnerRecord {
-        place: format!("another-host-{}", me().place),
-        ..me()
-    };
+    let other = OwnerRecord::on_another_machine();
     let elsewhere = capture(&resident, root.path(), Some(&other));
     let kept = files(&resident, &elsewhere.run);
     let reply = ask(&resident, cancel(&elsewhere.run)).await;
@@ -664,6 +661,160 @@ async fn a_cancel_that_overlaps_the_commit_of_its_run_cancels_the_run() {
         // The run took the capture over: the cancel deleted nothing of it.
         assert_eq!(files(&resident, &captured.run), before, "{case}");
     }
+}
+
+/// The tasks of the run and how many of them are cancelled.
+fn cancelled_tasks(resident: &Resident, run: &RunId) -> (i64, i64) {
+    let id = run.to_string();
+    resident
+        .coordinator
+        .store()
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*),count(cancel_requested_at_ms) FROM task WHERE run_id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap()
+}
+
+/// An owner row that cannot be read says nothing about the run: its enqueue
+/// may have passed its check and be about to commit. The cancel is not
+/// answered `NOT_FOUND` (the command would stop cancelling, and the run
+/// would go on) but with an error the command sends the cancel again for;
+/// the cancel sent again, once the enqueue committed, cancels the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_whose_owner_row_cannot_be_read_is_asked_again_and_not_refused() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    let command = Command::start();
+    let captured = capture(&resident, root.path(), Some(&command.record()));
+    let before = files(&resident, &captured.run);
+    // The enqueue passed its owner check and holds the source guard.
+    let (mut paused, resume) = resident
+        .captured
+        .retention_test
+        .pause_at("enqueue_before_commit");
+    let (mut client, job) = send(&resident, submit(&captured)).await;
+    paused.recv().await.unwrap();
+    // The read of the row fails: its PID is not a number.
+    let index = rusqlite::Connection::open(
+        resident
+            .captured
+            .parent_state
+            .join("sources")
+            .join("retention.db"),
+    )
+    .unwrap();
+    let changed = index
+        .execute(
+            "UPDATE capture_owner SET pid='unreadable' WHERE run_id=?1",
+            [captured.run.as_str()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert!(resident
+        .captured
+        .sources
+        .capture_owner(&captured.run)
+        .is_err());
+    let reply = ask(&resident, cancel(&captured.run)).await;
+    assert!(
+        matches!(&reply, Reply::ControlError { error } if error.code == crate::error::ErrorCode::CommunicationUnknown),
+        "{reply:?}"
+    );
+    // Nothing was written and nothing was deleted.
+    index
+        .execute(
+            "UPDATE capture_owner SET pid=?2 WHERE run_id=?1",
+            rusqlite::params![captured.run.as_str(), i64::from(command.record().pid)],
+        )
+        .unwrap();
+    assert_eq!(rows(&resident, &captured.run), (0, 0, 0, 0, 1));
+    assert_eq!(files(&resident, &captured.run), before);
+    resume.send(()).unwrap();
+    let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
+        .await
+        .unwrap();
+    job.await.unwrap().unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }), "{reply:?}");
+    // The command's next cancel (it sends one every 200 ms) finds the run.
+    let reply = ask(&resident, cancel(&captured.run)).await;
+    assert!(
+        matches!(&reply, Reply::Cancelled { snapshot } if snapshot.accepted && snapshot.cancel_requested),
+        "{reply:?}"
+    );
+    assert_eq!(cancelled_tasks(&resident, &captured.run), (1, 1));
+}
+
+/// The command was killed while its enqueue was on its way: the enqueue
+/// passed its owner check (it asks only whether the capture was given up)
+/// and holds the source guard. A cancel of the run from another command
+/// finds the owner gone. It is recorded all the same, as for a capture in
+/// progress, so the run the enqueue commits is a cancelled one; the
+/// abandonment after the answer cannot take the source lock and deletes
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_while_the_enqueue_of_a_killed_command_is_on_its_way_cancels_the_run() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    let mut command = Command::start();
+    let captured = capture(&resident, root.path(), Some(&command.record()));
+    let before = files(&resident, &captured.run);
+    let (mut paused, resume) = resident
+        .captured
+        .retention_test
+        .pause_at("enqueue_before_commit");
+    let (mut client, job) = send(&resident, submit(&captured)).await;
+    paused.recv().await.unwrap();
+    command.kill();
+    let reply = ask(&resident, cancel(&captured.run)).await;
+    assert!(
+        matches!(&reply, Reply::Cancelled { snapshot } if !snapshot.accepted && snapshot.cancel_requested),
+        "{reply:?}"
+    );
+    assert_eq!(rows(&resident, &captured.run), (0, 1, 1, 1, 1));
+    assert_eq!(files(&resident, &captured.run), before);
+    resume.send(()).unwrap();
+    let reply: Reply = read_message_with_timeout(&mut client, Duration::from_secs(20))
+        .await
+        .unwrap();
+    job.await.unwrap().unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }), "{reply:?}");
+    assert_eq!(cancelled_tasks(&resident, &captured.run), (1, 1));
+    assert!(matches!(rows(&resident, &captured.run), (1, 1, 1, _, 0)));
+    assert_eq!(files(&resident, &captured.run), before);
+}
+
+/// The same cancel when no enqueue is on its way: it is answered as
+/// recorded, and the abandonment in the same request deletes the capture
+/// with the rows of the cancel. An enqueue that came later would be refused:
+/// the owner row is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_after_the_owner_was_killed_leaves_nothing_when_no_enqueue_comes() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    registration_done(&resident);
+    let mut command = Command::start();
+    let captured = capture(&resident, root.path(), Some(&command.record()));
+    command.kill();
+    let reply = ask(&resident, cancel(&captured.run)).await;
+    assert!(
+        matches!(&reply, Reply::Cancelled { snapshot } if !snapshot.accepted && snapshot.cancel_requested),
+        "{reply:?}"
+    );
+    assert_eq!(rows(&resident, &captured.run), (0, 0, 0, 0, 0));
+    assert_eq!(files(&resident, &captured.run), Vec::<PathBuf>::new());
+    let reply = ask(&resident, submit(&captured)).await;
+    assert!(
+        matches!(&reply, Reply::ControlError { error } if error.code == crate::error::ErrorCode::NotFound),
+        "{reply:?}"
+    );
+    assert_eq!(rows(&resident, &captured.run), (0, 0, 0, 0, 0));
 }
 
 /// The answer to a refusal is written before the deletion of the capture

@@ -154,7 +154,9 @@ pub async fn wait(
 /// not it can be read: the resident may already have accepted the enqueue
 /// and released the row, or the enqueue may be on its way (it inherits the
 /// cancel of a capture in progress). A cancel of a run that is neither a run
-/// nor a capture in progress is answered "not found" and writes nothing.
+/// nor a capture its owner has not given up is answered "not found" and
+/// writes nothing; a resident that could not read the owner row answers
+/// with another error, and the cancel is sent again.
 /// Then the capture is given up, which changes only a row that is still
 /// there: the resident deletes the capture, with the rows of the cancel,
 /// unless the enqueue made it a run.

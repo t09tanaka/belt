@@ -1403,7 +1403,15 @@ enum UnsubmittedCancel {
     /// The capture of the run is in progress: the guard under which that was
     /// read is held until the cancel is written.
     Capturing(crate::source::retention::Guard),
-    /// The capture was given up or its owner is gone.
+    /// The row is `capturing` and its owner is proven gone. The enqueue the
+    /// owner sent before it ended may be on its way (an enqueue asks only
+    /// whether the row was given up), so the cancel is recorded as for a
+    /// capture in progress, under the same guard, and the capture is
+    /// abandoned after the answer: an enqueue that holds the source lock
+    /// commits a run that inherits the cancel, and without one the
+    /// abandonment deletes the rows of the cancel with the capture.
+    OwnerGone(crate::source::retention::Guard),
+    /// The owner gave the capture up: no enqueue of it is accepted.
     Abandoned,
     /// No row, or an owner that cannot be judged from here.
     Unknown,
@@ -1716,9 +1724,10 @@ async fn handle(
                     .map_err(Into::into);
                 };
                 // The run has no row (spec 25.4 (b)). Its cancel is recorded
-                // only for a capture in progress, read under the source guard
-                // an enqueue holds too; the guard is never awaited under the
-                // admission lock.
+                // only for a capture an enqueue may still follow (in
+                // progress, or its owner ended without giving up), read
+                // under the source guard an enqueue holds too; the guard is
+                // never awaited under the admission lock.
                 drop(gate);
                 let refused = |error: crate::storage::StorageError| Reply::ControlError {
                     error: crate::error::ApiError::new(error.code(), error.to_string()),
@@ -1734,8 +1743,11 @@ async fn handle(
                             crate::source::retention::CaptureVerdict::InProgress => {
                                 UnsubmittedCancel::Capturing(guard)
                             }
-                            crate::source::retention::CaptureVerdict::Abandoned => {
+                            crate::source::retention::CaptureVerdict::Abandoned if row.given_up => {
                                 UnsubmittedCancel::Abandoned
+                            }
+                            crate::source::retention::CaptureVerdict::Abandoned => {
+                                UnsubmittedCancel::OwnerGone(guard)
                             }
                             crate::source::retention::CaptureVerdict::Elsewhere => {
                                 UnsubmittedCancel::Unknown
@@ -1756,12 +1768,16 @@ async fn handle(
                     ),
                 };
                 let mut abandoned = false;
+                let owner_gone = matches!(found, Ok(UnsubmittedCancel::OwnerGone(_)));
                 let answer = match found {
-                    Ok(UnsubmittedCancel::Capturing(guard)) => {
+                    Ok(
+                        UnsubmittedCancel::Capturing(guard) | UnsubmittedCancel::OwnerGone(guard),
+                    ) => {
                         let gate = admission.lock().await;
                         if *gate || coordinator.is_fenced() {
                             stopping()
                         } else {
+                            abandoned = owner_gone;
                             let owner = coordinator.clone();
                             let accepted = tokio::task::spawn_blocking(move || {
                                 let accepted = owner.store().cancel_control_of_capture(
@@ -1825,8 +1841,20 @@ async fn handle(
                                         error: crate::source::classify::api_error_of(&busy),
                                     }
                                 }
-                                (Err(error), found) => {
-                                    abandoned = matches!(found, Ok(UnsubmittedCancel::Abandoned));
+                                // Nor is any other failure to read it (the
+                                // store or the index cannot be opened or
+                                // read): an enqueue that passed its check
+                                // may be about to commit the run, and "not
+                                // found" would end the command's cancel.
+                                // The answer asks for the cancel again.
+                                (Err(_), Err(_)) => Reply::ControlError {
+                                    error: crate::error::ApiError::new(
+                                        crate::error::ErrorCode::CommunicationUnknown,
+                                        "the owner of the capture of this run could not be read; send the cancel again",
+                                    ),
+                                },
+                                (Err(error), Ok(found)) => {
+                                    abandoned = matches!(found, UnsubmittedCancel::Abandoned);
                                     refused(error)
                                 }
                             }
@@ -2037,6 +2065,11 @@ async fn handle(
                             && task.has_secret_bundle == (has_secrets && !task.in_place)),
                         "source digest mismatch"
                     );
+                    #[cfg(test)]
+                    captured
+                        .retention_test
+                        .reached("enqueue_before_commit")
+                        .await;
                     let guard = admission.lock().await;
                     anyhow::ensure!(!*guard && !coordinator.is_fenced(), "resident is stopping");
                     let owner = coordinator.clone();

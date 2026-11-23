@@ -1071,7 +1071,7 @@ pub fn capture_checks(spec: &Spec) -> Vec<Check> {
         Ok(Some(counts)) => vec![check(
             Level::Notice,
             format!(
-                "kept because nothing proves they are abandoned: {} capture(s) whose owner was recorded on another host or PID namespace, {} run record(s) and {} in-place binding(s) that no run and no capture owner claims, {} entr(ies) with a name that is not a run's; they are never deleted automatically",
+                "kept because nothing proves they are abandoned: {} capture(s) whose owner was recorded on another machine or PID namespace, {} run record(s) and {} in-place binding(s) that no run and no capture owner claims, {} entr(ies) with a name that is not a run's; they are never deleted automatically",
                 counts.elsewhere, counts.records, counts.bindings, counts.unnamed
             ),
         )],

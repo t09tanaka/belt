@@ -214,11 +214,12 @@ fn gone() -> OwnerRecord {
     child.wait().unwrap();
     OwnerRecord { pid, ..me() }
 }
+/// An owner on another machine (the same host name: the place does not hold
+/// one), with a PID that no process has here.
 fn elsewhere() -> OwnerRecord {
-    let me = me();
     OwnerRecord {
-        place: format!("another-host-{}", me.place),
-        ..me
+        pid: gone().pid,
+        ..OwnerRecord::on_another_machine()
     }
 }
 
@@ -459,6 +460,41 @@ fn a_second_pending_root_is_refused_while_the_row_names_one_that_exists() {
     );
 }
 
+/// An interrupt does not stop the blocking capture: the command gives up and
+/// the capture goes on until the process ends. A pending root created after
+/// that would have no name: the row is `given_up`, or the abandonment has
+/// already deleted it. No root is written in either case; a capture that
+/// never had a row (a plan draft) is not held to this.
+#[test]
+fn a_capture_that_was_given_up_creates_no_pending_root() {
+    let parts = Parts::new();
+    let roots = || parts.count("SELECT count(*) FROM root");
+    let run = RunId::generate();
+    parts.sources.own_capture_as(&run, &me()).unwrap();
+    parts.sources.give_up_capture(&run).unwrap();
+    assert!(parts.sources.capture_pending_root(Some(&run)).is_err());
+    assert_eq!(roots(), 0);
+    assert_eq!(
+        parts.sources.capture_owner(&run).unwrap().unwrap().root,
+        None
+    );
+    // Another handle on the store (it did not write the row) is refused by
+    // the row itself.
+    let other = SourceStore::open(&parts.state).unwrap();
+    assert!(other.capture_pending_root(Some(&run)).is_err());
+    assert_eq!(roots(), 0);
+    // The abandonment deleted the row: the handle still knows it owned one.
+    let report = parts.passes();
+    assert_eq!(report.finished, 1, "{report:?}");
+    assert!(parts.sources.capture_owner(&run).unwrap().is_none());
+    assert!(parts.sources.capture_pending_root(Some(&run)).is_err());
+    assert_eq!(roots(), 0);
+    // A capture that never had a row goes on without one.
+    let draft = RunId::generate();
+    parts.sources.capture_pending_root(Some(&draft)).unwrap();
+    assert_eq!(roots(), 1);
+}
+
 /// "3の途中": the owner died while the members of its pending root were
 /// being registered. The root has no source and an unfinished graph, which
 /// holds every other deletion of the store; the abandonment exempts exactly
@@ -684,7 +720,7 @@ fn a_capture_its_owner_gave_up_is_deleted_while_the_owner_lives() {
     parts.assert_nothing_left(&run);
 }
 
-/// (v) An owner recorded on another host cannot be judged here: its capture
+/// (v) An owner recorded on another machine cannot be judged here: its capture
 /// stays whole and is counted.
 #[test]
 fn a_capture_owned_on_another_host_is_kept_and_counted() {

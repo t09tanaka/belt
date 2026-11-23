@@ -43,6 +43,10 @@ pub(crate) struct Index {
     path: PathBuf,
     database: PathBuf,
     root: Arc<File>,
+    /// The runs whose owner row this handle wrote ([`SourceStore::own_capture`]):
+    /// their pending root is named by that row or is not created. One entry
+    /// for each capture a command owns.
+    owned: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     #[cfg(test)]
     reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -123,6 +127,7 @@ impl Index {
                     .context("open source root")?
                     .into(),
             ),
+            owned: Default::default(),
             #[cfg(test)]
             reads: Default::default(),
             #[cfg(test)]
@@ -1897,6 +1902,7 @@ mod tests {
                         .into(),
                 ),
                 path,
+                owned: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
@@ -1945,6 +1951,7 @@ mod tests {
                         .into(),
                 ),
                 path,
+                owned: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),

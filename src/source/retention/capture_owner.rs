@@ -39,11 +39,13 @@ pub(crate) fn stop_point(_name: &str) {}
 pub enum CaptureVerdict {
     /// `capturing`, and the owner is not proven gone here: never deleted.
     InProgress,
-    /// `given_up`, or the owner is proven gone.
+    /// `given_up`, or the owner is proven gone. Only `given_up` says that no
+    /// enqueue of the capture is accepted: the enqueue of an owner that is
+    /// gone may still be on its way.
     Abandoned,
     /// `capturing`, and the owner was recorded somewhere this process cannot
-    /// see (another host or PID namespace, or an unreadable record): kept and
-    /// counted.
+    /// see (another machine or PID namespace, or an unreadable record): kept
+    /// and counted.
     Elsewhere,
 }
 
@@ -110,7 +112,20 @@ impl Index {
     /// name, and a pending root nothing names is never deleted and holds
     /// every deletion of the store. The owner of the refused capture gives
     /// up, and the abandonment deletes the root the row still names.
+    ///
+    /// A capture this handle owns ([`SourceStore::own_capture`]) has a row,
+    /// and its root is named by that row or is not created: the owner may
+    /// have given up while the capture went on (an interrupt does not stop
+    /// the blocking capture), and the abandonment may have deleted the row
+    /// since. A root created then would have no name. So the row must still
+    /// be `capturing` and take the name, or nothing is written.
     pub(crate) fn pending_of_capture(&self, id: &str, run: Option<&RunId>) -> Result<()> {
+        let owned = run.is_some_and(|run| {
+            self.owned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(run.as_str())
+        });
         let mut c = self.connect_for_import()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(run) = run {
@@ -129,10 +144,23 @@ impl Index {
             [id],
         )?;
         if let Some(run) = run {
-            tx.execute(
-                "UPDATE capture_owner SET root=?1 WHERE run_id=?2",
+            let named = tx.execute(
+                "UPDATE capture_owner SET root=?1 WHERE run_id=?2 AND state='capturing'",
                 params![id, run.as_str()],
             )?;
+            // A row that is not `capturing` takes no name either, whoever
+            // wrote it. Only a capture that never had a row (a plan draft)
+            // goes on without one.
+            let given_up: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_owner WHERE run_id=?1)",
+                [run.as_str()],
+                |r| r.get(0),
+            )?;
+            // Dropping the transaction rolls the root back.
+            ensure!(
+                named == 1 || !(owned || given_up),
+                "the capture of this run was given up; no pending root is created"
+            );
         }
         tx.commit()?;
         Ok(())
@@ -213,6 +241,11 @@ impl SourceStore {
             "the capture of this run has another owner, or was given up"
         );
         tx.commit()?;
+        self.retention
+            .owned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run.to_string());
         Ok(())
     }
     /// The owner will not submit this capture (its capture failed, its
