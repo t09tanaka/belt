@@ -52,7 +52,7 @@ pub(crate) use worker::MembershipImage;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
     MemberPin, NewAcceptance, ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
-    MAX_UNDELIVERED_TOMBSTONES,
+    MAX_UNDELIVERED_TOMBSTONES, DedupRecord, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNRELEASED_PAGE, RELEASE_BATCH,
 };
 
 use crate::error::ErrorCode;
@@ -130,6 +130,11 @@ pub enum StorageError {
     /// committed.
     #[error("{live} attempts are not terminal on this worker and its window is {window}")]
     Capacity { live: u64, window: u64 },
+    /// The member holds as many dedup records on this worker as it may
+    /// (spec 25.6 (c)): a new attempt of it is refused until it releases
+    /// some. Nothing of the call was committed.
+    #[error("this worker holds {0} dedup records of this member; release the attempts it no longer reads")]
+    AttemptRecords(u64),
     #[error("lease for {0} cannot be renewed")]
     LeaseNotRenewable(AttemptId),
     #[error(transparent)]
@@ -186,6 +191,7 @@ impl StorageError {
             StorageError::Overloaded(_)
                 | StorageError::AttemptIdInUse(_)
                 | StorageError::Capacity { .. }
+                | StorageError::AttemptRecords(_)
                 | StorageError::LiveAttemptExists(_)
                 | StorageError::Invalid(_)
         )
@@ -199,7 +205,8 @@ impl StorageError {
             | StorageError::MigrationRefused(_) => ErrorCode::ProtocolIncompatible,
             StorageError::Overloaded(_)
             | StorageError::AttemptIdInUse(_)
-            | StorageError::Capacity { .. } => ErrorCode::Overloaded,
+            | StorageError::Capacity { .. }
+            | StorageError::AttemptRecords(_) => ErrorCode::Overloaded,
             StorageError::Locked(_)
             | StorageError::PayloadConflict(_)
             | StorageError::Immutable(_)

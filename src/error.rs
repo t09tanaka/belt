@@ -129,6 +129,10 @@ pub enum OverloadedReason {
     /// stored nothing, no tombstone either: an attempt that was sent once
     /// and got this answer exists nowhere.
     Capacity,
+    /// A `submit_attempt` of a member that holds 10,000 dedup records on
+    /// this worker (spec 25.6 (c)): the member reconciles with
+    /// `list_unreleased` and releases what it no longer reads.
+    AttemptRecords,
     /// A reason this version does not know (a newer peer sent it): the
     /// caller treats the error as a plain `OVERLOADED`.
     #[serde(other)]
@@ -265,6 +269,9 @@ pub enum GroupRefusal {
     MemberIdentityMismatch,
     /// The peer told this worker that it retired the identity it still has.
     IdentityRetired,
+    /// `belt group forget` removed this member on the worker (spec 25.6
+    /// (d)): its coordinator id is refused for good.
+    MemberForgotten,
 }
 
 impl ApiError {

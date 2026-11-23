@@ -449,6 +449,40 @@ CREATE TABLE upgrade_hold (
 INSERT INTO schema_meta(key,value) VALUES('group_membership_v1','1');
 ";
 
+/// Worker step 5 (spec 25.6, stage 3): an attempt goes as soon as its member
+/// says it reads no more of it, and a small dedup record answers a late
+/// submit in its place. The journal and the tombstones of accepted attempts
+/// lose their delete triggers (an attempt's events and tombstone go with
+/// it; events of no attempt go by age). A member removed with
+/// `belt group forget` is refused for good.
+const WORKER_V5: &str = "
+CREATE TABLE attempt_record (
+    coordinator_id    TEXT NOT NULL,
+    attempt_id        TEXT NOT NULL,
+    run_id            TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    generation        INTEGER NOT NULL,
+    payload_hash      TEXT NOT NULL,
+    coordinator_epoch INTEGER NOT NULL,
+    termination_json  TEXT,
+    released          INTEGER NOT NULL CHECK (released IN (0, 1)),
+    recorded_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (coordinator_id, attempt_id)
+) WITHOUT ROWID;
+CREATE INDEX attempt_record_released ON attempt_record(coordinator_id, attempt_id) WHERE released = 1;
+CREATE TABLE refused_member (
+    coordinator_id TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    refused_at_ms  INTEGER NOT NULL
+) WITHOUT ROWID;
+DROP TRIGGER event_no_delete;
+DROP TRIGGER tombstone_no_delete;
+CREATE INDEX event_unowned ON event(seq) WHERE attempt_id IS NULL;
+CREATE INDEX worker_attempt_unacked ON worker_attempt(terminal_at_ms)
+    WHERE state = 'terminal' AND acked_at_ms IS NULL;
+CREATE INDEX worker_attempt_acked ON worker_attempt(acked_at_ms) WHERE acked_at_ms IS NOT NULL;
+";
+
 /// What must hold before step `to` of a `kind` database runs, checked in the
 /// step's own transaction. Worker step 4 drops every attempt row, so it is
 /// refused while one is live, and while one has ended with a result nobody
@@ -710,7 +744,7 @@ CREATE INDEX ci_test_timing_written ON ci_test_timing(written_at_ms);"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
-        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string()],
+        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_V5.to_string()],
     }
 }
 

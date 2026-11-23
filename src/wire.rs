@@ -251,10 +251,15 @@ pub enum Operation {
     GroupProof,
     /// The notice that a worker identity was retired.
     IdentityRetired,
+    /// A member reads and submits no more of an attempt (spec 25.6).
+    ReleaseAttempt,
+    /// The terminal attempts of a member that were neither acknowledged nor
+    /// released, one page (spec 25.6).
+    ListUnreleased,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 25] = [
+    pub const ALL: [Operation; 27] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -280,6 +285,8 @@ impl Operation {
         Operation::WorkflowArtifact,
         Operation::GroupProof,
         Operation::IdentityRetired,
+        Operation::ReleaseAttempt,
+        Operation::ListUnreleased,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -293,6 +300,7 @@ impl Operation {
             | Operation::BlobPut
             | Operation::SecretBundlePut
             | Operation::IdentityRetired
+            | Operation::ReleaseAttempt
             | Operation::EnvSync => Idempotency::RequestId,
             Operation::Hello
             | Operation::GroupProof
@@ -308,6 +316,7 @@ impl Operation {
             | Operation::BlobVerify
             | Operation::EnvReport
             | Operation::ResolveToolchains
+            | Operation::ListUnreleased
             | Operation::PreparationProbe => Idempotency::ReadOnly,
         }
     }
@@ -435,6 +444,53 @@ pub struct IdentityRetiredResponse {
     pub schema_version: SchemaVersion,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
+}
+
+/// The feature under which a member sends `release_attempt` and
+/// `list_unreleased`, and a worker deletes an attempt at its
+/// acknowledgement (spec 25.6).
+pub const ATTEMPT_RELEASE_FEATURE: &str = "attempt_release_v1";
+
+/// "This member reads nothing more of this attempt and submits it no
+/// more" (spec 25.6 (a)). No generation or digest: a member that pruned the
+/// run has neither. A `control` request, so it keeps its place behind the
+/// submits written before it on the same connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAttemptRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+}
+
+/// The release was accepted (now, or before: a resend gets the same
+/// answer while the record stays; after that it is `NOT_FOUND`, which the
+/// member also takes as done).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAttemptResponse {
+    pub schema_version: SchemaVersion,
+    pub attempt_id: AttemptId,
+}
+
+/// One page of the terminal attempts of the asking member that got neither
+/// `ack_collected` nor `release_attempt`, in attempt id order after
+/// `after`; `limit` is at most 500.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListUnreleasedRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    #[serde(default)]
+    pub after: Option<AttemptId>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListUnreleasedResponse {
+    pub schema_version: SchemaVersion,
+    pub attempts: Vec<AttemptId>,
+    /// More follow after the last one.
+    pub more: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2008,6 +2064,8 @@ operations! {
     WorkflowArtifact(WorkflowArtifactRequest, WorkflowArtifactResponse),
     GroupProof(GroupProofRequest, GroupProofResponse),
     IdentityRetired(IdentityRetiredRequest, IdentityRetiredResponse),
+    ReleaseAttempt(ReleaseAttemptRequest, ReleaseAttemptResponse),
+    ListUnreleased(ListUnreleasedRequest, ListUnreleasedResponse),
 }
 
 /// An error reply.
@@ -2477,6 +2535,17 @@ mod tests {
             worker_id: worker(),
             worker_boot_id: boot(),
         }));
+        out.push(Request::ReleaseAttempt(ReleaseAttemptRequest {
+            schema_version: SV,
+            request_id: rid(),
+            attempt_id: AttemptId::generate(),
+        }));
+        out.push(Request::ListUnreleased(ListUnreleasedRequest {
+            schema_version: SV,
+            request_id: rid(),
+            after: Some(AttemptId::generate()),
+            limit: 500,
+        }));
         out
     }
 
@@ -2785,6 +2854,15 @@ mod tests {
             worker_id: worker(),
             worker_boot_id: boot(),
         }));
+        out.push(Response::ReleaseAttempt(ReleaseAttemptResponse {
+            schema_version: SV,
+            attempt_id: AttemptId::generate(),
+        }));
+        out.push(Response::ListUnreleased(ListUnreleasedResponse {
+            schema_version: SV,
+            attempts: vec![AttemptId::generate()],
+            more: true,
+        }));
         out
     }
 
@@ -3037,6 +3115,8 @@ mod tests {
             (Hello, ReadOnly),
             (GroupProof, ReadOnly),
             (IdentityRetired, RequestId),
+            (ReleaseAttempt, RequestId),
+            (ListUnreleased, ReadOnly),
             (Inspect, ReadOnly),
             (Forecast, ReadOnly),
             (ForecastCommand, ReadOnly),

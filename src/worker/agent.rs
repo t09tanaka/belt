@@ -191,6 +191,16 @@ impl AgentConfig {
     }
 }
 
+/// Where a request came from, for the rules of stage 3 (spec 25.6): whether
+/// its connection agreed `attempt_release_v1`, and where it was taken from
+/// the connection's queue. The default is a call that is not over a
+/// connection and did not agree the feature (today's behaviour).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Link {
+    pub release: bool,
+    pub taken: Option<super::release::Taken>,
+}
+
 /// What the connection's `hello` and group proof established: the member
 /// at the other end. Every request of the connection is that member's, and
 /// reaches that member's attempts only (spec 24.4).
@@ -258,6 +268,12 @@ pub struct Agent {
     noted: Mutex<BTreeMap<String, String>>,
     /// One new acceptance at a time: the live cap and the insert are one step.
     submitting: Mutex<()>,
+    /// The released dedup records and the submits that may be behind them
+    /// (spec 25.6 (c)).
+    releases: super::release::Releases,
+    /// When this agent started (wall clock): the rows acknowledged before it
+    /// are an older version's (spec 25.6 (c2)).
+    started_ms: u64,
     ticking: AtomicBool,
     /// Warm-ups in progress or just answered, by `sync_id`.
     warmups: Mutex<BTreeMap<String, warmup::Warmup>>,
@@ -629,6 +645,31 @@ impl Agent {
         }
         let (store, epoch) = opened.expect("the store step ran");
         report.watched = todo.clone();
+        // Spec 25.6 (c), (c2): before any connection is accepted. No submit
+        // is in flight, so every released record may go; the rows an older
+        // version acknowledged go as an acknowledgement goes now. Not on
+        // trial (a rollback restores the database, not the directories).
+        let started_ms = now();
+        if !super::control::in_trial(&cfg.state_dir) {
+            while store
+                .purge_released_records(crate::storage::RELEASE_BATCH)
+                .map_err(api)?
+                == crate::storage::RELEASE_BATCH as usize
+            {}
+            for _ in 0..STARTUP_ACKED_BATCHES {
+                let dropped = store
+                    .drop_acked_before(started_ms, crate::storage::RELEASE_BATCH)
+                    .map_err(api)?;
+                if dropped.len() < crate::storage::RELEASE_BATCH as usize {
+                    break;
+                }
+            }
+            let dropped = remove_dropped_attempts(&cfg.attempts_root(), &store).map_err(api)?;
+            for (attempt, error) in &dropped.failed {
+                let payload = json!({ "attempt": attempt, "error": error });
+                let _ = store.append_event(None, None, "agent_dropped_attempt_kept", &payload, now());
+            }
+        }
         let max_prepares = cfg.max_concurrent_prepares.max(1);
         let toolchains = cfg
             .capability_profile
@@ -669,6 +710,8 @@ impl Agent {
             gave_up: Mutex::default(),
             noted: Mutex::default(),
             submitting: Mutex::default(),
+            releases: super::release::Releases::default(),
+            started_ms,
             ticking: AtomicBool::new(false),
             warmups: Mutex::default(),
             cleanup_scan: Mutex::new(None),
@@ -940,7 +983,7 @@ impl Agent {
             // taking it for a moment cannot make a new one give up. (The
             // acknowledgement of an attempt that ended without a result
             // takes it too, for an attempt that is terminal already.)
-            match SupervisorLock::try_acquire(&self.cfg.state_dir, attempt) {
+            match SupervisorLock::try_acquire_existing(&self.cfg.state_dir, attempt) {
                 Ok(Some(lock)) => drop(lock),
                 Ok(None) | Err(_) => {
                     self.pause(self.cfg.poll_ms);
@@ -2175,6 +2218,7 @@ impl Agent {
         self.reap_warmups();
         self.supervise_attempts();
         self.clean_ended();
+        self.retire_rows();
         if let Err(e) = self.gc() {
             self.note_global(
                 "agent_gc_failed",
@@ -2182,6 +2226,93 @@ impl Agent {
                 json!({ "code": e.code, "message": e.message }),
             );
         }
+    }
+
+    /// One bounded batch of each deletion of stage 3 that time drives (spec
+    /// 25.6 (b), (c2), (e)). Not on trial.
+    fn retire_rows(&self) {
+        if super::control::in_trial(&self.cfg.state_dir) {
+            return;
+        }
+        let batch = crate::storage::RELEASE_BATCH;
+        let at = now();
+        let mut ids = Vec::new();
+        match self.store.expire_unreleased(at, self.cfg.ack_wait_ms, batch) {
+            Ok(v) => ids.extend(v),
+            Err(e) => self.note_global("agent_release_failed", "ack_wait", json!({ "error": e.to_string() })),
+        }
+        match self.store.drop_acked_before(self.started_ms, batch) {
+            Ok(v) => ids.extend(v),
+            Err(e) => self.note_global("agent_release_failed", "acked", json!({ "error": e.to_string() })),
+        }
+        for id in ids {
+            self.remove_dropped(&id);
+        }
+        if let Err(e) = self
+            .store
+            .prune_unowned_events(at.saturating_sub(self.cfg.retention_ms), batch)
+        {
+            self.note_global("agent_release_failed", "events", json!({ "error": e.to_string() }));
+        }
+    }
+
+    /// The directory and the lock of an attempt whose row just went, at
+    /// once; what fails stays in `dropped_attempt` for the next start.
+    fn remove_dropped(&self, id: &str) {
+        let mut report = DroppedReport::default();
+        let done = remove_dropped_attempt(&self.cfg.attempts_root(), &self.store, id, &mut report);
+        for (attempt, error) in &report.failed {
+            self.note_global(
+                "agent_dropped_attempt_kept",
+                attempt,
+                json!({ "attempt": attempt, "error": error }),
+            );
+        }
+        if let Err(e) = done {
+            self.note_global("agent_dropped_attempt_kept", id, json!({ "attempt": id, "error": e.to_string() }));
+        }
+    }
+
+    /// A release of `attempt` by `member` was committed: its directory and
+    /// lock go now, and its record once no submit can be behind it.
+    fn released(&self, member: &CoordinatorId, attempt: &AttemptId, at: Option<super::release::Taken>) {
+        self.remove_dropped(attempt.as_str());
+        let ripe = self.releases.released(member, attempt, at);
+        self.forget_ripe(ripe);
+    }
+
+    fn forget_ripe(&self, ripe: super::release::Ripe) {
+        if let Err(e) = self.store.forget_released(ripe) {
+            // Kept: the next start deletes every released record.
+            self.note_global("agent_release_failed", "records", json!({ "error": e.to_string() }));
+        }
+    }
+
+    /// A connection of `member` was proven (spec 25.6 (c)).
+    pub(crate) fn connection_opened(&self, member: &CoordinatorId) -> u64 {
+        self.releases.open(member)
+    }
+
+    /// A request was taken from connection `conn`.
+    pub(crate) fn request_taken(&self, conn: u64, submit: bool) -> super::release::Taken {
+        self.releases.take(conn, submit)
+    }
+
+    /// A submit taken from a connection was handled.
+    pub(crate) fn submit_handled(&self, taken: super::release::Taken) {
+        let ripe = self.releases.handled(taken);
+        self.forget_ripe(ripe);
+    }
+
+    /// Connection `conn` takes nothing more.
+    pub(crate) fn connection_closed(&self, conn: u64) {
+        let ripe = self.releases.close(conn);
+        self.forget_ripe(ripe);
+    }
+
+    /// Released records that still wait for a submit (tests).
+    pub fn releases_waiting(&self) -> usize {
+        self.releases.waiting()
     }
 
     fn apply_rekey(self: &Arc<Self>) {
@@ -2285,19 +2416,15 @@ impl Agent {
         self.reap();
         let spawned = lock(&self.children).len() as u64;
         let builds = self.host.setup_owner().map_or(0, |s| s.running() as u64);
+        // The supervisors that still run: the locks of the attempts the
+        // database has as not terminal, by their own path (spec 25.6 (b)),
+        // never a scan of `supervisors/`. A supervisor only runs for such an
+        // attempt; a terminal attempt's supervisor has stored its end.
         let held = (|| {
-            let dir = self.cfg.state_dir.join("supervisors");
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
-                Err(_) => return None,
-            };
             let mut held = 0u64;
-            for entry in entries {
-                let name = entry.ok()?.file_name().into_string().ok()?;
-                let attempt = AttemptId::parse(name.strip_suffix(".lock")?).ok()?;
+            for rec in self.store.list_nonterminal().ok()? {
                 // Taken for a moment and dropped: only a live supervisor holds it.
-                match SupervisorLock::try_acquire(&self.cfg.state_dir, &attempt) {
+                match SupervisorLock::try_acquire_existing(&self.cfg.state_dir, &rec.attempt_id) {
                     Ok(Some(_)) => {}
                     Ok(None) => held += 1,
                     Err(_) => return None,
@@ -2473,6 +2600,19 @@ impl Agent {
         request: Request,
         expected: Option<&WorkerBootId>,
     ) -> Result<Response, ApiError> {
+        self.handle_linked(session, request, expected, Link::default())
+    }
+
+    /// [`Self::handle`] for a request taken from a connection: whether the
+    /// connection agreed `attempt_release_v1`, and where the request was
+    /// taken (spec 25.6).
+    pub fn handle_linked(
+        self: &Arc<Self>,
+        session: Session,
+        request: Request,
+        expected: Option<&WorkerBootId>,
+        link: Link,
+    ) -> Result<Response, ApiError> {
         let _gate = self.rekey_gate.read().unwrap_or_else(|e| e.into_inner());
         self.check_rekey()?;
         if expected.is_some_and(|boot| boot != &self.advertised_boot()) {
@@ -2502,9 +2642,43 @@ impl Agent {
                 .map(Response::IdentityRetired),
             Request::Inspect(r) => self.inspect(store, r).map(Response::Inspect),
             Request::SubmitAttempt(r) => self.submit(store, r).map(Response::SubmitAttempt),
-            Request::GetAttempt(r) => {
-                let rec = self.known(store, &r.attempt_id)?;
-                self.status(&rec).map(Response::GetAttempt)
+            Request::GetAttempt(r) => match self.known(store, &r.attempt_id) {
+                Ok(rec) => self.status(&rec).map(Response::GetAttempt),
+                Err(e) if e.code == ErrorCode::NotFound => {
+                    // Spec 25.6 (c): of an attempt that went, the record
+                    // says how it ended, and nothing else.
+                    match store.attempt_record(&r.attempt_id).map_err(api)? {
+                        Some(rec) => Ok(Response::GetAttempt(self.recorded_status(rec)?)),
+                        None => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            },
+            Request::ReleaseAttempt(r) => {
+                if !link.release {
+                    return Err(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "attempt_release_v1 was not negotiated",
+                    ));
+                }
+                self.release(store, &session, r, link.taken)
+                    .map(Response::ReleaseAttempt)
+            }
+            Request::ListUnreleased(r) => {
+                if !link.release {
+                    return Err(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "attempt_release_v1 was not negotiated",
+                    ));
+                }
+                let (attempts, more) = store
+                    .list_unreleased(r.after.as_ref(), r.limit)
+                    .map_err(api)?;
+                Ok(Response::ListUnreleased(crate::wire::ListUnreleasedResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    attempts,
+                    more,
+                }))
             }
             Request::ListAttempts(r) => self.list(store, r).map(Response::ListAttempts),
             Request::WorkflowArtifact(r) => {
@@ -2548,7 +2722,9 @@ impl Agent {
             Request::WatchEvents(r) => self.watch(store, r).map(Response::WatchEvents),
             Request::ReadLog(r) => self.read_log(store, r).map(Response::ReadLog),
             Request::GetResult(r) => self.result(store, r).map(Response::GetResult),
-            Request::AckCollected(r) => self.ack(store, &session, r).map(Response::AckCollected),
+            Request::AckCollected(r) => self
+                .ack(store, &session, r, link)
+                .map(Response::AckCollected),
             Request::SecretBundlePut(r) => self.secrets(store, r).map(Response::SecretBundlePut),
             Request::BlobPut(r) => {
                 let (host, limits) = (self.host.as_ref(), &self.cfg.blobs);
@@ -3107,6 +3283,7 @@ impl Agent {
         store: &WorkerStore,
         session: &Session,
         r: AckCollectedRequest,
+        link: Link,
     ) -> Result<AckCollectedResponse, ApiError> {
         let (_, _, _, digest, has_result) = self.ended(store, &r.attempt_id, r.generation)?;
         if digest != r.result_digest {
@@ -3125,7 +3302,7 @@ impl Agent {
         let _no_supervisor = if has_result {
             None
         } else {
-            match SupervisorLock::try_acquire(&self.cfg.state_dir, &r.attempt_id) {
+            match SupervisorLock::try_acquire_existing(&self.cfg.state_dir, &r.attempt_id) {
                 Ok(Some(lock)) => Some(lock),
                 Ok(None) => {
                     return Err(ApiError::new(
@@ -3139,13 +3316,90 @@ impl Agent {
         // A result that is stored between that read and this write is
         // another result than the acknowledged one: refused like a digest
         // that does not match.
-        store
-            .ack_collected_as_read(&r.attempt_id, session.coordinator_epoch, now(), has_result)
-            .map_err(api)?;
+        if link.release {
+            // Spec 25.6 (b): the member reads no more of it. The attempt
+            // goes in the same transaction, a released record stays.
+            store
+                .ack_and_release(&r.attempt_id, session.coordinator_epoch, now(), has_result)
+                .map_err(api)?;
+            drop(_no_supervisor);
+            self.released(&session.coordinator_id, &r.attempt_id, link.taken);
+        } else {
+            store
+                .ack_collected_as_read(&r.attempt_id, session.coordinator_epoch, now(), has_result)
+                .map_err(api)?;
+        }
         Ok(AckCollectedResponse {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
             released: true,
+        })
+    }
+
+    /// `release_attempt` (spec 25.6 (a)).
+    fn release(
+        &self,
+        store: &WorkerStore,
+        session: &Session,
+        r: crate::wire::ReleaseAttemptRequest,
+        taken: Option<super::release::Taken>,
+    ) -> Result<crate::wire::ReleaseAttemptResponse, ApiError> {
+        // A terminal attempt without a result can still get one while a
+        // supervisor of it lives: released under its lock, as an
+        // acknowledgement is, or not now.
+        let rec = store.get(&r.attempt_id).map_err(api)?;
+        let needs_lock = rec.as_ref().is_some_and(|rec| {
+            rec.state == AttemptState::Terminal
+                && !matches!(store.get_result(&r.attempt_id), Ok(Some(_)))
+        });
+        let _no_supervisor = if needs_lock {
+            match SupervisorLock::try_acquire_existing(&self.cfg.state_dir, &r.attempt_id) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    return Err(ApiError::new(
+                        ErrorCode::Overloaded,
+                        "a supervisor of the attempt may still store its result; release it again later",
+                    ))
+                }
+                Err(e) => return Err(internal("supervisor lock", e)),
+            }
+        } else {
+            None
+        };
+        let done = store
+            .release_attempt(&r.attempt_id, session.coordinator_epoch, now())
+            .map_err(api)?;
+        drop(_no_supervisor);
+        let _ = done;
+        self.released(&session.coordinator_id, &r.attempt_id, taken);
+        Ok(crate::wire::ReleaseAttemptResponse {
+            schema_version: SchemaVersion::CURRENT,
+            attempt_id: r.attempt_id,
+        })
+    }
+
+    /// What `get_attempt` answers for an attempt that left only a record.
+    fn recorded_status(&self, rec: crate::storage::DedupRecord) -> Result<AttemptStatus, ApiError> {
+        let corrupt = |what: &str, e: String| internal(what, e);
+        Ok(AttemptStatus {
+            schema_version: SchemaVersion::CURRENT,
+            attempt_id: rec.attempt_id,
+            run_id: RunId::parse(&rec.run_id).map_err(|e| corrupt("record run id", e.to_string()))?,
+            task_id: TaskId::parse(&rec.task_id)
+                .map_err(|e| corrupt("record task id", e.to_string()))?,
+            generation: Generation(rec.generation),
+            worker_boot_id: self.advertised_boot(),
+            agent_epoch: self.epoch,
+            state: AttemptState::Terminal,
+            receipts: crate::state::Receipts::default(),
+            spawned_at_ms: None,
+            observation: policy::observation(AttemptState::Terminal, false, Recovery::Nothing),
+            termination: Some(rec.termination.unwrap_or_else(failed)),
+            nodes: Vec::new(),
+            steps: Vec::new(),
+            retired: false,
+            log_truncated: false,
+            log_dropped_bytes: 0,
         })
     }
 
@@ -3404,6 +3658,10 @@ impl Agent {
 /// The most dropped attempts one start clears; more wait for the next start.
 const DROPPED_PER_START: u32 = 10_000;
 
+/// Batches of rows an older version acknowledged that the start deletes
+/// before it accepts a connection; the tick goes on with the rest.
+const STARTUP_ACKED_BATCHES: usize = 10;
+
 /// What [`remove_dropped_attempts`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DroppedReport {
@@ -3417,45 +3675,82 @@ pub struct DroppedReport {
     pub failed: Vec<(String, String)>,
 }
 
-/// Remove the directories of the attempts the rebuild of the worker database
-/// dropped (migration step 4): their spec, supervisor state and workspace
-/// record have no row that would clean them up. Only an entry directly below
-/// `attempts_root` whose name is one of the dropped ids is touched. A
-/// symbolic link in its place is unlinked, never followed, and links inside
-/// the directory are removed as links. An id that a member holds again is
-/// left alone. Each entry is forgotten once its directory is gone, so a pass
-/// that was cut short goes on at the next start.
+/// Remove the directories of the attempts the worker database dropped: the
+/// rebuild of migration step 4, and from stage 3 every deletion of an
+/// attempt (spec 25.6 (b)). Only an entry directly below `attempts_root`
+/// whose name is one of the dropped ids is touched. A symbolic link in its
+/// place is unlinked, never followed, and links inside the directory are
+/// removed as links. After the directory, the supervisor lock of the
+/// attempt in the state directory above `attempts_root` is unlinked (taken
+/// without creating it); a lock a live supervisor holds keeps the entry for
+/// the next start. An id that a member holds again is left alone. Each
+/// entry is forgotten once its directory and lock are gone, so a pass that
+/// was cut short goes on at the next start.
 pub fn remove_dropped_attempts(
     attempts_root: &Path,
     store: &WorkerStore,
 ) -> Result<DroppedReport, StorageError> {
     let mut report = DroppedReport::default();
     for id in store.dropped_attempts(DROPPED_PER_START)? {
-        // `parse` re-encodes the id, so only the canonical spelling passes:
-        // nothing that could name another place.
-        let canonical = AttemptId::parse(&id).is_ok_and(|a| a.as_str() == id);
-        if !canonical || store.attempt_id_held(&id)? {
-            store.forget_dropped_attempt(&id)?;
-            report.skipped += 1;
-            continue;
-        }
-        let path = attempts_root.join(&id);
-        let removed = match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
-            Ok(_) => fs::remove_file(&path),
-            Err(e) => Err(e),
-        };
-        match removed {
-            Ok(()) => report.removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.skipped += 1,
-            Err(e) => {
-                report.failed.push((id, e.to_string()));
-                continue;
-            }
-        }
-        store.forget_dropped_attempt(&id)?;
+        remove_dropped_attempt(attempts_root, store, &id, &mut report)?;
     }
     Ok(report)
+}
+
+/// [`remove_dropped_attempts`] for one entry, right after the transaction
+/// that deleted the attempt (it does not wait for the next start).
+pub(crate) fn remove_dropped_attempt(
+    attempts_root: &Path,
+    store: &WorkerStore,
+    id: &str,
+    report: &mut DroppedReport,
+) -> Result<(), StorageError> {
+    // `parse` re-encodes the id, so only the canonical spelling passes:
+    // nothing that could name another place.
+    let parsed = AttemptId::parse(id).ok().filter(|a| a.as_str() == id);
+    let Some(attempt) = parsed else {
+        store.forget_dropped_attempt(id)?;
+        report.skipped += 1;
+        return Ok(());
+    };
+    if store.attempt_id_held(id)? {
+        store.forget_dropped_attempt(id)?;
+        report.skipped += 1;
+        return Ok(());
+    }
+    let path = attempts_root.join(id);
+    let removed = match fs::symlink_metadata(&path) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
+        Ok(_) => fs::remove_file(&path),
+        Err(e) => Err(e),
+    };
+    match removed {
+        Ok(()) => report.removed += 1,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.skipped += 1,
+        Err(e) => {
+            report.failed.push((id.to_string(), e.to_string()));
+            return Ok(());
+        }
+    }
+    // The directory first, the lock after it: a check that read the
+    // attempt's `supervise.json` did so before this point.
+    if let Some(state_dir) = attempts_root.parent() {
+        match SupervisorLock::remove(state_dir, &attempt) {
+            Ok(true) => {}
+            Ok(false) => {
+                report
+                    .failed
+                    .push((id.to_string(), "a supervisor holds its lock".into()));
+                return Ok(());
+            }
+            Err(e) => {
+                report.failed.push((id.to_string(), e.to_string()));
+                return Ok(());
+            }
+        }
+    }
+    store.forget_dropped_attempt(id)?;
+    Ok(())
 }
 
 /// The SSH helper holds agent.lock while the resident is absent. Stop through
@@ -3476,7 +3771,7 @@ pub(crate) fn interrupt_offline(
         store.expire_lease(&rec.attempt_id, now()).map_err(api)?;
         // A living supervisor observes the lease. Otherwise hold its lock
         // while settling an unstarted attempt or recovering a recorded launch.
-        let Some(_owner) = SupervisorLock::try_acquire(state, &rec.attempt_id)
+        let Some(_owner) = SupervisorLock::try_acquire_existing(state, &rec.attempt_id)
             .map_err(|e| internal("supervisor lock", e))?
         else {
             continue;
@@ -3589,7 +3884,7 @@ fn settle(
     how: Settle,
     lost: bool,
 ) -> Result<bool, ApiError> {
-    let lock = SupervisorLock::try_acquire(&cfg.state_dir, attempt)
+    let lock = SupervisorLock::try_acquire_existing(&cfg.state_dir, attempt)
         .map_err(|e| internal("supervisor lock", e))?;
     let Some(_lock) = lock else {
         return Ok(false);
@@ -3627,6 +3922,7 @@ fn changes_state(request: &Request) -> bool {
             | Request::CancelAttempt(_)
             | Request::RetireAttempt(_)
             | Request::AckCollected(_)
+            | Request::ReleaseAttempt(_)
             | Request::SecretBundlePut(_)
             | Request::BlobPut(_)
             | Request::EnvSync(_)

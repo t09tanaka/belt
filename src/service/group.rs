@@ -22,6 +22,7 @@ pub(crate) fn refusal_code(reason: &GroupRefusal) -> &'static str {
         GroupRefusal::GroupKeyMismatch { .. } => "group_key_mismatch",
         GroupRefusal::MemberIdentityMismatch => "member_identity_mismatch",
         GroupRefusal::IdentityRetired => "identity_retired",
+        GroupRefusal::MemberForgotten => "member_forgotten",
     }
 }
 
@@ -438,6 +439,7 @@ mod tests {
                 "member_identity_mismatch",
             ),
             (GroupRefusal::IdentityRetired, "identity_retired"),
+            (GroupRefusal::MemberForgotten, "member_forgotten"),
         ] {
             record_refusal(root.path(), &member, Some(&reason)).unwrap();
             assert_eq!(

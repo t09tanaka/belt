@@ -99,6 +99,8 @@ pub fn kind_of_operation(op: Operation) -> StreamKind {
         | Operation::WatchEvents
         | Operation::GetResult
         | Operation::AckCollected
+        | Operation::ReleaseAttempt
+        | Operation::ListUnreleased
         | Operation::BlobVerify
         | Operation::EnvReport
         | Operation::EnvSync => StreamKind::Control,

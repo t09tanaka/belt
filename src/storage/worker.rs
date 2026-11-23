@@ -35,6 +35,12 @@ use std::path::Path;
 
 const ATTEMPT: &str = "worker_attempt";
 
+mod release;
+pub use release::{
+    DedupRecord, Leave, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
+    MAX_UNRELEASED_PAGE, RELEASE_BATCH,
+};
+
 /// How long a worker waits for `ack_collected` after an attempt ended before
 /// it stops protecting the attempt's files from GC (spec chapter 13: seven
 /// days after terminal).
@@ -799,7 +805,8 @@ impl WorkerStore {
                         |_| Ok(()),
                     )
                     .optional()?
-                    .is_some();
+                    .is_some()
+                    || release::recorded(tx, o, &aid)?;
                 let verdict = decide_submit(
                     existing.as_ref().map(|e| ExistingAttempt {
                         key: SubmitKey {
@@ -854,6 +861,9 @@ impl WorkerStore {
                         if let Some(live) = live {
                             return Err(StorageError::LiveAttemptExists(live));
                         }
+                        // Spec 25.6 (c): a member at its bound of records is
+                        // refused a new attempt (a resend was answered above).
+                        release::record_room(tx, o)?;
                         if let Some(window) = window {
                             let live: i64 = tx.query_row(
                                 "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal'",
@@ -1073,7 +1083,8 @@ impl WorkerStore {
                         |_| Ok(()),
                     )
                     .optional()?
-                    .is_some();
+                    .is_some()
+                    || release::recorded(tx, o, &a)?;
                 if !known {
                     undelivered_room(tx, o)?;
                     tx.execute(
@@ -1117,6 +1128,11 @@ impl WorkerStore {
         let a = attempt_id.to_string();
         under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
             let existing = load(tx, o, &a)?;
+            // An attempt that left a record ended and was deleted: there is
+            // nothing to stop, and its record refuses a late submit.
+            if existing.is_none() && release::recorded(tx, o, &a)? {
+                return Ok(None);
+            }
             let updated = tx.execute(
                 "UPDATE tombstone SET kind = 'retire' WHERE coordinator_id = ?1 AND attempt_id = ?2",
                 [o, a.as_str()],
@@ -1684,7 +1700,7 @@ impl WorkerStore {
         epoch: CoordinatorEpoch,
         at_ms: u64,
     ) -> Result<bool> {
-        self.ack(attempt_id, epoch, at_ms, None)
+        self.ack(attempt_id, epoch, at_ms, None, false)
     }
 
     /// [`Self::ack_collected`] for a parent whose digest was checked against
@@ -1699,7 +1715,22 @@ impl WorkerStore {
         at_ms: u64,
         had_result: bool,
     ) -> Result<bool> {
-        self.ack(attempt_id, epoch, at_ms, Some(had_result))
+        self.ack(attempt_id, epoch, at_ms, Some(had_result), false)
+    }
+
+    /// [`Self::ack_collected_as_read`] from a member that agreed
+    /// `attempt_release_v1` (spec 25.6 (b)): the acknowledged attempt is
+    /// deleted in the same transaction and a released record is left; its
+    /// id is queued in `dropped_attempt` for the directory and the lock.
+    /// Returns false for a resend (nothing left but the record).
+    pub fn ack_and_release(
+        &self,
+        attempt_id: &AttemptId,
+        epoch: CoordinatorEpoch,
+        at_ms: u64,
+        had_result: bool,
+    ) -> Result<bool> {
+        self.ack(attempt_id, epoch, at_ms, Some(had_result), true)
     }
 
     fn ack(
@@ -1708,6 +1739,7 @@ impl WorkerStore {
         epoch: CoordinatorEpoch,
         at_ms: u64,
         had_result: Option<bool>,
+        release: bool,
     ) -> Result<bool> {
         let a = attempt_id.to_string();
         under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
@@ -1749,6 +1781,9 @@ impl WorkerStore {
                     &Value::Null,
                     at_ms,
                 )?;
+            }
+            if release {
+                release::drop_attempt(tx, o, &a, Leave::Released, at_ms)?;
             }
             Ok(n == 1)
         })

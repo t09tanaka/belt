@@ -55,6 +55,17 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
     let failed = |what: &str, e: crate::storage::StorageError| {
         ApiError::new(e.code(), format!("{what}: {e}"))
     };
+    // Spec 25.6 (d): a member removed with `belt group forget` is refused
+    // for good, whatever key it proves with.
+    if store
+        .member_refused(&peer.coordinator_id)
+        .map_err(|e| failed("the refused members", e))?
+    {
+        return Err(ApiError::group_refused(
+            GroupRefusal::MemberForgotten,
+            "this worker forgot this member (belt group forget); a member that returns needs a new state",
+        ));
+    }
     // A version on trial records no new member: a rollback would lose the
     // record (§24.8). A member pinned before is admitted as always.
     let pin = if super::control::in_trial(&cfg.state_dir) {
@@ -221,6 +232,16 @@ async fn serve_proven(
         .iter()
         .any(|v| v == crate::toolchain::capability::FEATURE);
     let negotiated_features = accepted.negotiated.features;
+    let release = negotiated_features
+        .iter()
+        .any(|f| f == crate::wire::ATTEMPT_RELEASE_FEATURE);
+    // Spec 25.6 (c): the submits this connection takes are counted until
+    // they are handled; the connection is closed in the tracker however
+    // this loop ends.
+    let conn = Opened {
+        agent: agent.clone(),
+        conn: agent.connection_opened(&session.coordinator_id),
+    };
     let mut incoming = accepted.incoming;
     loop {
         let next = tokio::select! {
@@ -257,6 +278,18 @@ async fn serve_proven(
         else {
             return Ok(ConnectionEnd::Closed);
         };
+        // Numbered when it is taken, before it waits for a permit: a submit
+        // taken before a release is in flight from here on.
+        let is_submit = matches!(&request, crate::wire::Request::SubmitAttempt(_));
+        let taken = agent.request_taken(conn.conn, is_submit);
+        let handled = is_submit.then(|| Handled {
+            agent: agent.clone(),
+            taken,
+        });
+        let link = super::agent::Link {
+            release,
+            taken: Some(taken),
+        };
         // No further request is taken from this connection until this one
         // may run: what cannot run yet stays queued where the protocol layer
         // counts it. An idle connection holds no permit.
@@ -268,6 +301,7 @@ async fn serve_proven(
         let session = session.clone();
         let request_boot = connection_boot.clone();
         tokio::spawn(async move {
+            let _handled = handled;
             let uses_workflow_artifacts = matches!(
                 &request,
                 crate::wire::Request::WorkflowArtifact(_)
@@ -401,7 +435,7 @@ async fn serve_proven(
                 }
             }
             let done = tokio::task::spawn_blocking(move || {
-                agent.handle_identity(session, request, Some(&request_boot))
+                agent.handle_linked(session, request, Some(&request_boot), link)
             })
             .await;
             let _ = match done {
@@ -427,6 +461,31 @@ async fn serve_proven(
             };
             drop(permit);
         });
+    }
+}
+
+/// A connection in the release tracker, closed there when dropped.
+struct Opened {
+    agent: Arc<Agent>,
+    conn: u64,
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.agent.connection_closed(self.conn);
+    }
+}
+
+/// A submit taken from a connection, handled when dropped (answered,
+/// refused, failed or panicked).
+struct Handled {
+    agent: Arc<Agent>,
+    taken: super::release::Taken,
+}
+
+impl Drop for Handled {
+    fn drop(&mut self) {
+        self.agent.submit_handled(self.taken);
     }
 }
 

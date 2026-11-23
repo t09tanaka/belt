@@ -56,9 +56,90 @@ impl SupervisorLock {
     }
 }
 
+/// What [`SupervisorLock::try_acquire_existing`] found when no live
+/// supervisor holds the lock: the lock, held until this is dropped, or no
+/// file at all (no supervisor took it, or it went with its attempt).
+#[derive(Debug)]
+pub struct Free(#[allow(dead_code)] Option<SupervisorLock>);
+
+impl SupervisorLock {
+    /// Take the lock without creating its file (spec 25.6 (b)): `None` while
+    /// a live supervisor holds it. Only the start of a supervisor creates
+    /// the file ([`Self::try_acquire`]); every check of "does a supervisor
+    /// live" uses this one, so a check never makes the file again after the
+    /// attempt and its lock were deleted.
+    pub fn try_acquire_existing(state_dir: &Path, attempt: &AttemptId) -> Result<Option<Free>> {
+        let path = lock_path(state_dir, attempt);
+        let file = match OpenOptions::new().write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Free(None))),
+            Err(e) => return Err(e.into()),
+        };
+        // SAFETY: the fd is valid for the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(Free(Some(SupervisorLock { _file: file }))));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(err.into())
+        }
+    }
+
+    /// Delete the lock file of an attempt whose row and directory are gone:
+    /// taken without creating it, unlinked while held, then let go. True
+    /// when there is no file any more; false while a live supervisor holds
+    /// it (the caller keeps its `dropped_attempt` entry for the next start).
+    pub fn remove(state_dir: &Path, attempt: &AttemptId) -> Result<bool> {
+        match Self::try_acquire_existing(state_dir, attempt)? {
+            None => Ok(false),
+            Some(Free(None)) => Ok(true),
+            Some(Free(Some(held))) => {
+                match std::fs::remove_file(lock_path(state_dir, attempt)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                drop(held);
+                Ok(true)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_without_creating_never_makes_the_file_again() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let a = AttemptId::generate();
+        let path = lock_path(dir.path(), &a);
+        // No file: nobody holds it, and the check creates nothing.
+        assert!(SupervisorLock::try_acquire_existing(dir.path(), &a)
+            .unwrap()
+            .is_some());
+        assert!(!path.exists());
+        let held = SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .unwrap();
+        assert!(SupervisorLock::try_acquire_existing(dir.path(), &a)
+            .unwrap()
+            .is_none());
+        assert!(!SupervisorLock::remove(dir.path(), &a).unwrap());
+        assert!(path.exists(), "a held lock is not removed");
+        drop(held);
+        assert!(SupervisorLock::remove(dir.path(), &a).unwrap());
+        assert!(!path.exists());
+        assert!(SupervisorLock::remove(dir.path(), &a).unwrap());
+        assert!(SupervisorLock::try_acquire_existing(dir.path(), &a)
+            .unwrap()
+            .is_some());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn dropping_owner_releases_lock_even_with_an_inherited_description() {

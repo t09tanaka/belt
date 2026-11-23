@@ -41,6 +41,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     group::MEMBERSHIP_FEATURE,
     group::IDENTITY_RETIRED_FEATURE,
     group::SHARED_ADMISSION_FEATURE,
+    crate::wire::ATTEMPT_RELEASE_FEATURE,
 ];
 
 /// The features no connection of this build goes without, on either side
