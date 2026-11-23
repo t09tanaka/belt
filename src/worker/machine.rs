@@ -547,6 +547,7 @@ impl Host for Machine {
     fn received_pass(
         &self,
         attempts: &super::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
     ) -> Option<anyhow::Result<crate::source::retention::ReceivedPassReport>> {
         use crate::source::retention::ReceivedPassInputs;
         let uses = |ci: &str, id: Option<&crate::ids::SourceId>| {
@@ -559,6 +560,7 @@ impl Host for Machine {
             max_age_ms: RECEIVED_MAX_AGE_MS,
             cap_bytes: RECEIVED_CAP_BYTES,
             uses: &uses,
+            stop,
         }))
     }
 

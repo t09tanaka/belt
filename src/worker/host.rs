@@ -97,10 +97,14 @@ pub trait Host: Send + Sync {
     /// member, whether a non-terminal attempt names the source and the
     /// newest `terminal_at_ms` of those that did
     /// ([`crate::storage::WorkerStore::source_use`]); the host adds its
-    /// in-process pins ((h)7). `None`: this host has no source store.
+    /// in-process pins ((h)7). `stop` is asked at each section under the
+    /// exclusive lock: when it is true the pass returns without detaching
+    /// (the agent is stopping, or a version is on trial). `None`: this host
+    /// has no source store.
     fn received_pass(
         &self,
         _attempts: &SourceAttempts,
+        _stop: &dyn Fn() -> bool,
     ) -> Option<anyhow::Result<crate::source::retention::ReceivedPassReport>> {
         None
     }

@@ -69,7 +69,11 @@ struct DirHost {
     tool_poll: Mutex<Option<Option<String>>>,
     /// While set, `toolchain_poll` does not come back (a slow disk).
     tool_poll_hold: AtomicBool,
+    /// What `received_pass` runs, given its `stop`; `None`: no source store.
+    pass_hook: Mutex<Option<PassHook>>,
 }
+
+type PassHook = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
 
@@ -89,6 +93,15 @@ impl DirHost {
 }
 
 impl Host for DirHost {
+    fn received_pass(
+        &self,
+        _attempts: &belt::worker::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
+        let hook = self.pass_hook.lock().unwrap().clone()?;
+        hook(stop);
+        Some(Ok(belt::source::retention::ReceivedPassReport::default()))
+    }
     fn preparation_observation_page(
         &self,
         _request: &belt::setup::observation_transport::ObservationPageRequest,
@@ -310,6 +323,7 @@ pub(crate) fn fx_named(worker: &str) -> Fx {
         setup_skip: Mutex::default(),
         tool_poll: Mutex::new(None),
         tool_poll_hold: AtomicBool::new(false),
+        pass_hook: Mutex::default(),
     });
     Fx {
         dir,
@@ -3252,8 +3266,9 @@ impl Host for RealButCore {
     fn received_pass(
         &self,
         attempts: &belt::worker::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
     ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
-        self.0.received_pass(attempts)
+        self.0.received_pass(attempts, stop)
     }
     fn secret_paths(
         &self,
@@ -6255,4 +6270,66 @@ async fn received_passes_leave_a_parent_store_alone_and_wait_out_a_trial() {
     control::begin_trial(&state).unwrap();
     assert_eq!(agent.received_passes(), 0);
     control::end_trial(&state).unwrap();
+}
+
+/// A pass hook that says it came in, waits for its `stop` to turn true,
+/// holds on a little, then says it went out. Returns the three flags.
+fn stoppable_pass(f: &Fx) -> (Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let (calls, entered, left) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (c, e, l) = (calls.clone(), entered.clone(), left.clone());
+    *f.host.pass_hook.lock().unwrap() = Some(Arc::new(move |stop| {
+        c.fetch_add(1, Ordering::SeqCst);
+        e.store(true, Ordering::SeqCst);
+        let end = Instant::now() + T;
+        while !stop() {
+            assert!(Instant::now() < end, "stop never turned true");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        l.store(true, Ordering::SeqCst);
+    }));
+    (calls, entered, left)
+}
+
+/// Review round 1 (M1): `shutdown` joins a round of the received-source
+/// passes that is running (its `stop` turns true) before it lets the agent
+/// lock go, and no pass starts afterwards.
+#[test]
+fn shutdown_joins_a_running_received_pass() {
+    let f = fx();
+    let (calls, entered, left) = stoppable_pass(&f);
+    let agent = f.start("boot-a");
+    agent.tick();
+    wait_for("the pass to start", || entered.load(Ordering::SeqCst));
+    assert!(!left.load(Ordering::SeqCst));
+    agent.shutdown();
+    assert!(
+        left.load(Ordering::SeqCst),
+        "shutdown did not wait for the pass"
+    );
+    assert_eq!(
+        agent.received_passes(),
+        0,
+        "the flag is free again, but stopped"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Review round 1 (L1): a version put on trial while a pass runs stops it
+/// at its next section.
+#[test]
+fn a_trial_stops_a_running_received_pass() {
+    let f = fx();
+    let (_, entered, left) = stoppable_pass(&f);
+    let agent = f.start("boot-a");
+    agent.tick();
+    wait_for("the pass to start", || entered.load(Ordering::SeqCst));
+    belt::worker::control::begin_trial(&f.state()).unwrap();
+    wait_for("the pass to see the trial", || left.load(Ordering::SeqCst));
+    belt::worker::control::end_trial(&f.state()).unwrap();
+    agent.shutdown();
 }

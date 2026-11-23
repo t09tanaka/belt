@@ -45,6 +45,11 @@ pub struct ReceivedPassInputs<'a> {
     /// that does not convert: the pass keeps such a source whatever the
     /// answer, so a caller may answer `Live` without a lookup.
     pub uses: &'a dyn Fn(&str, Option<&crate::ids::SourceId>) -> Result<SourceUse>,
+    /// Asked at each section under the exclusive lock (and so after the
+    /// agent's lock may have gone): when it is true the pass returns
+    /// without detaching anything (the agent is stopping, or a version is
+    /// on trial, spec 25.1 8).
+    pub stop: &'a dyn Fn() -> bool,
 }
 
 /// What one pass did.
@@ -114,10 +119,17 @@ const TIMED: &str = "SELECT r.id,r.source,r.used_ms FROM root r WHERE r.kind='re
      AND NOT EXISTS(SELECT 1 FROM graph g WHERE g.source=r.source AND g.root<>r.id)
      AND NOT EXISTS(SELECT 1 FROM clone_ref_retry t WHERE t.root=r.id)
      ORDER BY r.used_ms,r.id LIMIT ?3";
+/// Abandoned roots left without a member (by a shared detach elsewhere, or
+/// a member a crash took): at most [`EMPTY_LIMIT`] go in a section, so a
+/// store with many of them is not scanned and rewritten in one lock hold.
+const EMPTY_ROOTS: &str = "SELECT id FROM root WHERE kind='abandoned'
+     AND (id LIKE 'drop:%' OR id LIKE 'receive:%' OR id LIKE 'import:%')
+     AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id) LIMIT ?1";
+const EMPTY_LIMIT: i64 = 64;
 /// The queries whose plans a test checks.
 #[cfg(test)]
-pub(in crate::source::retention) const PLANNED: [&str; 4] =
-    [STEP0_ROOTS, STEP0_MEMBERS, UNTIMED, TIMED];
+pub(in crate::source::retention) const PLANNED: [&str; 5] =
+    [STEP0_ROOTS, STEP0_MEMBERS, UNTIMED, TIMED, EMPTY_ROOTS];
 
 /// A member step 0 looks at: root, object, path, counted bytes.
 type Member = (String, String, String, Option<i64>);
@@ -161,6 +173,9 @@ impl SourceStore {
                 }
                 Err(e) => return Err(e),
             };
+            if (inputs.stop)() {
+                return Ok(report);
+            }
             self.retention.check_anchor()?;
             let mut c = self.retention.connect()?;
             // (the parent's roots are looked at again under the lock)
@@ -331,22 +346,28 @@ impl Index {
         // crash took) go in the same section.
         // (their graph rows go in the same transaction)
         let empty = {
-            const EMPTY: &str = "kind='abandoned' AND (id LIKE 'drop:%' OR id LIKE 'receive:%' OR id LIKE 'import:%') AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id)";
             let tx = c.transaction()?;
-            // (an empty `import:` root takes its token's unused session with
-            // it, as the per-root removal below does; step 0's page skips
-            // empty roots, so they go here)
-            tx.execute(
-                &format!("DELETE FROM import_session WHERE state='pending' AND source IS NULL AND run_id IS NULL AND 'import:'||token IN (SELECT id FROM root WHERE {EMPTY})"),
-                [],
-            )?;
-            tx.execute(
-                &format!("DELETE FROM graph WHERE root IN (SELECT id FROM root WHERE {EMPTY})"),
-                [],
-            )?;
-            let empty = tx.execute(&format!("DELETE FROM root WHERE {EMPTY}"), [])?;
+            let ids: Vec<String> = {
+                let mut s = tx.prepare(EMPTY_ROOTS)?;
+                let rows = s.query_map([EMPTY_LIMIT], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let mut removed = 0;
+            for id in &ids {
+                // (an empty `import:` root takes its token's unused
+                // session with it, as the per-root removal below does;
+                // step 0's page skips empty roots, so they go here)
+                if let Some(token) = id.strip_prefix("import:") {
+                    tx.execute(
+                        "DELETE FROM import_session WHERE token=?1 AND state='pending' AND source IS NULL AND run_id IS NULL",
+                        [token],
+                    )?;
+                }
+                tx.execute("DELETE FROM graph WHERE root=?1", [id])?;
+                removed += tx.execute("DELETE FROM root WHERE id=?1", [id])?;
+            }
             tx.commit()?;
-            empty
+            removed
         };
         report.forgotten += empty;
         if members.is_empty() {

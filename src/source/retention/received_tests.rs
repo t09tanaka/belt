@@ -118,6 +118,7 @@ impl Env {
             max_age_ms: AGE,
             cap_bytes: cap,
             uses,
+            stop: &|| false,
         })
     }
     fn pass(&self) -> ReceivedPassReport {
@@ -745,4 +746,51 @@ fn nothing_is_detached_before_the_process_recounts() {
     let report = env.pass();
     assert_eq!(report.detached, 1, "{report:?}");
     assert!(!env.received(&old));
+}
+
+/// Review round 1 (M1, L1): a pass whose `stop` is true (the agent is
+/// stopping, or a version is on trial) runs no section and detaches nothing.
+#[test]
+fn a_stopped_pass_runs_no_section() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.trust_clock();
+    let report = env
+        .receiver
+        .received_pass(&ReceivedPassInputs {
+            wall: NOW,
+            mono: AGE,
+            boot: Some("b".into()),
+            max_age_ms: AGE,
+            cap_bytes: u64::MAX,
+            uses: &|_, _| Ok(SourceUse::Ended(None)),
+            stop: &|| true,
+        })
+        .unwrap();
+    assert_eq!(report.sections, 0, "{report:?}");
+    assert_eq!(report.detached, 0, "{report:?}");
+    assert!(env.received(&old));
+    // the same pass, not stopped, detaches it
+    assert_eq!(env.pass().detached, 1);
+}
+
+/// Review round 1 (L2): a section removes at most 64 empty roots.
+#[test]
+fn empty_roots_go_a_bounded_number_a_section() {
+    let env = Env::new();
+    let rows: String = (0..100)
+        .map(|i| format!("INSERT INTO root(id,kind,source) VALUES('drop:e:{i}','abandoned',NULL);"))
+        .collect();
+    env.sql(&rows);
+    let (what, _) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(what, "progress");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:e:%'"),
+        36
+    );
+    let (_, _) = env.receiver.retention.leftovers_with(1 << 20).unwrap();
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:e:%'"),
+        0
+    );
 }

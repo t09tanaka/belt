@@ -2364,7 +2364,7 @@ impl Agent {
     /// thread, at most one at a time, at most once a minute, not while a
     /// version is on trial (25.1, 8).
     fn schedule_received_passes(self: &Arc<Self>) {
-        if super::control::in_trial(&self.cfg.state_dir) {
+        if self.stopping() || super::control::in_trial(&self.cfg.state_dir) {
             return;
         }
         if self
@@ -2378,15 +2378,29 @@ impl Agent {
         if self.deleting.swap(true, Ordering::SeqCst) {
             return;
         }
+        // (in `threads` like the attempts' threads, so `shutdown` joins it
+        // before the agent lock goes: a pass that outlived it could detach
+        // a source another process's agent pins in the meantime. The check
+        // of `stopping` is under the list's lock: `shutdown` sets it before
+        // it takes the list.)
+        let mut threads = lock(&self.threads);
+        if self.stopping() {
+            self.deleting.store(false, Ordering::SeqCst);
+            return;
+        }
         let agent = self.clone();
         let spawned = std::thread::Builder::new()
             .name("belt-received-pass".into())
             .spawn(move || {
                 let _running = Ticking(&agent.deleting);
-                agent.received_passes();
+                agent.run_received_passes();
             });
-        if spawned.is_err() {
-            self.deleting.store(false, Ordering::SeqCst);
+        match spawned {
+            Ok(t) => {
+                threads.retain(|t| !t.is_finished());
+                threads.push(t);
+            }
+            Err(_) => self.deleting.store(false, Ordering::SeqCst),
         }
     }
 
@@ -2395,17 +2409,33 @@ impl Agent {
     /// pass that ends is followed by the next, 100 ms apart); a pass that
     /// changed nothing, a busy store, a closed gate, a parent's store or a
     /// claim that did not drain ends the round. Returns the passes run.
+    ///
+    /// For the tests and [`Self::schedule_received_passes`]: it takes the
+    /// same flag as the scheduled round, so two rounds never run at once
+    /// (`0`: one is running).
     pub fn received_passes(&self) -> usize {
+        if self.deleting.swap(true, Ordering::SeqCst) {
+            return 0;
+        }
+        let _running = Ticking(&self.deleting);
+        self.run_received_passes()
+    }
+
+    /// The round, with `deleting` held by the caller.
+    fn run_received_passes(&self) -> usize {
         *self.deleted_at.lock().unwrap() = Some(Instant::now());
+        // (stop at the next section: the agent is stopping, or a version
+        // is on trial, spec 25.1 8)
+        let stop = || self.stopping() || super::control::in_trial(&self.cfg.state_dir);
         let attempts = |source: &crate::ids::SourceId| -> anyhow::Result<(bool, Option<i64>)> {
             Ok(self.store.source_use(source)?)
         };
         let mut passes = 0;
         loop {
-            if super::control::in_trial(&self.cfg.state_dir) {
+            if stop() {
                 return passes;
             }
-            let Some(result) = self.host.received_pass(&attempts) else {
+            let Some(result) = self.host.received_pass(&attempts, &stop) else {
                 return passes;
             };
             passes += 1;
@@ -2425,6 +2455,9 @@ impl Agent {
             // changes)
             if report.parent {
                 self.note_global("source_store_shared", "", json!({}));
+            } else if !report.busy {
+                // (a later share is news again)
+                lock(&self.noted).remove("/source_store_shared/");
             }
             let progress = report.detached + report.unlinked + report.forgotten > 0;
             if !progress || report.busy || report.parent || report.stuck || report.gate.is_some() {
