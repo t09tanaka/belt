@@ -2414,7 +2414,7 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 
 ### (a) 古いbinary
 
-**今の挙動。** `<config>/bin/<digest>/` と `tool-bin/<digest>/` は、版ごとに1つ増え、消さない。
+**今の挙動。** 段階4で実装した（`src/service/old_binaries.rs`）。それより前は、`<config>/bin/<digest>/` と `tool-bin/<digest>/` は版ごとに1つ増え、消さなかった。
 
 **規則。** `<config>/bin/<digest>/` を消してよいのは、その版を名指すものが1つも無いと確かめたときである。名指し得るものをすべて挙げる。
 
@@ -2436,19 +2436,22 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 - `tool-bin/<digest>/` は、指す先の `bin/<digest>/` と一緒に消す。
 - `bin/.resident.<pid>`・`bin/.current.<pid>` は、段階1の名前の規則に移し、切替の完了かrollbackで消す。
 
+**実装の読み。** 名指すものは、linkの指す先と、journalとserviceの定義の本文に版のdigestが現れるかで判定する（現れれば名指す。広めに残す）。system userのworkerが固定した版は、そのworkerの `worker-service.json` の `binary_sha256` で、同じ本文の検査に入る（system userのworkerの起動は、自分のconfigの中でこのpassを行う）。番人、builder、supervisorは、居る間はpassを丸ごと見送る。builderは、lockを取るかわりに `setup/builders/` にdirectoryが1つでもあれば見送る（directoryは、builderとそれが起動したものの停止を確かめた後にだけ消える。25.7の (b)）。版のdirectoryを置くcommand（`init`、`worker-service install`・`upgrade`）は、`init.lock` か `worker-service.lock` を、directoryを作る前からjournalが名指すまで持つので、passはその2つを待たずに取り、取れなければ何も消さない。最初の `init` は `init.lock` を作る前に版を置くので、作られて10分以内のdirectoryも残す。1回のpassで消す版は8個まで。読めないjournalや定義があれば何も消さない。`doctor` は、`bin/current`・`bin/resident` の指す先以外に残っている版の数を示す。
+
 動いているprocessの実行fileをunlinkしても、そのprocessは動き続ける。害になるのは、pathで実行し直す経路（supervisorの起動、`tool-bin` のlink）だけで、表はその経路をすべて挙げている。
 
 **受け入れ試験。** (i) commitの後、前の版のdirectoryと `tool-bin` が消える。(ii) 表の各行について、それだけが前の版を名指す状態を作ると、消えない（行ごとに1つ）。番人は、登録だけが残る場合と、定義のfileだけが残る場合の両方。(iii) builderが動いている間のcommitでは消えず、builderの終了後の起動で消える。(iv) 試用中は消えない。
 
 ### (b) toolchainのroot
 
-**今の挙動。** `toolchains/<identity>/` は、導入の計画ごとに1つ増え、receiptのあるrootを消す処理は無い。既存のrootを使うattemptは、lockを取らずに `receipt.json` を読む（`toolchain::adapters::detect`）。
+**今の挙動。** 段階4で実装した（`src/storage/toolchain_roots.rs`、`src/setup/builder/roots.rs`）。それより前は、`toolchains/<identity>/` は導入の計画ごとに1つ増え、receiptのあるrootを消す処理は無く、既存のrootを使うattemptはlockを取らずに `receipt.json` を読んだ。
 
 **規則。** 参照の記録と削除のclaimを、worker DBの1つのtransactionで直列にする。
 
 - worker DBに、rootの表（identity、状態 `live`・`evicting`、最後に使った時刻、bytes）と、参照の表（identity、参照する者）を持つ。参照する者は、attempt（`coordinator_id` と `attempt_id`）、setup builder（builderのID）、ウォームアップ（`env_sync` の要求とagentの起動の番号）、setup template（templateのkey）である。
 - **bind。** 既存のrootを使うattemptは、`receipt.json` を読む前に、1つのtransaction（`BEGIN IMMEDIATE`）で、rootの状態が `live` であることを確かめ、参照を足し、最後に使った時刻を更新する。状態が `evicting` か、行が無ければ、rootは無いものとして扱い、導入の経路へ進む。
 - **導入。** builderは、`install.lock` を取り、同じ形で参照を足してから導入し、完了で行を `live` にする。状態が `evicting` のrootへは導入せず、削除の完了を待ってやり直す。
+- **実装の読み。** attemptとウォームアップは、どちらも `Setups::poll_tool` を同じ形で通るので、worker DBにそのIDのattemptの行があればattempt、無ければウォームアップとする。attemptの参照は、`worker_attempt` のtriggerが、terminalにする更新と行の削除のtransactionで外す（どのprocessが書いても）。ウォームアップの参照は、解放（`setup_release`）で外し、agentの起動ごとに全部外す（ウォームアップはagentのmemoryにしか無いので、起動の番号の比較と同じになる）。setup builderは実行のbindingの環境のpathに現れるrootを、templateは作ったbuilderと同じrootを参照する。templateの参照は、passがstoreにそのtemplateが無いのを見て外す。削除のpassは、agentのtickで60秒に1回までと、agentの起動時に行い、1回に1つのrootしか消さず、bytesは1回に1つのrootだけ測る（測っていないrootは0として数える）。段階4より前に受理され、まだterminalでないattemptがある間は、参照の無いrootを使っている恐れがあるので、passを見送る。期間で消す判定は、時計が戻った場合は古いと見なさない（workerの側に時計のHoldの判定は無い）。
 - **参照を外す時点。** attemptはterminalを記録するtransactionで。builderは終了時に。ウォームアップは完了時に。templateは、templateが消えたときに（templateは自分のpinと放置の規則で消える。第8章）。受け皿: builderの参照は、builderのlockを取れたら外す。ウォームアップの参照は、agentの起動の番号が今と違えば外す。
 - **削除。** 1つのtransactionで、参照が無いことと下の条件を確かめ、状態を `evicting` にする（これがclaimである）。その後、`install.lock` を取り、22.2の手順（`toolchains` の中のtrashへrenameしてから消す）で消し、最後に行を消す。`evicting` の行は、起動時に続きを行う。
 - **対象。** 参照が無く、14日使われなかったroot。合計が20 GiBを超えたら、参照の無いものを、最後に使った時刻の古い順に消す（数値はsetup templateと同じ。読み手はどちらも「次の実行を速くするcache」）。
@@ -2458,7 +2461,9 @@ attemptに属さないworkerのevent（起動、identity、GCの記録）は、`
 
 **`install.lock`（25.1の (A)）。** 開く経路は3つである。(1) そのrootへ導入するsetup builder（導入の入口 `adapters::install_admitted` を呼ぶ `src/setup/builder.rs` と `src/setup/builder/probe.rs`）。(2) builderが起動する導入のhelper process（`src/toolchain/preparation.rs` の `helper_main`。builderがnodeとして起動し（`src/setup/builder.rs`）、helperが `install_admitted` を呼ぶ。CLIは呼ばない）。(3) workerの起動時のtrashの片付け（`adapters::sweep_trash`。agentが `agent.lock` の下で行う）。
 
-helperはbuilderとは別のprocessである。builderがSIGKILLで終わると、builderのlockは空くが、builderが起動したprocessは残り得る。したがって、「builderのlockを取れた」は、helperが居ないことの証明にならない。**builderの参照を外してよいのは、builderのlockを取れ、かつ、builderのprocess groupと、builderが起動したprocess（helperを含む）のprocess groupに、processが残っていないときである。** groupは、builderのdirectoryの起動の記録（pid・process group・開始identity）から読む。残っていれば、参照は残し、次のtickで確かめ直す。この確認は新しい要求である（helperがどのprocess groupで起動されるか、今のbuilderの片付けがその終了まで確かめているかは、コードから確認できていない。段階4の実装が最初に確かめ、無ければ足す。25.16）。
+helperはbuilderとは別のprocessである。builderがSIGKILLで終わると、builderのlockは空くが、builderが起動したprocessは残り得る。したがって、「builderのlockを取れた」は、helperが居ないことの証明にならない。**builderの参照を外してよいのは、builderのlockを取れ、かつ、builderのprocess groupと、builderが起動したprocess（helperを含む）のprocess groupに、processが残っていないときである。** groupは、builderのdirectoryの起動の記録（pid・process group・開始identity）から読む。残っていれば、参照は残し、次のtickで確かめ直す。
+
+**確かめた結果（段階4）。** builderは自分のsupervisorを `setsid` で別のsessionに起動し（`src/supervisor/process.rs` の `spawn_detached`）、helperはそのsupervisorのnodeとして、supervisorが記録するprocess groupで動く（builderのdirectoryの `worker.db` の起動の記録）。builderのdirectoryが消えるのは、supervisorが `SETTLED`（起動したものの停止を確かめた）で終わったときか、supervisorのlockを取ったうえで、supervisorの回復（`settle_in_process`。記録したgroupを止め、確かめられなければ `unresolved`）が済んだときだけで、確かめられなければdirectoryを残し（`leftover`）、`reap` と次の起動の `settle_old` がやり直す。したがって、新しい確認は足さず、**builderの参照は、builderのdirectoryがある間残す**: directoryが消えたら外す（`run_tool_builder` の最後と、tickの受け皿）。
 
 削除の時点で、参照の表にbuilderが無く（したがって、そのhelperのgroupも無い）、古い版のbuilderとそのhelperも居ない（上）。削除を行うのは今のagentで、(3) と同時には動かない。したがって、開くprocessは残っていない。lockはrootと一緒に消える。
 
@@ -2579,10 +2584,10 @@ helperはbuilderとは別のprocessである。builderがSIGKILLで終わると�
 | 取り込みの作業領域・socketの準備 | `sources/tmp/`、`.s*/` | 書いた処理だけ | 正常終了で消える。crashで残るものは、workerの起動（`agent.lock` の下）が、名前かmarkerで所有を証明できたものだけ消す | 25.4の (a) | 1 | `agent.lock` と持ち主 |
 | setup template | `setup/templates/<key>/` と、最後に使った時刻のstamp `<key>.used` | setupの適用 | 20 GiB、14日、run scopeは1時間。stampは、templateの無いものを片付けのときに消す | 同じ | 既存 | copy中でないこと、pin |
 | setup builder | `setup/builders/<id>/` | そのbuilder | 終了時と起動時に消す | 同じ | 既存 | 持ち主のprocessが居ないこと |
-| toolchainのroot | `toolchains/<identity>/`（`install.lock`・`receipt.json` を含む） | attempt、setup、導入のhelper | 消さない | 14日、20 GiB。参照が無いとき。段階4より前のrootは、最初の起動で行を得る | 4 | 25.7の (b) |
+| toolchainのroot | `toolchains/<identity>/`（`install.lock`・`receipt.json` を含む） | attempt、setup、導入のhelper | 参照の無いものを、14日使われないか合計20 GiBを超えたら消す（段階4） | 14日、20 GiB。参照が無いとき。段階4より前のrootは、最初の起動で行を得る | 4 | 25.7の (b) |
 | toolchainのtrash | `toolchains/.trash-*` | なし | 次の導入と起動時に消す | 同じ | 既存 | 22.2 |
 | FrozenPlan | `ci-plans/<digest>` | CI task | 名指すattemptが無くなって `retention_days` 日 | 同じ | 既存 | 名指すattemptが無いこと |
-| toolのlink | `tool-bin/<digest>/` | hookとcommand | 消さない | 指す先のbinaryと一緒 | 4 | 25.7の (a) |
+| toolのlink | `tool-bin/<digest>/` | hookとcommand | 指す先の版が消えたら消す（段階4） | 指す先のbinaryと一緒 | 4 | 25.7の (a) |
 | 更新の試用 | `upgrade/`、`<config>/bin/<digest>/worker.db.saved` | rollback | 試用の間 | 同じ | 既存 | commitの記録 |
 | 一時workerのmarkerとlock | `ephemeral.json`（書く途中は `ephemeral.json.part`）、`ephemeral.lock` | 次の一時workerの起動 | 一時workerがstateを作るときに、lockを作って共有で持ってからmarkerを書き、lockを子のprocessへ継承させる。stateと一緒に消える（正常終了、または次の一時workerの起動。どちらもdirectoryのflockの下で、markerを最後に消す）。作成の途中でkillされてmarkerが無いまま残った `ephemeral.lock` と `ephemeral.json.part` も、次の一時workerの起動が、その2つしか無いことをlockの下で確かめて消す。stateの中にmountされた別のfilesystemには入らず、その親とmarkerを残す（外れた後の起動が消す） | stateと一緒 | 1 | 25.4の (d) |
 | 外したメンバー（workerだけのhost） | `removed-members.json` | 接続の拒否 | 1個。coordinator DBが無いhostでは正 | 同じ | 既存 | 利用者の操作 |
@@ -2605,7 +2610,7 @@ task-traffic-controllerの台帳と履歴の置き場は、製品では単独CLI
 
 | もの | path | 読み手 | 今の挙動 | 規則 | 段階 | 証明 |
 | - | - | - | - | - | - | - |
-| beltのbinary | `bin/<digest>/belt`、link `bin/current`・`bin/resident` | serviceの入口、supervisor、builder、番人 | 版ごとに1つ増え、消さない | 名指すものが無い版を消す | 4 | 25.7の (a) |
+| beltのbinary | `bin/<digest>/belt`、link `bin/current`・`bin/resident` | serviceの入口、supervisor、builder、番人 | 名指すものの無い版を、commitとresident・workerの起動で消す（段階4） | 名指すものが無い版を消す | 4 | 25.7の (a) |
 | 切替の途中のlink | `bin/.resident.<pid>`、`bin/.current.<pid>` | 切替の処理 | 名前が所有を証明し、`upgrade`・`init` の開始とresident・workerの起動が、持ち主の居ないものを消す | 25.4の (a) の名前にする | 1 | 持ち主のprocessが居ないこと |
 | 設定と鍵 | `profiles.toml`、`cluster.key`、`worker-cluster.key`、次の鍵、ユーザー設定 | 起動 | 各1個。鍵の一時fileは、名前が所有を証明するので持ち主が居なければ次の起動で消す（古い名前は600秒） | 同じ | 既存 | 各操作の規則 |
 | 設定とjournalの一時file | config directoryの中の `.belt-tmp.*` | 書いたcommandだけ | 正常終了で消える。crashで残るものは、各commandの開始が名前で所有を証明できたものだけ消す | 25.4の (a) | 1 | 持ち主のprocessが居ないこと |
@@ -2688,7 +2693,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | 第13章 | resultなしで確定したattemptに後からresultが保存された場合の検出（`ack_collected` の `CONFLICT`、digestを照合した読み取りの後の保存の拒否） | 変えない | 成功した回収のACKは変わらない。`release_attempt` はdigestを運ばないが、resultを持たないattemptへは、supervisorのlockを取れたときだけ受理する |
 | （他の章に記述は無い。段階1より前の実装は、行の無いrun IDへのcancelを受理して記録した） | なし | 1（入れてある） | 持ち主の行が `capturing` の取り込みのrunへのcancelだけを受理し、ほかは `NOT_FOUND`（持ち主の行を読めなかったときは、送り直しを求める答え。25.4の (b)） |
 | 第15章 | 退役したidentityはtombstoneを永続保持する | 未決 | 25.16 |
-| 第15章 | バイナリはversion別directoryへ配置する | 4 | 名指すものの無い版を消す |
+| 第15章 | バイナリはversion別directoryへ配置する（名指すものの無い版は、commitと起動で消す。段階4で実装した） | 4（実装済み） | 25.7の (a) |
 | 第15章 | 残ったstateは、次の一時workerが、使われていないことを証明できたときだけ消して起動する（「起動し直し」。段階1で書き足した。それより前は記述が無く、実装はstateが残っていると起動を断っていた） | 1（実装済み） | 25.4の (d) |
 | 第23章 | reader-pinsのinodeはparent stateとともに保持し、unlinkしない | 2 | runの刈り取りの最後にunlinkする |
 | 第23章 | sourceのrun fence、完了したclaim、`vault_delete_claim`、root・graph・objectの索引は恒久に残す | 2 | runの刈り取りで消す。runの行が無いことが、fenceの代わりに断る（fenceを確かめる経路は、runの行があるときにだけ到達する） |
@@ -2734,7 +2739,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 - **親のGit領域とcloneのref**（`refs/local-ci/snapshots/*`・`refs/local-ci/index/*`・`refs/local-ci/heads/*`）。beltは、local-ciのGit領域の中を自分で書き換えない。取り込みがstoreへ入れるobjectとmanifestは、scratch directoryと予約で数えるようになった（25.4の (b)）が、Git領域のobjectとrefは、今もlocal-ciが取り込みの途中で直接書く。途中で終わった取り込み・入力が動いてやり直した取り込みが書いた分も、この項目に含まれる。閉じるには、local-ciのライブラリに次の関数が要る: (1) store（またはclone）とsource IDの集合を受け取り、「残すsource」以外のsnapshotとindexのrefを消す。(2) `heads/*`（履歴の取り込みに使う）について、残すsourceのどれからも要らなくなったものを消す。どれが要るかはlocal-ciだけが知っている。(3) 消したrefの数を返し、進行中の取り込みと競合しない（local-ci自身のlockの下で行う）。beltは、刈り取りの段4と、段階5bのsourceの削除から、残すsourceの集合を渡してこの関数を呼ぶ。この関数が無い間、refと、それが指すGit objectは残る。
 - **段階5b**（workerが受け取ったsourceとclone）。25.9の「決まっていないこと」の9つ（8は、製品の呼び出し元が無いことを確かめたので、今増えるものは無い）。
 - **retireを確認したattemptのworkerの写し。** 親がretireを確認したattemptは、親がその結果を読まない。workerが受理していたものは、今は `ack_wait`（7日）か、runの刈り取りの `release_attempt` まで、workerに写しが残る。確認の時点で `release_attempt` を送れば、その場で消せる。閉じるには、(1) 親が、retireを確認した後に、そのattemptのsubmitを送り直さないこと（25.6の (c) の証明は「terminalの記録の後は送らない」に依っており、retire済みのattemptは親の側でterminalにならない）、(2) workerの側で、retireを確認したattemptがterminalになっていること（`release_attempt` はterminalのattemptだけ受理する）、を実装で確かめる必要がある。
-- **導入のhelperが残っていないことの確認**（25.7の (b)）。規則は書いたが、helperがどのprocess groupで起動されるか、今のbuilderの片付けがその終了を確かめているかは確認していない。段階4の実装の最初に確かめる。
+- **導入のhelperが残っていないことの確認**（25.7の (b)）。段階4で確かめて閉じた: helperはbuilderのsupervisorのnodeで、builderのdirectoryは、その停止を確かめた後にだけ消える（25.7の (b) の「確かめた結果」）。
 - **組み込んだライブラリの自動保持**（task-traffic-controller、fast-worktree、portool）。それぞれの版の採用のときに、beltが呼ぶ関数を25.10の表に書く。
 - **予約をしない以前の版が残した、名指すものの無いobjectとmanifest。** local-ci 0.19.0を採用する前の版は、objectとmanifestを、memberとして登録する前にstoreへ直接書いた。その版の取り込みが途中で終わるか、入力が動いてやり直すと、どのrootのmemberでもないfileが残った。この版からは増えない（25.4の (b)）。既に在る分は、同じ内容を後の取り込みが予約したときにだけ索引に入り、ほかは残る。閉じるには、索引に行の無いfileを `sources/objects/` の全走査で探す処理と、その間に進行中の取り込みが無いこと（sourceの排他lock）の下で消す規則が要る。
 - **他のrootが持つ、内容の違うobjectとmanifest。** 取り込みを止めた宛先のfileを、他のrootがmemberに持つときは、内容が違っても消さない（25.4の (b)）。放棄の処理は数える（`corrupt_held`）だけで、そのfileを持つrootの内容が欠けたまま残る。閉じるには、そのrootのrunを失敗として扱うか、fileを正しい内容で置き換える規則が要る。
