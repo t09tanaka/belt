@@ -162,7 +162,8 @@ impl Index {
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
             self.ensure_capture_owner_table(&mut db)?;
-            return self.ensure_import_session_index(&db);
+            self.ensure_import_session_index(&db)?;
+            return Self::ensure_size_accounting(&mut db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
@@ -192,7 +193,289 @@ impl Index {
         tx.execute_batch(capture_owner::TABLE)?;
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
+        Self::ensure_size_accounting(&mut db)
+    }
+    /// Stage 5b (spec 25.13): `object.bytes` with its total `store_bytes`,
+    /// `root.used_ms` and its index, the index `graph(source, root)` and the
+    /// table `clone_ref`. Additive, so the version stays 1 (an older binary
+    /// still opens the index). The rows that were there before are filled
+    /// by the worker's passes: `bytes_fill` and `clone_ref_fill` hold their
+    /// cursors (`done` at the end).
+    fn ensure_size_accounting(db: &mut Connection) -> Result<()> {
+        let present: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // (a concurrent opener may have done it between the check and the
+        // write lock)
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('object') WHERE name='bytes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(
+                "ALTER TABLE object ADD COLUMN bytes INTEGER;
+                 ALTER TABLE root ADD COLUMN used_ms INTEGER;
+                 CREATE INDEX IF NOT EXISTS root_used ON root(kind,used_ms);
+                 CREATE INDEX IF NOT EXISTS graph_source ON graph(source,root);
+                 CREATE TABLE IF NOT EXISTS clone_ref(clone TEXT NOT NULL,source TEXT NOT NULL,root TEXT NOT NULL,PRIMARY KEY(clone,source,root));
+                 CREATE INDEX IF NOT EXISTS clone_ref_root ON clone_ref(root);
+                 INSERT OR IGNORE INTO meta VALUES('store_bytes','0');
+                 INSERT OR IGNORE INTO meta VALUES('bytes_fill','');
+                 INSERT OR IGNORE INTO meta VALUES('clone_ref_fill','');",
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+    /// Record that `object`'s file is placed with `bytes` bytes: only the
+    /// change from empty to a value adds to `store_bytes` (spec 25.8 5b (c)).
+    pub(super) fn record_bytes(c: &Connection, object: &str, bytes: u64) -> Result<()> {
+        let changed = c.execute(
+            "UPDATE object SET bytes=?2 WHERE id=?1 AND bytes IS NULL",
+            params![object, bytes as i64],
+        )?;
+        if changed == 1 {
+            Self::add_store_bytes(c, bytes as i64)?;
+        }
+        Ok(())
+    }
+    fn add_store_bytes(c: &Connection, delta: i64) -> Result<()> {
+        c.execute(
+            "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+?1 AS TEXT) WHERE key='store_bytes'",
+            [delta],
+        )?;
+        Ok(())
+    }
+    /// Delete `object`'s row when `condition` (SQL over `?1`) holds, taking
+    /// its counted bytes off `store_bytes` in the same transaction.
+    pub(super) fn forget_object(c: &Connection, object: &str, condition: &str) -> Result<()> {
+        let bytes: Option<Option<i64>> = c
+            .query_row(
+                &format!("DELETE FROM object WHERE id=?1 AND {condition} RETURNING bytes"),
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(Some(bytes)) = bytes {
+            Self::add_store_bytes(c, -bytes)?;
+        }
+        Ok(())
+    }
+    /// The size of `path` (relative to the store) when it is a regular file
+    /// there, from a stat at registration; anything else stays uncounted.
+    fn stat_bytes(&self, path: &str) -> Option<u64> {
+        let st =
+            rustix::fs::statat(&*self.root, path, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+        (rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile)
+            .then_some(st.st_size as u64)
+    }
+    fn record_stat(&self, c: &Connection, object: &str, path: &str) -> Result<()> {
+        if let Some(bytes) = self.stat_bytes(path) {
+            Self::record_bytes(c, object, bytes)?;
+        }
+        Ok(())
+    }
+    /// The import placed `object`'s file with `bytes` bytes.
+    pub(crate) fn placed(&self, object: &str, bytes: u64) -> Result<()> {
+        Self::record_bytes(&self.connect_for_import()?, object, bytes)
+    }
+    /// One page of the fill of the rows made before stage 5b (spec 25.8 5b
+    /// (c), 25.13): up to `limit` object rows, in id order from the cursor
+    /// `meta.bytes_fill`, are stat-ed and counted; a row with no file stays
+    /// empty and is counted when its file is placed. The fill is finished
+    /// (`done`) when the cursor reaches the end, not when no row is empty.
+    /// Returns `true` once it is finished.
+    pub(crate) fn fill_bytes(&self, limit: u32) -> Result<bool> {
+        let mut c = self.connect()?;
+        let Some(cursor) = Self::fill_cursor(&c, "bytes_fill")? else {
+            return Ok(true);
+        };
+        let rows: Vec<(String, String)> = {
+            let mut s = c.prepare("SELECT id,path FROM object WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let rows = s.query_map(params![cursor, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (id, path) in &rows {
+            self.record_stat(&tx, id, path)?;
+        }
+        let finished = rows.len() < limit as usize;
+        let next = if finished {
+            "done"
+        } else {
+            &rows.last().unwrap().0
+        };
+        tx.execute("UPDATE meta SET value=?1 WHERE key='bytes_fill'", [next])?;
+        tx.commit()?;
+        Ok(finished)
+    }
+    /// One page of the `clone_ref` migration (spec 25.8 5b (e)): for up to
+    /// `limit` `received` roots from the cursor `meta.clone_ref_fill`, a row
+    /// for each of the root's graph rows, in the clone of the root's
+    /// manifest's `repository_id` (where the code before 5b put the refs).
+    /// A root whose manifest cannot be read gets no rows. `true` once done.
+    pub(crate) fn fill_clone_refs(&self, limit: u32) -> Result<bool> {
+        let mut c = self.connect()?;
+        let Some(cursor) = Self::fill_cursor(&c, "clone_ref_fill")? else {
+            return Ok(true);
+        };
+        let roots: Vec<(String, String)> = {
+            let mut s = c.prepare("SELECT id,source FROM root WHERE kind='received' AND id>?1 AND source IS NOT NULL ORDER BY id LIMIT ?2")?;
+            let rows = s.query_map(params![cursor, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let manifest_limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
+        let clones: Vec<(String, Option<String>)> = roots
+            .iter()
+            .map(|(root, source)| {
+                let repository = self
+                    .load_validated(source, manifest_limit)
+                    .ok()
+                    .and_then(|v| v.manifest.repository_id.clone());
+                (root.clone(), repository)
+            })
+            .collect();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (root, repository) in &clones {
+            if let Some(repository) = repository {
+                tx.execute(
+                    "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
+                    params![root, crate::workspace::plan::clone_dir_name(repository)],
+                )?;
+            }
+        }
+        let finished = roots.len() < limit as usize;
+        let next = if finished {
+            "done"
+        } else {
+            &roots.last().unwrap().0
+        };
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key='clone_ref_fill'",
+            [next],
+        )?;
+        tx.commit()?;
+        Ok(finished)
+    }
+    fn fill_cursor(c: &Connection, key: &str) -> Result<Option<String>> {
+        let v: Option<String> = c
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?;
+        Ok(v.filter(|v| v != "done"))
+    }
+    /// One page of the registration of the manifests received before stage
+    /// 5a, which have no `m:` row (spec 25.8 5b (h)5). The first page lists
+    /// `manifests/` once into `legacy_queue` (one row per manifest there
+    /// then, without an `m:` row); each page registers up to `limit` of them
+    /// as `receive:<id>` and deletes their rows. One that cannot be
+    /// registered (its own or a child's manifest missing or invalid) leaves
+    /// its root `abandoned` with no source and no graph rows, without its
+    /// `m:` membership, and the next one goes on. Nothing is done in a store
+    /// with a parent's root. `true` once the queue is empty. The marker
+    /// `legacy_registration` is left as it is: turning it `done` opens the
+    /// gate of the deleting passes and is part of the change that brings
+    /// them.
+    pub(crate) fn register_legacy(&self, limit: u32) -> Result<bool> {
+        if !self.legacy_registration_pending()? || self.holds_parent_roots()? {
+            return Ok(true);
+        }
+        let mut c = self.connect()?;
+        let listed: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_queue')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !listed {
+            let fd = rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty());
+            let mut names = Vec::new();
+            match fd {
+                Ok(fd) => {
+                    for entry in rustix::fs::Dir::read_from(&fd)? {
+                        let entry = entry?;
+                        let Ok(name) = entry.file_name().to_str() else {
+                            continue;
+                        };
+                        if let Some(id) = name.strip_suffix(".json") {
+                            if super::classify::source_id_of_ci(id).is_some() {
+                                names.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "CREATE TABLE IF NOT EXISTS legacy_queue(name TEXT PRIMARY KEY)",
+                [],
+            )?;
+            for id in &names {
+                tx.execute(
+                    "INSERT OR IGNORE INTO legacy_queue SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM object WHERE id='m:'||?1)",
+                    [id],
+                )?;
+            }
+            tx.execute("INSERT INTO meta VALUES('legacy_queue','listed')", [])?;
+            tx.commit()?;
+        }
+        let names: Vec<String> = {
+            let mut s = c.prepare("SELECT name FROM legacy_queue ORDER BY name LIMIT ?1")?;
+            let rows = s.query_map([limit], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let manifest_limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
+        for id in &names {
+            let root = format!("receive:{id}");
+            let registered = (|| -> Result<()> {
+                if self.has_object(&format!("m:{id}"))? {
+                    return Ok(()); // (received again meanwhile)
+                }
+                let mut cache = Some(self.load_validated(id, manifest_limit)?);
+                self.pending(&root)?;
+                while !self.register_step(&root, "received", id, 32, &mut cache, manifest_limit)? {}
+                Ok(())
+            })();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if registered.is_err() {
+                tx.execute(
+                    "UPDATE root SET kind='abandoned',source=NULL WHERE id=?1 AND (source IS NULL OR kind<>'received')",
+                    [&root],
+                )?;
+                let abandoned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND kind='abandoned')",
+                    [&root],
+                    |r| r.get(0),
+                )?;
+                if abandoned {
+                    tx.execute("DELETE FROM graph WHERE root=?1", [&root])?;
+                    tx.execute(
+                        "DELETE FROM member WHERE root=?1 AND object='m:'||?2",
+                        params![root, id],
+                    )?;
+                }
+            }
+            tx.execute("DELETE FROM legacy_queue WHERE name=?1", [id])?;
+            tx.commit()?;
+        }
+        Ok(names.len() < limit as usize)
+    }
+    /// The total of the counted object files (`meta.store_bytes`).
+    pub(crate) fn store_bytes(&self) -> Result<u64> {
+        let v: Option<String> = self
+            .connect()?
+            .query_row("SELECT value FROM meta WHERE key='store_bytes'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()).unwrap_or(0))
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -646,10 +929,40 @@ impl Index {
             };
             let next=match current {Some(current)=>Some(current),None=>c.query_row("SELECT source,position FROM graph WHERE root=?1 AND done=0 ORDER BY source LIMIT 1",[root],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?))).optional()?};
             let Some((next, position)) = next else {
-                c.execute(
-                    "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
-                    params![root, id, kind],
+                if kind != "received" {
+                    c.execute(
+                        "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
+                        params![root, id, kind],
+                    )?;
+                    *cache = None;
+                    return Ok(true);
+                }
+                // A received root records when it was last used and, in the
+                // same transaction, which refs its source and the sources of
+                // its graph have in the clone of its repository (spec 25.8
+                // 5b (c), (e)).
+                let repository = match cache.as_ref() {
+                    Some(cached) if cached.manifest.source_id == id => {
+                        cached.manifest.repository_id.clone()
+                    }
+                    _ => self
+                        .load_validated(id, manifest_limit)?
+                        .manifest
+                        .repository_id
+                        .clone(),
+                };
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE root SET source=?2,kind=?3,used_ms=?4 WHERE id=?1",
+                    params![root, id, kind, crate::platform::clock::wall_ms() as i64],
                 )?;
+                if let Some(repository) = repository {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
+                        params![root, crate::workspace::plan::clone_dir_name(&repository)],
+                    )?;
+                }
+                tx.commit()?;
                 *cache = None;
                 return Ok(true);
             };
@@ -673,13 +986,14 @@ impl Index {
                 [&key],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO object VALUES(?1,?2)",
+                "INSERT OR IGNORE INTO object(id,path) VALUES(?1,?2)",
                 params![key, path],
             )?;
             tx.execute(
                 "INSERT OR IGNORE INTO member VALUES(?1,?2)",
                 params![root, key],
             )?;
+            self.record_stat(&tx, &key, &path)?;
             let total = m.object_manifest.entries.len() + m.submodules.len();
             let end = (position as usize + 32).min(total);
             for position in position as usize..end {
@@ -693,13 +1007,14 @@ impl Index {
                         [&key],
                     )?;
                     tx.execute(
-                        "INSERT OR IGNORE INTO object VALUES(?1,?2)",
+                        "INSERT OR IGNORE INTO object(id,path) VALUES(?1,?2)",
                         params![key, path],
                     )?;
                     tx.execute(
                         "INSERT OR IGNORE INTO member VALUES(?1,?2)",
                         params![root, key],
                     )?;
+                    self.record_stat(&tx, &key, &path)?;
                 } else if let Some(child) =
                     &m.submodules[position - m.object_manifest.entries.len()].source_id
                 {
@@ -787,7 +1102,7 @@ impl Index {
             [&key],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO object VALUES(?1,?2)",
+            "INSERT OR IGNORE INTO object(id,path) VALUES(?1,?2)",
             params![key, format!("objects/{}/{hash}", &hash[..2])],
         )?;
         tx.execute(
@@ -2831,7 +3146,7 @@ mod tests {
         let c = f.store.retention.connect().unwrap();
         for root in ["producer", "destination"] {
             c.execute(
-                "INSERT INTO root VALUES(?1,'pending','src-00000000000000000000000000000000')",
+                "INSERT INTO root(id,kind,source) VALUES(?1,'pending','src-00000000000000000000000000000000')",
                 [root],
             )
             .unwrap();
@@ -2915,7 +3230,7 @@ mod tests {
             }
         }
         let c = f.store.retention.connect().unwrap();
-        c.execute("INSERT INTO root VALUES('published','received','src-00000000000000000000000000000000')",[]).unwrap();
+        c.execute("INSERT INTO root(id,kind,source) VALUES('published','received','src-00000000000000000000000000000000')",[]).unwrap();
         c.execute(
             "INSERT INTO member SELECT 'published',object FROM member WHERE root=?1 AND object<>?2",
             params![a.root(), format!("b:{:064x}", 64)],
@@ -4092,6 +4407,188 @@ mod tests {
             )
             .optional()
             .unwrap()
+    }
+    /// The sum of the sizes of the object files the index has a row for.
+    fn files_on_disk(store: &SourceStore) -> u64 {
+        let c = store.retention.connect().unwrap();
+        let mut s = c.prepare("SELECT path FROM object").unwrap();
+        let paths: Vec<String> = s
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        paths
+            .iter()
+            .filter_map(|p| std::fs::symlink_metadata(store.root().join(p)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+    #[test]
+    fn store_bytes_counts_each_placed_file_once_and_drops_it_with_the_file() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        // (g)13: the import counts the blob once it is placed, registration
+        // counts the manifest from a stat, and a second publication of the
+        // same source adds nothing (only the change from empty counts)
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        assert_eq!(receiver.store_bytes().unwrap(), want.size);
+        receiver.publish_received(&m, None).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let total = receiver.store_bytes().unwrap();
+        assert!(total > want.size);
+        assert_eq!(total, files_on_disk(&receiver));
+        // a failed receipt's own blob goes with its token's release, and
+        // its bytes with it (the gate is open once registration is done)
+        let other = SourceStore::open(&f._root.path().join("other")).unwrap();
+        other
+            .retention
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+                [],
+            )
+            .unwrap();
+        let token = other.begin_import().unwrap();
+        other
+            .ingest_blob_with_token(&token, &want, &mut &bytes[..])
+            .unwrap();
+        assert_eq!(other.store_bytes().unwrap(), want.size);
+        other
+            .release_import(SourceStore::import_token_id(&token))
+            .unwrap();
+        assert!(!other
+            .root()
+            .join(format!("objects/{}/{}", &want.hash[..2], want.hash))
+            .exists());
+        assert_eq!(other.store_bytes().unwrap(), 0);
+        assert_eq!(files_on_disk(&other), 0);
+    }
+    #[test]
+    fn the_bytes_fill_counts_rows_made_before_it_and_skips_missing_files() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        let expected = receiver.store_bytes().unwrap();
+        // as the migration leaves an index made before 5b, plus a row whose
+        // file was never placed
+        let c = receiver.retention.connect().unwrap();
+        c.execute_batch(
+            "UPDATE object SET bytes=NULL; UPDATE meta SET value='0' WHERE key='store_bytes';
+             UPDATE meta SET value='' WHERE key='bytes_fill';
+             INSERT INTO object(id,path) VALUES('b:0000','objects/00/0000');",
+        )
+        .unwrap();
+        assert!(!receiver.retention.fill_bytes(1).unwrap());
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(receiver.store_bytes().unwrap(), expected);
+        let missing: Option<i64> = c
+            .query_row("SELECT bytes FROM object WHERE id='b:0000'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(missing, None);
+        // done: a later page reads nothing
+        assert!(receiver.retention.fill_bytes(1000).unwrap());
+        assert_eq!(receiver.store_bytes().unwrap(), expected);
+    }
+    #[test]
+    fn publication_records_used_time_and_the_clone_refs_of_its_graph() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let before = crate::platform::clock::wall_ms() as i64;
+        receiver.publish_received(&m, None).unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let used: Option<i64> = c
+            .query_row(
+                "SELECT used_ms FROM root WHERE id='receive:'||?1",
+                [&m.source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(used.unwrap() >= before);
+        let refs = |c: &Connection| -> Vec<(String, String)> {
+            let mut s = c
+                .prepare(
+                    "SELECT clone,source FROM clone_ref WHERE root='receive:'||?1 ORDER BY source",
+                )
+                .unwrap();
+            s.query_map([&m.source_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let expected: Vec<(String, String)> = m
+            .repository_id
+            .iter()
+            .map(|r| {
+                (
+                    crate::workspace::plan::clone_dir_name(r),
+                    m.source_id.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(refs(&c), expected);
+        // the migration fills the same rows for a root made before 5b
+        c.execute_batch(
+            "DELETE FROM clone_ref; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        assert!(receiver.retention.fill_clone_refs(32).unwrap());
+        assert_eq!(refs(&c), expected);
+    }
+    #[test]
+    fn legacy_manifests_are_registered_from_the_queue_and_unregistrable_ones_abandoned() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        // (h)5: a manifest received before 5a (a file and no `m:` row) and
+        // one whose blob is not readable as a manifest
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let broken = "src-00000000000000000000000000000001";
+        std::fs::write(path.with_file_name(format!("{broken}.json")), b"{").unwrap();
+        assert!(receiver.retention.register_legacy(32).unwrap());
+        let c = receiver.retention.connect().unwrap();
+        let root = |id: &str| -> Option<(String, Option<String>)> {
+            c.query_row(
+                "SELECT kind,source FROM root WHERE id='receive:'||?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(root(&id), Some(("received".into(), Some(id.clone()))));
+        assert!(receiver.retention.has_object(&format!("m:{id}")).unwrap());
+        assert_eq!(root(broken), None);
+        let queued: i64 = c
+            .query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        // the marker that opens deletion is not turned here
+        assert!(receiver.retention.legacy_registration_pending().unwrap());
+        // a store with a parent's root is left as it is (g)35
+        let parent = SourceStore::open(&f._root.path().join("parent")).unwrap();
+        let pc = parent.retention.connect().unwrap();
+        pc.execute(
+            "INSERT INTO root(id,kind,source) VALUES('run:x','run','s')",
+            [],
+        )
+        .unwrap();
+        assert!(parent.retention.register_legacy(32).unwrap());
+        let listed: bool = pc
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_queue')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!listed);
     }
     #[test]
     fn refused_publication_leaves_no_empty_receive_root() {

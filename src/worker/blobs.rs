@@ -1962,6 +1962,11 @@ impl BlobSink for Incoming {
         // What a dropped or finished source's token still holds (spec 25.8,
         // 3): a pass that waits for no lock.
         let _ = self.store.release_abandoned_imports();
+        // The stage 5b fills of the rows made before it, and the claim rows
+        // an older version kept, a bounded page each per tick (spec 25.8 5b
+        // (c), (e), (h)3, (h)5): rows left from before need no restart.
+        let _ = self.store.fill_retention_pages();
+        let _ = self.store.forget_completed_claims();
     }
 
     fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {

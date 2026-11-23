@@ -1328,8 +1328,11 @@ fn a_file_only_another_reservation_holds_is_kept() {
         .unwrap();
     let other = "capture:01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let c = parts.sources.retention.connect().unwrap();
-    c.execute("INSERT INTO root VALUES(?1,'abandoned',NULL)", [other])
-        .unwrap();
+    c.execute(
+        "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',NULL)",
+        [other],
+    )
+    .unwrap();
     c.execute("INSERT INTO member VALUES(?1,?2)", [other, key.as_str()])
         .unwrap();
     let report = parts.passes();

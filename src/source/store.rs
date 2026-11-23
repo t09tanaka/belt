@@ -673,6 +673,8 @@ impl SourceStore {
         if stored != want.hash {
             bail!("the store named {stored}, not {}", want.hash);
         }
+        // the file is placed: count it (spec 25.8 5b (c))
+        self.retention.placed(&format!("b:{}", want.hash), n)?;
         Ok(())
     }
 
@@ -791,6 +793,22 @@ impl SourceStore {
         let _held = self.mutation_guard()?;
         let gone = self.retention.forget_completed_claims(1000, CLAIM_PAGES)?;
         Ok(gone < 1000 * u64::from(CLAIM_PAGES))
+    }
+    /// The worker's periodic pages of the stage 5b fills (spec 25.8 5b (c),
+    /// (e), (h)5), under the shared lock taken without waiting (a busy store
+    /// leaves them for the next tick): 1,000 object rows of `bytes`, 32
+    /// roots of `clone_ref`, 32 manifests of the legacy registration.
+    /// Returns whether all three are finished.
+    pub fn fill_retention_pages(&self) -> Result<bool> {
+        let _held = self.mutation_guard()?;
+        let bytes = self.retention.fill_bytes(1000)?;
+        let refs = self.retention.fill_clone_refs(32)?;
+        let legacy = self.retention.register_legacy(32)?;
+        Ok(bytes && refs && legacy)
+    }
+    /// The total of the counted object files (spec 25.8 5b (c)).
+    pub fn store_bytes(&self) -> Result<u64> {
+        self.retention.store_bytes()
     }
     /// At the worker's start, under `agent.lock` and before anything is
     /// received (spec 25.8 5b (h)1 (ii)): the `receive:%` roots with no
