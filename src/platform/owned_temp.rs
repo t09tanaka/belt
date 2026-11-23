@@ -4,11 +4,12 @@
 //! killed, or that exits while another thread still holds a guard, runs no
 //! destructor. So the directory also records who made it: a marker file with
 //! the boot, the PID and the start identity of the owning process, and the
-//! host and PID namespace in which those three mean anything. A later process
-//! may remove such a directory only when that record proves the owner is
-//! gone, and only a process on the same host and in the same PID namespace
-//! can prove that: the parent directory may be shared between hosts or
-//! containers. Every doubt keeps the directory. A directory without a
+//! machine and PID namespace in which those three mean anything. A later
+//! process may remove such a directory only when that record proves the owner
+//! is gone, and only a process on the same machine and in the same PID
+//! namespace can prove that: the parent directory may be shared between hosts
+//! or containers. The machine is its identity (the host UUID of macOS, the
+//! machine ID of Linux), never its name: two hosts may have the same name. Every doubt keeps the directory. A directory without a
 //! readable marker is never touched, and no process is ever signalled here.
 
 use super::{boot_id, process_start_identity, StartIdentity};
@@ -20,17 +21,22 @@ use std::path::{Path, PathBuf};
 const MARKER: &str = "owner";
 const INSIDE: &str = "d";
 const MAX_MARKER_BYTES: u64 = 1024;
+/// What the line of a marker that names the machine starts with. A marker of
+/// an earlier version has the host name there, which says nothing about the
+/// machine: such a marker is not a record.
+const MACHINE_LINE: &str = "machine:";
 /// How much later than the recorded start (in seconds) the process that has
 /// the PID now must have started on macOS to count as another process. The
 /// start is wall-clock time there, so a small difference proves nothing.
 const MAC_CLEARLY_LATER_SECS: u64 = 2;
 
 /// Where a PID, a start identity and a boot ID can be compared: the same
-/// facts read on another host, or in another PID namespace, say nothing about
-/// the processes here.
+/// facts read on another machine, or in another PID namespace, say nothing
+/// about the processes here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Place {
-    host: String,
+    /// [`machine_id`]: 32 lowercase hex digits.
+    machine: String,
     /// Linux: the inode of `/proc/self/ns/pid`. macOS has no PID namespaces.
     pid_ns: String,
     boot: String,
@@ -41,7 +47,7 @@ impl Place {
     /// and nothing is swept.
     fn here() -> Option<Place> {
         Some(Place {
-            host: hostname()?,
+            machine: machine_id()?,
             pid_ns: pid_namespace()?,
             boot: boot_id()?,
         })
@@ -53,16 +59,46 @@ fn one_line(s: &str) -> Option<&str> {
     (!s.is_empty() && !s.contains(['\n', '\r'])).then_some(s)
 }
 
-fn hostname() -> Option<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is valid for `buf.len()` bytes.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return None;
+/// A machine identity as it is recorded: 32 hex digits (dashes of a UUID
+/// and the case are dropped), not all zero. Anything else is not one.
+fn machine_of(text: &str) -> Option<String> {
+    let hex: String = text
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (is_hex(&hex, 32) && hex.bytes().any(|b| b != b'0')).then_some(hex)
+}
+
+/// The identity of this machine, which a host name is not: two hosts that
+/// share a directory (a home on NFS) may have the same name, and then one
+/// would take the other's live files for those of an earlier boot of its
+/// own. macOS: the host UUID. Linux: the machine ID (`/etc/machine-id`, else
+/// the one of D-Bus). `None` when the system has none that can be read: then
+/// this process records nothing and proves nothing.
+fn machine_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = [0u8; 16];
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: `id` is a writable buffer of the 16 bytes of a UUID and
+        // `timeout` is a valid timespec.
+        let rc = unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) };
+        (rc == 0).then(|| machine_of(&hex_of(&id))).flatten()
     }
-    // Without a NUL the name may have been cut short: not known.
-    let len = buf.iter().position(|b| *b == 0)?;
-    one_line(std::str::from_utf8(&buf[..len]).ok()?).map(str::to_string)
+    #[cfg(target_os = "linux")]
+    {
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+            .iter()
+            .find_map(|path| machine_of(fs::read_to_string(path).ok()?.trim()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn pid_namespace() -> Option<String> {
@@ -92,8 +128,15 @@ struct Owner {
 impl Owner {
     /// The last newline is what says the record is complete.
     fn marker_text(&self) -> String {
-        let Place { host, pid_ns, boot } = &self.place;
-        format!("{boot}\n{}\n{}\n{host}\n{pid_ns}\n", self.pid, self.start)
+        let Place {
+            machine,
+            pid_ns,
+            boot,
+        } = &self.place;
+        format!(
+            "{boot}\n{}\n{}\n{MACHINE_LINE}{machine}\n{pid_ns}\n",
+            self.pid, self.start
+        )
     }
 }
 
@@ -224,13 +267,55 @@ pub fn remove_if_owner_gone(dir: &Path) -> bool {
     fs::remove_dir_all(dir).is_ok()
 }
 
+fn effective_uid() -> u32 {
+    // SAFETY: plain syscall without arguments, which cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// What `lstat` says about an entry, as far as a sweep asks: the link itself,
+/// never what it points to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    directory: bool,
+    regular: bool,
+    symlink: bool,
+    links: u64,
+    uid: u32,
+}
+
+impl Seen {
+    fn of(meta: &fs::Metadata) -> Seen {
+        Seen {
+            directory: meta.is_dir(),
+            regular: meta.is_file(),
+            symlink: meta.file_type().is_symlink(),
+            links: meta.nlink(),
+            uid: meta.uid(),
+        }
+    }
+
+    /// A real directory of the user `euid`. Another user's is never touched,
+    /// whatever its marker or name says: that user's processes are not ours
+    /// to judge.
+    fn is_own_directory(&self, euid: u32) -> bool {
+        self.directory && self.uid == euid
+    }
+
+    /// A regular file of the user `euid` with one link, or a link of that
+    /// user (a switch in progress: removed itself, never followed). A file
+    /// with a second link has a name elsewhere that somebody may still use.
+    fn is_own_file(&self, euid: u32) -> bool {
+        ((self.regular && self.links == 1) || self.symlink) && self.uid == euid
+    }
+}
+
 /// True only with proof: a real directory of this user, a complete marker,
 /// and [`proven_gone`]. Every "cannot tell" is false.
 fn owner_is_gone(dir: &Path, here: Option<&Place>) -> bool {
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return false;
     };
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+    if !Seen::of(&meta).is_own_directory(effective_uid()) {
         return false;
     }
     let (Some(owner), Some(here)) = (read_marker(&dir.join(MARKER)), here) else {
@@ -248,14 +333,14 @@ fn owner_is_gone(dir: &Path, here: Option<&Place>) -> bool {
 /// Whether `owner` is proven gone, seen from `here`, where `now` is what the
 /// system says about the process that has the owner's PID.
 ///
-/// - Another host or another PID namespace: never. The owner may be alive
+/// - Another machine or another PID namespace: never. The owner may be alive
 ///   where this process cannot see it.
-/// - The same host and namespace but another boot: gone with that boot.
+/// - The same machine and namespace but another boot: gone with that boot.
 /// - The same boot: gone when no process has the PID, or when the process
 ///   that has it started clearly later than the owner did (the PID was
 ///   reused). A start that differs in any other way is not proof.
 fn proven_gone(owner: &Owner, here: &Place, now: &StartIdentity) -> bool {
-    if owner.place.host != here.host || owner.place.pid_ns != here.pid_ns {
+    if owner.place.machine != here.machine || owner.place.pid_ns != here.pid_ns {
         return false;
     }
     if owner.place.boot != here.boot {
@@ -327,22 +412,23 @@ fn read_marker(path: &Path) -> Option<Owner> {
     parse_marker(&text)
 }
 
-/// Exactly five complete lines: boot, PID, start, host, PID namespace. A
+/// Exactly five complete lines: boot, PID, start, machine, PID namespace. A
 /// marker of the older three-line form does not say where its PID is valid,
-/// so it is not a record.
+/// and one that names a host instead of a machine does not say it either: a
+/// name is not an identity. Neither is a record.
 fn parse_marker(text: &str) -> Option<Owner> {
     let mut lines = text.strip_suffix('\n')?.split('\n');
     let boot = one_line(lines.next()?)?;
     let pid: u32 = lines.next()?.parse().ok().filter(|pid| *pid > 1)?;
     let start = one_line(lines.next()?)?;
-    let host = one_line(lines.next()?)?;
+    let machine = machine_of(lines.next()?.strip_prefix(MACHINE_LINE)?)?;
     let pid_ns = one_line(lines.next()?)?;
     if lines.next().is_some() || i32::try_from(pid).is_err() {
         return None;
     }
     Some(Owner {
         place: Place {
-            host: host.to_string(),
+            machine,
             pid_ns: pid_ns.to_string(),
             boot: boot.to_string(),
         },
@@ -355,7 +441,7 @@ fn parse_marker(text: &str) -> Option<Owner> {
 // Single temporary files: the NAME proves the owner (spec 25.4 (a)).
 //
 // `.belt-tmp.<place hash>.<boot hash>.<pid>.<start identity>.<random>`: the
-// same facts as a marker. The host and the PID namespace are folded into 16
+// same facts as a marker. The machine and the PID namespace are folded into 16
 // hex digits and the boot into 8 of its own, so that the name stays at most
 // 80 bytes, far below `NAME_MAX`, and a file left by an earlier boot of this
 // place can still be told from a file of another place.
@@ -383,13 +469,13 @@ fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The first 16 hex digits of SHA-256 over host and PID namespace, separated
-/// by NUL (which neither can contain). The boot is not part of it: see
+/// The first 16 hex digits of SHA-256 over the machine identity and the PID
+/// namespace, separated by NUL (which neither can contain). The boot is not part of it: see
 /// [`boot_hash`].
 fn place_hash(place: &Place) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(place.host.as_bytes());
+    h.update(place.machine.as_bytes());
     h.update([0]);
     h.update(place.pid_ns.as_bytes());
     hex_of(&h.finalize()[..PLACE_HASH_LEN / 2])
@@ -652,9 +738,7 @@ fn file_owner_is_gone(path: &Path, name: &str, kind: &str, here: Option<&Place>)
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
-    // A link of a switch in progress is removed itself, never followed.
-    let plain = (meta.is_file() && meta.nlink() == 1) || meta.file_type().is_symlink();
-    if !plain || meta.uid() != unsafe { libc::geteuid() } {
+    if !Seen::of(&meta).is_own_file(effective_uid()) {
         return false;
     }
     name_is_of_gone_owner(name, kind, here)
@@ -667,7 +751,7 @@ pub fn name_owner_is_gone(name: &str) -> bool {
     name_is_of_gone_owner(name, FILE_PREFIX, Place::here().as_ref())
 }
 
-/// The rule of [`proven_gone`], read from a name: another host or PID
+/// The rule of [`proven_gone`], read from a name: another machine or PID
 /// namespace (another place hash) proves nothing; the same place with
 /// another boot hash is an owner that went with that boot; in the same boot
 /// the process is looked at.
@@ -752,7 +836,7 @@ pub(crate) mod testing {
         )
     }
 
-    fn other_hex(here: &str) -> String {
+    pub(super) fn other_hex(here: &str) -> String {
         let fill = if here.starts_with('f') { "e" } else { "f" };
         fill.repeat(here.len())
     }
@@ -868,12 +952,17 @@ mod tests {
         .marker_text()
     }
 
-    fn place(host: &str, pid_ns: &str, boot: &str) -> Place {
+    fn place(machine: &str, pid_ns: &str, boot: &str) -> Place {
         Place {
-            host: host.into(),
+            machine: machine.into(),
             pid_ns: pid_ns.into(),
             boot: boot.into(),
         }
+    }
+
+    /// A machine identity that is not this machine's.
+    fn other_machine() -> String {
+        testing::other_hex(&Place::here().unwrap().machine)
     }
 
     fn owner(start: &str) -> Owner {
@@ -925,12 +1014,138 @@ mod tests {
     fn this_place_is_readable_and_fits_a_marker() {
         let here = Place::here().expect("macOS and Linux say where this is");
         assert_eq!(Place::here().as_ref(), Some(&here));
-        for field in [&here.host, &here.pid_ns, &here.boot] {
+        assert_eq!(machine_of(&here.machine).as_ref(), Some(&here.machine));
+        for field in [&here.machine, &here.pid_ns, &here.boot] {
             assert_eq!(one_line(field), Some(field.as_str()));
         }
         let text = marker(&here, std::process::id(), "mac:1.000000");
         assert!(text.len() as u64 <= MAX_MARKER_BYTES);
         assert_eq!(parse_marker(&text).unwrap().place, here);
+    }
+
+    /// The place is the machine, not its name: two hosts with one name (and,
+    /// on Linux, the PID namespace number every host starts with) that share
+    /// a directory are two places, and neither proves anything about the
+    /// other's files, whatever their boots and PIDs say.
+    #[test]
+    fn two_machines_with_one_name_are_two_places() {
+        let here = Place::here().unwrap();
+        let twin = place(&other_machine(), &here.pid_ns, "the-boot-of-the-twin");
+        assert_ne!(place_hash(&twin), place_hash(&here));
+        let (pid, start) = ended_process();
+        // a file the twin made: its PID is free here and its boot is not ours
+        let name = format!(
+            "{FILE_PREFIX}{}.{}.{pid}.{}.abcDEF123456",
+            place_hash(&twin),
+            boot_hash(&twin),
+            start_digits(&start).unwrap()
+        );
+        assert!(parse_file_name(&name).is_some());
+        assert!(!name_is_of_gone_owner(&name, FILE_PREFIX, Some(&here)));
+        let parent = parent();
+        fs::write(parent.path().join(&name), b"live on the twin").unwrap();
+        assert_eq!(
+            sweep_files(parent.path()),
+            FileSweep {
+                removed: 0,
+                kept: 1
+            }
+        );
+        // the same for a marker directory
+        let dir = parent.path().join("of-the-twin");
+        fs::create_dir(&dir).unwrap();
+        write_marker(&dir, &marker(&twin, pid, &start));
+        assert!(!owner_is_gone(&dir, Some(&here)));
+        // and a marker that names a host (an earlier version) is no record
+        write_marker(
+            &dir,
+            &marker(&here, pid, &start)
+                .replace(&format!("{MACHINE_LINE}{}", here.machine), "the-host-name"),
+        );
+        assert!(!owner_is_gone(&dir, Some(&here)));
+        write_marker(&dir, &marker(&here, pid, &start));
+        assert!(owner_is_gone(&dir, Some(&here)));
+    }
+
+    /// Another user's entry is never removed, and neither is a file with a
+    /// second link or anything that is not a plain file, a link or (for a
+    /// marker) a directory. The examination is a function of what `lstat`
+    /// said, so that the rule for another uid, whose file a test cannot make
+    /// without being root, is tested with the uid given.
+    #[test]
+    fn only_the_own_users_plain_entries_are_examined_further() {
+        let parent = parent();
+        let file = parent.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let me = effective_uid();
+        let seen = Seen::of(&fs::symlink_metadata(&file).unwrap());
+        assert_eq!(
+            seen,
+            Seen {
+                directory: false,
+                regular: true,
+                symlink: false,
+                links: 1,
+                uid: me
+            }
+        );
+        assert!(seen.is_own_file(me) && !seen.is_own_directory(me));
+        // the same file as another user's, seen by us, and ours seen by another
+        for (uid, euid) in [(me + 1, me), (me, me + 1), (0, me + 1), (me + 1, 0)] {
+            assert!(!Seen { uid, ..seen }.is_own_file(euid), "{uid} {euid}");
+        }
+        for links in [0, 2, 3] {
+            assert!(!Seen { links, ..seen }.is_own_file(me), "{links}");
+        }
+        fs::hard_link(&file, parent.path().join("second")).unwrap();
+        let linked = Seen::of(&fs::symlink_metadata(&file).unwrap());
+        assert_eq!(linked.links, 2);
+        assert!(!linked.is_own_file(me));
+        // a link is seen as the link, whatever it points to
+        let link = parent.path().join("l");
+        std::os::unix::fs::symlink(parent.path(), &link).unwrap();
+        let seen = Seen::of(&fs::symlink_metadata(&link).unwrap());
+        assert!(seen.symlink && !seen.directory && !seen.regular);
+        assert!(seen.is_own_file(me) && !seen.is_own_directory(me));
+        assert!(!Seen { uid: me + 1, ..seen }.is_own_file(me));
+        // a directory
+        let seen = Seen::of(&fs::symlink_metadata(parent.path()).unwrap());
+        assert!(seen.directory && seen.is_own_directory(me) && !seen.is_own_file(me));
+        assert!(!Seen { uid: me + 1, ..seen }.is_own_directory(me));
+        assert!(!seen.is_own_directory(me + 1));
+        // neither a file, a link nor a directory (a socket, a FIFO)
+        let other = Seen {
+            directory: false,
+            regular: false,
+            symlink: false,
+            links: 1,
+            uid: me,
+        };
+        assert!(!other.is_own_file(me) && !other.is_own_directory(me));
+    }
+
+    #[test]
+    fn a_machine_identity_is_32_hex_digits_that_are_not_all_zero() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(machine_of(id).as_deref(), Some(id));
+        // the forms a system gives: upper case, a UUID with dashes
+        assert_eq!(
+            machine_of("01234567-89AB-CDEF-0123-456789ABCDEF").as_deref(),
+            Some(id)
+        );
+        for bad in [
+            "",
+            // an image without one: empty, or the placeholder
+            "uninitialized",
+            "00000000000000000000000000000000",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef\n",
+        ] {
+            assert_eq!(machine_of(bad), None, "{bad:?}");
+        }
+        assert!(machine_of("00000000000000000000000000000001").is_some());
     }
 
     #[test]
@@ -946,7 +1161,11 @@ mod tests {
         let parent = parent();
         let live = OwnedTemp::new_in(parent.path(), "own-").unwrap();
         let here = Place::here().unwrap();
-        let Place { host, pid_ns, boot } = here.clone();
+        let Place {
+            machine,
+            pid_ns,
+            boot,
+        } = here.clone();
         let (pid, start) = ended_process();
         let me = std::process::id();
         let make = |name: &str, marker: Option<String>| {
@@ -966,14 +1185,14 @@ mod tests {
         let dead = make("own-dead", Some(full.clone()));
         let other_boot = make(
             "own-boot",
-            Some(marker(&place(&host, &pid_ns, "not-this-boot"), me, &start)),
+            Some(marker(&place(&machine, &pid_ns, "not-this-boot"), me, &start)),
         );
         // This process has the PID, and started long after the record says.
         let reused = make(
             "own-reused",
             Some(marker(&here, me, &my_start_shifted(-3600))),
         );
-        let with_pid = |pid: &str| format!("{boot}\n{pid}\n{start}\n{host}\n{pid_ns}\n");
+        let with_pid = |pid: &str| format!("{boot}\n{pid}\n{start}\n{MACHINE_LINE}{machine}\n{pid_ns}\n");
         let kept = [
             make("own-unmarked", None),
             // The form without a host and a namespace, of a dead owner.
@@ -984,21 +1203,21 @@ mod tests {
             ),
             make(
                 "own-no-ns",
-                Some(format!("{boot}\n{pid}\n{start}\n{host}\n")),
+                Some(format!("{boot}\n{pid}\n{start}\n{MACHINE_LINE}{machine}\n")),
             ),
             // The record of a dead owner from another host or namespace.
             make(
                 "own-host",
-                Some(marker(&place("not-this-host", &pid_ns, &boot), pid, &start)),
+                Some(marker(&place(&other_machine(), &pid_ns, &boot), pid, &start)),
             ),
             make(
                 "own-ns",
-                Some(marker(&place(&host, "not-this-ns", &boot), pid, &start)),
+                Some(marker(&place(&machine, "not-this-ns", &boot), pid, &start)),
             ),
             make(
                 "own-host-boot",
                 Some(marker(
-                    &place("not-this-host", &pid_ns, "not-this-boot"),
+                    &place(&other_machine(), &pid_ns, "not-this-boot"),
                     pid,
                     &start,
                 )),
@@ -1006,7 +1225,7 @@ mod tests {
             make(
                 "own-ns-boot",
                 Some(marker(
-                    &place(&host, "not-this-ns", "not-this-boot"),
+                    &place(&machine, "not-this-ns", "not-this-boot"),
                     pid,
                     &start,
                 )),
@@ -1075,8 +1294,8 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let me = std::process::id();
         write_marker(&dir, &marker(&here, me, &my_start_shifted(-3600)));
-        let other_host = place("not-this-host", &here.pid_ns, &here.boot);
-        let other_ns = place(&here.host, "not-this-ns", &here.boot);
+        let other_host = place(&other_machine(), &here.pid_ns, &here.boot);
+        let other_ns = place(&here.machine, "not-this-ns", &here.boot);
         assert!(!owner_is_gone(&dir, Some(&other_host)));
         assert!(!owner_is_gone(&dir, Some(&other_ns)));
         assert!(owner_is_gone(&dir, Some(&here)));
@@ -1175,11 +1394,11 @@ mod tests {
 
     #[test]
     fn a_marker_is_five_complete_lines() {
-        let text = "boot\n42\nmac:1.000000\nhost\nns\n";
+        let text = "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n";
         assert_eq!(
             parse_marker(text),
             Some(Owner {
-                place: place("host", "ns", "boot"),
+                place: place("0123456789abcdef0123456789abcdef", "ns", "boot"),
                 pid: 42,
                 start: "mac:1.000000".into(),
             })
@@ -1188,27 +1407,33 @@ mod tests {
         for bad in [
             // The older form, and every shorter or longer one.
             "boot\n42\nmac:1.000000\n",
-            "boot\n42\nmac:1.000000\nhost\n",
-            "boot\n42\nmac:1.000000\nhost\nns\nmore\n",
-            "boot\n42\nmac:1.000000\nhost\nns\n\n",
-            "boot\n42\nmac:1.000000\nhost\nns",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\n",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\nmore\n",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n\n",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns",
             // An empty field.
-            "\n42\nmac:1.000000\nhost\nns\n",
-            "boot\n42\n\nhost\nns\n",
+            "\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n",
+            "boot\n42\n\nmachine:0123456789abcdef0123456789abcdef\nns\n",
             "boot\n42\nmac:1.000000\n\nns\n",
-            "boot\n42\nmac:1.000000\nhost\n\n",
-            "boot\n42\nmac:1.000000\nhost\r\nns\n",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\n\n",
+            "boot\n42\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\r\nns\n",
+            // A host name where the machine belongs (an earlier version),
+            // and what is not a machine identity.
+            "boot\n42\nmac:1.000000\nhost\nns\n",
+            "boot\n42\nmac:1.000000\n0123456789abcdef0123456789abcdef\nns\n",
+            "boot\n42\nmac:1.000000\nmachine:host\nns\n",
+            "boot\n42\nmac:1.000000\nmachine:00000000000000000000000000000000\nns\n",
             // A PID that is never an owner.
-            "boot\n1\nmac:1.000000\nhost\nns\n",
-            "boot\n0\nmac:1.000000\nhost\nns\n",
-            "boot\n-1\nmac:1.000000\nhost\nns\n",
-            "boot\n2147483648\nmac:1.000000\nhost\nns\n",
+            "boot\n1\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n",
+            "boot\n0\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n",
+            "boot\n-1\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n",
+            "boot\n2147483648\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n",
             "",
         ] {
             assert_eq!(parse_marker(bad), None, "{bad:?}");
         }
-        assert!(parse_marker("boot\n2147483647\nmac:1.000000\nhost\nns\n").is_some());
-        assert!(parse_marker("boot\n2\nmac:1.000000\nhost\nns\n").is_some());
+        assert!(parse_marker("boot\n2147483647\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n").is_some());
+        assert!(parse_marker("boot\n2\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n").is_some());
     }
 
     #[test]
@@ -1316,7 +1541,7 @@ mod tests {
             (Some(&here), StartIdentity::Unknown),
             (Some(&here), StartIdentity::NoProcess),
             (Some(&here), StartIdentity::Zombie("linux:42".to_string())),
-            // no place: the host, the namespace or the boot is not readable
+            // no place: the machine, the namespace or the boot is not readable
             (None, StartIdentity::Identity("linux:42".to_string())),
         ] {
             assert_eq!(owner_part(place, &start, 77), nobody, "{start:?}");
