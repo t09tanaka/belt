@@ -447,7 +447,34 @@ fn the_event_journal_is_append_only_with_increasing_sequence() {
 #[test]
 fn events_are_numbered_per_attempt_without_holes() {
     let f = fx();
-    let (a, b) = (AttemptId::generate(), AttemptId::generate());
+    // An event names an attempt that has a row (spec 25.5): one task each,
+    // and the events their creation wrote come first.
+    let other = TaskId::generate();
+    f.store.create_task(&other, &f.run, &json!({}), 1).unwrap();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let b = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: other,
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            10,
+        )
+        .unwrap()
+        .attempt_id;
+    let made = |att: &AttemptId| {
+        f.store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|e| e.attempt_id.as_deref() == Some(att.as_str()))
+            .count() as u64
+    };
+    let (ma, mb) = (made(&a), made(&b));
     let add = |att: Option<&AttemptId>, k: &str| {
         f.store
             .append_event(Some(&f.run), att, k, &json!({"k": k}), 1)
@@ -466,8 +493,9 @@ fn events_are_numbered_per_attempt_without_holes() {
             .map(|e| e.attempt_seq.unwrap())
             .collect()
     };
-    assert_eq!(of(&a), [1, 2, 3]);
-    assert_eq!(of(&b), [1, 2]);
+    // Numbered with no hole, after the events of their creation.
+    assert_eq!(of(&a), (1..=ma + 3).collect::<Vec<_>>());
+    assert_eq!(of(&b), (1..=mb + 2).collect::<Vec<_>>());
     let none: Vec<_> = all.iter().filter(|e| e.attempt_id.is_none()).collect();
     assert!(none.iter().all(|e| e.attempt_seq.is_none()));
     // By attempt and kind, oldest first.
@@ -476,7 +504,7 @@ fn events_are_numbered_per_attempt_without_holes() {
         xs.iter()
             .map(|e| e.attempt_seq.unwrap())
             .collect::<Vec<_>>(),
-        [1, 3]
+        [ma + 1, ma + 3]
     );
     assert!(f.store.events_of(&a, "nope").unwrap().is_empty());
     // The pair is unique, and an event has an attempt_seq exactly when it has an attempt.
@@ -502,7 +530,15 @@ fn events_are_numbered_per_attempt_without_holes() {
 #[test]
 fn unseen_events_are_appended_once_per_key() {
     let f = fx();
-    let a = AttemptId::generate();
+    let a = f.attempt('a').unwrap().attempt_id;
+    // The events its creation wrote come first.
+    let made = f
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|e| e.attempt_id.as_deref() == Some(a.as_str()))
+        .count() as u64;
     let want = |keys: &[&str]| -> Vec<(String, serde_json::Value)> {
         keys.iter()
             .map(|k| (k.to_string(), json!({"stream": k})))
@@ -522,13 +558,28 @@ fn unseen_events_are_appended_once_per_key() {
         ev.iter()
             .map(|e| e.attempt_seq.unwrap())
             .collect::<Vec<_>>(),
-        [1, 2, 3]
+        [made + 1, made + 2, made + 3]
     );
     assert!(ev
         .iter()
         .all(|e| e.run_id.as_deref() == Some(f.run.as_str())));
     // Other kinds and other attempts do not count as seen.
-    let b = AttemptId::generate();
+    let other = TaskId::generate();
+    f.store.create_task(&other, &f.run, &json!({}), 1).unwrap();
+    let b = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: other,
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            10,
+        )
+        .unwrap()
+        .attempt_id;
     assert_eq!(
         f.store
             .append_events_unseen(None, &b, "t", "stream", &want(&["o"]), 6)
