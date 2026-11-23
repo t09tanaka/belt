@@ -1622,7 +1622,10 @@ async fn another_configuration_directory_leaves_the_stages_of_a_shared_state() {
     assert!(initialize(b, &mut Unknown).await.is_err());
     let theirs: Journal = serde_json::from_slice(&fs::read(&other.journal).unwrap()).unwrap();
     assert!(theirs.pending.is_none() && !owns_database(&theirs, &other));
-    assert!(stage.exists(), "another configuration took a journaled stage");
+    assert!(
+        stage.exists(),
+        "another configuration took a journaled stage"
+    );
     assert!(abandoned.exists());
     sweep_abandoned_stages(&theirs, &other);
     assert!(stage.exists() && abandoned.exists());

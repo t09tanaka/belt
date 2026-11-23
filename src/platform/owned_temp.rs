@@ -1298,11 +1298,19 @@ mod tests {
         let seen = Seen::of(&fs::symlink_metadata(&link).unwrap());
         assert!(seen.symlink && !seen.directory && !seen.regular);
         assert!(seen.is_own_file(me) && !seen.is_own_directory(me));
-        assert!(!Seen { uid: me + 1, ..seen }.is_own_file(me));
+        assert!(!Seen {
+            uid: me + 1,
+            ..seen
+        }
+        .is_own_file(me));
         // a directory
         let seen = Seen::of(&fs::symlink_metadata(parent.path()).unwrap());
         assert!(seen.directory && seen.is_own_directory(me) && !seen.is_own_file(me));
-        assert!(!Seen { uid: me + 1, ..seen }.is_own_directory(me));
+        assert!(!Seen {
+            uid: me + 1,
+            ..seen
+        }
+        .is_own_directory(me));
         assert!(!seen.is_own_directory(me + 1));
         // neither a file, a link nor a directory (a socket, a FIFO)
         let other = Seen {
@@ -1558,14 +1566,19 @@ mod tests {
         let dead = make("own-dead", Some(full.clone()));
         let other_boot = make(
             "own-boot",
-            Some(marker(&place(&machine, &pid_ns, "not-this-boot"), me, &start)),
+            Some(marker(
+                &place(&machine, &pid_ns, "not-this-boot"),
+                me,
+                &start,
+            )),
         );
         // This process has the PID, and started long after the record says.
         let reused = make(
             "own-reused",
             Some(marker(&here, me, &my_start_shifted(-3600))),
         );
-        let with_pid = |pid: &str| format!("{boot}\n{pid}\n{start}\n{MACHINE_LINE}{machine}\n{pid_ns}\n");
+        let with_pid =
+            |pid: &str| format!("{boot}\n{pid}\n{start}\n{MACHINE_LINE}{machine}\n{pid_ns}\n");
         let kept = [
             make("own-unmarked", None),
             // The form without a host and a namespace, of a dead owner.
@@ -1581,7 +1594,11 @@ mod tests {
             // The record of a dead owner from another host or namespace.
             make(
                 "own-host",
-                Some(marker(&place(&other_machine(), &pid_ns, &boot), pid, &start)),
+                Some(marker(
+                    &place(&other_machine(), &pid_ns, &boot),
+                    pid,
+                    &start,
+                )),
             ),
             make(
                 "own-ns",
@@ -1805,8 +1822,14 @@ mod tests {
         ] {
             assert_eq!(parse_marker(bad), None, "{bad:?}");
         }
-        assert!(parse_marker("boot\n2147483647\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n").is_some());
-        assert!(parse_marker("boot\n2\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n").is_some());
+        assert!(parse_marker(
+            "boot\n2147483647\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n"
+        )
+        .is_some());
+        assert!(parse_marker(
+            "boot\n2\nmac:1.000000\nmachine:0123456789abcdef0123456789abcdef\nns\n"
+        )
+        .is_some());
     }
 
     #[test]
