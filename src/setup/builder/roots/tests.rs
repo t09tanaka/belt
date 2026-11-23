@@ -208,7 +208,10 @@ fn a_removal_cut_short_is_finished_at_the_next_start() {
     let s = f.open();
     assert!(!root.exists());
     assert!(f.rows().is_empty());
-    assert_eq!(s.bind_root(&AttemptId::generate(), &plan_of(&s, A)), RootBind::Absent);
+    assert_eq!(
+        s.bind_root(&AttemptId::generate(), &plan_of(&s, A)),
+        RootBind::Absent
+    );
 }
 
 /// Spec 25.7 (b) acceptance (iv) and (vi): a builder directory with no
@@ -342,4 +345,166 @@ fn an_attempt_from_before_the_tables_holds_every_removal() {
         )
         .unwrap();
     assert_eq!(s.roots_pass(now).removed, vec![A.to_string()]);
+}
+
+/// Review M1: a worker DB that cannot be opened is not remembered as none:
+/// meanwhile nothing is bound, installed into or removed, and the next use
+/// opens it.
+#[test]
+fn a_database_that_cannot_be_opened_is_opened_again_later() {
+    let f = Fixture::new();
+    f.root(A);
+    let blocker = f.state.join("worker.db");
+    private_dir(&blocker).unwrap();
+    let cfg = SetupConfig::new(
+        f.state.clone(),
+        crate::ids::WorkerId::parse("w-roots").unwrap(),
+        "/bin/sh".into(),
+    );
+    let s = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+    assert!(s.db().is_none());
+    let a = AttemptId::generate();
+    assert_eq!(s.bind_root(&a, &plan_of(&s, A)), RootBind::NoDatabase);
+    assert!(s
+        .hold_root_for_install(&BuilderId::generate(), &plan_of(&s, A))
+        .is_err());
+    assert!(!s.add_root_refs(vec![A.into()], "builder", "b"));
+    assert_eq!(s.roots_pass(platform::wall_ms()).held, Some("no_database"));
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(s.db().is_some());
+    assert_eq!(s.bind_root(&a, &plan_of(&s, A)), RootBind::Bound);
+}
+
+/// Review M3: a removal that fails in a way waiting does not cure puts the
+/// root back (used now, so it is not picked again at once), is counted for
+/// `doctor`, and the passes go on to remove the others.
+#[test]
+fn a_removal_that_fails_puts_the_root_back_and_the_passes_go_on() {
+    let f = Fixture::new();
+    let a = f.root(A);
+    let b = f.root(B);
+    let s = f.open();
+    let now = platform::wall_ms();
+    f.used(A, now - 31 * DAY);
+    f.used(B, now - 30 * DAY);
+    // Group-writable: `unsafe_private_directory`, every time.
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(s.roots_pass(now).removed.is_empty());
+    let db = s.db().unwrap();
+    let rows = db.toolchain_roots().unwrap();
+    let row = rows.iter().find(|r| r.identity == A).unwrap();
+    assert!(!row.evicting, "back to live");
+    assert!(row.last_used_ms >= now);
+    assert_eq!(db.toolchain_status().unwrap().evict_failures, 1);
+    assert_eq!(
+        doctor_notices(&f.state, now).len(),
+        1,
+        "{:?}",
+        doctor_notices(&f.state, now)
+    );
+    assert_eq!(s.roots_pass(now).removed, vec![B.to_string()]);
+    assert!(a.exists() && !b.exists());
+    assert_eq!(db.toolchain_status().unwrap().evict_failures, 0);
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Review M4: a builder or template references only roots that are `live`;
+/// one being removed fails the reference and adds none.
+#[test]
+fn references_are_refused_on_a_root_being_removed() {
+    let f = Fixture::new();
+    f.root(A);
+    f.root(B);
+    let s = f.open();
+    let db = s.db().unwrap();
+    assert!(db.toolchain_claim(A, None).unwrap());
+    assert!(!s.add_root_refs(vec![B.into(), A.into()], "builder", "b1"));
+    assert!(!db.toolchain_referenced(B).unwrap(), "none of them");
+    assert!(s.add_root_refs(vec![B.into()], "builder", "b1"));
+    assert!(db.toolchain_referenced(B).unwrap());
+}
+
+/// Review L1: a state directory reached through a link (macOS `/var`) still
+/// finds the roots on a binding's paths, which are canonical.
+#[test]
+fn a_linked_state_directory_finds_the_roots_of_a_binding() {
+    let temp = crate::test_tmp::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let real = base.join("real");
+    private_dir(&real.join("toolchains")).unwrap();
+    std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+    let cfg = SetupConfig::new(
+        base.join("link"),
+        crate::ids::WorkerId::parse("w-roots").unwrap(),
+        "/bin/sh".into(),
+    );
+    let s = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+    let canonical = s.private_tool_root().unwrap();
+    let env = BTreeMap::from([(
+        "PATH".to_string(),
+        format!("{}/{A}/bin:/usr/bin", canonical.display()),
+    )]);
+    assert_eq!(roots_in(&env, &s.toolchains()), vec![A.to_string()]);
+}
+
+/// Review L4: a root that cannot be measured is stamped too, so the next
+/// pass measures another; a root an installer holds is not measured.
+#[test]
+fn an_unmeasurable_root_does_not_keep_the_others_unmeasured() {
+    let f = Fixture::new();
+    let a = f.root(A);
+    f.root(B);
+    let s = f.open();
+    let now = platform::wall_ms();
+    f.used(A, now - 2 * DAY);
+    f.used(B, now - DAY);
+    let db = s.db().unwrap();
+    let bytes = |id: &str| {
+        db.toolchain_roots()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.identity == id)
+            .unwrap()
+    };
+    // Measured by the first pass of `open`: not any more.
+    f.db()
+        .execute(
+            "UPDATE toolchain_root SET bytes = NULL, measured_ms = NULL",
+            [],
+        )
+        .unwrap();
+    std::fs::set_permissions(a.join("bin"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    s.roots_pass(now);
+    s.roots_pass(now + 1);
+    std::fs::set_permissions(a.join("bin"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(bytes(A).bytes, None);
+    assert!(bytes(A).measured_ms.is_some());
+    assert!(bytes(B).bytes.is_some(), "B was measured at the next pass");
+}
+
+/// Review L3: a pass that keeps stopping for the same reason for an hour is
+/// told by `doctor`, naming the reason; a missing builders directory is no
+/// builder.
+#[test]
+fn a_pass_that_keeps_stopping_is_told_by_doctor() {
+    let f = Fixture::new();
+    f.root(A);
+    let s = f.open();
+    let now = platform::wall_ms();
+    let _ = std::fs::remove_dir(s.cfg.builders());
+    assert_eq!(s.roots_pass(now).held, None, "no builders directory");
+    private_dir(&s.cfg.builders().join("01OLDBUILDER")).unwrap();
+    let then = now - 2 * 3600 * 1000;
+    assert_eq!(s.roots_pass(then).held, Some("builder_without_references"));
+    assert_eq!(s.roots_pass(now).held, Some("builder_without_references"));
+    let notices = doctor_notices(&f.state, now);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("setup builder directory"),
+        "{notices:?}"
+    );
+    assert!(!notices[0].contains(f.state.to_str().unwrap()), "no paths");
+    std::fs::remove_dir(s.cfg.builders().join("01OLDBUILDER")).unwrap();
+    s.roots_pass(now);
+    assert!(doctor_notices(&f.state, now).is_empty());
 }

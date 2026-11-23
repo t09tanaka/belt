@@ -417,8 +417,7 @@ pub(crate) fn doctor_notices(state_dir: &Path, now_ms: u64) -> Vec<String> {
     if !state_dir.join("worker.db").is_file() {
         return Vec::new();
     }
-    let Ok(status) =
-        WorkerStore::open_read_only(state_dir).and_then(|db| db.toolchain_status())
+    let Ok(status) = WorkerStore::open_read_only(state_dir).and_then(|db| db.toolchain_status())
     else {
         return Vec::new();
     };

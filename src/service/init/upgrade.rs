@@ -826,7 +826,11 @@ pub(crate) fn guard_present<L: Launcher>(config: &Path, launcher: &mut L) -> any
 /// `doctor`): no resident journal, or one `watch` reads.
 pub(crate) fn guard_definition_known(config: &Path) -> bool {
     let journal = config.join("init.json").try_exists().unwrap_or(true)
-        || config.join("upgrade").join(KEPT_JOURNAL).try_exists().unwrap_or(true);
+        || config
+            .join("upgrade")
+            .join(KEPT_JOURNAL)
+            .try_exists()
+            .unwrap_or(true);
     !journal || watch(config).is_ok()
 }
 

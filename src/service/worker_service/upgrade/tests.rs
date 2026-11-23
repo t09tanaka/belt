@@ -455,10 +455,11 @@ fn an_unreadable_database_or_a_foreign_binding_fails_before_anything_stops() {
     assert!(h.upgrade(&mut |_| Ok(())).is_err());
     // A state that is bound to another identity is not touched at all.
     assert_eq!(h.journal(), before);
-    // Placement alone happened: the old service was never touched.
+    // The old service was never touched, and the copy the version check
+    // refused is gone (spec 25.7 (a)).
     assert_eq!(h.launchctl(), ["bootstrap"]);
     assert_eq!(h.current(), Path::new(&h.old));
-    assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
+    assert!(!paths.executable(&h.new).exists());
 }
 
 #[test]

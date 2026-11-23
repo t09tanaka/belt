@@ -1301,7 +1301,12 @@ pub fn run(
         &spec.worker_state_dir,
         crate::platform::wall_ms(),
     ) {
-        checks.push(Check::new("parent", "toolchain_roots", Level::Notice, notice));
+        checks.push(Check::new(
+            "parent",
+            "toolchain_roots",
+            Level::Notice,
+            notice,
+        ));
     }
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
     // Every worker is looked at at the same time (up to a bound), each on its

@@ -345,9 +345,11 @@ impl WorkerStore {
     pub fn toolchain_set_held(&self, reason: Option<&'static str>, now_ms: u64) -> Result<()> {
         self.db.write(move |tx| {
             let old: Option<String> = tx
-                .query_row("SELECT value FROM schema_meta WHERE key = ?1", [HELD], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = ?1",
+                    [HELD],
+                    |r| r.get(0),
+                )
                 .optional()?;
             match reason {
                 None if old.is_some() => {
@@ -404,24 +406,24 @@ fn bind_in(
     now_ms: u64,
 ) -> Result<Bind> {
     let live = tx
-            .query_row(
-                "SELECT state = 'live' FROM toolchain_root WHERE identity = ?1",
-                [identity],
-                |r| r.get::<_, bool>(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !live {
-            return Ok(Bind::Absent);
-        }
-        let attempt: Option<(String, String)> = tx
-            .query_row(
-                "SELECT coordinator_id, state FROM worker_attempt WHERE attempt_id = ?1",
-                [consumer],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match attempt {
+        .query_row(
+            "SELECT state = 'live' FROM toolchain_root WHERE identity = ?1",
+            [identity],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !live {
+        return Ok(Bind::Absent);
+    }
+    let attempt: Option<(String, String)> = tx
+        .query_row(
+            "SELECT coordinator_id, state FROM worker_attempt WHERE attempt_id = ?1",
+            [consumer],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match attempt {
             Some((_, state)) if state == "terminal" => return Ok(Bind::Absent),
             Some((member, _)) => tx.execute(
                 "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder, coordinator_id) VALUES (?1, 'attempt', ?2, ?3)",
@@ -432,11 +434,11 @@ fn bind_in(
                 params![identity, consumer],
             )?,
         };
-        tx.execute(
-            "UPDATE toolchain_root SET last_used_ms = max(last_used_ms, ?2) WHERE identity = ?1",
-            params![identity, now_ms as i64],
-        )?;
-        Ok(Bind::Bound)
+    tx.execute(
+        "UPDATE toolchain_root SET last_used_ms = max(last_used_ms, ?2) WHERE identity = ?1",
+        params![identity, now_ms as i64],
+    )?;
+    Ok(Bind::Bound)
 }
 
 #[cfg(test)]

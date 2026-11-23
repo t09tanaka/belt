@@ -275,3 +275,105 @@ fn a_tool_link_to_anything_else_is_kept() {
     assert!(other.exists());
     assert!(new.exists());
 }
+
+/// Acceptance (ii), the journal a trial keeps of the resident
+/// (`upgrade/init.json`) and a renewed trial marker of the worker
+/// (`upgrade-trial-renewed.json`): each alone keeps the version.
+#[test]
+fn a_version_only_the_kept_journal_or_a_renewed_trial_names_is_kept() {
+    let f = Fixture::new();
+    let kept = f.places.config.join("upgrade").join("init.json");
+    fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    fs::write(&kept, format!("{{\"binary_hash\":\"{OLD}\"}}")).unwrap();
+    f.assert_kept();
+    fs::remove_file(&kept).unwrap();
+    let renewed = f.places.worker_state.join("upgrade-trial-renewed.json");
+    fs::write(&renewed, format!("{{\"from\":\"{OLD}\"}}")).unwrap();
+    f.assert_kept();
+    fs::remove_file(&renewed).unwrap();
+    f.assert_removed();
+}
+
+/// Review L5 and L8: a definition too large to read whole, or a services
+/// directory that cannot be listed, keeps every version, and `doctor` can
+/// say which (no paths).
+#[test]
+fn a_definition_that_cannot_be_read_whole_or_listed_keeps_every_version() {
+    let f = Fixture::new();
+    let large = f.places.services[0].join("large.plist");
+    fs::write(&large, vec![b' '; (TEXT_LIMIT + 1) as usize]).unwrap();
+    assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
+    assert!(Named::read_why(&f.places)
+        .err()
+        .is_some_and(|why| why.contains("larger than 1 MiB")));
+    fs::remove_file(&large).unwrap();
+    let services = &f.places.services[0];
+    fs::set_permissions(services, fs::Permissions::from_mode(0o000)).unwrap();
+    let listed = fs::read_dir(services).is_ok();
+    if !listed {
+        assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
+        let why = Named::read_why(&f.places).err().unwrap();
+        assert!(why.contains("service definitions"), "{why}");
+        assert!(!why.contains('/'), "{why}");
+    }
+    fs::set_permissions(services, fs::Permissions::from_mode(0o755)).unwrap();
+    f.assert_removed();
+}
+
+/// A pass at the same time as a command that places a version (under
+/// `init.lock`, then a journal that names it): the placed version is never
+/// removed, whatever the order.
+#[test]
+fn a_pass_concurrent_with_a_placement_never_removes_the_placed_version() {
+    let f = Fixture::new();
+    let lock = f.places.config.join("init.lock");
+    let config = f.places.config.clone();
+    let placer = std::thread::spawn(move || {
+        for i in 0..40u8 {
+            let digest = format!("{:064x}", u64::from(i) + 0xabc);
+            // Waits for the pass, as `init` does (`lock()`).
+            let held = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)
+                .unwrap();
+            held.lock().unwrap();
+            let dir = config.join("bin").join(&digest);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("belt"), &digest).unwrap();
+            fs::write(
+                config.join("init.json"),
+                format!("{{\"binary_hash\":\"{digest}\"}}"),
+            )
+            .unwrap();
+            drop(held);
+            assert!(dir.join("belt").exists(), "{digest}");
+        }
+    });
+    while !placer.is_finished() {
+        f.sweep();
+    }
+    placer.join().unwrap();
+    // The last placement is named; the others were placed moments ago.
+    let last = format!("{:064x}", 39u64 + 0xabc);
+    assert!(f.version(&last).join("belt").exists());
+}
+
+/// Spec 25.7 (a): a copy refused at the version check goes at once when the
+/// command made it, unless a link of `bin/` points at it.
+#[test]
+fn a_refused_copy_goes_at_once_unless_linked() {
+    let f = Fixture::new();
+    remove_refused(&f.places.config, OLD, false);
+    assert!(f.version(OLD).exists(), "not made by the command");
+    symlink(OLD, f.places.bin().join("resident")).unwrap();
+    remove_refused(&f.places.config, OLD, true);
+    assert!(f.version(OLD).exists(), "linked");
+    fs::remove_file(f.places.bin().join("resident")).unwrap();
+    remove_refused(&f.places.config, OLD, true);
+    assert!(!f.version(OLD).exists());
+    remove_refused(&f.places.config, NEW, true);
+    assert!(f.version(NEW).exists(), "bin/current points at it");
+}

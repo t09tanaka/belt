@@ -293,8 +293,8 @@ impl Named {
             }
         }
         for dir in &places.services {
-            for name in
-                entries(dir).map_err(|_| "the directory of the service definitions cannot be listed")?
+            for name in entries(dir)
+                .map_err(|_| "the directory of the service definitions cannot be listed")?
             {
                 journals.push(dir.join(name));
             }
