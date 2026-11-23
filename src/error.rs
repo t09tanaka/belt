@@ -382,6 +382,22 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn an_input_missing_refusal_names_the_source_and_its_missing_blobs() {
+        let e = ApiError::input_missing("src_a", vec!["sha256:b".into()], "gone");
+        assert_eq!(e.code, ErrorCode::InputMissing);
+        assert_eq!(
+            e.input_missing.as_deref(),
+            Some(&InputMissing {
+                source_id: "src_a".into(),
+                missing: vec!["sha256:b".into()],
+            })
+        );
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(wire["input_missing"]["source_id"], json!("src_a"));
+        assert_eq!(wire["input_missing"]["missing"], json!(["sha256:b"]));
+    }
+
+    #[test]
     fn wire_string_matches_serde_for_every_code() {
         for c in ErrorCode::ALL {
             let json = serde_json::to_string(&c).unwrap();
