@@ -120,6 +120,10 @@ the directory for a retry. It never prunes Docker resources. Build caches, the
 worker image, and the reusable portool resource allocation remain for reruns;
 down does not change the shared portool ledger. Repeat with down/up/run, not by
 running `run.sh` twice against the same parent state.
+`down.sh --all` does the same and then gives the portool allocation back
+(`portool release`) and removes the build caches (`linux-cache`, `native`),
+the built Linux binaries, `resources` and the worker image of the current
+`S26_ARCH`. Pulled base images and `harness.lock` stay.
 
 ## A57 against a branch build
 
