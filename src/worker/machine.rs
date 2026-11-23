@@ -7,6 +7,7 @@
 
 use super::blobs::{BlobSink, Incoming};
 use super::host::Host;
+use super::pins::{Pin, SourcePins};
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform;
@@ -38,6 +39,9 @@ pub struct Machine {
     secrets: WorkerSecrets,
     key_path: PathBuf,
     incoming: Incoming,
+    /// What the readers that can outlive their attempt hold (spec 25.8 5b
+    /// (h)7); shared with the setup builders' workspaces.
+    pins: SourcePins,
 }
 
 fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
@@ -79,6 +83,7 @@ impl Machine {
             workspaces,
             secrets,
             key_path,
+            pins: SourcePins::default(),
         })
     }
 
@@ -87,11 +92,7 @@ impl Machine {
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
         let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
             .map_err(|e| internal("stored payload", e))?;
-        self.manifest_of(&payload)
-    }
-
-    fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
-        manifest_in(&self.store, payload)
+        manifest_in(&self.store, &payload, Wait::Yes)
     }
 
     /// Prepare the setup steps of attempts once per worker (spec chapter 8):
@@ -100,6 +101,7 @@ impl Machine {
     /// agent starts: it clears what builders of an earlier run left.
     pub fn with_setup(mut self, cfg: SetupConfig) -> Result<Self, ApiError> {
         let ws = BuilderWs {
+            pins: self.pins.clone(),
             store: self.store.clone(),
             workspaces: Workspaces::new(self.state_dir.clone(), self.env.clone(), self.fw.clone()),
         };
@@ -197,9 +199,37 @@ pub fn check_toolchain_source(
         .map_err(|e| invalid(&e))
 }
 
+/// [`check_toolchain_source`] for an accepted attempt: under one waited
+/// shared lock, so its blob reads (which only try the lock) wait for a
+/// deleting pass's step too (spec 25.8 5b (a)) instead of failing as an
+/// invalid bundle.
+fn check_toolchain_waiting(
+    store: &SourceStore,
+    state_dir: &Path,
+    m: &CiManifest,
+    payload: &AttemptPayload,
+) -> Result<(), ApiError> {
+    let _held = store
+        .mutation_guard_waiting()
+        .map_err(|e| internal("source store", format!("{e:#}")))?;
+    check_toolchain_source(store, state_dir, m, payload)
+}
+
+/// Whether a reader waits for a deleting pass's step (an accepted attempt's
+/// reader) or not (acceptance).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    Yes,
+    No,
+}
+
 /// The manifest of the source the payload names, and only if it is the
 /// manifest the payload names.
-fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
+fn manifest_in(
+    store: &SourceStore,
+    payload: &AttemptPayload,
+    wait: Wait,
+) -> Result<CiManifest, ApiError> {
     let missing = || {
         ApiError::new(
             ErrorCode::NotFound,
@@ -207,6 +237,17 @@ fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManife
         )
     };
     let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
+    // An accepted attempt's reader waits for a deleting pass's step instead
+    // of failing (spec 25.8 5b (a)); the read below shares this lock.
+    // Acceptance only tries it (inside `store.manifest`).
+    let _held = match wait {
+        Wait::Yes => Some(
+            store
+                .mutation_guard_waiting()
+                .map_err(|e| internal("source store", format!("{e:#}")))?,
+        ),
+        Wait::No => None,
+    };
     let m = store
         .manifest(&source)
         .map_err(|e| internal("source store", format!("{e:#}")))?
@@ -224,15 +265,25 @@ fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManife
     Ok(m)
 }
 
+/// A pin on the source of `m`, or the error a missing source gives.
+fn pin(pins: &SourcePins, store: &SourceStore, m: &CiManifest) -> Result<Pin, ApiError> {
+    pins.pin(store, &m.source_id)
+        .map_err(|e| ApiError::new(ErrorCode::NotFound, format!("{e:#}")))
+}
+
 /// The workspaces of the setup builders: made like an attempt's.
 struct BuilderWs {
+    pins: SourcePins,
     store: SourceStore,
     workspaces: Workspaces,
 }
 
 impl BuilderWorkspaces for BuilderWs {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
-        let m = manifest_in(&self.store, payload)?;
+        let m = manifest_in(&self.store, payload, Wait::Yes)?;
+        // (the builder's thread is not joined by the attempt's release: it
+        // pins the source for as long as it makes the workspace)
+        let _pin = pin(&self.pins, &self.store, &m)?;
         let repo = match (&m.execution_commit, &m.repository_id) {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
@@ -395,7 +446,13 @@ impl Host for Machine {
             ));
         }
         let m = self.manifest(attempt)?;
-        check_toolchain_source(&self.store, &self.state_dir, &m, payload)?;
+        // (the `prepare` thread reads on after a waiter gives up: it pins
+        // the source until the workspace is made)
+        let _pin = pin(&self.pins, &self.store, &m)?;
+        // (its blob reads only try the shared lock: one waited lock held
+        // around them makes them wait for a deleting pass's step too, spec
+        // 25.8 5b (a), instead of failing as an invalid bundle)
+        check_toolchain_waiting(&self.store, &self.state_dir, &m, payload)?;
 
         if payload.in_place {
             let root = self.original(payload)?;
@@ -435,8 +492,13 @@ impl Host for Machine {
         }
     }
 
-    fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
-        match self.manifest_of(payload) {
+    fn secret_paths(
+        &self,
+        payload: &AttemptPayload,
+        wait: bool,
+    ) -> Result<Option<Vec<String>>, ApiError> {
+        let wait = if wait { Wait::Yes } else { Wait::No };
+        match manifest_in(&self.store, payload, wait) {
             Ok(m) => Ok(Some(
                 m.secret_files.iter().map(|s| s.path.display()).collect(),
             )),
@@ -522,5 +584,135 @@ impl Host for Machine {
             Some(ws) if ws.root.exists() => self.workspaces.remove(ws),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{Digest, Generation, RunId, SourceId, TaskId};
+    use std::time::{Duration, Instant};
+
+    fn payload() -> AttemptPayload {
+        let d = Digest::of_bytes(b"x");
+        AttemptPayload {
+            ci_task: None,
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            run_id: RunId::generate(),
+            task_id: TaskId::generate(),
+            generation: Generation(1),
+            source_id: SourceId::generate(),
+            plan_digest: d.clone(),
+            manifest_digest: d,
+            permit_id: None,
+            commands: Vec::new(),
+            lease_ms: 60_000,
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// One exclusive step, held for `ms` on another thread.
+    fn step(store: &SourceStore, ms: u64) -> std::thread::JoinHandle<()> {
+        let exclusive = store.exclusive_step_for_test();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            drop(exclusive);
+        })
+    }
+
+    fn digest_of(s: &str) -> Digest {
+        Digest::parse(&if s.starts_with("sha256:") {
+            s.to_string()
+        } else {
+            format!("sha256:{s}")
+        })
+        .unwrap()
+    }
+
+    /// A machine over the store of a captured source, and the payload that
+    /// names that source.
+    fn machine_with_source(
+        f: &crate::ci::execute::tests::Fixture,
+        toolchains: Option<Box<crate::toolchain::contract::FrozenBundle>>,
+    ) -> (Machine, AttemptPayload) {
+        let machine = Machine::open(
+            &f.area.join("state"),
+            std::env::vars().collect(),
+            f.area.join("key"),
+        )
+        .unwrap();
+        let mut p = payload();
+        p.source_id = crate::source::classify::source_id_of_ci(&f.manifest.source_id).unwrap();
+        p.manifest_digest = digest_of(&f.manifest.manifest_digest);
+        p.toolchains = toolchains;
+        (machine, p)
+    }
+
+    #[test]
+    fn acceptance_does_not_wait_for_a_step_and_an_attempt_reader_does() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let (machine, p) = machine_with_source(&f, None);
+        // Acceptance: the answer under a held step is the untyped store
+        // error at once (a source that is not here would be NotFound).
+        let holder = step(&f.store, 600);
+        let started = Instant::now();
+        let e = machine.secret_paths(&p, false).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+        assert!(e.message.starts_with("source store"), "{e:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        holder.join().unwrap();
+        // The accepted attempt's `prepare` reads on after the step.
+        let holder = step(&f.store, 300);
+        let started = Instant::now();
+        let paths = machine.secret_paths(&p, true).unwrap();
+        assert_eq!(paths, Some(Vec::new()));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn the_toolchain_check_of_prepare_waits_for_a_step() {
+        use crate::toolchain::versions::*;
+        let f = crate::ci::execute::tests::fixture_with(
+            crate::ci::execute::tests::WORKFLOW,
+            |project| std::fs::write(project.join(".node-version"), "20.0.0\n").unwrap(),
+        );
+        // A bundle of the declarations the source holds: checking it reads
+        // the version file's blob (a verified, try-only open).
+        let declarations =
+            crate::toolchain::snapshot::read_captured(&f.store, &f.manifest, "", &[]).unwrap();
+        assert_eq!(declarations.len(), 1);
+        let source = digest_of(&f.manifest.manifest_digest);
+        let bundle = crate::toolchain::contract::FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                source,
+                Digest::of_bytes(b"parent"),
+                Scope::project(""),
+                &declarations,
+                &[],
+                &Default::default(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (_machine, p) = machine_with_source(&f, Some(Box::new(bundle)));
+        // Without the waited lock the blob read fails under a step.
+        let holder = step(&f.store, 300);
+        assert!(check_toolchain_source(&f.store, f.area.as_path(), &f.manifest, &p).is_err());
+        holder.join().unwrap();
+        let holder = step(&f.store, 300);
+        let started = Instant::now();
+        check_toolchain_waiting(&f.store, f.area.as_path(), &f.manifest, &p).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
     }
 }

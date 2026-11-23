@@ -193,7 +193,7 @@ impl Host for DirHost {
             Some(Some(why)) => Ok(ToolPreparationPoll::Failed(PreparationFailure(why))),
         }
     }
-    fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+    fn secret_paths(&self, _: &AttemptPayload, _: bool) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
             return Err(e);
         }
@@ -3188,8 +3188,8 @@ impl Host for RealButCore {
     fn setup_release(&self, a: &AttemptId) {
         self.0.setup_release(a)
     }
-    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
-        self.0.secret_paths(p)
+    fn secret_paths(&self, p: &AttemptPayload, w: bool) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p, w)
     }
     fn place_secrets(
         &self,
@@ -3240,6 +3240,7 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &captured.manifest.ci_source_id);
     // An orphan of an attempt nobody knows: the startup sweep takes it.
     let orphan = state
         .join("workspaces")
@@ -3464,6 +3465,7 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &included.manifest.ci_source_id);
     let secret_files: Vec<String> = included
         .manifest
         .secret_files
@@ -3521,6 +3523,7 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &captured.manifest.ci_source_id);
     let bundle = vault
         .load(&run, &captured.manifest.secret_files, &key)
         .unwrap();
@@ -3803,6 +3806,7 @@ async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &captured.manifest.ci_source_id);
     let machine =
         belt::worker::machine::Machine::open(&state, env.clone(), state.join("cluster.key"))
             .unwrap();
@@ -4693,6 +4697,7 @@ fn ci_fx(workflow: &str) -> CiFx {
         &CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&store, &captured.manifest.ci_source_id);
     let manifest = store
         .manifest(&captured.manifest.ci_source_id)
         .unwrap()

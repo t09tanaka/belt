@@ -101,13 +101,15 @@ async fn stop_with_live_attempt(pre: &str, tail: &str, bound: Duration) {
         ("HOME".to_string(), home.display().to_string()),
         ("PATH".to_string(), "/usr/bin:/bin".to_string()),
     ]);
+    let worker_sources = belt::source::SourceStore::open(&state).unwrap();
     let captured = belt::source::capture(
         &env,
-        &belt::source::SourceStore::open(&state).unwrap(),
+        &worker_sources,
         &belt::source::SourceRequest::Directory { dir: source },
         &belt::source::CaptureParams::default(),
     )
     .unwrap();
+    crate::common::publish_as_received(&worker_sources, &captured.manifest.ci_source_id);
     let marker = home.join("command.pid");
     let script = format!(
         "fixture_dir='{guard}'; {pre}echo $$ > '{m}.tmp' && mv '{m}.tmp' '{m}' && {tail}",

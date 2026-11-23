@@ -90,7 +90,7 @@ impl Index {
         let mut c = self.connect_for_import()?;
         let mut after = String::new();
         loop {
-            let (finished, last) = shared_page(&mut c, root, &after, &mut report)?;
+            let (finished, last, _) = shared_page(&mut c, root, &after, &mut report)?;
             if finished {
                 return Ok(report);
             }
@@ -114,9 +114,11 @@ impl Index {
                     .optional()?,
             )
         };
-        let mut root_after = get(&c, PATROL_ROOT)?.unwrap_or_default();
+        let stored_root = get(&c, PATROL_ROOT)?;
+        let mut root_after = stored_root.clone().unwrap_or_default();
         // `Some`: part-way through `root_after`, after this member
-        let mut object_after = get(&c, PATROL_OBJECT)?;
+        let stored_object = get(&c, PATROL_OBJECT)?;
+        let mut object_after = stored_object.clone();
         let mut looked = 0usize;
         let mut wrapped = false;
         while looked < PATROL {
@@ -140,8 +142,10 @@ impl Index {
             };
             let mut after = object_after.take().unwrap_or_default();
             loop {
-                let (finished, last) = shared_page(&mut c, &root, &after, &mut report)?;
-                looked += 32;
+                let (finished, last, rows) = shared_page(&mut c, &root, &after, &mut report)?;
+                // (the rows looked at, not the pages: a root of few
+                // members costs what it has; an empty one counts one)
+                looked += rows.max(1);
                 if finished {
                     root_after = root.clone();
                     object_after = None;
@@ -154,6 +158,10 @@ impl Index {
                     break;
                 }
             }
+        }
+        // (nothing is written when the cursor did not move)
+        if stored_root.as_deref() == Some(root_after.as_str()) && stored_object == object_after {
+            return Ok(report);
         }
         let tx = c.transaction()?;
         tx.execute(
@@ -298,8 +306,12 @@ const DOCTOR_PATHS: i64 = 10_000;
 
 /// For `doctor`: the abandoned token roots below `state_dir`, their
 /// memberships, and the bytes of the files only they hold (no paths; of at
-/// most [`DOCTOR_PATHS`] files). Read only; `None` when there is no index.
-pub fn abandoned_imports_read_only(state_dir: &std::path::Path) -> Result<Option<(u64, u64, u64)>> {
+/// most [`DOCTOR_PATHS`] files; the last value is `true` when there were more,
+/// so the byte total is a lower bound). Read only; `None` when there is no
+/// index.
+pub fn abandoned_imports_read_only(
+    state_dir: &std::path::Path,
+) -> Result<Option<(u64, u64, u64, bool)>> {
     let sources = state_dir.join("sources");
     let path = sources.join("retention.db");
     if !path.is_file() {
@@ -317,17 +329,19 @@ pub fn abandoned_imports_read_only(state_dir: &std::path::Path) -> Result<Option
     )?;
     let paths: Vec<String> = {
         let mut s = c.prepare("SELECT o.path FROM member m JOIN root r ON r.id=m.root JOIN object o ON o.id=m.object WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND NOT EXISTS(SELECT 1 FROM member b WHERE b.object=m.object AND b.root<>m.root) LIMIT ?1")?;
-        let rows = s.query_map([DOCTOR_PATHS], |r| r.get(0))?;
+        let rows = s.query_map([DOCTOR_PATHS + 1], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
     drop(c);
+    let truncated = paths.len() as i64 > DOCTOR_PATHS;
     let bytes = paths
         .iter()
+        .take(DOCTOR_PATHS as usize)
         .filter_map(|p| std::fs::symlink_metadata(sources.join(p)).ok())
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum();
-    Ok(Some((roots as u64, members as u64, bytes)))
+    Ok(Some((roots as u64, members as u64, bytes, truncated)))
 }
 
 /// One page (32 memberships after `after`, by object) of the abandoned
@@ -340,8 +354,18 @@ fn shared_page(
     root: &str,
     after: &str,
     report: &mut ImportReleaseReport,
-) -> Result<(bool, String)> {
+) -> Result<(bool, String, usize)> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Only an abandoned root's memberships are detached here: a live token
+    // (or any other root) passed by mistake keeps all of them.
+    let abandoned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND kind='abandoned')",
+        [root],
+        |r| r.get(0),
+    )?;
+    if !abandoned {
+        return Ok((true, String::new(), 0));
+    }
     let objects: Vec<(String, bool)> = {
         let mut s = tx.prepare("SELECT m.object, EXISTS(SELECT 1 FROM member o WHERE o.object=m.object AND o.root<>m.root) FROM member m WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT 32")?;
         let rows = s.query_map(params![root, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -371,7 +395,7 @@ fn shared_page(
     }
     tx.commit()?;
     let last = objects.last().map(|(o, _)| o.clone()).unwrap_or_default();
-    Ok((finished, last))
+    Ok((finished, last, objects.len()))
 }
 
 /// Remove the membership `object` of `root`, and the object's rows when no

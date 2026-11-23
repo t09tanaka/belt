@@ -310,6 +310,123 @@ impl Index {
             index: self.clone(),
         })
     }
+    /// [`Self::guard`] shared, waiting up to `limit` for an exclusive holder.
+    pub(crate) fn guard_waiting(&self, limit: std::time::Duration) -> Result<Guard> {
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(10);
+        loop {
+            match self.guard(false) {
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                        && start.elapsed() + pause < limit =>
+                {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(50));
+                }
+                other => return other,
+            }
+        }
+    }
+    /// [`Self::guard`] exclusive, waiting up to `limit`; `None` when it was
+    /// not had in time.
+    pub(crate) fn guard_exclusive_waiting(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<Option<Guard>> {
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(10);
+        loop {
+            match self.guard(true) {
+                Ok(g) => return Ok(Some(g)),
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock) =>
+                {
+                    if start.elapsed() + pause >= limit {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    /// The empty `receive:%` roots (no source yet: a publication cut before
+    /// its registration), at most `limit`.
+    pub(crate) fn empty_receive_roots(&self, limit: u32) -> Result<Vec<String>> {
+        let c = self.connect()?;
+        let mut s = c.prepare(
+            "SELECT id FROM root WHERE kind='pending' AND source IS NULL AND id LIKE 'receive:%' ORDER BY id LIMIT ?1",
+        )?;
+        let rows = s.query_map([limit], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+    /// Whether the store holds a parent's root (`run`, `import`): a worker
+    /// pass then changes nothing (spec 25.8 5b, the store is not shared).
+    pub(crate) fn holds_parent_roots(&self) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root WHERE kind IN ('run','import'))",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    /// An empty receive root whose manifest cannot be proven: abandoned (its
+    /// members go by the later passes), and its graph rows removed.
+    pub(crate) fn abandon_empty_receive_root(&self, root: &str) -> Result<bool> {
+        let mut c = self.connect_for_import()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE root SET kind='abandoned' WHERE id=?1 AND kind='pending' AND source IS NULL",
+            [root],
+        )?;
+        if changed == 1 {
+            tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+    /// Completed claim rows an older version kept (`done=1`): inert, they
+    /// only kept their object's publication row. Deleted a page of
+    /// `limit` at a time, at most `pages` pages per call (the rest goes on
+    /// the next call); returns how many went. Fewer than `limit * pages`
+    /// means none are left.
+    pub(crate) fn forget_completed_claims(&self, limit: u32, pages: u32) -> Result<u64> {
+        let mut gone = 0;
+        for _ in 0..pages {
+            let n = self.connect()?.execute(
+                "DELETE FROM source_delete_claim WHERE rowid IN (SELECT rowid FROM source_delete_claim WHERE done=1 LIMIT ?1)",
+                [limit],
+            )?;
+            gone += n as u64;
+            if n < limit as usize {
+                break;
+            }
+        }
+        Ok(gone)
+    }
+    pub(crate) fn received_row(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND source=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+    pub(crate) fn legacy_registration_pending(&self) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_registration' AND value<>'done')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    pub(crate) fn has_object(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
     fn connect(&self) -> Result<Connection> {
         self.connect_with_timeout(std::time::Duration::from_secs(1))
     }
@@ -331,9 +448,15 @@ impl Index {
         c.busy_timeout(timeout)?;
         Ok(c)
     }
+    /// The root of a publication that is being registered. A root that an
+    /// earlier settlement abandoned (with no source) is pending again: the
+    /// publication that crashes after this makes new graph and member rows
+    /// under it, which start-up settlement must pick up (it selects only
+    /// `pending`).
     pub(crate) fn pending(&self, id: &str) -> Result<()> {
         self.connect()?.execute(
-            "INSERT OR IGNORE INTO root(id,kind) VALUES(?1,'pending')",
+            "INSERT INTO root(id,kind) VALUES(?1,'pending')
+             ON CONFLICT(id) DO UPDATE SET kind='pending' WHERE kind='abandoned' AND source IS NULL",
             [id],
         )?;
         Ok(())
@@ -825,6 +948,31 @@ impl SourceStore {
     /// Nonblocking; acquire before coordinator operations, never inside its actor/txn.
     pub fn mutation_guard(&self) -> Result<Guard> {
         self.retention.guard(false)
+    }
+    /// The shared mutation lock for a reader that serves an accepted attempt
+    /// or a receipt (spec 25.8 5b (a), (h)2): it waits for a deleting pass,
+    /// which holds the exclusive lock for one step only, retrying from 10 ms
+    /// doubling up to 50 ms, and gives up after 120 s with the error the
+    /// nonblocking lock gives. Acceptance never calls this (it answers
+    /// `OVERLOADED` without waiting); call it on a blocking thread.
+    /// Tests only: the legacy registration is done, or `id` has its
+    /// `receive:` row, or its root is `abandoned`.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, sql: &str, id: &str) {
+        self.retention
+            .connect()
+            .unwrap()
+            .execute(sql, [id])
+            .unwrap();
+    }
+    /// The exclusive lock, as a deleting pass's step holds it (tests only).
+    #[cfg(test)]
+    pub(crate) fn exclusive_step_for_test(&self) -> Guard {
+        self.retention.guard(true).unwrap()
+    }
+    pub fn mutation_guard_waiting(&self) -> Result<Guard> {
+        self.retention
+            .guard_waiting(std::time::Duration::from_secs(120))
     }
     pub fn begin_import(&self) -> Result<ImportToken> {
         let _guard = self.mutation_guard()?;
@@ -2651,7 +2799,7 @@ mod tests {
     fn legacy_intake_keeps_independent_roots_without_hash_global_handoff() {
         let f = Fixture::new();
         let bytes = b"same bytes";
-        let hash = format!("{:x}", sha2::Sha256::digest(bytes));
+        let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
         let want = super::super::diff::BlobWant {
             hash: hash.clone(),
             size: bytes.len() as u64,
@@ -2866,12 +3014,18 @@ mod tests {
         }
         assert!(f.store.read_blob(&hash).is_err());
         assert!(f.store.open_blob_verified(&hash).is_err());
-        assert!(f
-            .store
-            .object_store()
-            .unwrap()
-            .put_bytes(b"original")
-            .is_err());
+        assert!({
+            let bytes: &[u8] = b"original";
+            let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+            let want = super::super::diff::BlobWant {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+            };
+            f.store
+                .ingest_blob(&want, &mut &bytes[..])
+                .map(|()| (hash, want.size))
+        }
+        .is_err());
         assert!(capture(
             &BTreeMap::new(),
             &f.store,
@@ -2913,12 +3067,18 @@ mod tests {
     async fn opened_reader_keeps_source_shared_guard_after_async_waiter_cancellation() {
         use std::io::Read as _;
         let f = Fixture::new();
-        let (hash, _) = f
-            .store
-            .object_store()
-            .unwrap()
-            .put_bytes(b"held-reader")
-            .unwrap();
+        let (hash, _) = {
+            let bytes: &[u8] = b"held-reader";
+            let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+            let want = super::super::diff::BlobWant {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+            };
+            f.store
+                .ingest_blob(&want, &mut &bytes[..])
+                .map(|()| (hash, want.size))
+        }
+        .unwrap();
         let mut reader = f.store.open_blob_verified(&hash).unwrap().file;
         let (entered, seen) = tokio::sync::oneshot::channel();
         let (release, resume) = std::sync::mpsc::channel();
@@ -2948,6 +3108,29 @@ mod tests {
         assert!(f.store.retention.guard(true).is_ok());
     }
     #[test]
+    fn an_attempts_sdk_view_waits_per_call_and_holds_no_lock_between_calls() {
+        let f = Fixture::new();
+        let view = f.store.object_store_per_call();
+        // a call waits for a step that is under way
+        let exclusive = f.store.retention.guard(true).unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(exclusive);
+        });
+        let started = std::time::Instant::now();
+        view.with_sdk(|_| {
+            // and the task's reads hold no lock: a step can run among them
+            assert!(f.store.retention.guard(true).is_ok());
+            Ok(())
+        })
+        .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        holder.join().unwrap();
+        // the next call after another step goes on
+        drop(f.store.retention.guard(true).unwrap());
+        view.with_sdk(|_| Ok(())).unwrap();
+    }
+    #[test]
     fn guarded_sdk_view_retains_shared_ownership_and_claim_fences_its_callback() {
         let f = Fixture::new();
         let view = f.store.object_store().unwrap();
@@ -2957,12 +3140,18 @@ mod tests {
         })
         .unwrap();
         drop(view);
-        let (hash, _) = f
-            .store
-            .object_store()
-            .unwrap()
-            .put_bytes(b"sdk-fence")
-            .unwrap();
+        let (hash, _) = {
+            let bytes: &[u8] = b"sdk-fence";
+            let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+            let want = super::super::diff::BlobWant {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+            };
+            f.store
+                .ingest_blob(&want, &mut &bytes[..])
+                .map(|()| (hash, want.size))
+        }
+        .unwrap();
         {
             let _exclusive = f.store.retention.guard(true).unwrap();
             f.store
@@ -3868,6 +4057,356 @@ mod tests {
                 |r| r.get::<_, bool>(0)
             )
             .unwrap());
+    }
+    /// A received source `S` with its one blob, from the fixture's capture.
+    fn received_fixture(
+        f: &Fixture,
+    ) -> (
+        SourceStore,
+        local_ci::source::SourceManifest,
+        super::super::diff::BlobWant,
+        Vec<u8>,
+    ) {
+        let run = RunId::generate();
+        f.bind(&run);
+        let id = f.store.source_of_run(&run).unwrap().unwrap();
+        let m = f.store.manifest(&id).unwrap().unwrap();
+        let entry = &m.object_manifest.entries[0];
+        let want = super::super::diff::BlobWant {
+            hash: entry.hash.clone(),
+            size: entry.size,
+        };
+        let bytes = f.store.read_blob(&entry.hash).unwrap();
+        let receiver = SourceStore::open(&f._root.path().join("receiver")).unwrap();
+        (receiver, m, want, bytes)
+    }
+    fn receive_root(store: &SourceStore, id: &str) -> Option<Option<String>> {
+        store
+            .retention
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM root WHERE id='receive:'||?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+    #[test]
+    fn refused_publication_leaves_no_empty_receive_root() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        // (g)25: the blob is not here, the publication is refused, and no
+        // `receive:<S>` row with an empty source stays behind
+        assert!(receiver.publish_received(&m, None).is_err());
+        assert_eq!(receive_root(&receiver, &m.source_id), None);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        assert_eq!(
+            receive_root(&receiver, &m.source_id),
+            Some(Some(m.source_id.clone()))
+        );
+    }
+    #[test]
+    fn a_source_is_in_the_store_by_its_receive_row_not_by_its_file() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        let present = |store: &SourceStore| {
+            let held = store.mutation_guard().unwrap();
+            store.received(&held, &id).unwrap()
+        };
+        assert!(!present(&receiver));
+        // a manifest file with no `m:` row counts while the legacy
+        // registration is pending...
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(present(&receiver));
+        // ...but not once it is done
+        let c = receiver.retention.connect().unwrap();
+        c.execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+        assert!(!present(&receiver));
+        c.execute(
+            "UPDATE meta SET value='pending' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+        // and not when an `m:` row says it belongs to a publication that has
+        // not finished (the file is written before the root's source)
+        c.execute(
+            "INSERT INTO object(id,path) VALUES('m:'||?1,'manifests/x')",
+            [&id],
+        )
+        .unwrap();
+        assert!(!present(&receiver));
+        c.execute("DELETE FROM object WHERE id='m:'||?1", [&id])
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver.publish_received(&m, None).unwrap();
+        c.execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+        assert!(present(&receiver));
+    }
+    #[test]
+    fn a_waiting_reader_outlasts_one_exclusive_step_and_gives_up_at_its_limit() {
+        let f = Fixture::new();
+        let exclusive = f.store.retention.guard(true).unwrap();
+        // the nonblocking lock fails at once; a short limit gives up with it
+        assert!(f.store.mutation_guard().is_err());
+        let started = std::time::Instant::now();
+        let e = f
+            .store
+            .retention
+            .guard_waiting(std::time::Duration::from_millis(150))
+            .err()
+            .unwrap();
+        assert!(
+            e.chain().any(|c| c
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)),
+            "{e:#}"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        // a waiting reader gets the lock once the step ends
+        let (go, gone) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            gone.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(exclusive);
+        });
+        go.send(()).unwrap();
+        let _shared = f.store.mutation_guard_waiting().unwrap();
+        holder.join().unwrap();
+    }
+    #[test]
+    fn a_completed_deletion_claim_leaves_no_row() {
+        let f = Fixture::new();
+        let (_run, mut cursor) = deletion_ready(&f);
+        let c = f.store.retention.connect().unwrap();
+        let mut claimed = false;
+        for _ in 0..20 {
+            let page = deletion_tick(&f, &mut cursor);
+            claimed |= page.removed > 0;
+        }
+        assert!(claimed, "the fixture deleted nothing");
+        // (g)29: no `done=1` row is kept; `publication.incarnation` keeps
+        // the generation
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM source_delete_claim", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn the_shared_release_detaches_only_an_abandoned_roots_memberships() {
+        let f = Fixture::new();
+        let (receiver, _m, want, bytes) = received_fixture(&f);
+        let a = receiver.begin_import().unwrap();
+        let b = receiver.begin_import().unwrap();
+        for t in [&a, &b] {
+            receiver
+                .ingest_blob_with_token(t, &want, &mut &bytes[..])
+                .unwrap();
+        }
+        let members = |root: String| -> i64 {
+            receiver
+                .retention
+                .connect()
+                .unwrap()
+                .query_row("SELECT count(*) FROM member WHERE root=?1", [root], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        // a live token's shared membership stays (5a round-3 L4)
+        let _held = receiver.mutation_guard().unwrap();
+        receiver.retention.release_shared_root(&a.root()).unwrap();
+        assert_eq!(members(a.root()), 1);
+        drop(_held);
+        receiver
+            .release_import(SourceStore::import_token_id(&a))
+            .unwrap();
+        assert_eq!(members(a.root()), 0);
+        assert_eq!(members(b.root()), 1);
+    }
+    #[test]
+    fn start_settles_empty_receive_roots_by_what_their_file_proves() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        // a publication cut after its root and file, before registration
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver
+            .retention
+            .pending(&format!("receive:{id}"))
+            .unwrap();
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        // and one cut before its file
+        let lost = "receive:0000000000000000000000000000000000000000000000000000000000000000";
+        receiver.retention.pending(lost).unwrap();
+        let kind = |root: &str| -> Option<String> {
+            receiver
+                .retention
+                .connect()
+                .unwrap()
+                .query_row("SELECT kind FROM root WHERE id=?1", [root], |r| r.get(0))
+                .optional()
+                .unwrap()
+        };
+        // busy: nothing is settled until the lock is had (shown with a
+        // short wait; the start waits up to 120 s)
+        {
+            let _shared = receiver.mutation_guard().unwrap();
+            assert!(receiver
+                .retention
+                .guard_exclusive_waiting(std::time::Duration::from_millis(50))
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), Some((1, 1)));
+        assert_eq!(receive_root(&receiver, &id), Some(Some(id.clone())));
+        assert_eq!(kind(lost).as_deref(), Some("abandoned"));
+        // a store with a parent's root is left as it is
+        let c = receiver.retention.connect().unwrap();
+        c.execute("INSERT INTO root(id,kind) VALUES('run:x','run')", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO root(id,kind) VALUES('receive:1111111111111111111111111111111111111111111111111111111111111111','pending')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), None);
+    }
+    #[test]
+    fn abandoned_receive_roots_are_not_settled_again_and_do_not_hide_a_new_one() {
+        let f = Fixture::new();
+        let (receiver, _m, _want, _bytes) = received_fixture(&f);
+        let c = receiver.retention.connect().unwrap();
+        for i in 0..1001u32 {
+            c.execute(
+                "INSERT INTO root(id,kind) VALUES(?1,'abandoned')",
+                [format!("receive:{i:064x}")],
+            )
+            .unwrap();
+        }
+        // only abandoned roots: nothing to settle, the start does not wait
+        let _shared = receiver.mutation_guard().unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), None);
+        drop(_shared);
+        // a new cut publication after 1,001 abandoned ones is settled
+        let fresh = format!("receive:{}", "f".repeat(64));
+        receiver.retention.pending(&fresh).unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), Some((0, 1)));
+        let kind: String = c
+            .query_row("SELECT kind FROM root WHERE id=?1", [&fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "abandoned");
+    }
+    #[test]
+    fn publishing_again_into_an_abandoned_root_makes_it_pending_for_settlement() {
+        let f = Fixture::new();
+        let (receiver, _m, _want, _bytes) = received_fixture(&f);
+        let root = format!("receive:{}", "a".repeat(64));
+        let c = receiver.retention.connect().unwrap();
+        c.execute("INSERT INTO root(id,kind) VALUES(?1,'abandoned')", [&root])
+            .unwrap();
+        receiver.retention.pending(&root).unwrap();
+        let kind = |r: &str| -> String {
+            c.query_row("SELECT kind FROM root WHERE id=?1", [r], |x| x.get(0))
+                .unwrap()
+        };
+        assert_eq!(kind(&root), "pending");
+        // a received root, and one that has a source, are left as they are
+        let other = format!("receive:{}", "b".repeat(64));
+        c.execute(
+            "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',?2)",
+            [&other, &"b".repeat(64)],
+        )
+        .unwrap();
+        receiver.retention.pending(&other).unwrap();
+        assert_eq!(kind(&other), "abandoned");
+        let done = format!("receive:{}", "c".repeat(64));
+        c.execute(
+            "INSERT INTO root(id,kind,source) VALUES(?1,'received',?2)",
+            [&done, &"c".repeat(64)],
+        )
+        .unwrap();
+        receiver.retention.pending(&done).unwrap();
+        assert_eq!(kind(&done), "received");
+    }
+    #[test]
+    fn a_root_whose_registration_fails_is_abandoned_and_the_rest_settled() {
+        let f = Fixture::new();
+        let (receiver, m, want, bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let root = format!("receive:{id}");
+        receiver.retention.pending(&root).unwrap();
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        // the cut registration had found a child whose manifest is gone
+        let c = receiver.retention.connect().unwrap();
+        c.execute(
+            "INSERT INTO graph(root,source) VALUES(?1,?2)",
+            [&root, &"e".repeat(64)],
+        )
+        .unwrap();
+        let lost = format!("receive:{}", "0".repeat(64));
+        receiver.retention.pending(&lost).unwrap();
+        assert_eq!(receiver.settle_empty_receive_roots().unwrap(), Some((0, 2)));
+        for r in [&root, &lost] {
+            let kind: String = c
+                .query_row("SELECT kind FROM root WHERE id=?1", [r], |x| x.get(0))
+                .unwrap();
+            assert_eq!(kind, "abandoned");
+        }
+        let graph: i64 = c
+            .query_row("SELECT count(*) FROM graph WHERE root=?1", [&root], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(graph, 0);
+    }
+    #[test]
+    fn completed_claim_rows_of_an_older_version_are_deleted_in_pages() {
+        let f = Fixture::new();
+        let c = f.store.retention.connect().unwrap();
+        for i in 0..5 {
+            c.execute(
+                "INSERT INTO source_delete_claim VALUES(?1,1,'{}',1)",
+                [format!("b:{i:064x}")],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO source_delete_claim VALUES('b:live',1,'{}',0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(f.store.retention.forget_completed_claims(2, 2).unwrap(), 4);
+        assert_eq!(f.store.retention.forget_completed_claims(2, 2).unwrap(), 1);
+        let left: Vec<String> = c
+            .prepare("SELECT object FROM source_delete_claim")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["b:live"]);
     }
     mod vault_cases {
         use super::*;

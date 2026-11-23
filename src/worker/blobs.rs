@@ -457,6 +457,25 @@ fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// For `doctor`: the staging directories under `<state_dir>/incoming` (at
+/// most 10,000 looked at) whose import token record exists and cannot be
+/// read. A discard keeps such a directory and its token's files (spec 25.8
+/// 5a); a record that names no token is not counted (it is no owner).
+pub fn unreadable_import_tokens(state_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(state_dir.join("incoming")) else {
+        return 0;
+    };
+    entries
+        .take(10_000)
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| match recorded_token(&e.path()) {
+            Ok(_) => false,
+            Err(e) => e.kind() != io::ErrorKind::InvalidData,
+        })
+        .count() as u64
+}
+
 /// The record of [`MADE_REFS`]: the repository, then one ref a line
 /// (`name`, the source it is the snapshot of or `-`, its commit or `-`).
 fn made_refs_text(repository_id: &str, refs: &[ImportRef]) -> String {
@@ -636,10 +655,13 @@ impl Incoming {
         Self::wait_lock(f, limits, "the incoming sources are busy")
     }
 
+    /// Whether `ci_id` is published here: the index's `receive:<id>` root
+    /// has its source (spec 25.8 5b (b), (h)1 (iii)), not that the manifest
+    /// file exists (a child's file is written before its row).
     fn published(&self, ci_id: &str) -> Result<bool, ApiError> {
         self.store
-            .manifest(ci_id)
-            .map(|m| m.is_some())
+            .mutation_guard()
+            .and_then(|held| self.store.received(&held, ci_id))
             .map_err(|e| internal("source store", format!("{e:#}")))
     }
 
@@ -663,7 +685,16 @@ impl Incoming {
         // it (25.8, 4). One that cannot be read keeps everything.
         match recorded_token(&dir) {
             Ok(Some(id)) => {
-                if self.store.release_import(&id).is_err() {
+                // (without `wait` the caller holds the lock over all
+                // sources: only the token's own rows are settled now, the
+                // rest is left to the agent's patrol, so this costs no
+                // more than the token's absent members)
+                let released = if wait {
+                    self.store.release_import(&id).map(|_| ())
+                } else {
+                    self.store.abandon_import_only(&id)
+                };
+                if released.is_err() {
                     return;
                 }
             }
@@ -1504,6 +1535,18 @@ impl Incoming {
         if !st.manifests.contains_key(root_id) {
             return Ok(false);
         }
+        // One waited shared lock over the whole publication (spec 25.8 5b
+        // (h)2): a deleting pass cannot step in between `published` skipping
+        // a child and the parent's publication. Lock order: the source's
+        // lock (held by the caller), this lock, the clone's import lock. A
+        // holder of the exclusive lock never waits for another lock, so the
+        // wait here cannot close a cycle. Released before every `discard`,
+        // whose token release tries the exclusive lock on another descriptor.
+        let mut shared = Some(
+            self.store
+                .mutation_guard_waiting()
+                .map_err(|e| internal("source store", format!("{e:#}")))?,
+        );
         for id in &st.named {
             if !st.manifests.contains_key(id) && !self.published(id)? {
                 return Ok(false);
@@ -1555,6 +1598,7 @@ impl Incoming {
             }
         }
         if let Some(why) = refused {
+            drop(shared.take());
             self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(format!("the source is refused: {why}")));
@@ -1580,9 +1624,16 @@ impl Incoming {
                 }
                 None => match self.objects(repository_id) {
                     Some(repo) => {
+                        // Looked at first without the lock: a source whose
+                        // commits are not here yet waits for its bundle and
+                        // need not queue behind an unpack.
+                        if !self.commits_here(&repo, st, &carried)? {
+                            return Ok(false);
+                        }
                         // Held until the publication ends, as an unpack
                         // holds it: a discard of another source of the
                         // repository must not drop a ref this one counts on.
+                        // Under it the commits are looked at again.
                         let busy = format!("the clone of {repository_id} is busy");
                         held = Some(Self::wait_lock(
                             self.workspaces.import_lock(repository_id)?,
@@ -1610,6 +1661,7 @@ impl Incoming {
                     .is_some_and(|m| m.execution_commit.is_some())
             });
         if homeless {
+            drop(shared.take());
             self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(
@@ -1685,6 +1737,7 @@ impl Incoming {
         // (the clone's lock first: the discard takes it again)
         drop(unpacked);
         drop(held);
+        drop(shared.take());
         self.discard(source.as_str(), limits, true);
         Ok(true)
     }
@@ -1930,8 +1983,17 @@ impl BlobSink for Incoming {
                 }
             }
         }
-        self.store
-            .forget_unowned_imports(&owned)
+        // (first the publications a crash cut before their registration:
+        // spec 25.8 5b (h)1 (ii); a busy store leaves them for later, and
+        // its gate stays closed meanwhile; its failure is reported after
+        // the 5a cleanup below, which runs in any case)
+        let settled = self.store.settle_empty_receive_roots();
+        // (and the claim rows an older version kept, (h)3; a bounded number
+        // of pages, and a busy store leaves the rest for the next start)
+        let _ = self.store.forget_completed_claims();
+        let forgotten = self.store.forget_unowned_imports(&owned);
+        settled.map_err(|e| internal("source store", format!("{e:#}")))?;
+        forgotten
             .map(Some)
             .map_err(|e| internal("source store", format!("{e:#}")))
     }
