@@ -401,7 +401,7 @@ pub struct CoordinatorStore {
     /// False for a file from before `run.pruning_at_ms` opened read-only:
     /// no run of it carries the mark.
     pruning: bool,
-    state_dir: std::path::PathBuf,
+    pub(super) state_dir: std::path::PathBuf,
     _lock: Option<ProcessLock>,
 }
 

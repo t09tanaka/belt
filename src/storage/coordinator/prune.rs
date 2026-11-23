@@ -43,6 +43,10 @@ pub enum RowsState {
     /// A result reference or a deletion claim of the run is left: step 3
     /// comes first.
     Results,
+    /// Only the last transaction is left, the one that deletes the row of
+    /// the run and its `source_ref`: it needs the source lock held
+    /// exclusively.
+    Source,
     /// No row of the run is left.
     Done,
 }
@@ -383,9 +387,22 @@ impl CoordinatorStore {
     /// the order of spec 25.5: children before parents, so the foreign keys
     /// hold after every transaction. The last transaction deletes the row of
     /// the run and, with it, the source and the secret bundle records no run
-    /// names any more.
-    pub(crate) fn prune_rows(&self, run: &RunId, limit: u32) -> Result<RowsPage> {
+    /// names any more. That one runs only with `source`, the source lock
+    /// held exclusively, so that no submit is between its `put_source_ref`
+    /// and the insert of its run (both under the lock held shared).
+    pub(crate) fn prune_rows(
+        &self,
+        run: &RunId,
+        limit: u32,
+        source: Option<&crate::source::retention::ExclusiveGuard>,
+    ) -> Result<RowsPage> {
         self.pruning_owner()?;
+        if let Some(source) = source {
+            if source.root() != self.state_dir.join("sources") {
+                return Err(StorageError::Invalid("foreign source guard".into()));
+            }
+        }
+        let locked = source.is_some();
         let run = run.to_string();
         self.db.write(move |tx| {
             let mut page = RowsPage::default();
@@ -448,6 +465,10 @@ impl CoordinatorStore {
                 }
             }
             // 9: the run, and what only it named.
+            if !locked {
+                page.state = RowsState::Source;
+                return Ok(page);
+            }
             let (source, bundle): (Option<String>, Option<String>) = tx.query_row(
                 "SELECT source_id,secret_bundle_id FROM run WHERE run_id=?1",
                 [&run],

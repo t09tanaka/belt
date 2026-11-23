@@ -237,19 +237,31 @@ fn prune(
     fault("after_inputs")?;
     // 6. The rows, children first.
     let mut ended = Vec::new();
+    let mut source = None;
     loop {
         if budget.transactions == 0 {
             return Ok(false);
         }
         budget.transactions -= 1;
-        let page = owner.prune_rows(run, ROWS_PER_TRANSACTION)?;
+        let page = owner.prune_rows(run, ROWS_PER_TRANSACTION, source.as_ref())?;
         ended.extend(page.attempts);
         match page.state {
             RowsState::More => fault("during_rows")?,
             RowsState::Results => return Ok(false),
+            // The last transaction, under the source lock taken without
+            // waiting: a submit that holds it waits for nothing, and this
+            // run waits for the next pass.
+            RowsState::Source => match sources.prune_rows_guard()? {
+                Some(guard) => {
+                    fault("before_source_rows")?;
+                    source = Some(guard);
+                }
+                None => return Ok(false),
+            },
             RowsState::Done => break,
         }
     }
+    drop(source);
     fault("after_rows")?;
     // 7. After the commit that deleted the row of the run.
     release_attempts(ended);

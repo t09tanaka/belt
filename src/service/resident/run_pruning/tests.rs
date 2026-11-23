@@ -771,7 +771,7 @@ fn nothing_of_a_run_without_the_mark_is_deleted_by_any_step() {
     assert!(db.prune_claim_results(&made.run, 32, 9).is_err());
     assert!(db.prune_pending_results(&made.run, 32).is_err());
     assert!(db.prune_pin(&made.run).is_err());
-    assert!(db.prune_rows(&made.run, ROWS_PER_TRANSACTION).is_err());
+    assert!(db.prune_rows(&made.run, ROWS_PER_TRANSACTION, None).is_err());
     assert_eq!(
         (
             f.paths(),

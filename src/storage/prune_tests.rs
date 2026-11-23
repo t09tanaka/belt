@@ -149,11 +149,23 @@ fn foreign_keys_hold(store: &CoordinatorStore) {
     );
 }
 
+/// The source lock held exclusively, as the driver takes it for the last
+/// transaction of a run.
+fn exclusive(store: &CoordinatorStore) -> crate::source::retention::ExclusiveGuard {
+    crate::source::SourceStore::open(&store.state_dir)
+        .unwrap()
+        .prune_rows_guard()
+        .unwrap()
+        .expect("the source lock is free")
+}
+
 /// Every transaction of the rows of a marked run, to the end.
 fn prune_all_rows(store: &CoordinatorStore, run: &RunId) -> (u32, Vec<(WorkerId, AttemptId)>) {
     let (mut transactions, mut attempts) = (0, Vec::new());
     loop {
-        let page = store.prune_rows(run, ROWS_PER_TRANSACTION).unwrap();
+        let page = store
+            .prune_rows(run, ROWS_PER_TRANSACTION, Some(&exclusive(store)))
+            .unwrap();
         transactions += 1;
         assert!(page.rows <= ROWS_PER_TRANSACTION, "{} rows", page.rows);
         foreign_keys_hold(store);
@@ -161,6 +173,7 @@ fn prune_all_rows(store: &CoordinatorStore, run: &RunId) -> (u32, Vec<(WorkerId,
         match page.state {
             RowsState::More => assert_eq!(page.rows, ROWS_PER_TRANSACTION),
             RowsState::Results => panic!("a result reference was left"),
+            RowsState::Source => panic!("the source lock was held"),
             RowsState::Done => return (transactions, attempts),
         }
     }
@@ -325,18 +338,18 @@ fn the_rows_of_a_run_go_in_bounded_transactions_children_first_and_none_is_left(
     // A run without the mark loses nothing.
     let before = sizes(&store);
     assert!(matches!(
-        store.prune_rows(&run, ROWS_PER_TRANSACTION),
+        store.prune_rows(&run, ROWS_PER_TRANSACTION, None),
         Err(StorageError::Invalid(_))
     ));
     assert_eq!(sizes(&store), before);
     store.mark_pruning_for_test(&run);
     // 2 of the order: while a result reference or a claim of the run is
     // left, no row goes; step 3 comes first.
-    let page = store.prune_rows(&run, ROWS_PER_TRANSACTION).unwrap();
+    let page = store.prune_rows(&run, ROWS_PER_TRANSACTION, None).unwrap();
     assert_eq!((page.rows, page.state), (0, RowsState::Results));
     assert_eq!(sizes(&store), before);
     assert_eq!(store.prune_claim_results(&run, 32, 10).unwrap(), (1, 0));
-    let page = store.prune_rows(&run, ROWS_PER_TRANSACTION).unwrap();
+    let page = store.prune_rows(&run, ROWS_PER_TRANSACTION, None).unwrap();
     assert_eq!((page.rows, page.state), (0, RowsState::Results));
     let claims = store.prune_pending_results(&run, 32).unwrap();
     assert_eq!(claims.len(), 1);
@@ -370,7 +383,7 @@ fn the_rows_of_a_run_go_in_bounded_transactions_children_first_and_none_is_left(
     );
     assert!(store.has_run(&other).unwrap() && store.has_run(&kept).unwrap());
     // Asking again finds nothing to do.
-    let again = store.prune_rows(&run, ROWS_PER_TRANSACTION).unwrap();
+    let again = store.prune_rows(&run, ROWS_PER_TRANSACTION, None).unwrap();
     assert_eq!((again.rows, again.state), (0, RowsState::Done));
 }
 
@@ -702,4 +715,51 @@ fn an_attempt_of_a_pruned_run_gets_no_row_back_and_the_worker_s_other_attempts_g
         store.get_attempt(&live).unwrap().unwrap().state,
         AttemptState::Preparing
     );
+}
+
+/// A submit of an unchanged tree writes the `source_ref` of its source and
+/// later inserts its run, both under the source lock held shared. The last
+/// transaction of a pruned run that named the same source deletes that
+/// `source_ref` only under the lock held exclusively, so it never falls
+/// between the two (the insert of the run would fail on its foreign key).
+#[test]
+fn the_last_rows_of_a_run_wait_for_a_submit_of_its_source() {
+    let (_dir, store) = store();
+    let source = SourceId::generate();
+    let digest = ManifestDigest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    store.put_source_ref(&source, &digest, 1).unwrap();
+    let run = RunId::generate();
+    store
+        .create_run(&run, Some(&source), None, &json!({}), 1)
+        .unwrap();
+    store.mark_pruning_for_test(&run);
+    // The submit: the lock held shared, its `source_ref`, then its run.
+    let shared = store.source_mutation_guard().unwrap();
+    store.put_source_ref(&source, &digest, 2).unwrap();
+    let again = RunId::generate();
+    store
+        .enqueue_guarded_after(
+            &again,
+            Some(&source),
+            &json!({}),
+            &[(TaskId::generate(), json!({}))],
+            3,
+            shared,
+            || {
+                // The pass of the pruning reaches the last transaction here.
+                let sources = crate::source::SourceStore::open(&store.state_dir).unwrap();
+                assert!(sources.prune_rows_guard().unwrap().is_none());
+                let page = store.prune_rows(&run, ROWS_PER_TRANSACTION, None).unwrap();
+                assert_eq!(page.state, RowsState::Source);
+                assert!(store.has_run(&run).unwrap());
+            },
+        )
+        .unwrap();
+    // The next pass deletes the run; the source stays, named by the submit.
+    let page = store
+        .prune_rows(&run, ROWS_PER_TRANSACTION, Some(&exclusive(&store)))
+        .unwrap();
+    assert_eq!(page.state, RowsState::Done);
+    assert!(!store.has_run(&run).unwrap() && store.has_run(&again).unwrap());
+    assert_eq!(count(&store, "SELECT count(*) FROM source_ref"), 1);
 }

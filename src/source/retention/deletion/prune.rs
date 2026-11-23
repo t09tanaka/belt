@@ -54,6 +54,31 @@ impl PruneBudget {
     }
 }
 
+/// The source lock held exclusively, taken without waiting: the last row
+/// transaction of a pruned run holds it while it deletes the run's
+/// `source_ref` (spec 25.5, step 6). A submit writes `source_ref` and later
+/// inserts its run under the same lock held shared, so under this one no
+/// submit is between the two.
+#[derive(Debug)]
+pub struct ExclusiveGuard(Guard);
+
+impl ExclusiveGuard {
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.0.root
+    }
+}
+
+impl SourceStore {
+    /// `None` while a submit or a capture holds the source lock.
+    pub fn prune_rows_guard(&self) -> Result<Option<ExclusiveGuard>> {
+        match self.retention.guard(true) {
+            Ok(guard) => Ok(Some(ExclusiveGuard(guard))),
+            Err(error) if would_block(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl Index {
     /// The index the pruning finds the import sessions of a run by (spec
     /// 25.5, 25.13). A new index has it from its first open; an index of
@@ -186,10 +211,13 @@ impl SourceStore {
             return Ok(out);
         }
         fault("prune_after_roots")?;
-        // The bundles of a source go with the last run that names it. A run
-        // row appears only under the source lock held shared, so "no other
-        // run" holds while this runs; a bundle that is asked for again is
-        // written again.
+        // The bundles of a source go with the last run that names it. A
+        // submit holds the source lock shared from its check of the source
+        // to the insert of its run row (`enqueue_guarded`), so under this
+        // lock "no other run" holds; a bundle that is asked for again is
+        // written again. The lock is let go when this call returns: the
+        // `source_ref` of the source goes in step 6, in the last row
+        // transaction, which takes the lock exclusively again for it.
         if let Some((Some(source), false)) = owner.run_source(run)? {
             if let Some(ci) = crate::source::classify::ci_id_of(&source) {
                 self.remove_bundles_held(&ci)?;
