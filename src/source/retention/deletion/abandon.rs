@@ -467,8 +467,12 @@ impl SourceStore {
                             budget.paths -= 1;
                             report.paths += 1;
                             if let Err(error) = drained {
+                                // The claim is durable and the membership
+                                // gone; the root and the owner row stay, so
+                                // the next pass of this deletion replays it.
                                 report.unknown += 1;
                                 report.errors.push(format!("{error:#}"));
+                                return Ok(false);
                             }
                         }
                     }

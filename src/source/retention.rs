@@ -743,6 +743,9 @@ impl Index {
         }
         let done = keys.len() < 32;
         if done {
+            // The graph of a root is read only while the root exists: it
+            // goes with the root, not after it (spec 25.1, 4).
+            tx.execute("DELETE FROM graph WHERE root=?1", [pending])?;
             tx.execute("DELETE FROM root WHERE id=?1", [pending])?;
         }
         tx.commit()?;

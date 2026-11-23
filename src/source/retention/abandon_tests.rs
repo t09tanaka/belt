@@ -167,6 +167,21 @@ impl Parts {
     /// Nothing of the capture of `run` is left: no row of the index, no
     /// object or manifest file, no file the run ID names.
     fn assert_nothing_left(&self, run: &RunId) {
+        let left: Vec<(&str, i64)> = [
+            "capture_owner",
+            "root",
+            "member",
+            "graph",
+            "import_session",
+            "run_expiry",
+            "vault_delete_claim",
+            "source_delete_claim WHERE done=0",
+        ]
+        .into_iter()
+        .map(|table| (table, self.count(&format!("SELECT count(*) FROM {table}"))))
+        .filter(|(_, rows)| *rows > 0)
+        .collect();
+        assert_eq!(left, vec![]);
         assert_eq!(self.index_rows(), 0);
         assert_eq!(self.stored_files(), Vec::<PathBuf>::new());
         assert_eq!(self.run_files(run), Vec::<PathBuf>::new());
