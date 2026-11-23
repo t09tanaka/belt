@@ -457,6 +457,11 @@ pub const FILE_PREFIX: &str = ".belt-tmp.";
 /// about it ([`sweep_stages`]). The rest of the name is that of a temporary
 /// file, so an abandoned stage can still be told from one in use.
 pub const STAGE_PREFIX: &str = ".init-";
+/// What the preparation of a database in a stage puts beside it: the
+/// journals of SQLite and the setup lock (`storage::db`). Each is the stage's
+/// name with one of these endings, so it says who made it as the stage does,
+/// and it goes where the stage goes ([`sweep_stages`]).
+const STAGE_SIDECARS: [&str; 4] = ["-wal", "-shm", "-journal", ".init-lock"];
 const RANDOM_LEN: usize = 12;
 const MAX_PID_DIGITS: usize = 10;
 const MAX_START_DIGITS: usize = 20;
@@ -706,9 +711,40 @@ pub fn sweep_files(dir: &Path) -> FileSweep {
 /// stage pending and while it holds the lock that keeps another recovery
 /// out: a stage of a gone owner that the journal does not name is nobody's.
 /// A stage in the older form (`.init-<ulid>`) does not say who made it and
-/// is kept.
+/// is kept. What a database stage has beside it ([`STAGE_SIDECARS`]) is its
+/// maker's like the stage and is removed by the same proof: the process that
+/// made the stage is the only one that ever opens it as a database.
 pub fn sweep_stages(dir: &Path) -> FileSweep {
     sweep_named(dir, STAGE_PREFIX)
+}
+
+/// Remove what the preparation of the database `stage` left beside it. For
+/// the process that made the stage, after it closed the database and before
+/// the journal names the stage: nobody else ever opens a stage as a
+/// database (a recovery only renames it), so the setup lock among them has
+/// no other holder and can go with the rest. What is not there is skipped.
+pub fn remove_stage_sidecars(stage: &Path) -> io::Result<()> {
+    for ending in STAGE_SIDECARS {
+        let mut path = stage.as_os_str().to_owned();
+        path.push(ending);
+        match fs::remove_file(PathBuf::from(path)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The name that says who made the entry `name` of the kind `kind`: for a
+/// stage also the stage beside which `name` lies.
+fn owning_name<'a>(name: &'a str, kind: &str) -> &'a str {
+    if kind != STAGE_PREFIX {
+        return name;
+    }
+    STAGE_SIDECARS
+        .iter()
+        .find_map(|ending| name.strip_suffix(ending))
+        .unwrap_or(name)
 }
 
 fn sweep_named(dir: &Path, kind: &str) -> FileSweep {
@@ -723,7 +759,9 @@ fn sweep_named(dir: &Path, kind: &str) -> FileSweep {
             continue;
         };
         let path = entry.path();
-        if file_owner_is_gone(&path, name, kind, here.as_ref()) && fs::remove_file(&path).is_ok() {
+        let owner = owning_name(name, kind);
+        if file_owner_is_gone(&path, owner, kind, here.as_ref()) && fs::remove_file(&path).is_ok()
+        {
             out.removed += 1;
         } else {
             out.kept += 1;
@@ -1625,6 +1663,58 @@ mod tests {
             }
         );
         assert!(!dead.exists() && made.exists() && old_form.exists());
+    }
+
+    /// What SQLite and the setup lock leave beside a database stage whose
+    /// maker was killed is the maker's, like the stage: it goes in the same
+    /// sweep, and only there.
+    #[test]
+    fn what_lies_beside_a_stage_goes_with_it() {
+        let dir = parent();
+        let dead = testing::as_stage(&testing::dead_name("aaaaaaaaaaa1"));
+        let live = testing::as_stage(&testing::live_name("aaaaaaaaaaa2"));
+        let temporary = testing::dead_name("aaaaaaaaaaa3");
+        let put = |name: String| {
+            let path = dir.path().join(name);
+            fs::write(&path, b"x").unwrap();
+            path
+        };
+        let mut gone = vec![put(dead.clone())];
+        let mut kept = vec![put(live.clone())];
+        for ending in STAGE_SIDECARS {
+            assert_eq!(owning_name(&format!("{dead}{ending}"), STAGE_PREFIX), dead);
+            // a temporary file has nothing beside it
+            assert_ne!(owning_name(&format!("{dead}{ending}"), FILE_PREFIX), dead);
+            gone.push(put(format!("{dead}{ending}")));
+            kept.push(put(format!("{live}{ending}")));
+            kept.push(put(format!("{temporary}{ending}")));
+        }
+        // an ending nobody makes, two endings, and the old form's lock
+        kept.push(put(format!("{dead}-other")));
+        kept.push(put(format!("{dead}-wal-shm")));
+        kept.push(put(".init-01JD0000000000000000000000.init-lock".into()));
+        assert_eq!(sweep_files(dir.path()).removed, 0);
+        assert_eq!(
+            sweep_stages(dir.path()),
+            FileSweep {
+                removed: gone.len(),
+                kept: kept.len() - STAGE_SIDECARS.len()
+            }
+        );
+        for path in &gone {
+            assert!(!path.exists(), "{path:?}");
+        }
+        for path in &kept {
+            assert!(path.exists(), "{path:?}");
+        }
+        // the maker removes its own before the journal names the stage
+        let stage = dir.path().join(&live);
+        remove_stage_sidecars(&stage).unwrap();
+        remove_stage_sidecars(&stage).unwrap();
+        assert!(stage.exists());
+        for ending in STAGE_SIDECARS {
+            assert!(!dir.path().join(format!("{live}{ending}")).exists());
+        }
     }
 
     #[test]

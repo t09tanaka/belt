@@ -1601,4 +1601,13 @@ fn the_database_is_prepared_in_a_stage() {
     assert!(is_stage_name(stage.file_name().unwrap().to_str().unwrap()));
     assert_eq!(stage.parent(), Some(dir.path()));
     assert_eq!(crate::platform::owned_temp::count_files(dir.path()), 0);
+    // nothing lies beside the stage when the journal gets its name: the
+    // setup lock and the journals of SQLite went with the preparation
+    let mut left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    let stage_name = stage.file_name().unwrap().to_str().unwrap().to_string();
+    assert_eq!(left, [stage_name, "coordinator.lock".to_string()]);
 }

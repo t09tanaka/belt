@@ -694,6 +694,10 @@ impl CoordinatorStore {
             Ok(())
         })?;
         drop(db);
+        // The setup lock (and a journal SQLite may have left) of the stage
+        // is this process's alone: gone before the journal names the stage,
+        // so that the publication leaves nothing beside it.
+        crate::platform::owned_temp::remove_stage_sidecars(stage.path())?;
         stage.as_file().sync_all()?;
         // Retain the staged inode when publication/journal outcome is uncertain.
         let (_file, path) = stage.keep()?;
