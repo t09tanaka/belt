@@ -109,9 +109,8 @@ impl Undo {
                 let entry = entry?;
                 if entry.file_type()?.is_symlink()
                     && entry.file_name().to_str().is_some_and(|name| {
-                        name.strip_prefix(".resident.").is_some_and(|pid| {
-                            !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
-                        })
+                        crate::platform::owned_temp::is_own_file_name(name)
+                            || crate::platform::owned_temp::name_owner_is_gone(name)
                     })
                 {
                     fs::remove_file(entry.path())?;
@@ -162,7 +161,7 @@ fn stages(dirs: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
                 if entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|s| s.starts_with(".init-"))
+                    .is_some_and(|s| s.starts_with(crate::platform::owned_temp::STAGE_PREFIX))
                 {
                     paths.insert(entry.path());
                 }
@@ -359,13 +358,14 @@ mod tests {
                 fs::remove_file(&link).unwrap();
             }
             std::os::unix::fs::symlink("new-digest", &link).unwrap();
-            let stage = bin.join(format!(".resident.{}", std::process::id()));
+            use crate::platform::owned_temp::testing::{dead_name, live_name};
+            let stage = bin.join(live_name("aaaaaaaaaaaa"));
             std::os::unix::fs::symlink("new-digest", &stage).unwrap();
-            let stale = bin.join(".resident.987654");
+            let stale = bin.join(dead_name("bbbbbbbbbbbb"));
             std::os::unix::fs::symlink("missing-target", &stale).unwrap();
-            let regular = bin.join(".resident.123456");
+            let regular = bin.join(dead_name("cccccccccccc"));
             fs::write(&regular, "keep").unwrap();
-            let unrelated = bin.join(".resident.123.extra");
+            let unrelated = bin.join(".belt-tmp.123.extra");
             std::os::unix::fs::symlink("missing-target", &unrelated).unwrap();
             undo.restore(&paths).unwrap();
             assert!(fs::symlink_metadata(stale).is_err());

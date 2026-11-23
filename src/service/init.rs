@@ -77,6 +77,17 @@ fn services_dir(backend: Backend, home: &Path, config: &Path) -> anyhow::Result<
         }
     })
 }
+/// The directories of the parent in which a killed command can leave a
+/// temporary file, beyond those of the worker on the same host: the parent's
+/// state directory (`traffic-hold.json` and the like) and the directory of
+/// the upgrade record. `None` when the paths cannot be resolved.
+pub(super) fn temporary_dirs(
+    env: &BTreeMap<String, String>,
+    backend: Backend,
+) -> Option<[PathBuf; 2]> {
+    let paths = Paths::resolve_for(env, backend).ok()?;
+    Some([paths.state, paths.config.join("upgrade")])
+}
 impl Paths {
     #[cfg(test)]
     fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
@@ -278,7 +289,7 @@ impl JournalFile {
         let bytes = serde_json::to_vec(journal)?;
         ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
         let mut tmp =
-            tempfile::NamedTempFile::new_in(self.path.parent().context("journal parent")?)?;
+            crate::platform::owned_temp::file_in(self.path.parent().context("journal parent")?)?;
         tmp.write_all(&bytes)?;
         tmp.as_file().sync_all()?;
         if self.proof.is_some() {
@@ -406,7 +417,7 @@ fn recover(
                     .path
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with(".init-")),
+                    .is_some_and(is_stage_name),
             "invalid pending stage"
         );
         if p.target.try_exists()? {
@@ -458,11 +469,68 @@ fn owned(j: &Journal, path: &Path) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
+/// Where the file that becomes `target` is prepared. The journal names this
+/// path (`pending`) and a later `init` finishes the publication, so it is a
+/// stage and not a temporary file (spec 25.4 (a)): no sweep of temporary
+/// files may touch it.
 fn stage_path(target: &Path) -> PathBuf {
     target
         .parent()
         .expect("absolute target")
-        .join(format!(".init-{}", ulid::Ulid::new()))
+        .join(crate::platform::owned_temp::new_stage_name())
+}
+/// A stage a journal may name: `.init-…`, both the form that says who made
+/// it and the `.init-<ulid>` of earlier versions, whose journal a later
+/// binary must still recover.
+fn is_stage_name(name: &str) -> bool {
+    name.starts_with(crate::platform::owned_temp::STAGE_PREFIX)
+}
+/// Remove the stages that an `init` which was killed before it journaled
+/// them left in the directories that only this journal governs: the
+/// configuration directory, the directory of the binary and, once this
+/// journal owns the database in it, the parent's state directory. Only after
+/// [`recover`] returned with no stage pending and under `init.lock`: then no
+/// journal names a stage whose owner is gone.
+///
+/// The state directory is not found through the configuration directory
+/// (`XDG_STATE_HOME`), so the `init` of another configuration directory, with
+/// its own lock and journal, may look at the same one. Its journal may name a
+/// database stage there, and this `init` cannot read that journal. So the
+/// state directory is swept only by the journal that owns `coordinator.db`
+/// in it ([`owns_database`]): while that file stands, a stage that another
+/// journal names there can never be published (the publication never
+/// replaces, and a recovery accepts a standing target only when it is the
+/// very file its stage was), so removing it takes nothing from anybody.
+/// The directory of the service definitions is shared with other
+/// installations in the same way and has no such owner, so a stage there is
+/// left alone.
+fn sweep_abandoned_stages(j: &Journal, paths: &Paths) {
+    if j.pending.is_some() {
+        return;
+    }
+    let state = owns_database(j, paths).then_some(paths.state.as_path());
+    // The journal is read from disk: its binary is looked for only where
+    // `init` puts one, below this configuration directory's `bin/`.
+    let binary_dir = j
+        .spec
+        .executable
+        .parent()
+        .filter(|dir| dir.parent() == Some(paths.config.join("bin").as_path()));
+    for dir in [Some(paths.config.as_path()), binary_dir, state]
+        .into_iter()
+        .flatten()
+    {
+        crate::platform::owned_temp::sweep_stages(dir);
+    }
+}
+/// Whether the journal `j` has published the database of this state
+/// directory and that very file still stands there.
+fn owns_database(j: &Journal, paths: &Paths) -> bool {
+    let database = paths.state.join("coordinator.db");
+    j.database
+        .iter()
+        .chain(&j.files)
+        .any(|proof| proof.path == database && proof.verify_inode().is_ok())
 }
 fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     resident::validate_components(path)?;
@@ -758,6 +826,7 @@ async fn initialize_prepared<L: Launcher>(
         p.verify()?;
     }
     recover(&mut j, &mut jf, &paths, &plan)?;
+    sweep_abandoned_stages(&j, &paths);
     private_dir_with(&paths.state, durability)?;
     private_dir_with(&paths.worker, durability)?;
     if !owned(&j, &paths.key)? {
@@ -846,6 +915,10 @@ async fn initialize_prepared<L: Launcher>(
             },
         )?;
     }
+    // The database is this journal's from here on: what an `init` that was
+    // killed while it prepared one left in the state directory goes now, not
+    // at an `init` that may never be run again.
+    sweep_abandoned_stages(&j, &paths);
     if !owned(&j, &paths.input)? {
         let stage = stage_path(&paths.input);
         bootstrap::write_input(&stage, &j.spec)?;
@@ -858,7 +931,7 @@ async fn initialize_prepared<L: Launcher>(
     let _service_lease = files.lifecycle_lock()?;
     if j.plist.is_none() {
         let receipt = files
-            .install_journaled(&plan, |receipt, stage| {
+            .install_staged(&plan, |receipt, stage| {
                 durability.sync_directory(stage.parent().context("plist stage parent")?)?;
                 j.plist = Some(receipt.clone());
                 j.pending = Some(Pending {
@@ -970,12 +1043,10 @@ fn link_resident(executable: &Path, durability: &mut impl Durability) -> anyhow:
     if fs::read_link(&link).ok().as_deref() == Some(Path::new(digest)) {
         return Ok(());
     }
-    let staged = bin.join(format!(".resident.{}", std::process::id()));
-    match fs::remove_file(&staged) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    // A name that proves its owner (spec 25.4 (a)): a crash here leaves a link
+    // that a later start of `upgrade`, `init` or the resident removes.
+    crate::platform::owned_temp::sweep_files(bin);
+    let staged = bin.join(crate::platform::owned_temp::new_file_name());
     std::os::unix::fs::symlink(digest, &staged)?;
     fs::rename(&staged, &link)?;
     durability.sync_directory(bin)?;
@@ -1301,7 +1372,8 @@ pub(crate) fn handover<L: Launcher>(
             replacements.push((paths.input.clone(), serde_json::to_vec(&journal.spec)?));
         }
         for (path, bytes) in replacements {
-            let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("file parent")?)?;
+            let mut temp =
+                crate::platform::owned_temp::file_in(path.parent().context("file parent")?)?;
             temp.write_all(&bytes)?;
             temp.as_file().sync_all()?;
             temp.persist(&path).map_err(|e| e.error)?;

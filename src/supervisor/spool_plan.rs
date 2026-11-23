@@ -235,7 +235,7 @@ pub fn source_under(workspace: &Path, source: &Path) -> Option<Vec<OsString>> {
 /// A name the store gives its temporary files. Artifact names may not start
 /// like this, so such a file is always ours to sweep.
 pub fn is_tmp_name(name: &str) -> bool {
-    name.starts_with(".tmp")
+    name.starts_with(".tmp") || name.starts_with(crate::platform::owned_temp::FILE_PREFIX)
 }
 
 /// Why a set of artifact names is refused.
@@ -803,6 +803,7 @@ mod tests {
     fn temporary_names_are_ours() {
         assert!(is_tmp_name(".tmp"));
         assert!(is_tmp_name(".tmpAb12"));
+        assert!(is_tmp_name(&crate::platform::owned_temp::new_file_name()));
         assert!(!is_tmp_name("tmp"));
         assert!(!is_tmp_name("x.tmp"));
         assert!(!is_tmp_name(".t"));

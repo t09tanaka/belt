@@ -1251,10 +1251,55 @@ fn the_sweeper_clears_what_no_record_names() {
         .join("workspaces")
         .join(AttemptId::generate().as_str());
     std::fs::create_dir_all(plain.join("sub")).unwrap();
+    // scratch directories carry a marker: only those of a gone owner go
+    let mut ended = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let ended_start = match belt::platform::process_start_identity(ended.id()) {
+        belt::platform::StartIdentity::Identity(s) | belt::platform::StartIdentity::Zombie(s) => s,
+        other => panic!("{other:?}"),
+    };
+    let ended_pid = ended.id();
+    ended.wait().unwrap();
+    let marked = |dir: &std::path::Path, pid: u32, start: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        belt::platform::owned_temp::OwnedTemp::write_marker_of(dir, pid, start).unwrap();
+    };
     let scratch = f.state.join("workspaces/.staging.abc");
-    std::fs::create_dir_all(&scratch).unwrap();
+    marked(&scratch, ended_pid, &ended_start);
     let half_clone = f.state.join("clones/.clone.xyz");
-    std::fs::create_dir_all(&half_clone).unwrap();
+    marked(&half_clone, ended_pid, &ended_start);
+    let me = std::process::id();
+    let my_start = match belt::platform::process_start_identity(me) {
+        belt::platform::StartIdentity::Identity(s) => s,
+        other => panic!("{other:?}"),
+    };
+    let live_scratch = f.state.join("workspaces/.staging.live");
+    marked(&live_scratch, me, &my_start);
+    // without a marker (an older version, or a maker that could not say who
+    // it was): removed, because the sweep runs where no writer can exist
+    let unmarked_scratch = f.state.join("clones/.clone.unmarked");
+    std::fs::create_dir_all(unmarked_scratch.join("c/.git")).unwrap();
+    let unmarked_staging = f.state.join("workspaces/.staging.unmarked");
+    std::fs::create_dir_all(&unmarked_staging).unwrap();
+    // a marker that is there but says nothing readable: kept
+    let garbled_scratch = f.state.join("clones/.clone.garbled");
+    std::fs::create_dir_all(&garbled_scratch).unwrap();
+    std::fs::write(garbled_scratch.join("owner"), "not a marker").unwrap();
+    // a scratch directory that its maker was still building when it was
+    // killed is under a name that says who made it: gone with a gone maker
+    let building = |root: &str, pid: u32, start: &str| {
+        let name = belt::platform::owned_temp::OwnedTemp::building_name_of(pid, start).unwrap();
+        let dir = f.state.join(root).join(name);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        dir
+    };
+    let half_built = [
+        building("clones", ended_pid, &ended_start),
+        building("workspaces", ended_pid, &ended_start),
+    ];
+    let being_built = building("clones", me, &my_start);
     let foreign = f.state.join("workspaces/notes.txt");
     std::fs::write(&foreign, "mine").unwrap();
     // a leftover that holds a directory it cannot read
@@ -1269,10 +1314,21 @@ fn the_sweeper_clears_what_no_record_names() {
         .sweep_orphans(&|a| kept_root.ends_with(a.as_str()))
         .unwrap();
     assert!(report.failed.is_empty(), "{:?}", report.failed);
-    assert_eq!(report.removed.len(), 4, "{:?}", report.removed);
+    assert_eq!(report.removed.len(), 6, "{:?}", report.removed);
     assert!(kept.root.exists());
-    assert!(foreign.exists());
-    for gone in [&lost.root, &plain, &scratch, &half_clone] {
+    assert!(foreign.exists() && live_scratch.exists() && garbled_scratch.exists());
+    assert!(being_built.exists());
+    for gone in &half_built {
+        assert!(!gone.exists(), "{gone:?}");
+    }
+    for gone in [
+        &lost.root,
+        &plain,
+        &scratch,
+        &half_clone,
+        &unmarked_scratch,
+        &unmarked_staging,
+    ] {
         assert!(!gone.exists(), "{gone:?}");
     }
     // the dead attempt's branch went with its worktree

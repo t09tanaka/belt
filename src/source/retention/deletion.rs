@@ -352,6 +352,10 @@ impl SourceStore {
         #[cfg(test)]
         self.retention.pause_page();
         self.retention.check_anchor()?;
+        // Spec 25.4 (a): the exclusive mutation lock is held, so nothing is
+        // writing in `tmp/`; and `secrets.lock` is tried without waiting.
+        self.sweep_tmp_dir();
+        self.sweep_secret_tmp_if_free();
         let owner_identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let mut c = self.retention.connect()?;
         let registered_owner: Option<String> = c

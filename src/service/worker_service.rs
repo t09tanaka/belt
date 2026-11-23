@@ -326,6 +326,18 @@ pub(crate) fn switch_lock(
 }
 
 /// The exclusive switch lock, or the reason nothing was done.
+/// Spec 25.4 (a): a command that writes this worker's input, journal and
+/// version link clears, when it starts, the temporary files that a killed
+/// one left in the very directories it writes. These are the paths the
+/// command itself resolved, so the worker of a system user, whose
+/// configuration directory the administrator chose, is covered like any
+/// other.
+fn sweep_written_directories(paths: &Paths) {
+    for dir in [&paths.config, &paths.config.join("bin"), &paths.state] {
+        crate::platform::owned_temp::sweep_files(dir);
+    }
+}
+
 fn exclusive_lock(paths: &Paths) -> anyhow::Result<SwitchLock> {
     // A host without an install has no lock to take, and says so as before.
     require_journal(paths)?;
@@ -361,7 +373,7 @@ fn read_journal(paths: &Paths) -> anyhow::Result<Option<Journal>> {
 }
 
 fn save_journal(paths: &Paths, journal: &Journal) -> anyhow::Result<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(&paths.config)?;
+    let mut temporary = crate::platform::owned_temp::file_in(&paths.config)?;
     temporary.write_all(&serde_json::to_vec(journal)?)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&paths.journal).map_err(|e| e.error)?;
@@ -457,7 +469,7 @@ fn private_dir(home: &Path, leaf: &Path) -> anyhow::Result<()> {
 /// registration (no receipt) may be overwritten, so a re-run can finish.
 fn publish_exact(path: &Path, bytes: &[u8], mode: u32, replace: bool) -> anyhow::Result<()> {
     let parent = path.parent().context("file parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = crate::platform::owned_temp::file_in(parent)?;
     temporary.write_all(bytes)?;
     temporary
         .as_file()
@@ -537,9 +549,7 @@ pub(crate) fn place_binary_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let temporary = tempfile::Builder::new()
-        .prefix(".part")
-        .tempfile_in(directory)?;
+    let temporary = crate::platform::owned_temp::file_in(directory)?;
     std::io::copy(&mut File::open(current)?, &mut temporary.as_file())?;
     temporary
         .as_file()
@@ -873,8 +883,9 @@ pub fn install<L: Launcher>(
     ensure!(request.schema == 1, "unsupported install request schema");
     let paths = Paths::resolve_for(env, launcher.backend())?;
     // Before the first write, on every path (the `init` handover too): an
-    // ephemeral worker's state is never installed over.
+    // ephemeral worker's state is never installed over, nor swept.
     super::worker::ephemeral::refuse_marked(&paths.state)?;
+    sweep_written_directories(&paths);
     // The worker will share the scope of the user's CLI: refuse here, at
     // install, an environment it would refuse at start. Only here: stop,
     // drain and status do not depend on the caller's scope.

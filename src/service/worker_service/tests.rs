@@ -1707,3 +1707,52 @@ fn membership_resume_starts_service_stopped_by_handover() {
     assert!(status.ready && status.loaded == Some(true));
     assert!(!h.paths().state.join("membership-restart").exists());
 }
+
+/// Spec 25.4 (a), the input directory of a worker: `install` clears, before
+/// it writes, what a killed command left in the directories it resolved
+/// itself, also when the configuration directory is not the default one (a
+/// system user's worker, whose directory the administrator names).
+#[test]
+fn install_sweeps_the_directories_it_writes_before_it_writes() {
+    use crate::platform::owned_temp::testing::{dead_name, live_name};
+    for system_user in [false, true] {
+        let mut host = Host::new();
+        host.request.system_user = system_user;
+        let config_home = host.root.join("h/chosen");
+        host.env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            config_home.to_str().unwrap().to_string(),
+        );
+        let paths = host.paths();
+        assert_eq!(paths.config, config_home.join("belt"));
+        let default_config = host.root.join("h/.config/belt");
+        let mut gone = Vec::new();
+        let mut kept = vec![];
+        for (n, dir) in [&paths.config, &paths.config.join("bin"), &paths.state]
+            .into_iter()
+            .enumerate()
+        {
+            fs::create_dir_all(dir).unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+            gone.push(dir.join(dead_name(&format!("gggggggggg{n:02}"))));
+            kept.push(dir.join(live_name(&format!("hhhhhhhhhh{n:02}"))));
+        }
+        // not a directory this command writes: not looked at
+        fs::create_dir_all(&default_config).unwrap();
+        kept.push(default_config.join(dead_name("iiiiiiiiiiii")));
+        for file in gone.iter().chain(&kept) {
+            fs::write(file, b"x").unwrap();
+        }
+        let system_dir = host.root.join("system");
+        fs::create_dir(&system_dir).unwrap();
+        // the result does not matter here (a system user's install stops at
+        // the missing registration): the sweep is the first thing it does
+        let _ = system_user::with_fixture_directory(&system_dir, || host.install());
+        for file in &gone {
+            assert!(!file.exists(), "{file:?}");
+        }
+        for file in &kept {
+            assert!(file.exists(), "{file:?}");
+        }
+    }
+}

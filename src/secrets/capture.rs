@@ -57,7 +57,7 @@ pub fn run_bundle_path(store: &SourceStore, run: &RunId) -> PathBuf {
 
 /// The leftover of a bundle write that was killed: local-ci's temporary file
 /// (`.secrets.tmp-*`) holds the secret files in plain.
-fn is_bundle_tmp(name: &str) -> bool {
+pub(crate) fn is_bundle_tmp(name: &str) -> bool {
     name.starts_with(".secrets.tmp-")
 }
 

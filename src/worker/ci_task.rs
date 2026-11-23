@@ -149,7 +149,7 @@ fn store_plan_within(
             ));
         }
     }
-    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    let mut tmp = crate::platform::owned_temp::file_in(&dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| e.error)?;

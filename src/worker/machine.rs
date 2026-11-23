@@ -325,7 +325,11 @@ impl Host for Machine {
     }
 
     fn sweep_store_copies(&self) -> Result<(), ApiError> {
-        sweep_store_copies(&self.store, |_| false).map(|_| ())
+        sweep_store_copies(&self.store, |_| false)?;
+        // Spec 25.4 (a): what a killed process left in `tmp/`. Busy means a
+        // capture is running; the next start looks again.
+        let _ = self.store.sweep_temporaries();
+        Ok(())
     }
 
     fn sweep_vault(&self) -> Result<(), ApiError> {

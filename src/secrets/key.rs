@@ -215,7 +215,7 @@ pub fn init(path: &Path) -> Result<ClusterKey> {
     // a crash before publication leaves a temporary key copy behind
     sweep_stale_tmp(dir, STALE_TMP_AGE)?;
     let key = ClusterKey::generate()?;
-    let tmp = dir.join(format!(".cluster-key.{}.tmp", ulid::Ulid::new()));
+    let tmp = dir.join(crate::platform::owned_temp::new_file_name());
     let io = |e| SecretError::io(format!("cluster key {}", path.display()), e);
     let mut f = OpenOptions::new()
         .write(true)
@@ -500,5 +500,37 @@ mod tests {
         init(&sub.join("cluster.key")).unwrap();
         assert!(!old.exists());
         assert!(fresh.exists());
+    }
+
+    /// Spec 25.4 (a): the key's temporary file has a name that proves its
+    /// owner; `init` removes the one of a gone process at once (no age), and
+    /// keeps the one of a live process, one of another place and one that
+    /// does not parse.
+    #[test]
+    fn a_temporary_key_copy_of_a_gone_owner_is_swept_by_init_without_waiting() {
+        use crate::platform::owned_temp::testing::{
+            dead_name, ended_process, live_name, name_in_another_place,
+        };
+        let d = crate::test_tmp::tempdir().unwrap();
+        let sub = d.path().join("k");
+        fs::create_dir(&sub).unwrap();
+        let gone = sub.join(dead_name("aaaaaaaaaaaa"));
+        let live = sub.join(live_name("bbbbbbbbbbbb"));
+        let (pid, start) = ended_process();
+        let elsewhere = sub.join(name_in_another_place(pid, &start, "cccccccccccc"));
+        let garbled = sub.join(".belt-tmp.garbage");
+        for f in [&gone, &live, &elsewhere, &garbled] {
+            fs::write(f, b"x").unwrap();
+        }
+        init(&sub.join("cluster.key")).unwrap();
+        assert!(!gone.exists());
+        assert!(live.exists() && elsewhere.exists() && garbled.exists());
+        // and what init itself leaves behind is nothing
+        let own: Vec<_> = fs::read_dir(&sub)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("cluster.key"))
+            .collect();
+        assert_eq!(own.len(), 1);
     }
 }

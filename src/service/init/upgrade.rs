@@ -142,7 +142,7 @@ fn read_record(paths: &Paths) -> anyhow::Result<Option<Record>> {
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let directory = path.parent().context("file parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut temporary = crate::platform::owned_temp::file_in(directory)?;
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -185,7 +185,10 @@ fn replace_journal(paths: &Paths, j: &Journal) -> anyhow::Result<()> {
 }
 
 fn put_input(paths: &Paths, spec: &Spec) -> anyhow::Result<()> {
-    let stage = stage_path(&paths.input);
+    // No journal names this file: a temporary file, not a stage.
+    let stage = paths
+        .config
+        .join(crate::platform::owned_temp::new_file_name());
     bootstrap::write_input(&stage, spec)?;
     fs::rename(&stage, &paths.input)?;
     File::open(&paths.config)?.sync_all()?;
