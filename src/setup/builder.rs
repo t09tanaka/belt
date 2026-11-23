@@ -559,6 +559,11 @@ impl Setups {
         }
         let root = self.private_tool_root()?;
         let plan = request.plan(&root).map_err(invalid)?;
+        // Spec 25.7 (b): without the worker DB no root is bound or installed
+        // into; the next poll asks again.
+        if self.db().is_none() {
+            return Ok(ToolPreparationPoll::Pending);
+        }
         self.poll_tool_checked(attempt, request, &plan, |receipt| match receipt {
             // Spec 25.7 (b): the root is bound before it is used. Without
             // the worker DB nothing is used; the next poll asks again.

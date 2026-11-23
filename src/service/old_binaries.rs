@@ -118,11 +118,6 @@ fn pass(
     switch_held: bool,
     now: SystemTime,
 ) -> Result<Outcome, Held> {
-    // Nothing to remove: the service manager is not asked (every start of
-    // the resident and the worker comes here).
-    if !anything_to_remove(places) {
-        return Ok(Outcome::default());
-    }
     if on_trial(places)? {
         return Err(Held::Trial);
     }
@@ -170,25 +165,6 @@ fn pass(
     }
     outcome.tool_bins = sweep_tool_bins(places);
     Ok(outcome)
-}
-
-/// Whether there is a version directory that no link of `bin/` points at, or
-/// a tool link directory. Read errors count as something (the pass decides).
-fn anything_to_remove(places: &Places) -> bool {
-    let bin = places.bin();
-    let linked: Vec<String> = ["current", "resident"]
-        .iter()
-        .filter_map(|l| fs::read_link(bin.join(l)).ok())
-        .map(|t| t.to_string_lossy().into_owned())
-        .collect();
-    let versions = match entries(&bin) {
-        Ok(names) => names
-            .iter()
-            .any(|n| is_digest(n) && !linked.iter().any(|l| l.contains(n.as_str()))),
-        Err(_) => true,
-    };
-    versions
-        || entries(&places.worker_state.join("tool-bin")).map_or(true, |names| !names.is_empty())
 }
 
 fn euid() -> u32 {
@@ -441,9 +417,14 @@ pub(crate) fn remove_refused(config: &Path, digest: &str, created: bool) {
         return;
     }
     let bin = config.join("bin");
-    let linked = ["current", "resident"].iter().any(|l| {
-        fs::read_link(bin.join(l)).map_or(true, |t| t.to_string_lossy().contains(digest))
-    });
+    // A link that is not there points at nothing; one that cannot be read
+    // may point here.
+    let linked = ["current", "resident"]
+        .iter()
+        .any(|l| match fs::read_link(bin.join(l)) {
+            Ok(t) => t.to_string_lossy().contains(digest),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        });
     let dir = bin.join(digest);
     let ours = fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && m.uid() == euid());
     if !linked && ours {

@@ -168,14 +168,14 @@ impl Setups {
         let Some(flight) = inner.flights.get(id) else {
             return;
         };
-        let now = platform::wall_ms();
-        for consumer in &flight.refs {
-            if !inner.consumers.contains_key(consumer) {
-                continue;
-            }
-            if let Some((attempt, _)) = consumer.rsplit_once("/tool:") {
-                let _ = db.toolchain_bind(identity, attempt, now);
-            }
+        let consumers: Vec<String> = flight
+            .refs
+            .iter()
+            .filter(|c| inner.consumers.contains_key(*c))
+            .filter_map(|c| c.rsplit_once("/tool:").map(|(a, _)| a.to_string()))
+            .collect();
+        if !consumers.is_empty() {
+            let _ = db.toolchain_bind_all(identity, consumers, platform::wall_ms());
         }
     }
 

@@ -115,41 +115,23 @@ impl WorkerStore {
     /// already gets no reference and is answered `Absent`.
     pub fn toolchain_bind(&self, identity: &str, consumer: &str, now_ms: u64) -> Result<Bind> {
         let (identity, consumer) = (identity.to_string(), consumer.to_string());
+        self.db
+            .write(move |tx| bind_in(tx, &identity, &consumer, now_ms))
+    }
+
+    /// [`Self::toolchain_bind`] of several consumers, in one transaction.
+    pub fn toolchain_bind_all(
+        &self,
+        identity: &str,
+        consumers: Vec<String>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let identity = identity.to_string();
         self.db.write(move |tx| {
-            let live = tx
-                .query_row(
-                    "SELECT state = 'live' FROM toolchain_root WHERE identity = ?1",
-                    [&identity],
-                    |r| r.get::<_, bool>(0),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if !live {
-                return Ok(Bind::Absent);
+            for consumer in &consumers {
+                bind_in(tx, &identity, consumer, now_ms)?;
             }
-            let attempt: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT coordinator_id, state FROM worker_attempt WHERE attempt_id = ?1",
-                    [&consumer],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            match attempt {
-                Some((_, state)) if state == "terminal" => return Ok(Bind::Absent),
-                Some((member, _)) => tx.execute(
-                    "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder, coordinator_id) VALUES (?1, 'attempt', ?2, ?3)",
-                    params![identity, consumer, member],
-                )?,
-                None => tx.execute(
-                    "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder) VALUES (?1, 'warmup', ?2)",
-                    params![identity, consumer],
-                )?,
-            };
-            tx.execute(
-                "UPDATE toolchain_root SET last_used_ms = max(last_used_ms, ?2) WHERE identity = ?1",
-                params![identity, now_ms as i64],
-            )?;
-            Ok(Bind::Bound)
+            Ok(())
         })
     }
 
@@ -304,7 +286,8 @@ impl WorkerStore {
         })
     }
 
-    /// The root of a claimed removal is gone: its row goes.
+    /// The root of a claimed removal is gone: its row goes, and so does the
+    /// count of failed removals (a removal works again).
     pub fn toolchain_forget(&self, identity: &str) -> Result<()> {
         let identity = identity.to_string();
         self.db.write(move |tx| {
@@ -312,6 +295,7 @@ impl WorkerStore {
                 "DELETE FROM toolchain_root WHERE identity = ?1 AND state = 'evicting'",
                 [&identity],
             )?;
+            tx.execute("DELETE FROM schema_meta WHERE key = ?1", [EVICT_FAILURES])?;
             Ok(())
         })
     }
@@ -410,6 +394,49 @@ impl WorkerStore {
             })
         })
     }
+}
+
+/// One bind (see [`WorkerStore::toolchain_bind`]) inside `tx`.
+fn bind_in(
+    tx: &rusqlite::Transaction<'_>,
+    identity: &str,
+    consumer: &str,
+    now_ms: u64,
+) -> Result<Bind> {
+    let live = tx
+            .query_row(
+                "SELECT state = 'live' FROM toolchain_root WHERE identity = ?1",
+                [identity],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !live {
+            return Ok(Bind::Absent);
+        }
+        let attempt: Option<(String, String)> = tx
+            .query_row(
+                "SELECT coordinator_id, state FROM worker_attempt WHERE attempt_id = ?1",
+                [consumer],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match attempt {
+            Some((_, state)) if state == "terminal" => return Ok(Bind::Absent),
+            Some((member, _)) => tx.execute(
+                "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder, coordinator_id) VALUES (?1, 'attempt', ?2, ?3)",
+                params![identity, consumer, member],
+            )?,
+            None => tx.execute(
+                "INSERT OR IGNORE INTO toolchain_ref (identity, kind, holder) VALUES (?1, 'warmup', ?2)",
+                params![identity, consumer],
+            )?,
+        };
+        tx.execute(
+            "UPDATE toolchain_root SET last_used_ms = max(last_used_ms, ?2) WHERE identity = ?1",
+            params![identity, now_ms as i64],
+        )?;
+        Ok(Bind::Bound)
 }
 
 #[cfg(test)]
