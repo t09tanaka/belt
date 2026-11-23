@@ -2391,7 +2391,9 @@ impl Agent {
         }
         ids.sort();
         ids.dedup();
-        let pass = self.passes.load(Ordering::SeqCst);
+        // The pass this one took above: a first failure is tried again on
+        // the next pass, then after 2, 4, ... passes.
+        let pass = self.passes.load(Ordering::SeqCst).saturating_sub(1);
         for id in ids {
             let done = self.remove_dropped(&id);
             let mut backoff = lock(&self.dropped_backoff);
