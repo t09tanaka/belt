@@ -212,8 +212,9 @@ you are in, where `hook remove` keeps commits that would be lost (see
 [Claude Code hooks](#claude-code-hooks)), with their commit and when they
 were kept. `prune` deletes those kept `<days>` (default 30) ago or more,
 going by the date in the ref's name, and those kept more than 25 hours ago
-whose commit a branch, a remote-tracking branch or a tag has; refs whose
-name has no date are left alone. The same is done by itself (see [What is
+whose commit a local branch or a tag has (a remote-tracking branch does not
+count: somebody else can delete it); refs whose name has no date are left
+alone. The same is done by itself (see [What is
 deleted by itself](#what-is-deleted-by-itself)).
 
 ```sh
@@ -1079,9 +1080,9 @@ worktree (or with `discard_changes`), so it always deletes it:
     it says so).
 
   The refs are named in the output, with the day each is deleted. One
-  whose commit a branch or tag has is deleted after 25 hours; one that
-  holds its commit alone after 30 days, and its commits can then be dropped
-  by `git gc` (see [What is deleted by
+  whose commit a local branch or a tag has is deleted after 25 hours; any
+  other after 30 days, and its commits can then be dropped by `git gc`;
+  either way a line on stderr says so, with the ref, the commit and why (see [What is deleted by
   itself](#what-is-deleted-by-itself)). `fast-worktree kept ls` lists them
   and `fast-worktree kept prune [--older-than <days>]` applies the same
   rules at once (default: 30 days; `git update-ref -d <ref>` deletes one). They are not pushed by `git push` of a
@@ -1190,19 +1191,31 @@ once.
 
 - **Every command** starts one background deleter for what an interrupted
   one left in the trash (none while one is at work), and, in its own
-  repository, discards the spares beyond the pool size.
+  repository, notes that the repository is in use (the modification time of
+  `<cache>/<repo>-<hash>/.main`) and discards the spares beyond the pool
+  size.
 - **At most once an hour, in its own repository** (stamped in
   `<cache>/<repo>-<hash>/.retention-stamp`), a command deletes the kept refs
-  that are no longer needed and the pool's leftovers. This part runs git and
-  may wait for that repository's locks, so it is never done for another
-  repository.
+  that are no longer needed, the pool's leftovers, and the registrations of
+  spares that are no longer there. This part runs git and may wait for that
+  repository's locks, so it is never done for another repository; and it
+  says what it deletes, so `pool fill`, which mostly runs in the background
+  with its output in a log file, leaves it (and its hour) to the next
+  command.
 - **At most once an hour, for the whole cache** (stamped in
   `<cache>/.retention-stamp`), whichever command comes first walks every
   repository's directory. This walk must not delay the command that makes
-  it: it lists directories and renames into the trash, takes locks only
-  without waiting (a busy one is left for the next walk), runs no git, moves
-  at most 200 things, and starts one deleter for all of them. When work is
-  left, the next command goes on, not the next hour's.
+  it: it reads and renames only inside the cache, takes locks only without
+  waiting (a busy one is left for the next walk), runs no git, moves at
+  most 200 things, and starts one deleter for all of them. When work is
+  left, the next command goes on, not the next hour's. It never looks at
+  where another repository is: a network mount that is down would hold the
+  command for ever.
+- **The repositories that ran no command for 7 days** are handed by that
+  walk to one detached, low-priority process (`fast-worktree cache retire`,
+  at most 200 of them, each at most once a day while its directory stays).
+  Only this process looks at their checkouts, and nobody waits for it. It
+  takes every lock without waiting, and looks again once it holds them.
 
 A sweep never fails the command that made it. A stamp that cannot be written
 is said once, and the walk is then made by every command.
@@ -1211,16 +1224,17 @@ is said once, and the walk is then made by every command.
 |---|---|---|---|
 | Cache entry, with its `.ok` and `.src` | `<cache>/<repo>/<project>/<key>` | until unused for 7 days (its modification time is its last use, set when it is cloned); the next install clones from it | the hourly walk (every project of every repository), `install` of that project, `cache prune` |
 | Half-made entry `<key>.tmp-<pid>-<n>` | the project directory | until its run is gone (the pid is not alive) and it was made 10 minutes ago, or 7 days ago whatever the pid. Its age is when its inode last changed: the modification time of a clone is that of its source | the same |
-| Pool spare | `<cache>/<repo>/pool/wt-*` | while its repository is there, the pool is on, and it is within `[pool] size` | `add` (it is used); the next command in the repository when the size was lowered or the pool turned off; the hourly walk when the repository is gone; `pool refresh`, `pool clear` |
-| Pool `.new-*`, `.no-hooks-*` | the pool | while the fill that makes them is alive (the pid in the name), a day at most | the start of the next `pool fill`, the repository's hourly sweep, `pool clear` |
-| Pool `.claimed-*` | the pool | while the `add` that took the spare is alive, a day at most | the same |
-| `pool/misses` | the pool | the last 7 days: `pool status` shows how often an `add` found no spare | trimmed by each `add` that adds to it, and by the repository's hourly sweep |
-| `pool/fill.log` | the pool | 7 days after the last fill wrote to it; started afresh when it passes 1 MiB | the repository's hourly sweep |
+| Pool spare | `<cache>/<repo>/pool/wt-*` | while the pool is on, it is within `[pool] size`, and a command ran in its repository in the last 7 days: the next `add` there takes it | `add` (it is used); the next command in the repository when the size was lowered or the pool turned off; the detached process once the repository ran no command for 7 days; `pool refresh`, `pool clear` |
+| Pool `.new-*`, `.no-hooks-*` | the pool | while the fill that makes them is alive (the pid in the name) and for 10 minutes after they were last touched (a pid says nothing about a fill in a container that shares the cache); a day at most | the start of the next `pool fill`, the repository's hourly sweep, `pool clear`; the detached process once the repository ran no command for 7 days |
+| Pool `.claimed-*` | the pool | while the `add` that took the spare is alive and for 10 minutes after it took it; a day at most | the same |
+| `pool/misses` | the pool | the last 7 days: `pool status` shows how often an `add` found no spare | trimmed by each `add` that adds to it, by the repository's hourly sweep, and by the detached process |
+| `pool/fill.log` | the pool | 7 days after the last fill wrote to it, and no longer than the repository is in use; started afresh when it passes 1 MiB | the repository's hourly sweep; the detached process |
+| Registration of a spare whose directory is gone | `<git dir>/worktrees/wt-*` | until the next command in the repository | the repository's hourly sweep |
 | Trash entry | `<cache>/trash` | deleted at once in the background; a leftover of a killed deleter after 10 minutes, a `keep-` entry (a worktree `hook remove` kept) for 24 hours | the next fast-worktree command after those times |
-| Hidden sibling `.fast-worktree-trash-*` | next to a removed worktree on another volume than the cache | as a trash entry | the same, by the note the trash keeps of it; without a note, the next removal next to it and the repository's hourly sweep, by its name |
-| Kept ref whose commit a branch, a remote-tracking branch or a tag has | `refs/fast-worktree/kept/*` | 25 hours: it protects nothing, but the removal that made it may be running, and the restore command for a worktree kept in the trash names it | the repository's hourly sweep, `kept prune` |
-| Kept ref that holds its commit alone | the same | 30 days (the date in the ref's name) | the same, with a line on stderr that names the ref and the commit |
-| Lock files: `.store.lock` (one for each project), `lifecycle.lock`, `pool/fill.lock`; the directories they are in; `.main` and `.retention-stamp` | `<cache>/<repo>` | while the repository's main checkout is there: a few empty files and directories for a repository | the hourly walk, once the main checkout is gone: the whole `<cache>/<repo>` at once |
+| Hidden sibling `.fast-worktree-trash-*` | next to a removed worktree on another volume than the cache | as a trash entry | the same, by the note the trash keeps of it, which goes with it; without a note, the next removal next to it and the repository's hourly sweep, by its name |
+| Kept ref whose commit a local branch or a tag has | `refs/fast-worktree/kept/*` | 25 hours: it protects nothing, but the removal that made it may be running, and the restore command for a worktree kept in the trash names it | the repository's hourly sweep (never `pool fill`), `kept prune`; a line on stderr names the ref, the commit and the branch or tag |
+| Any other kept ref (nothing has its commit, or only a remote-tracking branch) | the same | 30 days (the date in the ref's name) | the same; the line says that the 30 days passed and that `git gc` may drop the commit |
+| Lock files: `.store.lock` (one for each project), `lifecycle.lock`, `pool/fill.lock`; the directories they are in; `.main` and `.retention-stamp` | `<cache>/<repo>` | until the repository is gone (below): a few small files and empty directories for a repository | the detached process, once the repository ran no command for 7 days and its main checkout was deleted: the whole `<cache>/<repo>` at once |
 | Registration lock | `<git dir>/fast-worktree-registration.lock` | one empty file, as long as the repository | deleting the repository |
 | `<cache>/trash/.lock`, `<cache>/.retention-stamp` | the cache | two empty files, for ever | nothing |
 
@@ -1232,29 +1246,95 @@ and the next to come would both hold "the lock". So the lock files stay, and
 the directories that hold them: their number is fixed by the number of
 repositories and projects, and does not grow with use.
 
-**A repository that is gone** is told by `<cache>/<repo>/.main`, which
-records where its main checkout is (the directory's name has only a hash of
-that path): the checkout is missing while the directory it was in is still
-there. (When that directory is missing too, the volume may just not be
-mounted, and nothing is touched.) A directory of the cache that only older
-versions wrote to has no record and stays until a command of this version
-runs in its repository.
+**A repository that is not in use** ran no command for 7 days: the
+modification time of its `.main`, which every command renews, and of its
+pool directory, which a fill or an `add` of an older version changes too.
+Its spares are discarded then, with what a fill left half made, `fill.log`
+and `misses`: a spare is there for the next `add` of its repository, and 7
+days is also how long a cache entry stays that nothing cloned from, so past
+it an `add` there starts from nothing either way (the first one makes a
+worktree the slow way and starts a fill). When the checkout is there, they
+are discarded as any spare is, unregistered and deleted. When it cannot be
+reached, only the directories go, and the registrations are dropped by the
+repository's next command.
+
+**A repository that is gone** is one that is not in use and whose main
+checkout was deleted. `.main` records where the checkout is (the
+directory's name has only a hash of that path) and the device numbers of the
+checkout, of the directory it is in and of the cache. All of this must hold
+before `<cache>/<repo>` is deleted, and anything that cannot be read keeps
+it:
+
+1. no command ran in it for 7 days;
+2. `.main` has the device numbers (a record without them, or a directory of
+   the cache with no `.main` at all, that only versions up to 0.6.0 wrote
+   to, stays until a command of this version runs in its repository: no
+   length of time tells a deleted checkout from one on a disk that was not
+   plugged in);
+3. the checkout was not itself the root of a mount;
+4. the directory the checkout was in is there, on the same device as then
+   (the same device as the cache, when both were on one);
+5. the checkout's path does not exist.
+
+So these are not "gone":
+
+- A disk mounted at `/mnt/data` that is not mounted, a network or FUSE
+  mount that is down: the mount point is there, but on another device (4).
+  On macOS a volume under `/Volumes` takes its mount point with it (4, or
+  3 when the checkout is the volume's root).
+- A cache shared with another machine or a container, where the path only
+  exists on the other side: nothing happens while that side uses it (1),
+  and afterwards the directory it was in is missing or on another device
+  (4). Device numbers of two machines can be equal by chance; then only
+  what can be made again is lost (entries and spares).
+- A checkout whose path cannot be looked at (no permission, an I/O error).
+
+A checkout that was **moved** cannot be told from a deleted one, and after 7
+days the directory of its old path goes. Its commands use another directory
+of the cache from the first one on; the spares that stayed behind are still
+registered in the repository (locked, so `git worktree prune` keeps them),
+and the repository's next command after they are gone drops exactly those
+registrations: locked with the reason fast-worktree gives its spares
+(`fast-worktree pool`, the same in every version), recorded at a spare's
+place in this cache, with nothing there. A worktree that you or another
+tool locked is never touched.
+
+The detached process is `fast-worktree` itself. A program that embeds the
+library starts it with its helper executable (`with_helper`); with no
+helper, or one older than this version, the repositories that are not in
+use stay as they are until a `fast-worktree` command of this version runs.
 
 **What a kept ref's deletion loses.** `hook remove` keeps in
 `refs/fast-worktree/kept/` what would otherwise go with the worktree: the
 `HEAD` of a worktree with uncommitted changes whose branch it deleted, a
 detached `HEAD` that no branch has, and the `HEAD` of each checked-out
 submodule, fetched into the main repository. The worktree's reflog is gone
-with the worktree. Once the ref of a commit that nothing else holds is
-deleted (30 days after the removal; the line that names the ref says the
-date), nothing refers to those commits any more and `git gc` can drop them
-at once. To keep them, make a branch before then: `git branch <name> <ref>`.
+with the worktree.
+
+- A ref whose commit a local branch or a tag has is deleted 25 hours after
+  the removal. Nothing is lost: the branch or tag holds the commit, and
+  only you delete those. The line that says so names it.
+- Any other ref is deleted 30 days after the removal (the line that names
+  the ref when it is made says the date). From then on nothing of
+  fast-worktree refers to those commits, and unless a branch or a tag has
+  them `git gc` can drop them at once. A commit that only a remote-tracking
+  branch has counts as held by nothing: that branch goes when somebody
+  deletes or rewrites it on the remote and you fetch with `--prune`, so the
+  ref stays its 30 days.
+
+No kept ref is deleted without a line on stderr that says which, which
+commit and why, and none is deleted by the background `pool fill`, whose
+output nobody reads. A program that embeds the library gets the same list
+in the result of the call (`deleted_kept_refs`). To keep the commits, make
+a branch before then: `git branch <name> <ref>`.
 
 Only names that fast-worktree makes are removed from the cache directory: a
 repository directory `<name>-<8 hex digits>`, in it a key `<16 hex
 digits>-<...>` with its `.ok` marker, or such a key followed by
-`.tmp-<pid>-<n>`. Anything else there is left alone and is not listed by
-`cache ls`.
+`.tmp-<pid>-<n>`; in a pool, a spare's names (`wt-<time>-<pid>-<n>`, and
+that after `.new-`, `.no-hooks-` or `.claimed-<pid>-`), `fill.log` and
+`misses`. Anything else there is left alone and is not listed by `cache
+ls`.
 
 ## What is safe to clone
 

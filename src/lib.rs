@@ -63,6 +63,11 @@
 //! refilled automatically; [`Repository::fill_pool`] fills them in the
 //! calling thread.
 //!
+//! The same executable is run, at most once an hour, as `fast-worktree
+//! cache retire` to look at the repositories that ran no command for 7
+//! days (see [`sweep_trash`]). A helper older than this version does not
+//! know that command, and then nothing is done for them.
+//!
 //! A program that embeds the whole command (for example, one binary that
 //! acts as `fast-worktree` when started through a link of that name) runs
 //! it with `cli::run_with_helper(args, Some(path))`, so that the

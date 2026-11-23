@@ -1002,8 +1002,8 @@ fn surplus(ready: &[Spare], size: u32) -> &[Spare] {
 
 /// Discard the spares of the repository at `main` that are beyond its
 /// configured pool size: all of them when the pool was turned off. A spare
-/// is there only while its repository is, the pool is on, and it is within
-/// the size; every command in the repository checks (one directory
+/// is there only while its repository is in use ([`retire`]), the pool is
+/// on, and it is within the size; every command in the repository checks (one directory
 /// listing, and nothing more while the pool is empty). Returns how many
 /// were discarded.
 pub fn trim(main: &Path) -> usize {
