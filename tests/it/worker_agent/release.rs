@@ -454,3 +454,182 @@ async fn failing_unfinished_releases_do_not_hold_back_the_ones_after_them() {
     assert!(gone, "the entry after 33 failing ones was reached");
     agent.shutdown();
 }
+
+// M-2: nothing is collected while a version is on trial (a rollback restores
+// the database, not the files). The pass that is not on trial collects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_does_nothing_while_a_version_is_on_trial() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.retention_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = connect_old(&f, &agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo output")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    let digest = digest_of(&c, &a).await;
+    call(&c, ack_req(&a, digest)).await.unwrap();
+    let logs = f.state().join("attempts").join(a.as_str()).join("logs");
+    let stored = || std::fs::read_dir(&logs).is_ok_and(|mut d| d.next().is_some());
+    assert!(stored());
+    std::thread::sleep(Duration::from_millis(5));
+
+    belt::worker::control::begin_trial(&f.state()).unwrap();
+    for _ in 0..3 {
+        assert!(agent.gc().unwrap().removed.is_empty());
+        agent.collect_garbage();
+        agent.tick();
+        assert!(stored(), "collected on trial");
+        assert!(f.store().pending_deletes().unwrap().is_empty());
+    }
+    belt::worker::control::end_trial(&f.state()).unwrap();
+    wait_for("the pass off trial collects", || {
+        agent.gc().unwrap();
+        !stored()
+    });
+    agent.shutdown();
+}
+
+// M-2: the init host runs only `supervise`; on trial it expires nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_supervise_pass_of_an_init_host_expires_nothing_while_a_version_is_on_trial() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.ack_wait_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    belt::worker::control::begin_trial(&f.state()).unwrap();
+    for _ in 0..5 {
+        agent.supervise();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(f.store().get(&a).unwrap().is_some(), "expired on trial");
+    assert!(f.state().join("attempts").join(a.as_str()).exists());
+    belt::worker::control::end_trial(&f.state()).unwrap();
+    wait_for("off trial the ack wait expires it", || {
+        agent.supervise();
+        f.store().get(&a).unwrap().is_none()
+    });
+    agent.shutdown();
+}
+
+// M-2: GC never judges the ack wait by the wall clock: an attempt nobody
+// acknowledged keeps its result and logs however old it is (retention 0,
+// ack wait 0 in the config); only uptime (`retire_rows`) retires it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_never_deletes_the_result_of_an_unacknowledged_attempt_by_the_wall_clock() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.retention_ms = 0;
+    cfg.ack_wait_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("echo output")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    let logs = f.state().join("attempts").join(a.as_str()).join("logs");
+    std::thread::sleep(Duration::from_millis(20));
+    for _ in 0..3 {
+        let report = agent.gc().unwrap();
+        assert!(report.removed.is_empty(), "{report:?}");
+    }
+    assert!(std::fs::read_dir(&logs).is_ok_and(|mut d| d.next().is_some()));
+    assert!(f.store().get(&a).unwrap().is_some());
+    // The store itself, asked with the biggest ack wait and a clock far
+    // ahead, keeps it as well.
+    let report = f.store().gc(u64::MAX / 2, 0, u64::MAX).unwrap();
+    assert!(report.removed.is_empty(), "{report:?}");
+    agent.shutdown();
+}
+
+// L-3: an entry that keeps failing is tried again after 1, 2, 4, ... passes
+// up to 64, and the entries after it still go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permanently_failing_dropped_entry_is_retried_with_doubling_backoff_up_to_64_passes() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let agent = f.start("boot-a");
+    let root = f.state().join("attempts");
+    let stuck = AttemptId::generate();
+    let sealed = root.join(stuck.as_str()).join("sealed");
+    std::fs::create_dir_all(&sealed).unwrap();
+    std::fs::write(sealed.join("f"), b"").unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [stuck.as_str()])
+        .unwrap();
+    let unlock = || std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700));
+    let entry = root.join(stuck.as_str());
+    let mut pass = 0u32;
+    let mut run_to = |until: u32| {
+        while pass < until {
+            agent.supervise();
+            pass += 1;
+        }
+    };
+    // Passes 0..=8 fail at 0, 1, 3, 7; the next try is pass 15.
+    run_to(9);
+    // Another entry added now still goes at its first pass (not held back).
+    let good = AttemptId::generate();
+    std::fs::create_dir_all(root.join(good.as_str())).unwrap();
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [good.as_str()])
+        .unwrap();
+    unlock().unwrap();
+    run_to(10);
+    assert!(
+        !root.join(good.as_str()).exists(),
+        "held back by the failing one"
+    );
+    run_to(15);
+    assert!(
+        entry.exists(),
+        "tried again before its backoff (15) was over"
+    );
+    run_to(16);
+    assert!(!entry.exists(), "not tried again at pass 15");
+    drop(db);
+    agent.shutdown();
+}
+
+// The longest wait is 64 passes: failing at 0, 1, 3, 7, 15, 31, 63 (next 127)
+// and 127 (next 191, not 255).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_backoff_of_a_failing_dropped_entry_never_passes_64_passes() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let agent = f.start("boot-a");
+    let root = f.state().join("attempts");
+    let stuck = AttemptId::generate();
+    let sealed = root.join(stuck.as_str()).join("sealed");
+    std::fs::create_dir_all(&sealed).unwrap();
+    std::fs::write(sealed.join("f"), b"").unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    db.execute("INSERT INTO dropped_attempt VALUES (?1)", [stuck.as_str()])
+        .unwrap();
+    drop(db);
+    let entry = root.join(stuck.as_str());
+    let mut pass = 0u32;
+    let mut run_to = |until: u32| {
+        while pass < until {
+            agent.supervise();
+            pass += 1;
+        }
+    };
+    run_to(130);
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    run_to(191);
+    assert!(
+        entry.exists(),
+        "tried again before 64 passes after pass 127"
+    );
+    run_to(192);
+    assert!(!entry.exists(), "not tried again at pass 191");
+    agent.shutdown();
+}

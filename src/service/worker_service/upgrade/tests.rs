@@ -1126,3 +1126,85 @@ fn a_systemd_upgrade_stops_the_old_unit_then_starts_the_new_one() {
     let committed = h.commit(&h.new).unwrap();
     assert!(!committed.draining && committed.switching_from.is_none());
 }
+
+// --- the trial marker and forget.lock around the copies (spec 25.1 rule 8) ---
+
+fn group_spec(h: &Host) -> crate::service::bootstrap::Spec {
+    crate::service::bootstrap::Spec {
+        state_dir: h.paths().state,
+        worker_state_dir: h.paths().state,
+        worker_id: WorkerId::parse("mini-a").unwrap(),
+        cluster_key_path: h.paths().state.join("deliberately-absent-key"),
+        executable: h.new_exe.clone(),
+        env: h.env.clone(),
+        repo_root: None,
+        expected_cluster: None,
+        managed_service: None,
+    }
+}
+
+#[test]
+fn the_copy_and_the_putting_back_of_the_database_wait_for_forget_lock_and_change_nothing_without_it(
+) {
+    let h = Host::new();
+    let database = h.database();
+    let paths = h.paths();
+    let saved = saved_database(&paths, &h.old);
+    {
+        let _held =
+            crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)
+                .unwrap();
+        // The copy is refused while another holder deletes: no copy, no trial.
+        save_database(&paths, &h.old).unwrap_err();
+        assert!(absent(&saved).unwrap());
+        assert!(!crate::worker::control::in_trial(&paths.state));
+    }
+    assert!(save_database(&paths, &h.old).unwrap());
+    sql(&database, "CREATE TABLE made_by_new (x)");
+    {
+        let _held =
+            crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)
+                .unwrap();
+        // Putting it back is refused too: the database stays as it is.
+        restore_database(&paths, &h.old).unwrap_err();
+        assert!(tables(&database).contains(&"made_by_new".to_string()));
+    }
+    restore_database(&paths, &h.old).unwrap();
+    assert_eq!(tables(&database), ["left_by_old"]);
+}
+
+#[test]
+fn a_worker_switch_is_on_trial_from_the_copy_until_it_is_undone_or_committed() {
+    // Committed.
+    let h = Host::new();
+    h.database();
+    let state = h.paths().state;
+    let mut seen = Vec::new();
+    h.upgrade(&mut |step| {
+        seen.push((step, crate::worker::control::in_trial(&state)));
+        Ok(())
+    })
+    .unwrap();
+    for (step, on_trial) in &seen {
+        let index = |s: &Step| STEPS.iter().position(|x| x == s).unwrap();
+        let after_copy = index(step) >= index(&Step::Record);
+        assert_eq!(*on_trial, after_copy, "{step:?}");
+    }
+    assert!(crate::worker::control::in_trial(&state));
+    // The window the marker covers: a forget refuses, and writes nothing.
+    let spec = group_spec(&h);
+    let member = crate::ids::CoordinatorId::generate().to_string();
+    let e = crate::service::group::forget(&h.env, &spec, &member).unwrap_err();
+    assert!(e.message.contains("on trial"), "{e:?}");
+    h.commit(&h.new).unwrap();
+    assert!(!crate::worker::control::in_trial(&state));
+
+    // Undone.
+    let h = Host::new();
+    h.database();
+    let state = h.paths().state;
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(crate::worker::control::in_trial(&state));
+    h.rollback(&mut |_| Ok(())).unwrap();
+    assert!(!crate::worker::control::in_trial(&state));
+}
