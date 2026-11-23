@@ -23,6 +23,7 @@ pub(crate) fn refusal_code(reason: &GroupRefusal) -> &'static str {
         GroupRefusal::MemberIdentityMismatch => "member_identity_mismatch",
         GroupRefusal::IdentityRetired => "identity_retired",
         GroupRefusal::MemberForgotten => "member_forgotten",
+        GroupRefusal::Unknown => "unknown",
     }
 }
 

@@ -158,7 +158,10 @@ async fn a_forgotten_member_is_refused_at_its_proof() {
     submit(&c, &a, &payload("echo x")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
     let (name, _) = f.store().members().unwrap().remove(0);
-    let attempts = f.store().forget_member(&name, 1).unwrap();
+    let attempts = WorkerStore::open(&f.state(), &f.worker)
+        .unwrap()
+        .forget_member(&name, 1)
+        .unwrap();
     assert_eq!(attempts, vec![a.to_string()]);
     // The connection that stayed open has nothing accepted any more: with
     // its records gone, a resend would otherwise run again.
@@ -181,5 +184,44 @@ async fn a_forgotten_member_is_refused_at_its_proof() {
         Err(e) => panic!("refused otherwise: {e}"),
         Ok(_) => panic!("a forgotten member was let in"),
     }
+    agent.shutdown();
+}
+
+// (viii) Past `ack_wait` an attempt has no row and an unreleased record: a
+// restart keeps that record, a late submit of it does not run, and only a
+// release frees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_the_ack_wait_a_restart_keeps_the_unreleased_record_until_a_release() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.ack_wait_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let marker = f.path("ran-again");
+    submit(&c, &a, &payload("echo x")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the supervisor exits", || f.supervisors(&a).is_empty());
+    wait_for("the ack wait turns the row into a record", || {
+        agent.tick();
+        f.store().get(&a).unwrap().is_none()
+    });
+    agent.shutdown();
+
+    let agent = f.start("boot-b");
+    let c = f.connect(&agent).await;
+    let Response::ListUnreleased(page) = call(&c, unreleased_req()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.attempts, vec![a.clone()], "the restart kept it");
+    let late = payload(&format!("touch {}", marker.display()));
+    let _ = call(&c, submit_req(&a, &late)).await;
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(!marker.exists(), "a late submit ran");
+    call(&c, release_req(&a)).await.unwrap();
+    let Response::ListUnreleased(page) = call(&c, unreleased_req()).await.unwrap() else {
+        panic!()
+    };
+    assert!(page.attempts.is_empty());
     agent.shutdown();
 }

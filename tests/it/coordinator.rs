@@ -2063,9 +2063,13 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
     assert_eq!(logs["stdout"]["complete"], true);
     assert_eq!(logs["stdout"]["bytes"], 6);
     assert!(only(&c, &task).receipts.reached(Receipt::Collected));
-    // The worker recorded the acknowledgement, once.
-    let acked = agent.store().events_of(&a, "ack_collected").unwrap();
-    assert_eq!(acked.len(), 1);
+    // The worker accepted the acknowledgement: its copy and its events are
+    // gone, and with no submit of it in flight its record went in the same
+    // acceptance (spec 25.6 (i)).
+    let worker = agent.store();
+    assert!(worker.get(&a).unwrap().is_none());
+    assert!(worker.events_of(&a, "ack_collected").unwrap().is_empty());
+    assert!(worker.attempt_record(&a).unwrap().is_none());
     assert_eq!(
         c.collect(&files, cfg).await.unwrap(),
         CollectReport::default()

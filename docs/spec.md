@@ -2286,7 +2286,7 @@ SQLiteのfileは、行を消しても縮まない。空いたpageは次の書き
 
 **`ack_collected` は変えない。** 第13章の4と5のとおり、`generation` と `result_digest` の一致を求め、digestを照合した読み取りの後に保存されたresultを、ACKの記録と同じtransactionで断る。この検出は残す。
 
-**新しい操作 `release_attempt`。** 「このメンバーは、このattemptについてもう何も読まず、submitも送らない」を表す。項目は `attempt_id` だけで、generationもdigestも運ばない（刈り取った後の親は、どちらも持っていない）。機能 `attempt_release_v1` を `hello` で合意した相手にだけ送る。合意していない相手との間では、双方とも今の挙動のままである（workerは `ack_wait` で結果を消し、記録は残る）。
+**新しい操作 `release_attempt`。** 「このメンバーは、このattemptについてもう何も読まず、submitも送らない」を表す。項目は `attempt_id` だけで、generationもdigestも運ばない（刈り取った後の親は、どちらも持っていない）。機能 `attempt_release_v1` を `hello` で合意した相手にだけ送る。合意していない相手との間では、双方とも今の挙動のままである（workerは `ack_wait` で結果を消し、記録は残る）。段階3より前の親から見える違いは次の3つだけである。(1) ACKしなかったattemptは `ack_wait` の後、行の代わりに解放されていない記録になり、その親は `release_attempt` を送れないので、記録はそのメンバーの上限 10,000 に数え続けられる。上限に達すると submit は `OVERLOADED` で断られ、その親は `overloaded_reason` を知らない理由（`unknown`）として読み、ふつうの `OVERLOADED` として扱う。(2) `belt group forget` で忘れられた親の証明は `member_forgotten` で断られ、段階3より前の版の `group_refusal` には知らない理由の受け皿が無いので、その親はこの答えを読めず、接続の失敗として扱う。段階3からは `group_refusal` も `overloaded_reason`・`conflict_reason` と同じく、知らない理由を `unknown` として読み、ふつうの断られた証明として扱う。(3) それ以外のwireの答えは変わらない。belt は公開した版が無いので、この親は実際には動いていない。
 
 - workerは、terminalのattemptへの `release_attempt` を受理し、(b) の削除を行う。同じ要求の再送には同じ答えを返す。行の無いattemptには `NOT_FOUND` を返す（既に消してある）。
 - terminalでないattemptには、後で送り直せる答え（`OVERLOADED`）を返し、何も変えない。そのattemptは、leaseの失効か既存のretireで止まる。

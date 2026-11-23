@@ -272,6 +272,10 @@ pub enum GroupRefusal {
     /// `belt group forget` removed this member on the worker (spec 25.6
     /// (d)): its coordinator id is refused for good.
     MemberForgotten,
+    /// A reason this version does not know (a newer peer sent it): the
+    /// caller treats the refusal as a plain refused proof.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ApiError {
@@ -497,6 +501,16 @@ mod tests {
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
         let blocked = ApiError::blocked(BlockedReason::SecretUnavailable, "x");
         assert_eq!(blocked.conflict_reason, None);
+    }
+
+    #[test]
+    fn a_group_refusal_of_a_newer_peer_is_read_as_unknown() {
+        let unknown: GroupRefusal =
+            serde_json::from_value(json!({"reason": "some_later_reason", "x": 1})).unwrap();
+        assert_eq!(unknown, GroupRefusal::Unknown);
+        let known: GroupRefusal =
+            serde_json::from_value(json!({"reason": "member_forgotten"})).unwrap();
+        assert_eq!(known, GroupRefusal::MemberForgotten);
     }
 
     #[test]

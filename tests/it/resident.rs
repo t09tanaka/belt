@@ -226,17 +226,25 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         .collect();
     assert_eq!(paths, ["coverage/b", "reports/a"]);
     let worker = belt::storage::WorkerStore::open_read_only(&root.path().join("worker")).unwrap();
-    let journal = worker
+    // The parent acknowledged the copy it holds, so the worker kept nothing
+    // of the attempt: no row, no result, no events, and, with no submit of
+    // it in flight, no record either (spec 25.6 (i)).
+    assert!(worker.get(&attempt.attempt_id).unwrap().is_none());
+    assert!(worker.get_result(&attempt.attempt_id).unwrap().is_none());
+    assert!(worker
         .events_of(&attempt.attempt_id, "artifacts_stored")
-        .unwrap();
-    assert_eq!(journal.len(), 1);
-    assert_eq!(journal[0].payload["outputs_evaluated"], true);
-    assert_eq!(journal[0].payload["artifacts"][0]["encoding"], "tar_v1");
-    let immutable = worker.get_result(&attempt.attempt_id).unwrap().unwrap();
-    assert_eq!(
-        belt::wire::payload_hash(&immutable).unwrap(),
-        result.result_digest
-    );
+        .unwrap()
+        .is_empty());
+    assert!(worker
+        .attempt_record(&attempt.attempt_id)
+        .unwrap()
+        .is_none());
+    assert!(!root
+        .path()
+        .join("worker")
+        .join("attempts")
+        .join(attempt.attempt_id.as_str())
+        .exists());
     // Public CLI works offline without Git, project configuration or an owner.
     let config_root = root.path().join("config");
     let config_dir = config_root.join("belt");

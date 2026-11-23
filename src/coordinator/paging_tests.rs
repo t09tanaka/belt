@@ -24,7 +24,7 @@ impl WorkerLink for Silent {
     }
 }
 
-fn spec() -> TaskSpec {
+pub(super) fn spec() -> TaskSpec {
     TaskSpec {
         ci: None,
         toolchains: None,

@@ -6728,6 +6728,7 @@ async fn submit_with_native_node(
     reported: &str,
     declared: &str,
     exit: i32,
+    hold: bool,
 ) -> (
     super::common::DaemonRoot,
     Spec,
@@ -6738,9 +6739,17 @@ async fn submit_with_native_node(
     let host = native_node_profile(root.path(), &spec, reported);
     std::fs::write(input.join(".nvmrc"), format!("{declared}\n")).unwrap();
     let ran = host.join("ran-on");
+    // While `hold` exists the command stays running after it wrote `ran`, so
+    // a test can read what the worker accepted before the acknowledgement
+    // deletes it.
+    let held = ran.with_extension("hold");
+    if hold {
+        std::fs::write(&held, "").unwrap();
+    }
     let script = format!(
-        "test \"$(cat prepared-node.txt)\" = \"$(node --version)\" || exit 91; node --version > '{}'; exit {exit}",
-        ran.display()
+        "test \"$(cat prepared-node.txt)\" = \"$(node --version)\" || exit 91; node --version > '{}'; i=0; while [ -f '{}' ] && [ $i -lt 600 ]; do /bin/sleep 0.05; i=$((i+1)); done; exit {exit}",
+        ran.display(),
+        held.display()
     );
     let mut context =
         belt::service::context::Context::load(spec.env.clone(), input.clone(), spec.clone())
@@ -6817,8 +6826,26 @@ fn native_attempt(
 async fn a_declared_version_runs_on_the_native_tool_of_exactly_that_version() {
     use belt::service::{completion::Target, control};
     for declared in ["20.11.1", "20"] {
-        let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", declared, 0).await;
+        let (_root, spec, accepted, ran) =
+            submit_with_native_node("20.11.1", declared, 0, true).await;
         let accepted = accepted.unwrap_or_else(|e| panic!("{declared}: {e:?}"));
+        // Read what the worker accepted while the command is held: once the
+        // parent acknowledges the result the worker keeps no copy of it.
+        let end = std::time::Instant::now() + Duration::from_secs(45);
+        while !ran.exists() && std::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (frozen_to, binding) = if ran.exists() {
+            Some(native_attempt(&spec, &accepted.task_id))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("{declared}: the command never ran")
+        });
+        std::fs::remove_file(ran.with_extension("hold")).unwrap();
         let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
         let done = tokio::time::timeout(
             Duration::from_secs(45),
@@ -6832,7 +6859,6 @@ async fn a_declared_version_runs_on_the_native_tool_of_exactly_that_version() {
             panic!("{declared}: {done:?}");
         }
         assert_eq!(std::fs::read_to_string(&ran).unwrap(), "v20.11.1\n");
-        let (frozen_to, binding) = native_attempt(&spec, &accepted.task_id);
         assert_eq!(frozen_to, "20.11.1", "{declared}");
         let path = &binding.activation.environment["PATH"];
         assert!(
@@ -6855,7 +6881,8 @@ async fn a_declared_version_runs_on_the_native_tool_of_exactly_that_version() {
 /// with the line that names what the task asks for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_tool_of_another_version_does_not_serve_the_pin() {
-    let (_root, spec, accepted, ran) = submit_with_native_node("20.11.0", "20.11.1", 0).await;
+    let (_root, spec, accepted, ran) =
+        submit_with_native_node("20.11.0", "20.11.1", 0, false).await;
     let accepted = accepted.unwrap();
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let payload = native_task_waiting(&spec, &accepted.task_id, 0).await;
@@ -6885,7 +6912,8 @@ async fn an_alias_or_an_unmet_range_is_not_resolved_from_the_native_tool() {
         ("stable", "node=stable"),
         ("18", "node=>=18.0.0 <19.0.0-0"),
     ] {
-        let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", declared, 0).await;
+        let (_root, spec, accepted, ran) =
+            submit_with_native_node("20.11.1", declared, 0, false).await;
         let refused = accepted.expect_err(declared);
         assert_eq!(
             refused.blocked_reason,
@@ -6907,7 +6935,8 @@ async fn an_alias_or_an_unmet_range_is_not_resolved_from_the_native_tool() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_tool_that_changed_version_does_not_run_the_retry() {
     use belt::service::{completion::Target, control};
-    let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", "20.11.1", 23).await;
+    let (_root, spec, accepted, ran) =
+        submit_with_native_node("20.11.1", "20.11.1", 23, false).await;
     let accepted = accepted.unwrap();
     let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let done = tokio::time::timeout(

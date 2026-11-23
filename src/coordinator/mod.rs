@@ -2714,4 +2714,6 @@ fn demand_of(
 #[cfg(test)]
 mod paging_tests;
 #[cfg(test)]
+mod release_tests;
+#[cfg(test)]
 mod tests;
