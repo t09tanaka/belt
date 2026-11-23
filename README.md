@@ -4,7 +4,18 @@ Run CI and development commands on one machine or share work with other members 
 
 Status: in development. The specification (Japanese) is in [docs/spec.md](docs/spec.md), with progress and remaining acceptance work in [docs/plan.md](docs/plan.md).
 
-Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
+## One install, four tools
+
+You do not need a LAN to use belt. On a single machine, the `belt` binary is a complete local CI and development setup with these four tools linked in:
+
+| Tool | What it does in belt |
+|---|---|
+| [local-ci](https://github.com/t09tanaka/local-ci) | `belt ci` plans and runs your repository's workflows locally and can post the result as a GitHub commit status. |
+| [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) | Every command runs under the host's resource admission budget, so parallel builds and tests take turns instead of overloading the machine. |
+| fast-worktree | Workers prepare each run's worktree, dependencies included, in seconds. |
+| portool | Each worktree gets its own ports and local resources, so runs do not collide. |
+
+Workspace hooks and commands can call `fast-worktree` and `portool` directly. `belt workers diff` shows the version of each linked tool. You do not need to install any of them separately. Embedded fast-worktree and portool are copyright © 2026 Takuto Tanaka and distributed under the [MIT license](LICENSE).
 
 ## Install
 
