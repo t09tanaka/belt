@@ -295,12 +295,8 @@ fn a_new_attempt_waits_for_a_confirmed_retire_with_a_persisted_tombstone() {
             .retired
     );
     f.attempt('a').unwrap();
-    // The tombstone cannot be deleted, not even by SQL.
-    let del = f
-        .store
-        .db
-        .call(|c| Ok(c.execute("DELETE FROM retire_tombstone", [])?));
-    assert!(del.is_err());
+    // The tombstone stays with its attempt: only the pruning of the run
+    // deletes it, with the attempt (spec 25.5; `storage::prune_tests`).
     assert!(f.store.retire_tombstone(&a1.attempt_id).unwrap().is_some());
 }
 
@@ -451,7 +447,34 @@ fn the_event_journal_is_append_only_with_increasing_sequence() {
 #[test]
 fn events_are_numbered_per_attempt_without_holes() {
     let f = fx();
-    let (a, b) = (AttemptId::generate(), AttemptId::generate());
+    // An event names an attempt that has a row (spec 25.5): one task each,
+    // and the events their creation wrote come first.
+    let other = TaskId::generate();
+    f.store.create_task(&other, &f.run, &json!({}), 1).unwrap();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let b = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: other,
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            10,
+        )
+        .unwrap()
+        .attempt_id;
+    let made = |att: &AttemptId| {
+        f.store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|e| e.attempt_id.as_deref() == Some(att.as_str()))
+            .count() as u64
+    };
+    let (ma, mb) = (made(&a), made(&b));
     let add = |att: Option<&AttemptId>, k: &str| {
         f.store
             .append_event(Some(&f.run), att, k, &json!({"k": k}), 1)
@@ -470,8 +493,9 @@ fn events_are_numbered_per_attempt_without_holes() {
             .map(|e| e.attempt_seq.unwrap())
             .collect()
     };
-    assert_eq!(of(&a), [1, 2, 3]);
-    assert_eq!(of(&b), [1, 2]);
+    // Numbered with no hole, after the events of their creation.
+    assert_eq!(of(&a), (1..=ma + 3).collect::<Vec<_>>());
+    assert_eq!(of(&b), (1..=mb + 2).collect::<Vec<_>>());
     let none: Vec<_> = all.iter().filter(|e| e.attempt_id.is_none()).collect();
     assert!(none.iter().all(|e| e.attempt_seq.is_none()));
     // By attempt and kind, oldest first.
@@ -480,7 +504,7 @@ fn events_are_numbered_per_attempt_without_holes() {
         xs.iter()
             .map(|e| e.attempt_seq.unwrap())
             .collect::<Vec<_>>(),
-        [1, 3]
+        [ma + 1, ma + 3]
     );
     assert!(f.store.events_of(&a, "nope").unwrap().is_empty());
     // The pair is unique, and an event has an attempt_seq exactly when it has an attempt.
@@ -506,7 +530,15 @@ fn events_are_numbered_per_attempt_without_holes() {
 #[test]
 fn unseen_events_are_appended_once_per_key() {
     let f = fx();
-    let a = AttemptId::generate();
+    let a = f.attempt('a').unwrap().attempt_id;
+    // The events its creation wrote come first.
+    let made = f
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|e| e.attempt_id.as_deref() == Some(a.as_str()))
+        .count() as u64;
     let want = |keys: &[&str]| -> Vec<(String, serde_json::Value)> {
         keys.iter()
             .map(|k| (k.to_string(), json!({"stream": k})))
@@ -526,13 +558,28 @@ fn unseen_events_are_appended_once_per_key() {
         ev.iter()
             .map(|e| e.attempt_seq.unwrap())
             .collect::<Vec<_>>(),
-        [1, 2, 3]
+        [made + 1, made + 2, made + 3]
     );
     assert!(ev
         .iter()
         .all(|e| e.run_id.as_deref() == Some(f.run.as_str())));
     // Other kinds and other attempts do not count as seen.
-    let b = AttemptId::generate();
+    let other = TaskId::generate();
+    f.store.create_task(&other, &f.run, &json!({}), 1).unwrap();
+    let b = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: other,
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            10,
+        )
+        .unwrap()
+        .attempt_id;
     assert_eq!(
         f.store
             .append_events_unseen(None, &b, "t", "stream", &want(&["o"]), 6)
@@ -634,6 +681,7 @@ fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
     f.store
         .db
         .write(|tx| {
+            tx.execute_batch(schema::UNDO_PRUNE_STEP)?;
             tx.execute_batch(
                 "DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download;
                  DROP TABLE ci_test_timing; DROP TABLE workflow_artifact;
@@ -5395,7 +5443,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch(schema::UNDO_PRUNE_STEP)?;tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; ALTER TABLE run DROP COLUMN pruning_at_ms; DROP INDEX control_request_run; DROP INDEX event_run; ALTER TABLE control_request DROP COLUMN run_id; DROP TRIGGER event_no_delete; CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -6649,6 +6697,7 @@ fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_
     f.store
         .db
         .write(|tx| {
+            tx.execute_batch(schema::UNDO_PRUNE_STEP)?;
             tx.execute_batch(schema::UNDO_CAPTURE_STEP)?;
             tx.execute(
                 "UPDATE schema_meta SET value='23' WHERE key='schema_version'",
@@ -6740,7 +6789,9 @@ fn the_capture_step_names_the_run_of_every_receipt_and_deletes_the_rows_of_runs_
             Ok(())
         })
         .unwrap();
-    assert!(delete("DELETE FROM event WHERE run_id IS NULL", None).is_err());
+    // An event of no run was refused too by the trigger of this step; since
+    // the step of spec 25.5 one that names no attempt either goes by its
+    // age (`storage::prune_tests`), so it is not deleted here.
     assert!(delete(of_run, Some(unsubmitted.to_string())).unwrap() >= 1);
     let kept: i64 = store
         .db

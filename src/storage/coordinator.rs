@@ -19,8 +19,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod prune;
 mod retention;
 mod workflow_artifact;
+pub use prune::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use retention::{ResultDeleteClaim, ResultGcPage};
 pub use workflow_artifact::{WorkflowArtifact, WorkflowUpload};
 mod collect;
@@ -250,7 +252,18 @@ fn not_found(what: impl Into<String>) -> StorageError {
 pub(crate) const RUN_PRUNED: &str = "run_pruned";
 
 fn run_pruned(run: &str) -> StorageError {
-    not_found(format!("run {run} ({RUN_PRUNED})"))
+    not_found(format!("run {run} ({RUN_PRUNED}; {RUN_RETENTION})"))
+}
+
+/// What the `NOT_FOUND` of a run tells its user (spec 25.5): a run that is
+/// not there may be one whose retention has passed.
+pub(crate) const RUN_RETENTION: &str =
+    "a run is deleted retention_days days after it ended, 7 by default";
+
+/// `NOT_FOUND` for a run that has no row: one that never existed here, or
+/// one that was pruned. Nothing tells the two apart once the row is gone.
+fn no_run(run: &str) -> StorageError {
+    not_found(format!("run {run} ({RUN_RETENTION})"))
 }
 
 /// Whether `run` carries the mark. `known` is false for a file from before
@@ -308,6 +321,24 @@ fn refuse_pruned_attempt(c: &Connection, attempt: &str) -> Result<()> {
     match run {
         Some(run) => Err(run_pruned(&run)),
         None => Ok(()),
+    }
+}
+
+/// An event that names an attempt needs the row of that attempt: an event
+/// of an attempt without one belongs to no run that the pruning finds, and
+/// would be deleted by nothing (spec 25.5, acceptance (xii)).
+fn require_attempt(c: &Connection, attempt: &str) -> Result<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempt WHERE attempt_id=?1)",
+        [attempt],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StorageError::NotFound {
+            what: format!("attempt {attempt}"),
+        })
     }
 }
 
@@ -388,7 +419,7 @@ pub struct CoordinatorStore {
     /// False for a file from before `run.pruning_at_ms` opened read-only:
     /// no run of it carries the mark.
     pruning: bool,
-    state_dir: std::path::PathBuf,
+    pub(super) state_dir: std::path::PathBuf,
     _lock: Option<ProcessLock>,
 }
 
@@ -490,7 +521,7 @@ impl CoordinatorStore {
                         |r| r.get(0),
                     )?;
                     if !known {
-                        return Err(not_found("run"));
+                        return Err(no_run(run.as_str()));
                     }
                     run.to_string()
                 }
@@ -1476,6 +1507,7 @@ impl CoordinatorStore {
             }
             if let Some(attempt) = &a {
                 refuse_pruned_attempt(tx, attempt)?;
+                require_attempt(tx, attempt)?;
             }
             common::append_event(tx, r.as_deref(), a.as_deref(), &kind, &payload, at_ms)
         })
@@ -1517,6 +1549,7 @@ impl CoordinatorStore {
                 refuse_pruned(tx, run)?;
             }
             refuse_pruned_attempt(tx, &a)?;
+            require_attempt(tx, &a)?;
             common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
         })
     }

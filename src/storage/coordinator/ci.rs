@@ -318,11 +318,13 @@ impl CoordinatorStore {
                 return Ok(false);
             }
             if let Some((scope, history)) = timings {
-                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,worker,identity,millis) VALUES(?1,?2,?3,?4)
-                    ON CONFLICT(scope,identity,worker) DO UPDATE SET millis=excluded.millis")?;
+                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,worker,identity,millis,written_at_ms) VALUES(?1,?2,?3,?4,?5)
+                    ON CONFLICT(scope,identity,worker) DO UPDATE SET millis=excluded.millis,written_at_ms=excluded.written_at_ms")?;
+                // Spec 25.5: a timing that is not written for 14 days goes.
+                let written = to_i64(at_ms)?;
                 for (worker, shard) in history {
                     for (identity, millis) in shard.millis {
-                        insert.execute(params![scope, worker, identity, to_i64(millis)?])?;
+                        insert.execute(params![scope, worker, identity, to_i64(millis)?, written])?;
                     }
                 }
             }

@@ -260,34 +260,12 @@ impl CoordinatorStore {
             ));
         }
         let run = run.to_string();
-        self.db.call(move |c| {
-            let mut s=c.prepare("SELECT locator,attempt_id FROM result_delete_claim WHERE run_id=?1 ORDER BY locator LIMIT ?2")?;
-            let rows=s.query_map(params![run,limit],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-            let mut out=Vec::new();
-            for row in rows {let (locator,attempt)=row?;out.push(ResultDeleteClaim{locator,run:id("run_id",RunId::parse(&run))?,attempt:id("attempt_id",AttemptId::parse(&attempt))?});}
-            Ok(out)
-        })
+        self.db.call(move |c| pending_claims(c, &run, limit))
     }
     pub fn finish_result_delete(&self, guard: &RunPin, claim: &ResultDeleteClaim) -> Result<()> {
         guard.check_exclusive(&self.state_dir, &claim.run)?;
-        let (locator, run, attempt) = (
-            claim.locator.clone(),
-            claim.run.to_string(),
-            claim.attempt.to_string(),
-        );
-        self.db.write(move |tx| {
-            let n = tx.execute(
-                "DELETE FROM result_delete_claim WHERE locator=?1 AND run_id=?2 AND attempt_id=?3",
-                params![locator, run, attempt],
-            )?;
-            if n != 1 {
-                return Err(StorageError::Invalid(
-                    "result deletion claim changed".into(),
-                ));
-            }
-            common::complete_delete(tx, &locator)?;
-            Ok(())
-        })
+        let claim = claim.clone();
+        self.db.write(move |tx| finish_claim(tx, &claim))
     }
 }
 
@@ -340,19 +318,96 @@ fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
 /// placed itself, as `workflow_run_end` reads it (a probe whose discovery
 /// was applied, the origin of a matrix whose members were joined).
 fn input_retention_end_on(c: &Connection, run: &str, source: &str) -> Result<Option<u64>> {
-    let ended:Option<i64>=c.query_row("SELECT CASE WHEN
+    let ended: Option<i64> = c.query_row(
+        &format!(
+            "SELECT CASE WHEN
               EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
               AND EXISTS(SELECT 1 FROM task WHERE run_id=?1)
-              AND NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
+              AND {RUN_ENDED}
+              THEN {RUN_END}
+              ELSE NULL END"
+        ),
+        params![run, source],
+        |r| r.get(0),
+    )?;
+    ended.map(to_u64).transpose()
+}
+
+/// Spec 25.3 (a), rules 1 to 4, for the run `?1`: no task of it may still
+/// be placed, and every attempt that was not retired is terminal, observed
+/// and collected. One text for the retention of the inputs and for the
+/// pruning of the run (spec 25.5), so the two never judge a run differently.
+const RUN_ENDED: &str = "NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
                 t.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL)
                 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0
                 AND NOT (coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=1 AND json_extract(t.spec_json,'$.ci.core_outcome') IS NOT NULL)
                 AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal')))
               AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
-                WHERE t.run_id=?1 AND a.retired=0 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
-              THEN max((SELECT coalesce(max(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0),coalesce(x.closed_at_ms,0))),0) FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id) WHERE t.run_id=?1),
+                WHERE t.run_id=?1 AND a.retired=0 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))";
+/// The end of a run that [`RUN_ENDED`] holds for: the latest of the ends
+/// spec 25.3 (a) lists.
+const RUN_END: &str = "max((SELECT coalesce(max(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0),coalesce(x.closed_at_ms,0))),0) FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id) WHERE t.run_id=?1),
                 (SELECT coalesce(max(t.cancel_requested_at_ms),0) FROM task t WHERE t.run_id=?1),
-                (SELECT coalesce(max(closed_at_ms),0) FROM run WHERE run_id=?1))
-              ELSE NULL END",params![run,source],|r|r.get(0))?;
+                (SELECT coalesce(max(closed_at_ms),0) FROM run WHERE run_id=?1))";
+
+/// When the run ended, for its pruning (spec 25.5): the predicate of
+/// [`input_retention_end_on`], whatever the source of the run (a run may
+/// have none). A run without a task has ended only once it is closed: until
+/// then its first task may still be made, and a run that was just accepted
+/// must not look like one that ended at time zero.
+pub(super) fn run_end_on(c: &Connection, run: &str) -> Result<Option<u64>> {
+    let ended: Option<i64> = c.query_row(
+        &format!(
+            "SELECT CASE WHEN
+              (EXISTS(SELECT 1 FROM task WHERE run_id=?1)
+               OR EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND closed_at_ms IS NOT NULL))
+              AND {RUN_ENDED}
+              THEN {RUN_END}
+              ELSE NULL END"
+        ),
+        [run],
+        |r| r.get(0),
+    )?;
     ended.map(to_u64).transpose()
+}
+
+/// The deletion claims of a run that are not finished, in the order of
+/// their locators.
+pub(super) fn pending_claims(
+    c: &Connection,
+    run: &str,
+    limit: u32,
+) -> Result<Vec<ResultDeleteClaim>> {
+    let mut s = c.prepare(
+        "SELECT locator,attempt_id FROM result_delete_claim WHERE run_id=?1 ORDER BY locator LIMIT ?2",
+    )?;
+    let rows = s.query_map(params![run, limit], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (locator, attempt) = row?;
+        out.push(ResultDeleteClaim {
+            locator,
+            run: id("run_id", RunId::parse(run))?,
+            attempt: id("attempt_id", AttemptId::parse(&attempt))?,
+        });
+    }
+    Ok(out)
+}
+
+/// The file of `claim` is gone: the claim and the locator are forgotten in
+/// one transaction.
+pub(super) fn finish_claim(tx: &Connection, claim: &ResultDeleteClaim) -> Result<()> {
+    let n = tx.execute(
+        "DELETE FROM result_delete_claim WHERE locator=?1 AND run_id=?2 AND attempt_id=?3",
+        params![claim.locator, claim.run.as_str(), claim.attempt.as_str()],
+    )?;
+    if n != 1 {
+        return Err(StorageError::Invalid(
+            "result deletion claim changed".into(),
+        ));
+    }
+    common::complete_delete(tx, &claim.locator)?;
+    Ok(())
 }

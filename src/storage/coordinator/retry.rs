@@ -608,7 +608,7 @@ fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
     let (closed, source, digest): (Option<i64>, Option<String>, Option<String>) = c.query_row(
         "SELECT r.closed_at_ms,r.source_id,s.manifest_digest FROM run r LEFT JOIN source_ref s USING(source_id) WHERE r.run_id=?1",
         [&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).optional()?.ok_or_else(|| not_found(format!("run {run}")))?;
+    ).optional()?.ok_or_else(|| no_run(&run))?;
     if closed.is_some() {
         return Err(StorageError::Immutable(
             "closed run cannot be retried".into(),

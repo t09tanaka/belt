@@ -28,6 +28,7 @@ mod delivery;
 mod input_retention;
 mod remote;
 mod result_retention;
+mod run_pruning;
 
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -706,6 +707,13 @@ async fn connect_local(
         permits,
     )
     .await?;
+    // Spec 25.11, the scan at start: the pin of a run without a row is what
+    // a stop between the last two steps of a pruning left. No request is
+    // served yet, so no pin is being made. Not while a version is on trial.
+    if !parts.coordinator.in_trial() {
+        let owner = parts.coordinator.clone();
+        tokio::task::spawn_blocking(move || owner.store().sweep_orphan_pins()).await?;
+    }
     Ok((
         agent_listener,
         listener,
@@ -1020,6 +1028,7 @@ impl Resident {
         loops.spawn(result_retention::run(
             self.coordinator.clone(),
             self.files.clone(),
+            Some(self.captured.clone()),
             self.retention_days,
             gc_cadence,
             rx.clone(),

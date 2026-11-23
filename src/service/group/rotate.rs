@@ -532,8 +532,39 @@ fn record_removals(
                 )
                 .map_err(internal)?;
         }
+        // Spec 25.5: with a coordinator database the table is the record.
+        // What this command wrote beside the worker state while the host
+        // had no database is moved into the table, and the file goes. A
+        // file that cannot be read or moved is left in place with a warning:
+        // the rotation itself is done, and the next one tries again.
+        let moved = (|| -> Result<(), ApiError> {
+            let earlier = super::read_removed_json(spec)?;
+            for (name, record) in &earlier {
+                store
+                    .record_removed_member(
+                        &WorkerId::parse(name).map_err(internal)?,
+                        record.removed_at_ms,
+                        record.ssh.as_deref(),
+                    )
+                    .map_err(internal)?;
+            }
+            match std::fs::remove_file(spec.worker_state_dir.join("removed-members.json")) {
+                Ok(()) => std::fs::File::open(&spec.worker_state_dir)
+                    .and_then(|f| f.sync_all())
+                    .map_err(internal),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(internal(e)),
+            }
+        })();
+        if moved.is_err() {
+            // Never the error itself: it can name a private path.
+            eprintln!("warning: the earlier removal record beside the worker state could not be moved into the database; it is kept and tried again by the next rotation");
+        }
         return Ok(());
     }
+    // A host without a coordinator database has nowhere to move the record
+    // to: this file stays its record (one file; one entry for each removed
+    // name).
     let path = spec.worker_state_dir.join("removed-members.json");
     let mut removed = super::read_removed_json(spec)?;
     for name in names {

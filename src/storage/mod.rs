@@ -23,6 +23,8 @@ mod lock;
 mod paging_tests;
 pub mod policy;
 #[cfg(test)]
+mod prune_tests;
+#[cfg(test)]
 mod pruning_tests;
 #[cfg(test)]
 mod retry_dependents_tests;
@@ -35,6 +37,7 @@ mod worker;
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
 pub(crate) use coordinator::MAX_TASKS_PER_RUN;
 pub(crate) use coordinator::RUN_PRUNED;
+pub(crate) use coordinator::RUN_RETENTION;
 pub use coordinator::{
     ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, Forgotten,
     InputCursor, InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput,
@@ -43,6 +46,7 @@ pub use coordinator::{
 };
 pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
+pub use coordinator::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use db::Db;
 pub use lock::ProcessLock;
 pub use toolchain_roots::{Bind, RootRow};
