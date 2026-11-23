@@ -438,6 +438,58 @@ mod tests {
         }
     }
 
+    /// Spec 25.4 (b), "消す時点" (3): every pass of the driver looks at the
+    /// owner rows. A capture whose owner is gone disappears without any
+    /// request; one whose owner lives stays whole.
+    #[test]
+    fn the_driver_pass_deletes_an_abandoned_capture_and_leaves_one_in_progress() {
+        use crate::platform::owned_temp::OwnerRecord;
+        let f = Fixture::new();
+        let capture = |owner: &OwnerRecord| {
+            let run = RunId::generate();
+            f.captured.sources.own_capture_as(&run, owner).unwrap();
+            crate::secrets::capture::capture_run(
+                &BTreeMap::new(),
+                &f.captured.sources,
+                &f.captured.vault,
+                &crate::secrets::capture::SecretInputs {
+                    key: &f.captured.current_key().unwrap(),
+                    declared: &[],
+                },
+                &run,
+                &SourceRequest::Directory {
+                    dir: f.input.clone(),
+                },
+                &CaptureParams::default(),
+            )
+            .unwrap();
+            run
+        };
+        let me = OwnerRecord::this_process().unwrap();
+        let ended = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            OwnerRecord { pid, ..me.clone() }
+        };
+        let (live, abandoned) = (capture(&me), capture(&ended));
+        let record = |run: &RunId| f.captured.sources.root().join("runs").join(run.as_str());
+        assert!(record(&live).exists() && record(&abandoned).exists());
+        let mut driver = Driver::default();
+        f.ticks(&mut driver, 12, 0);
+        assert!(!record(&abandoned).exists());
+        assert!(f
+            .captured
+            .sources
+            .capture_owner(&abandoned)
+            .unwrap()
+            .is_none());
+        assert!(record(&live).exists());
+        assert!(f.captured.sources.capture_owner(&live).unwrap().is_some());
+        // The files both captures held are the live one's now.
+        assert!(f.manifest_path(&live).exists());
+    }
+
     #[test]
     fn leftover_temporaries_are_counted_apart_from_failures_and_logged_once() {
         let mut tally = Tally::default();

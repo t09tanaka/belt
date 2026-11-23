@@ -2633,7 +2633,7 @@ beltは、利用者のrepositoryとworktreeに、残るものを何も書かな�
 | 段階 | 親DB | worker DB | `sources/retention.db` | wire・CLI |
 | - | - | - | - | - |
 | 0 | `run.pruning_at_ms`。schemaの版を上げる | なし | なし | 断る理由 `run_pruned`。印の確認を再送の受領より先にする |
-| 1 | `control_request.run_id` と索引（既存の行は `target_json` から埋める）。索引 `event(run_id, seq)`。`event_no_delete` を外す。行の無いrunの `run_cancel_intent`・`control_request`・`event` を消す | なし | `capture_owner(run_id, state, root, place, pid, start)` | 断る理由 `capture_abandoned`。行の無いrunへのcancelは、進行中の取り込みのものだけ受理し、ほかは `NOT_FOUND`（挙動の変更）。`ephemeral.json`・`ephemeral.lock`。一時fileの名前の規則（場所はhash） |
+| 1 | `control_request.run_id` と索引（既存の行は `target_json` から埋める）。索引 `event(run_id, seq)`。`event_no_delete` を外す。行の無いrunの `run_cancel_intent`・`control_request`・`event` を消す | なし | `capture_owner(run_id, state, root, place, pid, start)`（版は上げない）。`root.kind` の値 `abandoned`。claimの印 | 断る理由 `capture_abandoned`。行の無いrunへのcancelは、進行中の取り込みのものだけ受理し、ほかは `NOT_FOUND`（挙動の変更）。`ephemeral.json`・`ephemeral.lock`。一時fileの名前の規則（場所はhash） |
 | 2 | `retire_tombstone_no_delete` を外す。索引 `event(seq)`（部分）、`run(source_id)`、`run(secret_bundle_id)`。`ci_test_timing` の時刻と索引。schemaの版を上げる | なし | `import_session(run_id)` の索引 | なし |
 | 3 | なし（submitと解放の排他は、親のprocessの中。打ち切りの時点の `release_attempt` と、照合は、既存の行から決まる） | 重複防止の記録の表、`refused_member`。`event_no_delete`・`tombstone_no_delete` を外す。submitの判定と挿入を1つのtransactionにする。段階3より前にACKされた行の削除（試用の後） | なし | 機能 `attempt_release_v1`、操作 `release_attempt`（controlの種類）・`list_unreleased`、`overloaded_reason.reason = "attempt_records"`、断る理由 `member_forgotten`、`belt group forget <member>` |
 | 4 | なし | toolchainのrootの表と参照の表。既存のrootの行の作成（最初の起動） | なし | なし |

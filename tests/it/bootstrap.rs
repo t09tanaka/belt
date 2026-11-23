@@ -1238,7 +1238,21 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
     assert!(context.repo_root.is_none());
     assert_eq!(context.config.outputs.len(), 1);
     let run = belt::ids::RunId::generate();
+    // A capture for a plan draft goes into the draft's own store and has no
+    // owner row, there or in the parent (spec 25.4 (b), (xiii)); the capture
+    // of a submission writes the row of its run, once.
+    let draft = root.path().join("draft");
+    std::fs::create_dir(&draft).unwrap();
+    std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o700)).unwrap();
+    input::capture_into(&context, &belt::ids::RunId::generate(), None, &draft).unwrap();
+    assert!(open_sources(&draft).capture_owners().unwrap().is_empty());
+    assert!(belt::source::retention::inspect_owners(context.state_dir())
+        .unwrap()
+        .is_none_or(|owners| owners.is_empty()));
     let first = input::capture(&context, &run, None).unwrap();
+    let owners = open_sources(context.state_dir()).capture_owners().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert!(owners[0].run == run.as_str() && !owners[0].given_up);
     assert!(!first
         .manifest
         .object_manifest
@@ -1248,6 +1262,13 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
     std::fs::write(dir.join("input"), "later content").unwrap();
     let second = input::capture(&context, &run, None).unwrap();
     assert_eq!(first.manifest.source_id, second.manifest.source_id);
+    assert_eq!(
+        open_sources(context.state_dir())
+            .capture_owners()
+            .unwrap()
+            .len(),
+        1
+    );
     let view = root.path().join("view");
     input::source_view(&context, &run, &view).unwrap();
     assert_eq!(
@@ -1274,6 +1295,10 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
         Context::load(invalid_env, dir, context.bootstrap.clone()).is_err(),
         "invalid Git context must not become a directory snapshot"
     );
+    // The owner gives up: the row stays, for the resident, and says so.
+    input::give_up(context.state_dir(), &run);
+    let owners = open_sources(context.state_dir()).capture_owners().unwrap();
+    assert!(owners.len() == 1 && owners[0].given_up);
 }
 
 #[test]
@@ -1545,6 +1570,20 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
     assert_eq!(report.state, "not_submitted");
     assert_eq!(report.cli_exit_code, 130);
     assert!(!report.cancel_acknowledged && report.snapshot.is_none());
+    // A cancel that is answered "not found" ends the wait at once: there
+    // is nothing to stop, and nothing was recorded.
+    let asked = std::time::Instant::now();
+    let unknown = control::cancel_and_stop(
+        &spec,
+        Target::Run(belt::ids::RunId::generate()),
+        &mut signals,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(unknown.state, "run_not_found");
+    assert_eq!(unknown.cli_exit_code, 130);
+    assert!(!unknown.cancel_acknowledged && unknown.snapshot.is_none());
+    assert!(asked.elapsed() < Duration::from_secs(10));
     // An interrupt while the capture is in progress: the owner row is
     // there, the cancel is accepted and durable, and the enqueue that
     // arrives late is a run that never starts.
