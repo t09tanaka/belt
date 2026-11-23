@@ -467,8 +467,14 @@ pub fn begin<L: Launcher>(
     clock: &dyn Fn() -> u64,
 ) -> anyhow::Result<Trial> {
     let initial = Paths::resolve_for(env, launcher.backend())?;
+    // `init.lock` says nothing: a pass over old versions makes it on a host
+    // where `init` never ran. The resident's journal does.
+    ensure!(
+        initial.config.join("init.json").try_exists()?,
+        "this machine has no initialized resident; run belt init first"
+    );
     let init_lock = resident::secure_file(&initial.config.join("init.lock"), true)
-        .context("this machine has no initialized resident; run belt init first")?;
+        .context("init.lock cannot be opened")?;
     // One upgrade, init or membership change at a time on this machine.
     init_lock.lock()?;
     membership_undo::recover(&initial, launcher)?;

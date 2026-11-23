@@ -485,12 +485,24 @@ impl Setups {
 /// The notices of the roots for `doctor`, from the worker DB of
 /// `state_dir` (read only): a pass that has stopped for an hour or more for
 /// the same reason, and removals that failed.
-pub(crate) fn doctor_notices(state_dir: &Path, now_ms: u64) -> Vec<String> {
+pub(crate) fn doctor_notices(
+    state_dir: &Path,
+    worker_id: &crate::ids::WorkerId,
+    now_ms: u64,
+) -> Vec<String> {
     if !state_dir.join("worker.db").is_file() {
         return Vec::new();
     }
-    let Ok(status) = WorkerStore::open_read_only(state_dir).and_then(|db| db.toolchain_status())
-    else {
+    // `open_read_only` does not compare the worker: the worker's own open
+    // does, and refuses a database that belongs to another.
+    let Ok(status) = WorkerStore::open_read_only(state_dir).and_then(|db| {
+        if db.worker_id() != worker_id {
+            return Err(crate::storage::StorageError::Invalid(
+                "database belongs to another worker".into(),
+            ));
+        }
+        db.toolchain_status()
+    }) else {
         // The worker reads the same file: while it cannot, no root is bound,
         // installed into or removed, and a tool preparation fails after its
         // deadline.

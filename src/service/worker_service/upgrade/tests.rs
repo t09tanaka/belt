@@ -231,17 +231,19 @@ fn upgrade_places_the_version_stops_the_old_service_and_starts_the_new_one() {
     let h = Host::new();
     let status = h.upgrade(&mut |_| Ok(())).unwrap();
     assert_eq!(status.binary_sha256, h.new);
+    // Before the commit the previous version keeps the exact input it ran with.
+    let paths = h.paths();
+    assert_eq!(
+        fs::read(version_input(&paths, &h.old)).unwrap(),
+        h.input_at_install
+    );
     h.assert_serving(&h.new);
     assert_eq!(h.launchctl(), ["bootstrap", "bootout", "bootstrap"]);
     // The worker stays drained until the caller has checked it and resumes.
     assert!(status.draining && !status.cancel_running);
-    let paths = h.paths();
     assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
-    // The previous version keeps the exact input it ran with (until the
-    // commit removes the version, spec 25.7 (a)).
-    if let Ok(input) = fs::read(version_input(&paths, &h.old)) {
-        assert_eq!(input, h.input_at_install);
-    }
+    // The commit removed the previous version (spec 25.7 (a)).
+    assert!(!version_input(&paths, &h.old).exists());
 }
 
 #[test]

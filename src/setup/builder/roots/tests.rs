@@ -397,10 +397,10 @@ fn a_removal_that_fails_puts_the_root_back_and_the_passes_go_on() {
     assert!(row.last_used_ms >= now);
     assert_eq!(db.toolchain_status().unwrap().evict_failures, 1);
     assert_eq!(
-        doctor_notices(&f.state, now).len(),
+        doctor_notices(&f.state, &wid(), now).len(),
         1,
         "{:?}",
-        doctor_notices(&f.state, now)
+        doctor_notices(&f.state, &wid(), now)
     );
     assert_eq!(s.roots_pass(now).removed, vec![B.to_string()]);
     assert!(a.exists() && !b.exists());
@@ -497,7 +497,7 @@ fn a_pass_that_keeps_stopping_is_told_by_doctor() {
     let then = now - 2 * 3600 * 1000;
     assert_eq!(s.roots_pass(then).held, Some("builder_without_references"));
     assert_eq!(s.roots_pass(now).held, Some("builder_without_references"));
-    let notices = doctor_notices(&f.state, now);
+    let notices = doctor_notices(&f.state, &wid(), now);
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].contains("setup builder directory"),
@@ -506,7 +506,7 @@ fn a_pass_that_keeps_stopping_is_told_by_doctor() {
     assert!(!notices[0].contains(f.state.to_str().unwrap()), "no paths");
     std::fs::remove_dir(s.cfg.builders().join("01OLDBUILDER")).unwrap();
     s.roots_pass(now);
-    assert!(doctor_notices(&f.state, now).is_empty());
+    assert!(doctor_notices(&f.state, &wid(), now).is_empty());
 }
 
 fn flight_of(refs: &[&str]) -> Flight {
@@ -586,7 +586,7 @@ fn a_tool_preparation_fails_when_the_database_never_opens() {
     assert_eq!(s.database_wait(1_000 + deadline - 1), None, "still waiting");
     let why = s.database_wait(1_000 + deadline).expect("failed");
     assert!(why.contains("worker.db"), "{why}");
-    let notices = doctor_notices(&f.state, platform::wall_ms());
+    let notices = doctor_notices(&f.state, &wid(), platform::wall_ms());
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("worker database"), "{notices:?}");
     assert!(!notices[0].contains(f.state.to_str().unwrap()), "no paths");
@@ -602,10 +602,28 @@ fn a_failed_hand_off_is_counted_and_cleared_by_the_next_that_works() {
     let db = s.db().unwrap();
     s.count_failed_hand_off(db, A);
     s.count_failed_hand_off(db, A);
-    let notices = doctor_notices(&f.state, platform::wall_ms());
+    let notices = doctor_notices(&f.state, &wid(), platform::wall_ms());
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("2 hand-off"), "{notices:?}");
     db.toolchain_bind_all(A, vec!["att-1".into()], platform::wall_ms())
         .unwrap();
-    assert!(doctor_notices(&f.state, platform::wall_ms()).is_empty());
+    assert!(doctor_notices(&f.state, &wid(), platform::wall_ms()).is_empty());
+}
+
+fn wid() -> crate::ids::WorkerId {
+    crate::ids::WorkerId::parse("w-roots").unwrap()
+}
+
+/// Review round 3: a database of another worker is the one the worker
+/// refuses to open, and `doctor` says so.
+#[test]
+fn doctor_says_a_database_of_another_worker_cannot_be_opened() {
+    let f = Fixture::new();
+    f.root(A);
+    let _s = f.open();
+    assert!(doctor_notices(&f.state, &wid(), platform::wall_ms()).is_empty());
+    let other = crate::ids::WorkerId::parse("w-other").unwrap();
+    let notices = doctor_notices(&f.state, &other, platform::wall_ms());
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("worker database"), "{notices:?}");
 }

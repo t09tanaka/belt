@@ -162,6 +162,15 @@ fn pass(
     Ok(outcome)
 }
 
+/// The running executable (a test stands one in).
+fn running_exe() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(exe) = tests::STAND_IN.with(|s| s.borrow().clone()) {
+        return Some(exe);
+    }
+    std::env::current_exe().ok()
+}
+
 fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
@@ -252,11 +261,14 @@ struct Named {
 
 impl Named {
     fn read(places: &Places) -> Result<Self, Held> {
-        Self::read_why(places).map_err(|_| Held::Unreadable)
+        Self::read_why(places, true).map_err(|_| Held::Unreadable)
     }
 
     /// The same, saying what could not be read (for `doctor`; no paths).
-    fn read_why(places: &Places) -> Result<Self, &'static str> {
+    /// `with_exe`: the running executable names its version too. A command
+    /// that refused a copy it made does not run from it, and a remote
+    /// bootstrap binary's path carries the very digest it was sent for.
+    fn read_why(places: &Places, with_exe: bool) -> Result<Self, &'static str> {
         let bin = places.bin();
         let mut links = Vec::new();
         for link in ["current", "resident"] {
@@ -266,7 +278,7 @@ impl Named {
                 Err(_) => return Err("the link bin/current or bin/resident cannot be read"),
             }
         }
-        if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = with_exe.then(running_exe).flatten() {
             links.push(exe.to_string_lossy().into_owned());
         }
         let mut texts = Vec::new();
@@ -428,7 +440,7 @@ pub(crate) fn remove_refused(places: &Places, digest: &str, created: bool, holds
     };
     // A link that is not there points at nothing; one that cannot be read
     // may point here (`Named::read` fails then, and nothing is removed).
-    let Ok(named) = Named::read(places) else {
+    let Ok(named) = Named::read_why(places, false) else {
         return;
     };
     let dir = places.bin().join(digest);
@@ -450,7 +462,7 @@ pub(crate) fn unreadable_reason(env: &BTreeMap<String, String>) -> Option<&'stat
     if !super::init::upgrade::guard_definition_known(&places.config) {
         return Some("the resident's journal does not say where the upgrade guard's definition is");
     }
-    Named::read_why(&places).err()
+    Named::read_why(&places, true).err()
 }
 
 /// How many version directories other than the ones `bin/current` and

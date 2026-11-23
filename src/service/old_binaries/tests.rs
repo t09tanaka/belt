@@ -3,6 +3,11 @@ use crate::ids::{CoordinatorId, WorkerId};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::time::{Duration, SystemTime};
 
+thread_local! {
+    /// The running executable a test stands in.
+    pub(super) static STAND_IN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -350,7 +355,7 @@ fn a_definition_that_cannot_be_read_whole_or_listed_keeps_every_version() {
     let large = f.places.services[0].join("large.plist");
     fs::write(&large, vec![b' '; (TEXT_LIMIT + 1) as usize]).unwrap();
     assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
-    assert!(Named::read_why(&f.places)
+    assert!(Named::read_why(&f.places, true)
         .err()
         .is_some_and(|why| why.contains("larger than 1 MiB")));
     fs::remove_file(&large).unwrap();
@@ -359,7 +364,7 @@ fn a_definition_that_cannot_be_read_whole_or_listed_keeps_every_version() {
     let listed = fs::read_dir(services).is_ok();
     if !listed {
         assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
-        let why = Named::read_why(&f.places).err().unwrap();
+        let why = Named::read_why(&f.places, true).err().unwrap();
         assert!(why.contains("service definitions"), "{why}");
         assert!(!why.contains('/'), "{why}");
     }
@@ -443,4 +448,27 @@ fn a_refused_copy_goes_at_once_unless_linked_named_or_being_placed() {
     drop(other);
     remove_refused(p, NEW, true, Holds::Init);
     assert!(f.version(NEW).exists(), "bin/current points at it");
+}
+
+/// Review round 3: a refused copy goes although the running executable's path
+/// carries its digest (a remote `worker-service upgrade` runs from
+/// `.belt-bootstrap/belt-<digest>`); a pass still counts that executable.
+#[test]
+fn a_refused_copy_goes_although_the_running_executable_carries_its_digest() {
+    let f = Fixture::new();
+    STAND_IN.with(|s| {
+        *s.borrow_mut() = Some(PathBuf::from(format!("/home/u/.belt-bootstrap/belt-{OLD}")))
+    });
+    remove_refused(&f.places, OLD, true, Holds::Switch);
+    let gone = !f.version(OLD).exists();
+    let kept_by_pass = {
+        let g = Fixture::new();
+        g.assert_kept().held.is_none() && g.version(OLD).exists()
+    };
+    STAND_IN.with(|s| *s.borrow_mut() = None);
+    assert!(gone, "the refused copy is removed");
+    assert!(
+        kept_by_pass,
+        "a pass keeps the running executable's version"
+    );
 }

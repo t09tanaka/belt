@@ -1299,6 +1299,7 @@ pub fn run(
     }
     for notice in crate::setup::builder::toolchain_doctor_notices(
         &spec.worker_state_dir,
+        &spec.worker_id,
         crate::platform::wall_ms(),
     ) {
         checks.push(Check::new(

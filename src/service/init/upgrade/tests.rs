@@ -993,3 +993,18 @@ async fn s25_7_a_guard_definition_left_unregistered_keeps_the_previous_version()
     sweep_old_versions(&h.paths, &mut fake);
     assert!(!h.exe(&h.old).exists());
 }
+
+/// Review round 3: `init.lock` is made by a pass over old versions on a host
+/// where `init` never ran, so it does not say a resident is there.
+#[tokio::test]
+async fn upgrade_without_a_resident_journal_says_so_even_when_init_lock_is_there() {
+    let h = Host::new().await;
+    fs::write(h.paths.config.join("init.lock"), b"").unwrap();
+    fs::remove_file(h.paths.config.join("init.json")).unwrap();
+    let mut fake = h.fake.clone();
+    let error = match begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0) {
+        Err(e) => format!("{e:#}"),
+        Ok(_) => panic!("no resident"),
+    };
+    assert!(error.contains("no initialized resident"), "{error}");
+}
