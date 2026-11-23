@@ -796,26 +796,41 @@ fn recorded_repo_at(w: &World, main: &Path) -> PathBuf {
     repo
 }
 
-/// What `<repo>/.main` records: the main checkout, and the three device
-/// numbers when it has them.
-fn record(repo: &Path) -> (PathBuf, Option<Vec<u64>>) {
+/// What `<repo>/.main` records after the NUL, split at spaces: the three
+/// device numbers, then the parent inode and the host identity.
+fn record_fields(repo: &Path) -> (PathBuf, Option<Vec<String>>) {
     use std::os::unix::ffi::OsStrExt;
     let bytes = fs::read(repo.join(".main")).unwrap();
     let mut parts = bytes.splitn(2, |b| *b == 0);
     let main = PathBuf::from(std::ffi::OsStr::from_bytes(parts.next().unwrap()));
-    let devices = parts.next().map(|d| {
+    let fields = parts.next().map(|d| {
         String::from_utf8_lossy(d)
             .split(' ')
-            .map(|n| n.parse().unwrap())
+            .map(str::to_owned)
             .collect()
     });
+    (main, fields)
+}
+
+/// What `<repo>/.main` records: the main checkout, and the three device
+/// numbers when it has them.
+fn record(repo: &Path) -> (PathBuf, Option<Vec<u64>>) {
+    let (main, fields) = record_fields(repo);
+    let devices = fields.map(|f: Vec<String>| f[..3].iter().map(|n| n.parse().unwrap()).collect());
     (main, devices)
 }
 
+/// Writes the record with other device numbers; the parent inode and host
+/// identity the command recorded stay as they are.
 fn set_record(repo: &Path, main: &Path, devices: Option<&[u64]>) {
+    let rest = record_fields(repo)
+        .1
+        .map(|f| f[3..].to_vec())
+        .unwrap_or_default();
     let mut bytes = main.as_os_str().as_encoded_bytes().to_vec();
     if let Some(d) = devices {
-        let d: Vec<String> = d.iter().map(u64::to_string).collect();
+        let mut d: Vec<String> = d.iter().map(u64::to_string).collect();
+        d.extend(rest);
         bytes.push(0);
         bytes.extend(d.join(" ").bytes());
     }

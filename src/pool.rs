@@ -861,13 +861,25 @@ fn spare_id(name: &str) -> Option<&str> {
 /// taken without waiting. Returns false when a fill holds it: nothing was
 /// done, and the next walk tries again.
 pub fn retire(pool: &Path, main: Option<&Path>, moved: &mut Vec<PathBuf>) -> bool {
-    let names: Vec<String> = fs::read_dir(pool)
+    let wall = SystemTime::now();
+    let entries: Vec<(String, u64)> = fs::read_dir(pool)
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n == FILL_LOG || n == MISSES || spare_id(n).is_some())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let age = e
+                .metadata()
+                .ok()
+                .map(|m| cache::changed_ago(&m, wall).as_secs());
+            // Unknown age cannot prove a leftover safe to discard.
+            if age.is_none() && name.starts_with('.') {
+                return None;
+            }
+            Some((name, age.unwrap_or(0)))
+        })
         .collect();
+    let names = retirement_names(&entries, now_secs(), &cache::pid_alive);
     if names.is_empty() {
         return true;
     }
@@ -902,6 +914,25 @@ pub fn retire(pool: &Path, main: Option<&Path>, moved: &mut Vec<PathBuf>) -> boo
         }
     }
     true
+}
+
+fn retirement_names(
+    entries: &[(String, u64)],
+    now: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    // Keep live owners even with the fill lock: another host may share this pool.
+    let stale = stale_leftovers(entries, now, false, LEFTOVER_MIN_SECS, alive);
+    entries
+        .iter()
+        .filter(|(name, _)| {
+            name == FILL_LOG
+                || name == MISSES
+                || (name.starts_with(SPARE_PREFIX) && spare_id(name).is_some())
+                || stale.contains(name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// The pool directory and the id of the spare that a registration in
@@ -1135,6 +1166,39 @@ mod tests {
         assert!(stale_leftovers(&all, now, false, 11, &dead).is_empty());
         assert!(stale_leftovers(&all, now, true, 11, &dead).is_empty());
         assert_eq!(LEFTOVER_MIN_SECS, 600);
+    }
+
+    #[test]
+    fn retirement_keeps_live_and_young_leftovers() {
+        let now = 1_000_000;
+        let leftovers = names(&[
+            ".new-wt-999900-1-0",
+            ".no-hooks-wt-999900-1-0",
+            ".claimed-77-wt-999900-1-0",
+        ]);
+        let entries = |age| {
+            leftovers
+                .iter()
+                .cloned()
+                .chain(names(&["wt-999900-1-0", "fill.lock", ".new-wt-x"]))
+                .map(|name| (name, age))
+                .collect::<Vec<_>>()
+        };
+        let plain = names(&["wt-999900-1-0"]);
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS), now, &|_| true),
+            plain
+        );
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS - 1), now, &|_| false),
+            plain
+        );
+        let mut discarded = leftovers.clone();
+        discarded.extend(plain);
+        assert_eq!(
+            retirement_names(&entries(LEFTOVER_MIN_SECS), now, &|_| false),
+            discarded
+        );
     }
 
     #[test]

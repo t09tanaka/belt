@@ -1268,14 +1268,17 @@ before `<cache>/<repo>` is deleted, and anything that cannot be read keeps
 it:
 
 1. no command ran in it for 7 days;
-2. `.main` has the device numbers (a record without them, or a directory of
-   the cache with no `.main` at all, that only versions up to 0.6.0 wrote
+2. `.main` has the device numbers, host identity and parent inode (a record
+   without them, or a directory of the cache with no `.main` at all,
+   that only versions up to 0.6.0 wrote
    to, stays until a command of this version runs in its repository: no
    length of time tells a deleted checkout from one on a disk that was not
    plugged in);
 3. the checkout was not itself the root of a mount;
 4. the directory the checkout was in is there, on the same device as then
-   (the same device as the cache, when both were on one);
+   (the same device as the cache, when both were on one), with the recorded
+   inode and host identity matching; parent device and inode must also agree
+   before and after checking the checkout;
 5. the checkout's path does not exist.
 
 So these are not "gone":
@@ -1285,10 +1288,8 @@ So these are not "gone":
   On macOS a volume under `/Volumes` takes its mount point with it (4, or
   3 when the checkout is the volume's root).
 - A cache shared with another machine or a container, where the path only
-  exists on the other side: nothing happens while that side uses it (1),
-  and afterwards the directory it was in is missing or on another device
-  (4). Device numbers of two machines can be equal by chance; then only
-  what can be made again is lost (entries and spares).
+  exists on the other side: a different or unavailable host identity keeps
+  the repository cache, even when device numbers happen to match (4).
 - A checkout whose path cannot be looked at (no permission, an I/O error).
 
 A checkout that was **moved** cannot be told from a deleted one, and after 7

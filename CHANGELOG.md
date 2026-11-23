@@ -47,10 +47,12 @@ change bumps the minor version).
     what a fill left half made, `fill.log` and `misses` are discarded.
   - The whole cache directory of a repository goes when, on top of that,
     its main checkout was deleted: the directory the checkout was in is
-    there, on the same device as when a command last ran, and the path is
-    missing. A disk that is not mounted at its mount point, a network or
-    FUSE mount that is down, a cache shared with another machine and a
-    record without the devices are not that, and keep it.
+    there, on the same device and inode as when a command last ran, the
+    recorded host identity matches, and the path is missing (the parent is
+    checked again afterwards). A disk that is not mounted at its mount
+    point, a network or FUSE mount that is down, a cache shared with another
+    machine and a record without devices, host identity or parent inode
+    are not that, and keep it.
   - The registrations of spares whose directories are gone (a checkout
     that was moved leaves them: they are locked, so `git worktree prune`
     keeps them) are dropped by the next command in the repository: only

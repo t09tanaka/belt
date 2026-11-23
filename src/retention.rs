@@ -179,11 +179,14 @@ struct Devices {
     main: u64,
     /// Of the repository's directory of the cache.
     cache: u64,
+    parent_inode: Option<u64>,
+    host: Option<[u8; 16]>,
 }
 
 /// What [`MAIN_RECORD`] holds: the real path of the main checkout, and,
-/// after a NUL, three numbers ([`Devices`]). One written before the
-/// numbers were added has the path alone.
+/// after a NUL, three device numbers, optionally followed by the parent
+/// inode and host identity. Earlier records have just devices or the path.
+/// The previous parser rejects the extra fields, so it keeps new records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
     main: PathBuf,
@@ -196,6 +199,19 @@ fn encode(main: &Path, devices: Option<Devices>) -> Vec<u8> {
     if let Some(d) = devices {
         out.push(0);
         out.extend(format!("{} {} {}", d.parent, d.main, d.cache).bytes());
+        // Always extend the format, even when identity is unknown: the
+        // previous branch must not mistake this for a deletable old record.
+        let inode = d
+            .parent_inode
+            .map_or_else(|| "-".to_owned(), |n| n.to_string());
+        out.extend(format!(" {inode} ").bytes());
+        if let Some(host) = d.host {
+            for byte in host {
+                out.extend(format!("{byte:02x}").bytes());
+            }
+        } else {
+            out.push(b'-');
+        }
     }
     out
 }
@@ -215,15 +231,69 @@ fn decode(bytes: &[u8]) -> Option<Record> {
     let devices = rest
         .and_then(|r| std::str::from_utf8(r).ok())
         .and_then(|text| {
-            let mut n = text.split(' ').map(str::parse::<u64>);
-            let d = Devices {
-                parent: n.next()?.ok()?,
-                main: n.next()?.ok()?,
-                cache: n.next()?.ok()?,
+            let mut n = text.split(' ');
+            let mut d = Devices {
+                parent: n.next()?.parse().ok()?,
+                main: n.next()?.parse().ok()?,
+                cache: n.next()?.parse().ok()?,
+                parent_inode: None,
+                host: None,
             };
+            if let Some(inode) = n.next() {
+                d.parent_inode = if inode == "-" {
+                    None
+                } else {
+                    Some(inode.parse().ok()?)
+                };
+                let host = n.next()?;
+                d.host = if host == "-" {
+                    None
+                } else {
+                    Some(parse_host(host)?)
+                };
+            }
             n.next().is_none().then_some(d)
         });
     Some(Record { main, devices })
+}
+
+fn parse_host(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut id = [0; 16];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    (id != [0; 16]).then_some(id)
+}
+
+fn host_id() -> Option<[u8; 16]> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = [0; 16];
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: id is a writable 16-byte UUID buffer and timeout is a valid timespec.
+        let result = unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) };
+        (result == 0 && id != [0; 16]).then_some(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+            .iter()
+            .find_map(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| parse_host(s.trim()))
+            })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// Write the real path of `main` and its devices into the [`MAIN_RECORD`]
@@ -235,11 +305,14 @@ fn record_main(repo: &Path, main: &Path) {
         return;
     };
     let dev = |p: &Path| fs::metadata(p).ok().map(|m| m.dev());
-    let devices = match (real.parent().and_then(dev), dev(&real), dev(repo)) {
+    let parent_meta = real.parent().and_then(|p| fs::metadata(p).ok());
+    let devices = match (parent_meta.as_ref().map(|m| m.dev()), dev(&real), dev(repo)) {
         (Some(parent), Some(main), Some(cache)) => Some(Devices {
             parent,
             main,
             cache,
+            parent_inode: parent_meta.as_ref().map(|m| m.ino()),
+            host: host_id(),
         }),
         _ => None,
     };
@@ -344,6 +417,8 @@ struct Outside {
     /// The device of the directory the main checkout was in; `None` when
     /// that directory is missing or cannot be read.
     parent: Option<u64>,
+    parent_inode: Option<u64>,
+    host: Option<[u8; 16]>,
     /// The device of the repository's directory of the cache.
     cache: Option<u64>,
     main: Seen,
@@ -370,16 +445,18 @@ struct Outside {
 /// - The checkout's path does not exist. Seen through a mount, an error
 ///   other than "no such file" is not that.
 ///
-/// What this cannot tell apart from a deleted checkout: one that was moved
-/// (its commands use another directory of the cache from then on, and
-/// [`pool::drop_dangling`] drops the registrations of the spares that went
-/// with this one), and one that only exists on another machine that shares
-/// this cache and whose device numbers happen to be the same.
+/// The host identity and parent inode must also be known and match.
+/// A checkout moved on this host still cannot be told from a deleted one.
 fn is_gone(devices: Option<Devices>, now: &Outside) -> bool {
     let Some(then) = devices else {
         return false;
     };
-    if then.main != then.parent {
+    if then.host.is_none()
+        || then.host != now.host
+        || then.parent_inode.is_none()
+        || then.parent_inode != now.parent_inode
+        || then.main != then.parent
+    {
         return false;
     }
     let same_device = match now.parent {
@@ -401,11 +478,28 @@ fn seen(path: &Path) -> Seen {
 /// Look where the main checkout `main` was. This may wait for a mount for
 /// ever: only the detached process does it.
 fn look(main: &Path, repo: &Path) -> Outside {
-    let dev = |p: &Path| fs::metadata(p).ok().map(|m| m.dev());
+    let parent = || {
+        main.parent()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| (m.dev(), m.ino()))
+    };
+    let before = parent();
+    let checkout = seen(main);
+    let after = parent();
+    let mut outside = checked_look(before, checkout, after);
+    outside.cache = fs::metadata(repo).ok().map(|m| m.dev());
+    outside.host = host_id();
+    outside
+}
+
+fn checked_look(before: Option<(u64, u64)>, main: Seen, after: Option<(u64, u64)>) -> Outside {
+    let stable = before.is_some() && before == after;
     Outside {
-        parent: main.parent().and_then(dev),
-        cache: dev(repo),
-        main: seen(main),
+        parent: before.filter(|_| stable).map(|p| p.0),
+        parent_inode: before.filter(|_| stable).map(|p| p.1),
+        cache: None,
+        host: None,
+        main: if stable { main } else { Seen::Unknown },
     }
 }
 
@@ -630,9 +724,19 @@ mod tests {
             parent: 16_777_234,
             main: 16_777_234,
             cache: 7,
+            parent_inode: Some(42),
+            host: Some([1; 16]),
         };
         let main = Path::new("/work/my app\n2");
-        for devices in [Some(d), None] {
+        for devices in [
+            Some(d),
+            Some(Devices { host: None, ..d }),
+            Some(Devices {
+                parent_inode: None,
+                ..d
+            }),
+            None,
+        ] {
             assert_eq!(
                 decode(&encode(main, devices)),
                 Some(Record {
@@ -641,6 +745,15 @@ mod tests {
                 })
             );
         }
+        let legacy = Devices {
+            parent_inode: None,
+            host: None,
+            ..d
+        };
+        assert_eq!(
+            decode(b"/work/app\x0016777234 16777234 7").unwrap().devices,
+            Some(legacy)
+        );
         // Not a record at all.
         assert_eq!(decode(b""), None);
         assert_eq!(decode(b"relative/path"), None);
@@ -671,6 +784,10 @@ mod tests {
         assert_eq!(record.main, main);
         let d = record.devices.expect("the devices are recorded");
         assert_eq!(d.parent, fs::metadata(base.join("work")).unwrap().dev());
+        assert_eq!(
+            d.parent_inode,
+            Some(fs::metadata(base.join("work")).unwrap().ino())
+        );
         assert_eq!(d.main, d.parent);
         assert_eq!(d.cache, fs::metadata(&repo).unwrap().dev());
         // The next command: the same inode, a new time.
@@ -777,10 +894,14 @@ mod tests {
                 parent,
                 main,
                 cache,
+                parent_inode: Some(42),
+                host: Some([1; 16]),
             })
         };
         let now = |parent, cache, main| Outside {
             parent,
+            parent_inode: Some(42),
+            host: Some([1; 16]),
             cache,
             main,
         };
@@ -810,6 +931,51 @@ mod tests {
         // The checkout was the root of a mount itself (/Volumes/X): its
         // mount point may be missing while the volume is away.
         assert!(!is_gone(on(5, 8, 5), &now(Some(5), Some(5), NotFound)));
+    }
+
+    #[test]
+    fn host_and_parent_inode_must_be_known_and_match() {
+        let old = decode(b"/work/app\x005 5 5").unwrap();
+        let mut now = checked_look(Some((5, 42)), Seen::NotFound, Some((5, 42)));
+        now.cache = Some(5);
+        now.host = Some([1; 16]);
+        assert_eq!(old.devices.unwrap().host, None);
+        assert_eq!(old.devices.unwrap().parent_inode, None);
+        assert!(!is_gone(old.devices, &now));
+        assert!(!is_gone(decode(b"/work/app").unwrap().devices, &now));
+        let d = Devices {
+            parent_inode: Some(42),
+            host: Some([1; 16]),
+            ..old.devices.unwrap()
+        };
+        assert!(is_gone(Some(d), &now));
+        now.host = Some([2; 16]);
+        assert!(!is_gone(Some(d), &now));
+        now.host = None;
+        assert!(!is_gone(Some(d), &now));
+        now.host = d.host;
+        now.parent_inode = Some(43);
+        assert!(!is_gone(Some(d), &now));
+        now.parent_inode = None;
+        assert!(!is_gone(Some(d), &now));
+    }
+
+    #[test]
+    fn a_parent_that_changes_during_the_look_is_unknown() {
+        for after in [None, Some((6, 42)), Some((5, 43))] {
+            let now = checked_look(Some((5, 42)), Seen::NotFound, after);
+            assert_eq!(now.main, Seen::Unknown);
+            assert_eq!(now.parent, None);
+            assert_eq!(now.parent_inode, None);
+        }
+        assert_eq!(
+            checked_look(None, Seen::NotFound, Some((5, 42))).main,
+            Seen::Unknown
+        );
+        assert_eq!(
+            checked_look(Some((5, 42)), Seen::NotFound, Some((5, 42))).main,
+            Seen::NotFound
+        );
     }
 
     #[test]
