@@ -28,6 +28,44 @@ pub struct ImportReleaseReport {
 const MEMBERS: usize = 1000;
 
 impl Index {
+    /// Is there anything a pass under the exclusive lock would do? The
+    /// exclusive lock makes every other writer of the store fail at once,
+    /// so it is taken only then: an empty abandoned token root, a member
+    /// another root holds, or anything at all once the gates are open.
+    pub(in crate::source::retention) fn import_release_due(&self) -> Result<bool> {
+        let c = self.connect()?;
+        let open = Gate::closed(&c)?.is_none();
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root r WHERE r.kind='abandoned' AND r.id LIKE 'import:%' AND (?1 OR NOT EXISTS(SELECT 1 FROM member m WHERE m.root=r.id) OR EXISTS(SELECT 1 FROM member m JOIN member o ON o.object=m.object AND o.root<>m.root WHERE m.root=r.id)))",
+            [open],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The members of the abandoned token root `root` whose file was never
+    /// written and that no other root holds go with their object rows (as
+    /// 25.4 (b) does). Needs only the shared lock: nothing drains under it.
+    pub(in crate::source::retention) fn forget_absent_members(&self, root: &str) -> Result<()> {
+        let mut c = self.connect()?;
+        let mut after = String::new();
+        loop {
+            let objects: Vec<(String, String)> = {
+                let mut s = c.prepare("SELECT m.object,o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root=?1 AND m.object>?2 AND NOT EXISTS(SELECT 1 FROM member b WHERE b.object=m.object AND b.root<>m.root) ORDER BY m.object LIMIT 32")?;
+                let rows = s.query_map(params![root, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (object, path) in &objects {
+                after = object.clone();
+                if self.destination_absent(object, path) {
+                    forget_member(&mut c, root, object)?;
+                }
+            }
+            if objects.len() < 32 {
+                return Ok(());
+            }
+        }
+    }
+
     /// One bounded pass over the abandoned token roots.
     pub(in crate::source::retention) fn release_abandoned_imports(
         &self,
@@ -92,21 +130,7 @@ impl Index {
                     if !shared && self.destination_absent(object, path) {
                         // Named before its file was written, and never
                         // written: nothing to prove or unlink.
-                        let tx = c.transaction()?;
-                        tx.execute(
-                            "DELETE FROM member WHERE root=?1 AND object=?2",
-                            params![root, object],
-                        )?;
-                        let unheld = "NOT EXISTS(SELECT 1 FROM member WHERE object=?1) AND NOT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1)";
-                        tx.execute(
-                            &format!("DELETE FROM object WHERE id=?1 AND {unheld}"),
-                            [object],
-                        )?;
-                        tx.execute(
-                            &format!("DELETE FROM publication WHERE object=?1 AND {unheld}"),
-                            [object],
-                        )?;
-                        tx.commit()?;
+                        forget_member(&mut c, &root, object)?;
                         continue;
                     }
                     match self.release_member(
@@ -149,4 +173,25 @@ impl Index {
         }
         Ok(report)
     }
+}
+
+/// Remove the membership `object` of `root`, and the object's rows when no
+/// root and no claim names it any more.
+fn forget_member(c: &mut Connection, root: &str, object: &str) -> Result<()> {
+    let tx = c.transaction()?;
+    tx.execute(
+        "DELETE FROM member WHERE root=?1 AND object=?2",
+        params![root, object],
+    )?;
+    let unheld = "NOT EXISTS(SELECT 1 FROM member WHERE object=?1) AND NOT EXISTS(SELECT 1 FROM source_delete_claim WHERE object=?1)";
+    tx.execute(
+        &format!("DELETE FROM object WHERE id=?1 AND {unheld}"),
+        [object],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM publication WHERE object=?1 AND {unheld}"),
+        [object],
+    )?;
+    tx.commit()?;
+    Ok(())
 }

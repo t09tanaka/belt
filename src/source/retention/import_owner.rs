@@ -123,6 +123,8 @@ impl SourceStore {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             self.retention.abandon_import(&tx, id)?;
             tx.commit()?;
+            self.retention
+                .forget_absent_members(&format!("import:{id}"))?;
         }
         self.release_abandoned_imports()
     }
@@ -130,6 +132,9 @@ impl SourceStore {
     /// One bounded pass over the abandoned tokens, under the exclusive
     /// mutation lock. A store that is busy is left for the next pass.
     pub fn release_abandoned_imports(&self) -> Result<ImportReleaseReport> {
+        if !self.retention.import_release_due()? {
+            return Ok(ImportReleaseReport::default());
+        }
         let _guard = match self.retention.guard(true) {
             Ok(g) => g,
             Err(e) if would_block(&e) => {
@@ -334,7 +339,9 @@ mod tests {
         store.capture_pending_root(None).unwrap();
         let id = SourceStore::import_token_id(&token).to_string();
         let r = store.release_import(&id).unwrap();
-        assert_eq!((r.released, r.unlinked, r.kept), (0, 0, 1));
+        // (nothing to do under the exclusive lock: it is not taken)
+        assert_eq!((r.released, r.unlinked), (0, 0));
+        assert_eq!(rows(&store), (1, 1, 1));
         assert_eq!(claims(&store), 0);
         assert!(store.has_blob(&want(&lone).hash));
         store.begin_import().unwrap();
@@ -348,7 +355,8 @@ mod tests {
         ingest(&store, &token, &[8u8; 9]);
         let id = SourceStore::import_token_id(&token).to_string();
         let r = store.release_import(&id).unwrap();
-        assert_eq!((r.unlinked, r.kept), (0, 1));
+        assert_eq!((r.released, r.unlinked), (0, 0));
+        assert_eq!(rows(&store), (1, 1, 1));
         assert_eq!(claims(&store), 0);
         assert!(store.has_blob(&want(&[8u8; 9]).hash));
     }
@@ -365,6 +373,35 @@ mod tests {
         assert_eq!((r.released, r.unlinked), (1, 0));
         assert_eq!(rows(&store), (0, 0, 0));
         assert_eq!(claims(&store), 0);
+    }
+
+    #[test]
+    fn a_failed_ingest_leaves_nothing_once_its_token_is_released() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = store(dir.path());
+        let token = store.begin_import().unwrap();
+        // the member row is written before the file; the wrong bytes never
+        // become the file
+        let b = [11u8; 9];
+        assert!(store
+            .ingest_blob_with_token(&token, &want(&b), &mut &[12u8; 9][..])
+            .is_err());
+        assert_eq!(rows(&store), (1, 1, 1));
+        let id = SourceStore::import_token_id(&token).to_string();
+        let r = store.release_import(&id).unwrap();
+        assert_eq!((r.released, r.unlinked, r.kept), (1, 0, 0));
+        assert_eq!(rows(&store), (0, 0, 0));
+        assert_eq!(claims(&store), 0);
+        let key = format!("b:{}", want(&b).hash);
+        let c = store.retention.connect().unwrap();
+        let left: i64 = c
+            .query_row(
+                "SELECT (SELECT count(*) FROM object WHERE id=?1)+(SELECT count(*) FROM publication WHERE object=?1)",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

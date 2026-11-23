@@ -3270,7 +3270,7 @@ fn index_rows(f: &Fx, root: &str) -> (i64, i64, i64) {
     (
         n("SELECT count(*) FROM import_session WHERE ?1=?1", ""),
         n(
-            "SELECT count(*) FROM root WHERE kind='pending' AND ?1=?1",
+            "SELECT count(*) FROM root WHERE kind IN ('pending','receipt') AND ?1=?1",
             "",
         ),
         n(
@@ -3529,6 +3529,15 @@ fn a_source_nobody_added_to_goes_at_the_next_pass_with_its_token() {
     // into the store
     assert_eq!(index_rows(&f, "").0, 0);
     assert!(p.blobs.keys().all(|h| !f.worker_store().has_blob(h)));
+    let claims: i64 = rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM source_delete_claim WHERE done=0)+(SELECT count(*) FROM publication WHERE state='claimed')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(claims, 0);
     // a source written to within the limit stays
     assert!(f.incoming(&fresh.source).exists());
 }
