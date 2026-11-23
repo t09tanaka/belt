@@ -248,7 +248,10 @@ fn names_in(dir: &impl AsFd) -> std::io::Result<Vec<CString>> {
 /// reached, whatever is renamed meanwhile.
 fn remove_at(dir: &impl AsFd, name: &CStr) -> std::io::Result<()> {
     let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+    // The field's type differs between the platforms.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode);
+    if kind != FileType::Directory {
         return Ok(rustix::fs::unlinkat(dir, name, AtFlags::empty())?);
     }
     let below = rustix::fs::openat(
