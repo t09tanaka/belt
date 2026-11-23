@@ -2203,7 +2203,7 @@ enqueueの前にCLIがCtrl-Cやcrashで終わると、どれも消えない（�
 | 4 | 取り込みの持ち主の行が保留のrootを名指していれば、その取り込みのscratch directory（`sources/staging/<ulid>/`）を先にまるごと消す（放棄の処理の段6と同じ）。入力の所属を外し、他のrunが参照しないmanifestとobjectを消す（第23章のB）。そのsourceを参照するrunが他に無ければ、そのsourceのbundle（`sources/bundles/<source>-<32hex>.bundle`）と、親のGit領域のそのsourceのref（下） | Bのclaimの再実行。bundleとrefの削除は冪等 |
 | 5 | runごとのfileと索引の行: `in-place/<run>.json`、`sources/runs/<run>`、`sources/retention.db` のそのrunの行（`run_expiry`、完了した `vault_delete_claim`、そのrunのrootとそのmember・graph、`import_session`、`capture_owner`）、最後に `sources/runs/<run>.lock` | 各削除は冪等。未完了のclaimが残るrunは、ここで止めて次のpassに回す |
 | 6 | 親DBの行を、下の順で消す。1 transactionは1,000行まで | 印のあるrunの残りの行を、同じ順で続ける |
-| 7 | 最後のtransaction（`run` の行を消すもの）のcommitの後、そのrunのattemptのうち、workerが受理していて、ACK済みでないものに `release_attempt` を送る（段階3が入っていれば。届かなくてよい。25.6）。送る相手の一覧（workerとattempt ID）は、段6でattemptの行を消すtransactionが、消す前に読んでメモリに持つ | 一覧は失われる。送らなかった分は、接続時の照合（25.6）が拾う |
+| 7 | 最後のtransaction（`run` の行を消すもの）のcommitの後、そのrunのattemptのうち、workerが受理していて、ACK済みでないものに `release_attempt` を送る（届かなくてよい。25.6）。実装は、runのattemptを全部送る（workerは、受理していないものとACK済みのものに `NOT_FOUND` と答える）。送る相手の一覧（workerとattempt ID）は、段6でattemptの行を消すtransactionが、消す前に読んでメモリに持つ | 一覧は失われる。送らなかった分は、接続時の照合（25.6）が拾う |
 | 8 | `reader-pins/<run>.lock` をunlinkし、排他pinを手放す（25.1の (B)）。結果のGCのcursorがこのrunを指していれば、cursorを捨てる（下） | 行が無くpinだけが残る。起動時の走査が消す（25.11） |
 
 **1 passの上限。** runは32件（印のあるrunを先に、run IDの順で。進めないrunが後ろのrunを待たせないように、続きの位置をメモリに持つ）、結果のpathは32件（段3のclaimと、attemptごとのdirectory `results/<attempt>/` の削除を1件ずつ数える）、入力のpathは32件と検証64 MiB（段階1の放棄の処理と同じ関数の上限）、行は1,000行のtransactionを64回までである。どの上限も、1 passの全runで共有する（runごとに取り直さない）。上限に達したrunは、印を持ったまま次のpassが続ける。attemptのdirectoryの走査は、続きの位置（task IDとattempt IDの順）をメモリに持ち、次のpassがそこから続ける（失っても、走査をやり直すだけで、消してよいものは変わらない）。印のあるrunは、部分索引 `run(run_id) WHERE pruning_at_ms IS NOT NULL` で探す（全runを読まない）。印のあるrunの数は `doctor` が示す。段4が入力の保持のgate（旧形式のmanifestの登録が済んでいない、進行中の取り込みがある、graphが終わっていない）で止まっている間は、`doctor` の行と、residentのログの `run pruning held` の行が、そのgateの名前（`legacy_registration`・`capture`・`graph`）を示す。
@@ -2251,7 +2251,7 @@ pinのfileを作る（`RunPin::ensure` を呼ぶ）のは、次の3つがすべ�
 | - | - |
 | 利用者の `show`・`logs`・`outputs`・`retry`・`cancel` | `NOT_FOUND`。メッセージで、終了から `retention_days` 日でrunを消すことを伝える（runを名指した場合。taskを名指した場合は、taskの行が無いので、どのrunのものだったかを言えず、従来の `NOT_FOUND` のままである）。cancelも何も書かない（刈り取ったrunには `capture_owner` の行が無いので、25.4の (b) の規則で断られる。`run_cancel_intent`・`event`・`control_request` の行はできない） |
 | 同じ `request_id` で送り直したcancel・`retry` | 刈り取りの途中（印がある間）は `run_pruned`、後は `NOT_FOUND`。保存した答えは返さない（25.3） |
-| workerに残る、親DBに行の無いattempt | 親は、自分の行があるattemptについてだけworkerへ尋ねる（追跡は行から始まる）ので、行の無いattemptの答えを受け取る経路は無い。workerの答え（`inspect` の件数、eventなど）に行の無いattemptが現れても、親は行を作らず、leaseも更新せず、そのworkerの他のattemptの処理を止めない。workerの側は、段階3の照合（25.6）が消す。段階3が入るまでは、workerが従来どおり `ack_wait` の7日で結果を消し、行は残る |
+| workerに残る、親DBに行の無いattempt | 親は、自分の行があるattemptについてだけworkerへ尋ねる（追跡は行から始まる）ので、行の無いattemptの答えを受け取る経路は無い。workerの答え（`inspect` の件数、eventなど）に行の無いattemptが現れても、親は行を作らず、leaseも更新せず、そのworkerの他のattemptの処理を止めない。workerの側は、段階3の照合（25.6）が消す |
 | 遅れて届いた古いsubmitの写し | workerの記録が断る（今は消さないtombstoneとattemptの行、段階3からは重複防止の記録） |
 | 古い版のreaderが開いた、消されたpin | inodeの照合で「無い」になる（25.1の (B)） |
 
