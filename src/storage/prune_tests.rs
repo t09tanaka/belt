@@ -80,12 +80,16 @@ fn count(store: &CoordinatorStore, query: &'static str) -> i64 {
         .unwrap()
 }
 
-/// Every text cell of every table that contains one of `needles`.
 fn mentions(store: &CoordinatorStore, needles: &[String]) -> Vec<String> {
-    let needles = needles.to_vec();
-    store
-        .db
-        .call(move |c| {
+    store.mentions_for_test(needles)
+}
+
+impl CoordinatorStore {
+    /// Every text cell of every table that contains one of `needles`.
+    pub(crate) fn mentions_for_test(&self, needles: &[String]) -> Vec<String> {
+        let needles = needles.to_vec();
+        self.db
+            .call(move |c| {
             let tables: Vec<String> = {
                 let mut s = c.prepare(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -111,6 +115,7 @@ fn mentions(store: &CoordinatorStore, needles: &[String]) -> Vec<String> {
             Ok(found)
         })
         .unwrap()
+    }
 }
 
 /// The whole table list, with how many rows each has.

@@ -2090,3 +2090,17 @@ fn removed_members_warn_without_registration_and_remain_after_failed_probe() {
         .contains("cannot be checked"));
     assert!(path.exists());
 }
+
+/// Spec 25.5: a run whose pruning began and did not reach its end is kept
+/// as it is and counted; no such run is no line at all.
+#[test]
+fn runs_whose_pruning_is_not_finished_are_counted() {
+    assert_eq!(pruning_report(Some(0)), None);
+    let (level, detail) = pruning_report(Some(3)).unwrap();
+    assert_eq!(level, Level::Notice);
+    assert!(
+        detail.starts_with("3 run(s) past their retention"),
+        "{detail}"
+    );
+    assert_eq!(pruning_report(None).unwrap().0, Level::NotChecked);
+}

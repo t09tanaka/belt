@@ -184,3 +184,10 @@ impl SourceStore {
         Ok(out)
     }
 }
+
+/// Stop the steps of this thread right after `stage` (a test of a resident
+/// that is stopped there).
+#[cfg(test)]
+pub fn set_prune_fault(stage: Option<&'static str>) {
+    super::set_fault(stage);
+}

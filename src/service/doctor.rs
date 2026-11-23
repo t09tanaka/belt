@@ -1091,18 +1091,26 @@ pub fn pruning_checks(spec: &Spec) -> Vec<Check> {
     let Ok(store) = super::bootstrap::read_only_store(spec) else {
         return Vec::new();
     };
-    match store.marked_run_count() {
-        Ok(0) => Vec::new(),
-        Ok(runs) => vec![check(
+    pruning_report(store.marked_run_count().ok())
+        .map(|(level, detail)| vec![check(level, detail)])
+        .unwrap_or_default()
+}
+
+/// What [`pruning_checks`] says for a count of marked runs (`None`: the
+/// count could not be read). Nothing for no run.
+fn pruning_report(runs: Option<u64>) -> Option<(Level, String)> {
+    match runs {
+        Some(0) => None,
+        Some(runs) => Some((
             Level::Notice,
             format!(
                 "{runs} run(s) past their retention are being deleted; they are no longer shown, and what is left of them (kept while a reader holds it or while it cannot be proven to be belt's) is tried again every minute"
             ),
-        )],
-        Err(_) => vec![check(
+        )),
+        None => Some((
             Level::NotChecked,
             "the runs being deleted cannot be counted".into(),
-        )],
+        )),
     }
 }
 

@@ -163,7 +163,10 @@ pub(super) fn pass(
             Ok(false) => report.continuing += 1,
             // The run keeps its mark and what is left of it; the runs after
             // it are not held back, and the next pass tries again.
-            Err(_) => {
+            Err(_error) => {
+                // Never logged: the error can name a private path.
+                #[cfg(test)]
+                eprintln!("pruning of {run} stopped: {_error:#}");
                 report.continuing += 1;
                 report.unknown += 1;
             }
@@ -329,3 +332,6 @@ fn results(
 fn release_attempts(attempts: Vec<(WorkerId, AttemptId)>) {
     drop(attempts);
 }
+
+#[cfg(test)]
+mod tests;

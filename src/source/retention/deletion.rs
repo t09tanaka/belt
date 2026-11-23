@@ -8,6 +8,8 @@ use std::os::unix::fs::MetadataExt;
 mod abandon;
 mod prune;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+#[cfg(test)]
+pub use prune::set_prune_fault;
 pub use prune::PruneInputs;
 
 type OpenedParent = (File, String, Vec<(u64, u64)>);
