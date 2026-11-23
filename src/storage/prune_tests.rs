@@ -763,3 +763,28 @@ fn the_last_rows_of_a_run_wait_for_a_submit_of_its_source() {
     assert!(!store.has_run(&run).unwrap() && store.has_run(&again).unwrap());
     assert_eq!(count(&store, "SELECT count(*) FROM source_ref"), 1);
 }
+
+/// Acceptance (xii): an event that names an attempt without a row is
+/// refused, so no event is left that the pruning of no run deletes.
+#[test]
+fn an_event_of_an_attempt_without_a_row_is_refused() {
+    let (_dir, store) = store();
+    let attempt = AttemptId::generate();
+    let before = count(&store, "SELECT count(*) FROM event");
+    assert!(matches!(
+        store.append_event(None, Some(&attempt), "worker_excluded", &json!({}), 1),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.append_events_unseen(
+            None,
+            &attempt,
+            "artifact_missing",
+            "name",
+            &[("out".into(), json!({"name": "out"}))],
+            1
+        ),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert_eq!(count(&store, "SELECT count(*) FROM event"), before);
+}

@@ -324,6 +324,24 @@ fn refuse_pruned_attempt(c: &Connection, attempt: &str) -> Result<()> {
     }
 }
 
+/// An event that names an attempt needs the row of that attempt: an event
+/// of an attempt without one belongs to no run that the pruning finds, and
+/// would be deleted by nothing (spec 25.5, acceptance (xii)).
+fn require_attempt(c: &Connection, attempt: &str) -> Result<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempt WHERE attempt_id=?1)",
+        [attempt],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StorageError::NotFound {
+            what: format!("attempt {attempt}"),
+        })
+    }
+}
+
 /// [`refuse_pruned`] for the run of the matrix group `group`. A group
 /// without a row is left to the caller.
 fn refuse_pruned_group(c: &Connection, group: &str) -> Result<()> {
@@ -1489,6 +1507,7 @@ impl CoordinatorStore {
             }
             if let Some(attempt) = &a {
                 refuse_pruned_attempt(tx, attempt)?;
+                require_attempt(tx, attempt)?;
             }
             common::append_event(tx, r.as_deref(), a.as_deref(), &kind, &payload, at_ms)
         })
@@ -1530,6 +1549,7 @@ impl CoordinatorStore {
                 refuse_pruned(tx, run)?;
             }
             refuse_pruned_attempt(tx, &a)?;
+            require_attempt(tx, &a)?;
             common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
         })
     }
