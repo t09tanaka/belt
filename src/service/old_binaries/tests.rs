@@ -1,0 +1,474 @@
+use super::*;
+use crate::ids::{CoordinatorId, WorkerId};
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::time::{Duration, SystemTime};
+
+thread_local! {
+    /// The running executable a test stands in.
+    pub(super) static STAND_IN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// A host whose `bin/current` points at the new version, with the old one
+/// placed long ago and a tool link of the old one. Nothing names the old
+/// version until a test adds exactly one thing that does.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    places: Places,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        let places = Places {
+            config: root.join("config"),
+            worker_state: root.join("state"),
+            parent_state: Some(root.join("parent")),
+            services: vec![root.join("services")],
+        };
+        for d in [
+            places.bin(),
+            places.worker_state.clone(),
+            places.parent_state.clone().unwrap(),
+            places.services[0].clone(),
+        ] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let f = Self { _dir: dir, places };
+        for v in [OLD, NEW] {
+            fs::create_dir(f.version(v)).unwrap();
+            fs::write(f.version(v).join("belt"), v).unwrap();
+            f.age(v);
+        }
+        symlink(NEW, f.places.bin().join("current")).unwrap();
+        let tool = f.tool_bin();
+        fs::create_dir_all(&tool).unwrap();
+        symlink(f.version(OLD).join("belt"), tool.join("portool")).unwrap();
+        f
+    }
+    fn version(&self, v: &str) -> PathBuf {
+        self.places.bin().join(v)
+    }
+    fn tool_bin(&self) -> PathBuf {
+        self.places.worker_state.join("tool-bin").join("abc")
+    }
+    /// Placed an hour ago.
+    fn age(&self, v: &str) {
+        let then = SystemTime::now() - Duration::from_secs(3600);
+        File::open(self.version(v))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+    fn sweep(&self) -> Outcome {
+        sweep(&self.places, &mut || Ok(false), false)
+    }
+    /// Swept, and the old version is still there with its tool link.
+    fn assert_kept(&self) -> Outcome {
+        let outcome = self.sweep();
+        assert!(self.version(OLD).join("belt").exists(), "{outcome:?}");
+        assert!(self.tool_bin().exists());
+        assert!(self.version(NEW).exists());
+        outcome
+    }
+    fn assert_removed(&self) {
+        let outcome = self.sweep();
+        assert_eq!(outcome.removed, vec![OLD.to_string()], "{outcome:?}");
+        assert!(!self.version(OLD).exists());
+        assert!(!self.tool_bin().exists());
+        assert!(self.version(NEW).join("belt").exists());
+    }
+}
+
+/// Acceptance (i): a version nothing names goes, with its tool link; the
+/// one `bin/current` points at stays.
+#[test]
+fn an_unnamed_version_goes_with_its_tool_link() {
+    Fixture::new().assert_removed();
+}
+
+/// Acceptance (ii), `bin/resident` (it may point elsewhere than `current`).
+#[test]
+fn a_version_bin_resident_points_at_is_kept() {
+    let f = Fixture::new();
+    symlink(OLD, f.places.bin().join("resident")).unwrap();
+    f.assert_kept();
+}
+
+/// Acceptance (ii), `bin/current`.
+#[test]
+fn a_version_bin_current_points_at_is_kept() {
+    let f = Fixture::new();
+    fs::remove_file(f.places.bin().join("current")).unwrap();
+    symlink(OLD, f.places.bin().join("current")).unwrap();
+    symlink(NEW, f.places.bin().join("resident")).unwrap();
+    f.assert_kept();
+}
+
+/// Acceptance (ii), a registered service definition (LaunchAgent or unit)
+/// that runs the version's path.
+#[test]
+fn a_version_a_service_definition_runs_is_kept() {
+    let f = Fixture::new();
+    let exe = f.version(OLD).join("belt");
+    fs::write(
+        f.places.services[0].join("dev.belt.worker.plist"),
+        format!("<string>{}</string>", exe.display()),
+    )
+    .unwrap();
+    f.assert_kept();
+}
+
+/// Acceptance (ii), the resident's journal (`init.json`, which also holds
+/// the version a trial goes back to).
+#[test]
+fn a_version_the_resident_journal_names_is_kept() {
+    let f = Fixture::new();
+    fs::write(
+        f.places.config.join("init.json"),
+        format!("{{\"binary_hash\":\"{OLD}\"}}"),
+    )
+    .unwrap();
+    f.assert_kept();
+}
+
+/// Acceptance (ii), the worker's journal: the version it runs, which is the
+/// path a system user's worker pins (`system_user::check_boot` runs
+/// `bin/<binary_sha256>/belt`), and the version an unfinished switch goes
+/// back to.
+#[test]
+fn a_version_the_worker_journal_pins_is_kept() {
+    let f = Fixture::new();
+    fs::write(
+        f.places.config.join("worker-service.json"),
+        format!("{{\"binary_sha256\":\"{NEW}\",\"switch\":{{\"from\":\"{OLD}\"}}}}"),
+    )
+    .unwrap();
+    f.assert_kept();
+}
+
+/// Acceptance (ii) and (iv): while an upgrade is on trial nothing goes:
+/// the record of the trial, or the trial marker of the worker or of the
+/// parent.
+#[test]
+fn nothing_goes_while_an_upgrade_is_on_trial() {
+    let f = Fixture::new();
+    let markers = [
+        f.places.config.join("upgrade").join("record.json"),
+        f.places.worker_state.join("upgrade-trial.json"),
+        f.places
+            .parent_state
+            .clone()
+            .unwrap()
+            .join("upgrade-trial.json"),
+    ];
+    for marker in &markers {
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(marker, b"{}").unwrap();
+        assert_eq!(f.assert_kept().held, Some(Held::Trial));
+        fs::remove_file(marker).unwrap();
+    }
+    f.assert_removed();
+}
+
+/// Acceptance (ii), the upgrade guard: when it is there by any account,
+/// nothing goes (the two ways it can be there are in `init::upgrade`'s tests).
+#[test]
+fn nothing_goes_while_the_guard_is_there() {
+    let f = Fixture::new();
+    let outcome = sweep(&f.places, &mut || Ok(true), false);
+    assert_eq!(outcome.held, Some(Held::Guard));
+    let outcome = sweep(
+        &f.places,
+        &mut || Err(anyhow::anyhow!("journal unreadable")),
+        false,
+    );
+    assert_eq!(outcome.held, Some(Held::Unreadable));
+    assert!(f.version(OLD).exists());
+    f.assert_removed();
+}
+
+/// Acceptance (ii) and (iii), a setup builder: while its directory is there
+/// nothing goes; after it is gone, the next start removes the version.
+#[test]
+fn a_running_builder_keeps_every_version_until_it_is_gone() {
+    let f = Fixture::new();
+    let builder = f.places.worker_state.join("setup/builders/b1");
+    fs::create_dir_all(&builder).unwrap();
+    assert_eq!(f.assert_kept().held, Some(Held::Builder));
+    fs::remove_dir(&builder).unwrap();
+    f.assert_removed();
+}
+
+/// Acceptance (ii), a supervisor: an attempt that is not terminal keeps
+/// every version (its supervisor runs a version path and starts again by it).
+#[test]
+fn a_live_attempt_keeps_every_version() {
+    let f = Fixture::new();
+    drop(
+        crate::storage::WorkerStore::open(&f.places.worker_state, &WorkerId::parse("w").unwrap())
+            .unwrap(),
+    );
+    let db = rusqlite::Connection::open(f.places.worker_state.join("worker.db")).unwrap();
+    crate::service::worker_service::tests::put_attempt(
+        &db,
+        &CoordinatorId::generate(),
+        1,
+        "active",
+    );
+    drop(db);
+    assert_eq!(f.assert_kept().held, Some(Held::Supervisor));
+}
+
+/// A command that places a version holds `init.lock` or
+/// `worker-service.lock` until a journal names it: while either is held by
+/// someone else, nothing goes.
+#[test]
+fn nothing_goes_while_a_version_is_being_placed() {
+    let f = Fixture::new();
+    for name in ["init.lock", "worker-service.lock"] {
+        let lock = try_lock(&f.places.config.join(name)).unwrap();
+        assert_eq!(f.assert_kept().held, Some(Held::Placing));
+        drop(lock);
+    }
+    f.assert_removed();
+}
+
+/// The pass makes `init.lock` and takes it (a first `init` that comes after
+/// the look finds it held, or finds a pass over), and makes nothing on a
+/// host that has no configuration directory.
+#[test]
+fn the_pass_takes_init_lock_even_when_none_was_there() {
+    let f = Fixture::new();
+    let lock = f.places.config.join("init.lock");
+    assert!(!lock.exists());
+    f.assert_removed();
+    assert!(lock.exists());
+    let bare = Places {
+        config: f.places.config.join("none"),
+        ..f.places.clone()
+    };
+    let outcome = sweep(&bare, &mut || Ok(false), false);
+    assert_eq!(outcome, Outcome::default());
+    assert!(!bare.config.exists());
+}
+
+/// A first `init` reuses a version directory placed long ago (the placer
+/// keeps its mtime) and names it in `init.json`, all under `init.lock`, which
+/// it makes if it is not there. Whatever the order against the pass, a
+/// journal never names a removed directory.
+#[test]
+fn a_first_init_that_reuses_an_old_version_is_never_left_naming_a_removed_directory() {
+    for _ in 0..30 {
+        let f = Fixture::new();
+        let config = f.places.config.clone();
+        let old = f.version(OLD);
+        let placer = std::thread::spawn(move || {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(config.join("init.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            // The directory is checked and reused under the lock.
+            let reused = old.join("belt").exists();
+            if reused {
+                fs::write(
+                    config.join("init.json"),
+                    format!("{{\"binary_hash\":\"{OLD}\"}}"),
+                )
+                .unwrap();
+            }
+            reused
+        });
+        let mut reused = false;
+        while !placer.is_finished() {
+            f.sweep();
+        }
+        reused |= placer.join().unwrap();
+        f.sweep();
+        if reused {
+            assert!(f.version(OLD).join("belt").exists());
+        }
+    }
+}
+
+/// A journal that cannot be read may name the version: nothing goes.
+#[test]
+fn an_unreadable_journal_keeps_every_version() {
+    let f = Fixture::new();
+    let journal = f.places.config.join("init.json");
+    fs::write(&journal, b"{}").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&journal).is_ok() {
+        // Run as root: the mode does not stop a read.
+        return;
+    }
+    assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
+}
+
+/// A tool link that points anywhere but a gone version of this
+/// configuration (a build elsewhere, a version that is still there) stays.
+#[test]
+fn a_tool_link_to_anything_else_is_kept() {
+    let f = Fixture::new();
+    let other = f.places.worker_state.join("tool-bin").join("dev");
+    fs::create_dir_all(&other).unwrap();
+    symlink("/somewhere/target/debug/belt", other.join("portool")).unwrap();
+    let new = f.places.worker_state.join("tool-bin").join("new");
+    fs::create_dir_all(&new).unwrap();
+    symlink(f.version(NEW).join("belt"), new.join("portool")).unwrap();
+    f.assert_removed();
+    assert!(other.exists());
+    assert!(new.exists());
+}
+
+/// Acceptance (ii), the journal a trial keeps of the resident
+/// (`upgrade/init.json`) and a renewed trial marker of the worker
+/// (`upgrade-trial-renewed.json`): each alone keeps the version.
+#[test]
+fn a_version_only_the_kept_journal_or_a_renewed_trial_names_is_kept() {
+    let f = Fixture::new();
+    let kept = f.places.config.join("upgrade").join("init.json");
+    fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    fs::write(&kept, format!("{{\"binary_hash\":\"{OLD}\"}}")).unwrap();
+    f.assert_kept();
+    fs::remove_file(&kept).unwrap();
+    let renewed = f.places.worker_state.join("upgrade-trial-renewed.json");
+    fs::write(&renewed, format!("{{\"from\":\"{OLD}\"}}")).unwrap();
+    f.assert_kept();
+    fs::remove_file(&renewed).unwrap();
+    f.assert_removed();
+}
+
+/// Review L5 and L8: a definition too large to read whole, or a services
+/// directory that cannot be listed, keeps every version, and `doctor` can
+/// say which (no paths).
+#[test]
+fn a_definition_that_cannot_be_read_whole_or_listed_keeps_every_version() {
+    let f = Fixture::new();
+    let large = f.places.services[0].join("large.plist");
+    fs::write(&large, vec![b' '; (TEXT_LIMIT + 1) as usize]).unwrap();
+    assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
+    assert!(Named::read_why(&f.places, true)
+        .err()
+        .is_some_and(|why| why.contains("larger than 1 MiB")));
+    fs::remove_file(&large).unwrap();
+    let services = &f.places.services[0];
+    fs::set_permissions(services, fs::Permissions::from_mode(0o000)).unwrap();
+    let listed = fs::read_dir(services).is_ok();
+    if !listed {
+        assert_eq!(f.assert_kept().held, Some(Held::Unreadable));
+        let why = Named::read_why(&f.places, true).err().unwrap();
+        assert!(why.contains("service definitions"), "{why}");
+        assert!(!why.contains('/'), "{why}");
+    }
+    fs::set_permissions(services, fs::Permissions::from_mode(0o755)).unwrap();
+    f.assert_removed();
+}
+
+/// A pass at the same time as a command that places a version (under
+/// `init.lock`, then a journal that names it): the placed version is never
+/// removed, whatever the order.
+#[test]
+fn a_pass_concurrent_with_a_placement_never_removes_the_placed_version() {
+    let f = Fixture::new();
+    let lock = f.places.config.join("init.lock");
+    let config = f.places.config.clone();
+    let placer = std::thread::spawn(move || {
+        for i in 0..40u8 {
+            let digest = format!("{:064x}", u64::from(i) + 0xabc);
+            // Waits for the pass, as `init` does (`lock()`).
+            let held = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)
+                .unwrap();
+            held.lock().unwrap();
+            let dir = config.join("bin").join(&digest);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("belt"), &digest).unwrap();
+            fs::write(
+                config.join("init.json"),
+                format!("{{\"binary_hash\":\"{digest}\"}}"),
+            )
+            .unwrap();
+            drop(held);
+            assert!(dir.join("belt").exists(), "{digest}");
+        }
+    });
+    while !placer.is_finished() {
+        f.sweep();
+    }
+    placer.join().unwrap();
+    // The last placement is named.
+    let last = format!("{:064x}", 39u64 + 0xabc);
+    assert!(f.version(&last).join("belt").exists());
+}
+
+/// Spec 25.7 (a): a copy refused at the version check goes at once when the
+/// command made it, unless a link of `bin/` points at it, a journal names it
+/// (the other command reused it) or the other command's lock is held.
+#[test]
+fn a_refused_copy_goes_at_once_unless_linked_named_or_being_placed() {
+    let f = Fixture::new();
+    let p = &f.places;
+    remove_refused(p, OLD, false, Holds::Init);
+    assert!(f.version(OLD).exists(), "not made by the command");
+    symlink(OLD, p.bin().join("resident")).unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
+    assert!(f.version(OLD).exists(), "linked");
+    fs::remove_file(p.bin().join("resident")).unwrap();
+    // The other command's journal names it.
+    fs::write(
+        p.config.join("worker-service.json"),
+        format!("{{\"binary_sha256\":\"{OLD}\"}}"),
+    )
+    .unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
+    assert!(
+        f.version(OLD).exists(),
+        "named by the other command's journal"
+    );
+    fs::remove_file(p.config.join("worker-service.json")).unwrap();
+    // The other command holds its lock: an init upgrade must not remove.
+    let other = try_lock(&p.config.join("worker-service.lock")).unwrap();
+    remove_refused(p, OLD, true, Holds::Init);
+    assert!(f.version(OLD).exists(), "the other lock is held");
+    // The lock the caller holds is its own, not the other's.
+    remove_refused(p, OLD, true, Holds::Switch);
+    assert!(!f.version(OLD).exists());
+    drop(other);
+    remove_refused(p, NEW, true, Holds::Init);
+    assert!(f.version(NEW).exists(), "bin/current points at it");
+}
+
+/// Review round 3: a refused copy goes although the running executable's path
+/// carries its digest (a remote `worker-service upgrade` runs from
+/// `.belt-bootstrap/belt-<digest>`); a pass still counts that executable.
+#[test]
+fn a_refused_copy_goes_although_the_running_executable_carries_its_digest() {
+    let f = Fixture::new();
+    STAND_IN.with(|s| {
+        *s.borrow_mut() = Some(PathBuf::from(format!("/home/u/.belt-bootstrap/belt-{OLD}")))
+    });
+    remove_refused(&f.places, OLD, true, Holds::Switch);
+    let gone = !f.version(OLD).exists();
+    let kept_by_pass = {
+        let g = Fixture::new();
+        g.assert_kept().held.is_none() && g.version(OLD).exists()
+    };
+    STAND_IN.with(|s| *s.borrow_mut() = None);
+    assert!(gone, "the refused copy is removed");
+    assert!(
+        kept_by_pass,
+        "a pass keeps the running executable's version"
+    );
+}

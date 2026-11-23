@@ -187,9 +187,21 @@ pub fn upgrade<L: Launcher>(
     hook(Step::Drain)?;
     own_drain(&paths, &mut journal)?;
     hook(Step::Place)?;
+    let created = absent(&paths.config.join("bin").join(&digest))?;
     place_binary(&paths, &digest, current_exe)?;
     hook(Step::Compat)?;
-    compatible(&paths, &journal)?;
+    if let Err(e) = compatible(&paths, &journal) {
+        // Spec 25.7 (a): a copy the version check refused goes at once.
+        if let Ok(places) = crate::service::old_binaries::Places::of(env, launcher.backend()) {
+            crate::service::old_binaries::remove_refused(
+                &places,
+                &digest,
+                created,
+                crate::service::old_binaries::Holds::Switch,
+            );
+        }
+        return Err(e);
+    }
     switch_to(&paths, journal, &digest, launcher, options, hook)
 }
 
@@ -279,8 +291,14 @@ fn save_database(paths: &Paths, digest: &str) -> anyhow::Result<bool> {
         remove_if_present(&saved)?;
         return Ok(false);
     }
+    // No deletion (a `belt group forget`, the agent's stage 3 passes) runs
+    // between this copy and the trial that keeps them out until the switch
+    // is committed or undone: the copy may be put back (spec 25.1 rule 8).
+    let _forget =
+        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     checkpoint(&database)?;
     copy_private(&database, &saved)?;
+    crate::worker::control::begin_trial(&paths.state)?;
     Ok(true)
 }
 
@@ -299,6 +317,8 @@ fn restore_database(paths: &Paths, digest: &str) -> anyhow::Result<()> {
     // A log of the replaced database must never be replayed into this one.
     remove_if_present(&paths.state.join("worker.db-wal"))?;
     remove_if_present(&paths.state.join("worker.db-shm"))?;
+    let _forget =
+        crate::storage::ProcessLock::acquire(&paths.state, crate::service::group::FORGET_LOCK)?;
     copy_private(&saved, &database)
 }
 
@@ -544,6 +564,7 @@ fn switch_to<L: Launcher>(
         remove_if_present(&saved_database(paths, to))?;
         journal.switch = None;
         save_journal(paths, &journal)?;
+        crate::worker::control::end_trial(&paths.state)?;
     }
     status_with(paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
@@ -574,6 +595,7 @@ pub fn commit<L: Launcher>(
         // refuses to roll back instead of starting on a missing database.
         remove_if_present(&saved_database(&paths, &switch.from))?;
         save_journal(&paths, &journal)?;
+        crate::worker::control::end_trial(&paths.state)?;
     }
     if journal.drained_by_upgrade {
         // The marker first: a crash in between leaves the ownership recorded
@@ -581,6 +603,19 @@ pub fn commit<L: Launcher>(
         marker(&paths, Duration::ZERO).request(&identity(&journal), WorkerRequest::Resume)?;
         journal.drained_by_upgrade = false;
         save_journal(&paths, &journal)?;
+    }
+    // Spec 25.7 (a): this host's commit removes the versions nothing names.
+    // The upgrade is committed: a failure here is not the commit's.
+    match crate::service::old_binaries::Places::of(env, launcher.backend()) {
+        Ok(places) => {
+            let config = paths.config.clone();
+            crate::service::old_binaries::sweep(
+                &places,
+                &mut || crate::service::init::upgrade::guard_present(&config, &mut launcher),
+                true,
+            );
+        }
+        Err(e) => eprintln!("belt: the old versions were not looked at: {e:#}"),
     }
     let plan = plan(&paths, &journal)?;
     let ready = agent_reachable(&paths.state);

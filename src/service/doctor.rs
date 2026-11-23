@@ -1314,6 +1314,37 @@ pub fn run(
             ),
         ));
     }
+    let kept = super::old_binaries::kept_versions(env);
+    if kept > 0 {
+        checks.push(Check::new(
+            "parent",
+            "kept_versions",
+            Level::Notice,
+            format!(
+                "{kept} earlier version(s) of belt are kept in the configuration directory's bin/: something still names them (a service definition, a journal, a trial) or they could not be proven unused (a setup builder or an attempt was running); belt removes them at the next commit or start that can prove it"
+            ),
+        ));
+    }
+    if let Some(why) = super::old_binaries::unreadable_reason(env) {
+        checks.push(Check::new(
+            "parent",
+            "versions_unexamined",
+            Level::Notice,
+            format!("no earlier version of belt can be removed while this stays: {why}"),
+        ));
+    }
+    for notice in crate::setup::builder::toolchain_doctor_notices(
+        &spec.worker_state_dir,
+        &spec.worker_id,
+        crate::platform::wall_ms(),
+    ) {
+        checks.push(Check::new(
+            "parent",
+            "toolchain_roots",
+            Level::Notice,
+            notice,
+        ));
+    }
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
     // Every worker is looked at at the same time (up to a bound), each on its
     // own ssh processes; what is printed keeps the order of the registrations.

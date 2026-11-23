@@ -236,7 +236,7 @@ impl Paged {
 // L1, L2: a refused release stops the page and the next pass goes on past
 // it, so the later pages are reached; a pass that began at a cursor and
 // reached the end stays due, and the next one reads the front again.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refused_release_does_not_keep_the_later_pages_unread_and_the_wrap_reads_the_front() {
     let f = fx();
     let mut ids: Vec<AttemptId> = (0..5).map(|_| AttemptId::generate()).collect();
@@ -253,8 +253,12 @@ async fn a_refused_release_does_not_keep_the_later_pages_unread_and_the_wrap_rea
     // The next goes on after the refused one, to the end.
     f.c.reconcile_unreleased(soon()).await.unwrap();
     assert_eq!(link.released(), ids);
-    // It began at a cursor: still due, and it reads the front again.
+    // It began at a cursor: the front is read again, a minute later (L-2:
+    // nothing was left to send again, so not on every pass).
     link.sent.lock().unwrap().clear();
+    f.c.reconcile_unreleased(soon()).await.unwrap();
+    assert!(link.sent.lock().unwrap().is_empty());
+    tokio::time::advance(Duration::from_secs(61)).await;
     f.c.reconcile_unreleased(soon()).await.unwrap();
     assert_eq!(link.released(), vec![ids[0].clone()]);
 }

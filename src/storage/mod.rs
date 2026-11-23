@@ -33,6 +33,7 @@ mod retry_dependents_tests;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod toolchain_roots;
 mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
@@ -50,12 +51,13 @@ pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPag
 pub use coordinator::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use db::Db;
 pub use lock::ProcessLock;
+pub use toolchain_roots::{Bind, RootRow, RootsStatus};
 pub(crate) use worker::MembershipImage;
 pub use worker::{
-    AcceptedAttempt, CancelOutcome, DedupRecord, KeyGeneration, LaunchClaim, LeaseOutcome,
-    LogPosition, MemberPin, NewAcceptance, ProcessIdentity, Released, SubmitOutcome, WorkerStore,
-    DEFAULT_ACK_WAIT_MS, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNDELIVERED_TOMBSTONES,
-    MAX_UNRELEASED_PAGE, RELEASE_BATCH,
+    uptime_step, AcceptedAttempt, CancelOutcome, DedupRecord, KeyGeneration, LaunchClaim,
+    LeaseOutcome, LogPosition, MemberPin, NewAcceptance, ProcessIdentity, Released, SubmitOutcome,
+    Uptime, WorkerStore, DEFAULT_ACK_WAIT_MS, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
+    MAX_UNDELIVERED_TOMBSTONES, MAX_UNRELEASED_PAGE, RELEASE_BATCH, UPTIME_WRITE_MS,
 };
 
 use crate::error::ErrorCode;

@@ -519,6 +519,11 @@ pub struct Coordinator {
     /// it read), so a pass does not read the same first pages again. In
     /// memory: a lost cursor only means the next pass starts at the front.
     unreleased_after: Mutex<BTreeMap<WorkerId, AttemptId>>,
+    /// Workers whose reconciliation had nothing left to send again but did
+    /// not read the whole list in one pass: due again at this instant, not
+    /// at once (a worker with many unreleasable attempts is not read on
+    /// every pass).
+    unreleased_resume: Mutex<BTreeMap<WorkerId, tokio::time::Instant>>,
     parent_local: Mutex<Option<WorkerId>>,
     preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
     preparation_query: tokio::sync::Mutex<()>,
@@ -594,6 +599,7 @@ impl Coordinator {
             submits: Arc::default(),
             unreleased_due: Mutex::default(),
             unreleased_after: Mutex::default(),
+            unreleased_resume: Mutex::default(),
             parent_local: Mutex::default(),
             preparation_identities: Mutex::default(),
             preparation_query: tokio::sync::Mutex::new(()),

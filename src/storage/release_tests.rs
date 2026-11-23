@@ -178,8 +178,10 @@ fn a_release_deletes_a_terminal_attempt_refuses_a_live_one_and_releases_a_record
 fn the_ack_wait_turns_rows_into_unreleased_records_that_only_a_release_frees() {
     let t = store();
     let (old, new) = ended(&t, 100);
+    assert_eq!(t.own.stamp_terminal_uptime(100, 1_000).unwrap(), 1);
     let (young, _) = ended(&t, 900);
-    let gone = t.own.expire_unreleased(1_000, 500, 1_000).unwrap();
+    t.own.stamp_terminal_uptime(900, 1_000).unwrap();
+    let gone = t.own.expire_unreleased(1_000, 1_000, 500, 1_000).unwrap();
     assert_eq!(gone, vec![old.to_string()]);
     assert!(t.m.get(&young).unwrap().is_some());
     let rec = t.m.attempt_record(&old).unwrap().unwrap();
@@ -215,7 +217,8 @@ fn list_unreleased_pages_through_more_than_six_hundred_attempts() {
         all.push(a);
     }
     // Half of them only left an unreleased record.
-    t.own.expire_unreleased(10_000, 0, 325).unwrap();
+    t.own.stamp_terminal_uptime(0, 1_000).unwrap();
+    t.own.expire_unreleased(10_000, 10_000, 0, 325).unwrap();
     // Acknowledged or released ones are not listed.
     let (acked, _) = ended(&t, 1);
     t.m.ack_and_release(&acked, CoordinatorEpoch(1), 2, false)
@@ -286,13 +289,25 @@ fn the_rows_an_older_version_acknowledged_go_with_no_record_and_later_ones_stay(
 fn events_of_no_attempt_go_by_age_and_an_attempts_events_stay_with_it() {
     let t = store();
     let (a, _) = ended(&t, 1);
-    for at in [10, 20, 30] {
+    for at in [10, 20] {
         t.own
             .append_event(None, None, "agent_started", &json!({}), at)
             .unwrap();
     }
-    assert_eq!(t.own.prune_unowned_events(25, 1).unwrap(), 1);
-    assert_eq!(t.own.prune_unowned_events(25, 1_000).unwrap(), 1);
+    // The hourly mark notes the newest event at an uptime of 100.
+    let up = Uptime {
+        boot: "b".into(),
+        mono: 0,
+        uptime_ms: 100,
+    };
+    t.own.store_uptime(&up, true).unwrap();
+    t.own
+        .append_event(None, None, "agent_started", &json!({}), 30)
+        .unwrap();
+    // Not before the mark is `keep` (100) of uptime old.
+    assert_eq!(t.own.prune_unowned_events(150, 100, 1_000).unwrap(), 0);
+    assert_eq!(t.own.prune_unowned_events(200, 100, 1).unwrap(), 1);
+    assert_eq!(t.own.prune_unowned_events(200, 100, 1_000).unwrap(), 1);
     assert_eq!(
         count(&t, "SELECT count(*) FROM event WHERE attempt_id IS NULL"),
         1
@@ -367,23 +382,30 @@ fn an_event_of_an_attempt_whose_row_went_is_not_written() {
 }
 
 #[test]
-fn the_ack_wait_judges_the_wall_clock_only_through_uptime() {
+fn the_ack_wait_counts_uptime_and_never_reads_the_wall_clock() {
     const W: u64 = 100_000;
     let t = store();
-    let c =
-        |boot: &str, wall: u64, mono: u64| t.own.release_clock_cutoff(boot, wall, mono, W).unwrap();
-    // The first sample waits a full wait of uptime.
-    assert_eq!(c("b", 1_000_000, 0), None);
-    assert_eq!(c("b", 1_060_000, 60_000), None);
-    // A reboot carries the clock over; the downtime (a day of wall clock)
-    // is not counted, and two short boots add up to the wait.
-    assert_eq!(c("c", 87_460_000, 5), None);
-    assert_eq!(c("c", 87_480_000, 30_005), None);
-    assert_eq!(c("c", 87_500_005, 40_005), Some(1_100_000));
-    // A forward step of the wall clock alone (same wait, same uptime
-    // rate) moves the cutoff only by the uptime.
-    assert_eq!(c("c", 900_000_000, 50_005), Some(1_110_000));
-    // A step back is followed down, and the step forward again is not.
-    assert_eq!(c("c", 1_000_000, 60_005), Some(1_000_000));
-    assert_eq!(c("c", 900_000_000, 70_005), Some(1_010_000));
+    // Ended at a 1970 wall clock, first seen at an uptime of 5.
+    let (a, _) = ended(&t, 1);
+    t.own.stamp_terminal_uptime(5, 1_000).unwrap();
+    // A wall clock far ahead or far back changes nothing; only uptime does.
+    for wall in [1, 10_000_000_000_000, 2] {
+        assert!(t
+            .own
+            .expire_unreleased(W + 4, wall, W, 1_000)
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        t.own.expire_unreleased(W + 5, 0, W, 1_000).unwrap(),
+        vec![a.to_string()]
+    );
+    // A row is stamped once: a later stamp does not move its wait.
+    let (b, _) = ended(&t, 1);
+    t.own.stamp_terminal_uptime(10, 1_000).unwrap();
+    t.own.stamp_terminal_uptime(1_000_000, 1_000).unwrap();
+    assert_eq!(
+        t.own.expire_unreleased(W + 10, 0, W, 1_000).unwrap(),
+        vec![b.to_string()]
+    );
 }

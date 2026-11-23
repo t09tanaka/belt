@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 /// Pages of `list_unreleased` one reconciliation reads; a worker with more
 /// stays due and the next pass goes on.
 const PAGES: usize = 8;
+/// A reconciliation that did not read the whole list in one pass and has
+/// nothing to send again goes on after this long.
+const WRAP_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The attempts whose submit is on its way: neither `ack_collected` nor
 /// `release_attempt` is sent for them until it is answered (or its
@@ -164,6 +167,22 @@ impl Coordinator {
     /// here or whose collection gave up. A worker that does not answer, or
     /// has more than [`PAGES`] pages, stays due.
     pub(crate) async fn reconcile_unreleased(&self, deadline: tokio::time::Instant) -> Result<()> {
+        {
+            let now = tokio::time::Instant::now();
+            let mut resume = self
+                .unreleased_resume
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let ripe: Vec<WorkerId> = resume
+                .iter()
+                .filter(|(_, at)| **at <= now)
+                .map(|(w, _)| w.clone())
+                .collect();
+            for w in ripe {
+                resume.remove(&w);
+                self.reconcile_due(&w);
+            }
+        }
         let due: Vec<WorkerId> = std::mem::take(
             &mut *self
                 .unreleased_due
@@ -214,7 +233,8 @@ impl Coordinator {
     /// comes back to it.
     async fn reconcile_one(&self, worker: &WorkerId, link: &dyn WorkerLink) -> Result<bool> {
         let mut after = self.cursor().get(worker).cloned();
-        let mut whole = after.is_none();
+        let whole = after.is_none();
+        let mut again = false;
         for _ in 0..PAGES {
             let answer = link
                 .call(Request::ListUnreleased(ListUnreleasedRequest {
@@ -248,7 +268,7 @@ impl Coordinator {
                 .await?;
             match release_over(link, &self.submits, &judged).await {
                 Released::All => {}
-                Released::Later => whole = false,
+                Released::Later => again = true,
                 Released::Refused(at) => {
                     self.keep_cursor(worker, Some(at));
                     return Ok(false);
@@ -261,12 +281,31 @@ impl Coordinator {
             let next = page.attempts.last().cloned();
             if !page.more || next.is_none() {
                 self.cursor().remove(worker);
-                return Ok(whole);
+                if again {
+                    return Ok(false);
+                }
+                if !whole {
+                    // Wrapped: the front is read again, but not before
+                    // [`WRAP_AFTER`].
+                    self.resume_later(worker);
+                }
+                return Ok(true);
             }
             after = next;
         }
         self.keep_cursor(worker, after);
-        Ok(false)
+        if again {
+            return Ok(false);
+        }
+        self.resume_later(worker);
+        Ok(true)
+    }
+
+    fn resume_later(&self, worker: &WorkerId) {
+        self.unreleased_resume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker.clone(), tokio::time::Instant::now() + WRAP_AFTER);
     }
 
     fn keep_cursor(&self, worker: &WorkerId, after: Option<AttemptId>) {

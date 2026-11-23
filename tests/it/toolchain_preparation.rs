@@ -1254,3 +1254,33 @@ fn preparation_telemetry_publish_failure_preserves_successful_installation() {
     ));
     assert!(f.setups.preparation_observations(64).is_empty());
 }
+
+/// Spec 25.7 (b), review M2: the consumer that waited for an install holds
+/// the root before the builder lets go of it, so a pass between the end of
+/// the install and the consumer's next poll cannot take the root.
+#[test]
+fn a_consumer_waiting_for_an_install_holds_the_root_before_the_builder_lets_go() {
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
+    let a = f.consumer();
+    assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
+    wait_until(&f, "manager called", || f.calls() == 1);
+    std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
+    wait_until(&f, "builder directories settled", || builders_settled(&f));
+    let root = f.plan().root().to_path_buf();
+    let identity = root.file_name().unwrap().to_str().unwrap().to_string();
+    let db = rusqlite::Connection::open(f.dir.path().join("state/worker.db")).unwrap();
+    let holders: Vec<(String, String)> = db
+        .prepare("SELECT kind, holder FROM toolchain_ref WHERE identity = ?1")
+        .unwrap()
+        .query_map([&identity], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        holders,
+        vec![("warmup".to_string(), a.to_string())],
+        "only the waiting consumer holds the root"
+    );
+    // The consumer gets the root it holds.
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Installed(_)));
+}

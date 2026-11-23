@@ -277,6 +277,13 @@ pub struct Agent {
     /// Where the retry of unfinished releases goes on: entries that keep
     /// failing never stop the ones after them (it wraps at the end).
     dropped_cursor: Mutex<String>,
+    /// Entries of `dropped_attempt` that keep failing: the pass after which
+    /// each is tried again and its current delay in passes (doubling, up to
+    /// [`DROPPED_BACKOFF_MAX`]). In memory only: a start tries all again.
+    dropped_backoff: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    passes: std::sync::atomic::AtomicU64,
+    /// The stored uptime sample and the newest event mark, once read.
+    uptime: Mutex<Option<(Option<crate::storage::Uptime>, Option<u64>)>>,
     /// When this agent started (wall clock): the rows acknowledged before it
     /// are an older version's (spec 25.6 (c2)).
     started_ms: u64,
@@ -760,6 +767,9 @@ impl Agent {
             releases: super::release::Releases::default(),
             ripe_later: Mutex::default(),
             dropped_cursor: Mutex::default(),
+            dropped_backoff: Mutex::default(),
+            passes: std::sync::atomic::AtomicU64::new(0),
+            uptime: Mutex::default(),
             started_ms,
             old_acks: AtomicBool::new(false),
             ticking: AtomicBool::new(false),
@@ -815,6 +825,8 @@ impl Agent {
         for t in threads {
             let _ = t.join();
         }
+        // The uptime since the last stored sample is not lost at a stop.
+        self.uptime_ms(true);
         lock(&self.lock).take();
     }
 
@@ -2173,9 +2185,16 @@ impl Agent {
     /// not be deleted, and queued names that are not this store's, are
     /// written to the journal (once each while they stay the same).
     pub fn gc(&self) -> Result<GcReport, ApiError> {
+        // Not while a version is on trial (spec 25.1 rule 8).
+        if super::control::in_trial(&self.cfg.state_dir) {
+            return Ok(GcReport::default());
+        }
+        // The ack wait is never judged here by the wall clock: a row whose
+        // acknowledgement never came goes by uptime (`retire_rows`), with
+        // its directory, results and logs.
         let report = self
             .store
-            .gc(now(), self.cfg.retention_ms, self.cfg.ack_wait_ms)
+            .gc(now(), self.cfg.retention_ms, u64::MAX)
             .map_err(api)?;
         let drained = drain_pending_deletes(&self.store, &self.cfg.attempts_root())
             .map_err(|e| internal("gc", e))?;
@@ -2219,6 +2238,7 @@ impl Agent {
         // an init host here, as `tick` does on a worker-only host.
         self.apply_control();
         self.supervise_attempts();
+        self.host.toolchain_tick();
         self.cleanup_terminal(32);
         // The deletions time drives (the ack wait, rows an older version
         // acknowledged, retried teardowns, events of no attempt) run on an
@@ -2289,6 +2309,7 @@ impl Agent {
         self.apply_control();
         self.reap_warmups();
         self.supervise_attempts();
+        self.host.toolchain_tick();
         self.clean_ended();
         self.retire_rows();
         self.drop_stale_incoming();
@@ -2315,30 +2336,15 @@ impl Agent {
         let batch = crate::storage::RELEASE_BATCH;
         let at = now();
         let mut ids = Vec::new();
-        // The ack wait judges by a wall time that advances only with uptime
-        // (`release_clock_step`): a step of the wall clock or a reboot never
-        // brings a deletion earlier.
-        let cutoff = self.store.release_clock_cutoff(
-            self.cfg.boot_id.as_str(),
-            at,
-            platform::monotonic_ms(),
-            self.cfg.ack_wait_ms,
-        );
-        let cut = match cutoff {
-            Ok(cut) => cut,
-            Err(e) => {
-                self.note_global(
-                    "agent_release_failed",
-                    "ack_wait",
-                    json!({ "error": e.to_string() }),
-                );
-                None
-            }
-        };
-        let expired = match cut {
-            Some(cut) => self
-                .store
-                .expire_unreleased(cut, self.cfg.ack_wait_ms, batch),
+        // The ack wait counts uptime only (spec 25.6 (b)): rows are stamped
+        // with the uptime at which the agent first sees them ended, and go
+        // once `ack_wait` more of it has passed. No wall clock is read.
+        let uptime = self.uptime_ms(false);
+        let expired = match uptime {
+            Some(u) => self.store.stamp_terminal_uptime(u, batch).and_then(|_| {
+                self.store
+                    .expire_unreleased(u, at, self.cfg.ack_wait_ms, batch)
+            }),
             None => Ok(Vec::new()),
         };
         match expired {
@@ -2375,20 +2381,35 @@ impl Agent {
                 } else {
                     left.last().cloned().unwrap_or_default()
                 };
-                ids.extend(left);
+                let pass = self.passes.fetch_add(1, Ordering::SeqCst);
+                let backoff = lock(&self.dropped_backoff);
+                ids.extend(
+                    left.into_iter()
+                        .filter(|id| backoff.get(id).is_none_or(|(next, _)| pass >= *next)),
+                );
             }
         }
         ids.sort();
         ids.dedup();
+        let pass = self.passes.load(Ordering::SeqCst);
         for id in ids {
-            self.remove_dropped(&id);
+            let done = self.remove_dropped(&id);
+            let mut backoff = lock(&self.dropped_backoff);
+            if done {
+                backoff.remove(&id);
+            } else {
+                let delay = backoff
+                    .get(&id)
+                    .map_or(1, |(_, d)| (d * 2).min(DROPPED_BACKOFF_MAX));
+                backoff.insert(id, (pass + delay, delay));
+            }
         }
-        // Events of no attempt go by age on the same clock: not while it is
-        // held (spec 25.6 (e)).
-        let pruned = match cut {
-            Some(cut) => self
+        // Events of no attempt go by uptime too (spec 25.6 (e)): those older
+        // than the newest hourly mark `retention` of uptime old.
+        let pruned = match uptime {
+            Some(u) => self
                 .store
-                .prune_unowned_events(cut.saturating_sub(self.cfg.retention_ms), batch),
+                .prune_unowned_events(u, self.cfg.retention_ms, batch),
             None => Ok(0),
         };
         if let Err(e) = pruned {
@@ -2402,7 +2423,7 @@ impl Agent {
 
     /// The directory and the lock of an attempt whose row just went, at
     /// once; what fails stays in `dropped_attempt` for the next start.
-    fn remove_dropped(&self, id: &str) {
+    fn remove_dropped(&self, id: &str) -> bool {
         // The teardown of a terminal attempt (workspace, placed secrets,
         // scratch) may not have run yet when its member released it: it
         // runs first, under the attempt's shard, as `clean_ended` would.
@@ -2419,7 +2440,7 @@ impl Agent {
                         id,
                         json!({ "attempt": id, "error": "its cleanup is not finished" }),
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -2432,13 +2453,42 @@ impl Agent {
                 json!({ "attempt": attempt, "error": error }),
             );
         }
-        if let Err(e) = done {
+        if let Err(e) = &done {
             self.note_global(
                 "agent_dropped_attempt_kept",
                 id,
                 json!({ "attempt": id, "error": e.to_string() }),
             );
         }
+        done.is_ok() && report.failed.is_empty()
+    }
+
+    /// The worker's accumulated uptime now ([`crate::storage::uptime_step`]),
+    /// stored at most once a minute (always with `flush`) and marked against
+    /// the event journal once an hour. `None` while it cannot be read.
+    pub fn uptime_ms(&self, flush: bool) -> Option<u64> {
+        let mut g = lock(&self.uptime);
+        if g.is_none() {
+            let stored = self.store.stored_uptime().ok()?;
+            let mark = self.store.last_uptime_mark().ok()?;
+            *g = Some((stored, mark));
+        }
+        let (stored, mark) = g.as_mut()?;
+        let (u, write) = crate::storage::uptime_step(
+            stored.as_ref(),
+            self.cfg.boot_id.as_str(),
+            platform::monotonic_ms(),
+        );
+        if write || flush {
+            let marked = mark.is_none_or(|m| u.uptime_ms >= m.saturating_add(UPTIME_MARK_MS));
+            if self.store.store_uptime(&u, marked).is_ok() {
+                *stored = Some(u.clone());
+                if marked {
+                    *mark = Some(u.uptime_ms);
+                }
+            }
+        }
+        Some(u.uptime_ms)
     }
 
     /// Whether the teardown of `attempt` left something to do again: its
@@ -3868,6 +3918,10 @@ const DROPPED_PER_START: u32 = 10_000;
 
 /// Leftover dropped attempts one tick tries again.
 const DROPPED_PER_TICK: u32 = 32;
+/// The longest wait, in passes, before a failing dropped entry is retried.
+const DROPPED_BACKOFF_MAX: u64 = 64;
+/// How often (in uptime) the event journal is marked for (e).
+const UPTIME_MARK_MS: u64 = 3_600_000;
 
 /// Batches of rows an older version acknowledged that the start deletes
 /// before it accepts a connection; the tick goes on with the rest.

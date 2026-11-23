@@ -335,43 +335,67 @@ impl WorkerStore {
         })
     }
 
-    /// The wall time the ack wait may judge by now ([`release_clock_step`]):
-    /// `None` until the first wait of uptime has passed. The state is kept
-    /// in the worker database and written only when it changes meaningfully.
-    pub fn release_clock_cutoff(
-        &self,
-        boot: &str,
-        wall: u64,
-        mono: u64,
-        wait: u64,
-    ) -> Result<Option<u64>> {
-        let boot = boot.to_string();
+    /// The stored uptime sample ([`uptime_step`]).
+    pub fn stored_uptime(&self) -> Result<Option<Uptime>> {
+        self.db.call(|c| {
+            Ok(c.query_row(
+                "SELECT boot, mono, uptime_ms FROM uptime WHERE singleton = 1",
+                [],
+                |r| {
+                    Ok(Uptime {
+                        boot: r.get(0)?,
+                        mono: to_u64(r.get(1)?).unwrap_or(0),
+                        uptime_ms: to_u64(r.get(2)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?)
+        })
+    }
+
+    /// Store `u`; with `mark`, also note the newest event at this uptime,
+    /// which (e) prunes by. Marks a full `keep_ms` older than the newest
+    /// one that is old enough to prune by go.
+    pub fn store_uptime(&self, u: &Uptime, mark: bool) -> Result<()> {
+        let u = u.clone();
         self.db.write(move |tx| {
-            // A database a build of stage 3 made before this table existed
-            // gets it here; its migration step has already run.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS release_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state_json TEXT NOT NULL);",
+            tx.execute(
+                "INSERT INTO uptime VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(singleton) DO UPDATE SET boot = excluded.boot,
+                     mono = excluded.mono, uptime_ms = excluded.uptime_ms",
+                params![u.boot, to_i64(u.mono)?, to_i64(u.uptime_ms)?],
             )?;
-            let previous: Option<String> = tx
-                .query_row(
-                    "SELECT state_json FROM release_clock WHERE singleton = 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            // A state of an earlier shape starts the clock again: that only
-            // delays a deletion.
-            let previous = previous.and_then(|s| serde_json::from_str::<ReleaseClock>(&s).ok());
-            let next = release_clock_step(previous.as_ref(), &boot, wall, mono, wait);
-            if let (Some(state), true) = (&next.state, next.write) {
+            if mark {
                 tx.execute(
-                    "INSERT INTO release_clock VALUES (1, ?1)
-                     ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
-                    [serde_json::to_string(state)
-                        .map_err(|e| StorageError::Invalid(e.to_string()))?],
+                    "INSERT OR IGNORE INTO uptime_mark
+                     SELECT ?1, COALESCE(MAX(seq), 0) FROM event",
+                    [to_i64(u.uptime_ms)?],
                 )?;
             }
-            Ok(next.cutoff)
+            Ok(())
+        })
+    }
+
+    /// The newest uptime mark, if any.
+    pub fn last_uptime_mark(&self) -> Result<Option<u64>> {
+        self.db.call(|c| {
+            let v: Option<i64> =
+                c.query_row("SELECT MAX(uptime_ms) FROM uptime_mark", [], |r| r.get(0))?;
+            Ok(v.and_then(|v| to_u64(v).ok()))
+        })
+    }
+
+    /// Terminal rows not yet stamped get `uptime_ms` (at most `batch`):
+    /// their wait starts when the agent first sees them ended, never before.
+    pub fn stamp_terminal_uptime(&self, uptime_ms: u64, batch: u32) -> Result<usize> {
+        self.db.write(move |tx| {
+            Ok(tx.execute(
+                "UPDATE worker_attempt SET terminal_uptime_ms = ?1
+                 WHERE (coordinator_id, attempt_id) IN (
+                     SELECT coordinator_id, attempt_id FROM worker_attempt
+                     WHERE state = 'terminal' AND terminal_uptime_ms IS NULL LIMIT ?2)",
+                params![to_i64(uptime_ms)?, batch],
+            )?)
         })
     }
 
@@ -382,17 +406,21 @@ impl WorkerStore {
     /// Returns the ids, whose directories are queued.
     pub fn expire_unreleased(
         &self,
+        uptime_ms: u64,
         now_ms: u64,
         ack_wait_ms: u64,
         batch: u32,
     ) -> Result<Vec<String>> {
-        let cutoff = now_ms.saturating_sub(ack_wait_ms);
+        // Judged by uptime only: no wall clock and no downtime counts.
+        let Some(cutoff) = uptime_ms.checked_sub(ack_wait_ms) else {
+            return Ok(Vec::new());
+        };
         self.db.write(move |tx| {
             let rows: Vec<(String, String)> = {
                 let mut s = tx.prepare(
                     "SELECT coordinator_id, attempt_id FROM worker_attempt
-                     WHERE state = 'terminal' AND acked_at_ms IS NULL AND terminal_at_ms <= ?1
-                     ORDER BY terminal_at_ms LIMIT ?2",
+                     WHERE state = 'terminal' AND acked_at_ms IS NULL AND terminal_uptime_ms <= ?1
+                     ORDER BY terminal_uptime_ms LIMIT ?2",
                 )?;
                 let rows = s.query_map(params![to_i64(cutoff)?, batch], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -462,16 +490,33 @@ impl WorkerStore {
         })
     }
 
-    /// Spec 25.6 (e): events of no attempt older than `before_ms`, the
-    /// oldest first, at most `batch`. Returns how many went.
-    pub fn prune_unowned_events(&self, before_ms: u64, batch: u32) -> Result<usize> {
+    /// Spec 25.6 (e): events of no attempt written before the newest uptime
+    /// mark at least `keep_ms` of uptime old, the oldest first, at most
+    /// `batch`; the marks before that one go. Returns how many events went.
+    pub fn prune_unowned_events(&self, uptime_ms: u64, keep_ms: u64, batch: u32) -> Result<usize> {
+        let Some(old) = uptime_ms.checked_sub(keep_ms) else {
+            return Ok(0);
+        };
         self.db.write(move |tx| {
-            Ok(tx.execute(
+            let mark: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT uptime_ms, event_seq FROM uptime_mark WHERE uptime_ms <= ?1
+                     ORDER BY uptime_ms DESC LIMIT 1",
+                    [to_i64(old)?],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((at, seq)) = mark else {
+                return Ok(0);
+            };
+            let n = tx.execute(
                 "DELETE FROM event WHERE seq IN (
-                     SELECT seq FROM event WHERE attempt_id IS NULL AND at_ms < ?1
+                     SELECT seq FROM event WHERE attempt_id IS NULL AND seq <= ?1
                      ORDER BY seq LIMIT ?2)",
-                params![to_i64(before_ms)?, batch],
-            )?)
+                params![seq, batch],
+            )?;
+            tx.execute("DELETE FROM uptime_mark WHERE uptime_ms < ?1", [at])?;
+            Ok(n)
         })
     }
 
@@ -560,130 +605,84 @@ impl WorkerStore {
     }
 }
 
-/// The clock of the ack wait (spec 25.6 (b)), kept across restarts and
-/// reboots: `effective` is a wall time that advances only by the monotonic
-/// clock (time the machine was down is not counted) and never past the wall
-/// clock; `pending` is the uptime still to pass before anything expires.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ReleaseClock {
-    pub boot: String,
-    pub effective: u64,
-    pub mono: u64,
-    pub pending: u64,
-}
-
+/// The worker's accumulated uptime (spec 25.6 (b)): `uptime_ms` at the
+/// monotonic reading `mono` of boot `boot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReleaseClockStep {
-    pub state: Option<ReleaseClock>,
-    /// Whether `state` must be stored: a new boot, the first wait ending, the
-    /// wall clock holding `effective` back by more than a second, or a
-    /// minute of uptime since the stored sample. Otherwise the stored state
-    /// gives the same answer next time (at most once a minute per agent).
-    pub write: bool,
-    pub cutoff: Option<u64>,
+pub struct Uptime {
+    pub boot: String,
+    pub mono: u64,
+    pub uptime_ms: u64,
 }
 
-/// Uptime between two stored samples of the same boot.
-const RELEASE_CLOCK_WRITE_MS: u64 = 60_000;
-/// How far the wall clock may hold `effective` back without a write.
-const RELEASE_CLOCK_SLACK_MS: u64 = 1_000;
+/// Stored at most once a minute of uptime (and at a new boot, at shutdown).
+pub const UPTIME_WRITE_MS: u64 = 60_000;
 
-/// One sample of the ack wait's clock. No row may expire before the wait has
-/// passed in uptime after it was stamped: `effective` never runs ahead of the
-/// monotonic clock (a forward step of the wall clock is not followed) and
-/// never ahead of the wall clock (a backward step is followed down). A new
-/// boot carries `effective` and `pending` over, so a machine that never runs
-/// a full wait in one boot still expires rows; the first sample ever waits
-/// a full wait of uptime, since the rows it finds were stamped by a clock it
-/// never saw.
-pub(crate) fn release_clock_step(
-    previous: Option<&ReleaseClock>,
-    boot: &str,
-    wall: u64,
-    mono: u64,
-    wait: u64,
-) -> ReleaseClockStep {
-    let hold = || ReleaseClockStep {
-        state: previous.cloned(),
-        write: false,
-        cutoff: None,
-    };
-    if wall == 0 || wall > i64::MAX as u64 || mono == u64::MAX {
-        return hold();
-    }
-    let (state, write) = match previous {
-        None => (
-            ReleaseClock {
+/// The uptime now, from the stored sample, and whether to store the new
+/// one. The same boot adds the monotonic time since the sample; a new boot
+/// (or no sample) adds nothing, so downtime never counts and what was not
+/// stored before a reboot (under a minute) only delays. The wall clock is
+/// not an input.
+pub fn uptime_step(stored: Option<&Uptime>, boot: &str, mono: u64) -> (Uptime, bool) {
+    match stored {
+        Some(s) if s.boot == boot => {
+            let elapsed = mono.saturating_sub(s.mono);
+            let u = Uptime {
                 boot: boot.to_string(),
-                effective: wall,
-                mono,
-                pending: wait,
-            },
-            true,
-        ),
-        Some(old) if old.boot != boot => (
-            ReleaseClock {
-                boot: boot.to_string(),
-                effective: old.effective.min(wall),
-                mono,
-                pending: old.pending.min(wait),
-            },
-            true,
-        ),
-        Some(old) => {
-            let Some(elapsed) = mono.checked_sub(old.mono) else {
-                return hold();
+                mono: s.mono.max(mono),
+                uptime_ms: s.uptime_ms.saturating_add(elapsed),
             };
-            let ahead = old.effective.saturating_add(elapsed);
-            let effective = ahead.min(wall);
-            let pending = old.pending.min(wait).saturating_sub(elapsed);
-            let write = (old.pending > 0 && pending == 0)
-                || ahead - effective > RELEASE_CLOCK_SLACK_MS
-                || elapsed >= RELEASE_CLOCK_WRITE_MS;
-            (
-                ReleaseClock {
-                    boot: boot.to_string(),
-                    effective,
-                    mono,
-                    pending,
-                },
-                write,
-            )
+            (u, elapsed >= UPTIME_WRITE_MS)
         }
-    };
-    let cutoff = (state.pending == 0).then_some(state.effective);
-    ReleaseClockStep {
-        state: Some(state),
-        write,
-        cutoff,
+        _ => (
+            Uptime {
+                boot: boot.to_string(),
+                mono,
+                uptime_ms: stored.map_or(0, |s| s.uptime_ms),
+            },
+            true,
+        ),
     }
 }
 
 #[cfg(test)]
-mod clock_tests {
-    use super::{release_clock_step as step, ReleaseClock};
+mod uptime_tests {
+    use super::*;
+
+    /// Downtime is not counted, and a machine up 12 hours a day reaches a
+    /// 7-day wait after 14 days.
+    #[test]
+    fn uptime_counts_only_running_time_across_boots() {
+        let h = 3_600_000;
+        let mut stored: Option<Uptime> = None;
+        for day in 0..14u64 {
+            let boot = format!("boot-{day}");
+            // Boot at an arbitrary monotonic origin; tick each minute.
+            let origin = day * 7;
+            let mut last = None;
+            for minute in 0..=(12 * 60) {
+                let (u, write) = uptime_step(stored.as_ref(), &boot, origin + minute * 60_000);
+                if write {
+                    stored = Some(u.clone());
+                }
+                last = Some(u);
+            }
+            assert_eq!(last.unwrap().uptime_ms, (day + 1) * 12 * h);
+        }
+        assert_eq!(stored.unwrap().uptime_ms, 14 * 12 * h);
+    }
 
     #[test]
-    fn the_ack_wait_clock_is_written_only_when_it_changes_meaningfully() {
-        let s = step(None, "b", 1_000, 0, 10).state.unwrap();
-        // A tick within the minute is answered from the stored sample.
-        let n = step(Some(&s), "b", 1_005, 5, 10);
-        assert!(!n.write);
-        assert_eq!(n.cutoff, None);
-        // The end of the wait, a held-back wall clock, a minute and a reboot are.
-        assert!(step(Some(&s), "b", 1_010, 10, 10).write);
-        assert!(step(Some(&s), "b", 1, 2_000, 10).write);
-        assert!(step(Some(&s), "b", 70_000, 60_000, 10).write);
-        let r = step(Some(&s), "c", 5, 1, 10);
-        assert!(r.write);
-        assert_eq!(
-            r.state.unwrap(),
-            ReleaseClock {
-                boot: "c".into(),
-                effective: 5,
-                mono: 1,
-                pending: 10
-            }
-        );
+    fn a_tick_within_the_minute_is_not_stored() {
+        let (s, w) = uptime_step(None, "b", 10);
+        assert!(w);
+        assert_eq!(s.uptime_ms, 0);
+        let (u, w) = uptime_step(Some(&s), "b", 59_000);
+        assert!(!w);
+        assert_eq!(u.uptime_ms, 58_990);
+        assert!(uptime_step(Some(&s), "b", 60_010).1);
+        // A new boot carries the uptime and adds nothing.
+        let (r, w) = uptime_step(Some(&u), "c", 5);
+        assert!(w);
+        assert_eq!(r.uptime_ms, 58_990);
     }
 }

@@ -37,8 +37,8 @@ const ATTEMPT: &str = "worker_attempt";
 
 mod release;
 pub use release::{
-    DedupRecord, Leave, Released, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNRELEASED_PAGE,
-    RELEASE_BATCH,
+    uptime_step, DedupRecord, Leave, Released, Uptime, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
+    MAX_UNRELEASED_PAGE, RELEASE_BATCH, UPTIME_WRITE_MS,
 };
 
 /// How long a worker waits for `ack_collected` after an attempt ended before

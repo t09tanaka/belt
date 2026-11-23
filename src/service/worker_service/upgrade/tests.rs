@@ -162,7 +162,7 @@ impl Host {
     }
     /// Once the parent has committed, the host serves `digest`: journal, link,
     /// input and service agree, the journal is at rest in its first shape,
-    /// and no version binary changed.
+    /// and no version binary changed (the previous one may have been removed).
     fn assert_serving(&self, digest: &str) {
         let paths = self.paths();
         self.commit(digest).unwrap();
@@ -180,10 +180,12 @@ impl Host {
         let receipt = journal.receipt.expect("a service file is registered");
         let plist = fs::read_to_string(receipt.path()).unwrap();
         assert!(plist.contains(paths.executable(digest).to_str().unwrap()));
-        assert_eq!(
-            fs::read(paths.executable(&self.old)).unwrap(),
-            b"old version"
-        );
+        // The previous version is gone once the commit has looked (spec
+        // 25.7 (a)), or, when it is still there or is the one served, intact.
+        match fs::read(paths.executable(&self.old)) {
+            Ok(bytes) => assert_eq!(bytes, b"old version"),
+            Err(_) => assert_ne!(digest, self.old, "the served version is there"),
+        }
         assert_eq!(
             status.bridge_binary.as_deref(),
             paths.bridge_binary().to_str()
@@ -229,17 +231,19 @@ fn upgrade_places_the_version_stops_the_old_service_and_starts_the_new_one() {
     let h = Host::new();
     let status = h.upgrade(&mut |_| Ok(())).unwrap();
     assert_eq!(status.binary_sha256, h.new);
-    h.assert_serving(&h.new);
-    assert_eq!(h.launchctl(), ["bootstrap", "bootout", "bootstrap"]);
-    // The worker stays drained until the caller has checked it and resumes.
-    assert!(status.draining && !status.cancel_running);
+    // Before the commit the previous version keeps the exact input it ran with.
     let paths = h.paths();
-    assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
-    // The previous version keeps the exact input it ran with.
     assert_eq!(
         fs::read(version_input(&paths, &h.old)).unwrap(),
         h.input_at_install
     );
+    h.assert_serving(&h.new);
+    assert_eq!(h.launchctl(), ["bootstrap", "bootout", "bootstrap"]);
+    // The worker stays drained until the caller has checked it and resumes.
+    assert!(status.draining && !status.cancel_running);
+    assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
+    // The commit removed the previous version (spec 25.7 (a)).
+    assert!(!version_input(&paths, &h.old).exists());
 }
 
 #[test]
@@ -455,10 +459,11 @@ fn an_unreadable_database_or_a_foreign_binding_fails_before_anything_stops() {
     assert!(h.upgrade(&mut |_| Ok(())).is_err());
     // A state that is bound to another identity is not touched at all.
     assert_eq!(h.journal(), before);
-    // Placement alone happened: the old service was never touched.
+    // The old service was never touched, and the copy the version check
+    // refused is gone (spec 25.7 (a)).
     assert_eq!(h.launchctl(), ["bootstrap"]);
     assert_eq!(h.current(), Path::new(&h.old));
-    assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
+    assert!(!paths.executable(&h.new).exists());
 }
 
 #[test]
