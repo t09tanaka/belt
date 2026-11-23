@@ -83,7 +83,7 @@ coordinatorとworker agentは、1つのメンバーの1つのresidentの中で�
 
 `task-traffic-controller` に分散システム全体を入れない。ホスト内の資源制御を再利用可能にし、その情報を `belt` が配置判断に使う。
 
-配布物は原則として1つの `belt` バイナリとする。通常利用で `local-ci`、`task-traffic-controller`、`fast-worktree`、`portool` の別インストールを要求しない。既存リポジトリから `local-ci-core` と `task-traffic-controller-core` を抽出し、既存CLIもそのcoreを使う薄いadapterとして維持する。fast-worktree（0.5.0）とportool（0.11.0）も、crates.ioに公開したライブラリとして組み込む。どちらの単独CLIも公開を続け、手元の開発環境（編集を続けるworktree、devサーバー、Composeのポート分離）にはそれを使う。beltには `worktree`・`port` のような入口を作らない。依存version・protocol・cache schemaは固定し、配布物に元のライセンス表記を含める。
+配布物は原則として1つの `belt` バイナリとする。通常利用で `local-ci`、`task-traffic-controller`、`fast-worktree`、`portool` の別インストールを要求しない。既存リポジトリから `local-ci-core` と `task-traffic-controller-core` を抽出し、既存CLIもそのcoreを使う薄いadapterとして維持する。fast-worktree（0.7.0）とportool（0.14.0）も、crates.ioに公開したライブラリとして組み込む。どちらの単独CLIも公開を続け、手元の開発環境（編集を続けるworktree、devサーバー、Composeのポート分離）にはそれを使う。beltには `worktree`・`port` のような入口を作らない。依存version・protocol・cache schemaは固定し、配布物に元のライセンス表記を含める。
 
 workerには待受プロセスを置く。ただしLANへ独自の未認証TCPポートを開ける構成を既定にはしない。親がSSH接続を張り、`belt worker --stdio` をUnix socketへのbridgeとして起動する。agentとsupervisorはSSHから独立して動く。親のlocal workerも同じ実行経路を使い、通信部分だけUnix socket直結とする。他のメンバーがSSH越しに使うworkerと、そのマシンのlocal workerは同じ1つのworker agentである（24.1）。
 
@@ -1380,7 +1380,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 ## 22.4 worker上の周辺tool
 
-task-traffic-controller runtime、local-ci core、fast-worktree（0.5.0）、portool（0.11.0）はbeltバイナリに含める（第3章）。どれもprofileの必要toolとして検査せず、自動導入もしない。組み込んだ版はbeltの版で決まるので、`workers diff` はbelt自身の版の行にそれぞれの版を添えて示し、別の差分項目にはしない。workerのPATHにある単独のCLI（別に入れた `portool` など）の版は、attemptの実行に使わない（22.5）ので差分にしない。
+task-traffic-controller runtime、local-ci core、fast-worktree（0.7.0）、portool（0.14.0）はbeltバイナリに含める（第3章）。どれもprofileの必要toolとして検査せず、自動導入もしない。組み込んだ版はbeltの版で決まるので、`workers diff` はbelt自身の版の行にそれぞれの版を添えて示し、別の差分項目にはしない。workerのPATHにある単独のCLI（別に入れた `portool` など）の版は、attemptの実行に使わない（22.5）ので差分にしない。
 
 それ以外にプロジェクトが必要とするtool（版管理ツール、Dockerなど）は、22.1のとおりprofileの必要toolとして扱う。
 
@@ -1391,7 +1391,7 @@ workerのattempt workspaceは、beltに組み込んだfast-worktreeのライブ�
 - **設定の源泉**: プロジェクトの `.fast-worktree.toml`（`[[clone]]`、`post_add`、`pre_remove` のportool release）と `.worktreeinclude` をそのまま使い、worker用の準備設定を別に持たない。`[[clone]]` と `post_add` が依存の準備を担う（第6章・第8章）。
 - **hookとcommandが呼ぶ `portool`・`fast-worktree`**: `.fast-worktree.toml` のhook（例: `pre_remove` の `portool release`）や、commandの中の `portool exec` は、その名前のcommandを呼ぶ。beltだけを入れたworkerでも動くように、workerはstate directoryの中の私用のbin directoryに、belt自身を指す `portool` と `fast-worktree` のlinkを置き、hookとattemptのcommand、CI taskのstep、setupのstepのPATHの先頭に足す（PATHが無い、または空のときは、このbin directoryだけにする。空のentryはcurrent directoryを意味するので作らない）。beltは起動名（argv[0]）がこの2つのどちらかのとき、組み込んだライブラリの単独CLIの入口として動く。引数・出力・終了コードは同じ版の単独CLIと同じである。hookの中身をbeltが解釈することはしない。beltのsubcommand（`belt port` など）にもしない。workerのPATHに単独CLIがあっても、attemptの中では組み込みの版が先に見つかるので、`workers diff` が示す版と実際に動く版が一致する。linkは第15章のversion別directoryごとに置き、そのversionのbeltを指す。更新とrollback（24.8）ではversion別directoryと一緒に切り替わり、動いているattemptは開始したときのversionのlinkを使い続ける。
 - **割当の解放**: terminal後の削除では、`pre_remove` のhookを通常どおり実行し、その後で、そのworkspaceに紐づくportoolの割当を組み込みのportoolで解放する（解放済みなら何もしない）。hookがportool releaseを書いていないプロジェクトや、hookが失敗した場合も割当を残さないためである。解放するのは、workspaceのdirectoryが実際に無くなったときだけで、まだ残っているworkspaceの割当は残す。解放に失敗したら、workspaceの削除の失敗と同じくcleanupのeventに残し、workerの起動時のreconcileでやり直す。
-- **単独CLIとの共存**: 同じhostで単独のfast-worktree・portoolを使っていても、組み込みの版は同じstate directory、lock、registry（portoolの割当表、fast-worktreeのcache・pool・trash・kept ref）を、単独CLIと同じ規則で使う。どちらが割り当てたポートも他方から見え、同じポートを二重に割り当てない。組み込みの版が読めない形式（新しい単独CLIが書いたもの）は書き換えずに断り、そのworkerを `blocked: environment_mismatch` にして（portoolのregistryの版が組み込みの版で読めないときに限る。attemptの準備でも、workspaceの割当の解放でも同じ）、`doctor` と `workers diff` が単独CLIとbeltの版を示す。beltのcanonical cloneとattempt workspaceはworkerのstate directoryの中にあり、利用者が単独のfast-worktreeで作ったworktreeとは混ざらない。
+- **単独CLIとの共存**: 同じhostで単独のfast-worktree・portoolを使っていても、組み込みの版は同じstate directory、lock、registry（portoolの割当表、fast-worktreeのcache・pool・trash・kept ref）を、単独CLIと同じ規則で使う。どちらが割り当てたポートも他方から見え、同じポートを二重に割り当てない。組み込みの版が読めない形式（新しい単独CLIが書いたもの）は書き換えずに断り、そのworkerを `blocked: environment_mismatch` にして（portoolのregistryの版が組み込みの版で読めないときに限る。attemptの準備でも、workspaceの割当の解放でも同じ）、`doctor` と `workers diff` が単独CLIとbeltの版を示す。組み込みの版（fast-worktree 0.7.0、portool 0.14.0）が持つ自動の保持（古いkept ref・cache・spareの削除と、無くなったworktreeの割当の自動解放）は、attemptの中の `fast-worktree` の呼び出しがそのまま行い、beltは別の掃除を持たない。fast-worktreeの裏の掃除（`cache retire`）は、beltのlinkを起動した版が自分を指す `fast-worktree` として再実行するので、beltだけを入れたworkerでも動く。beltはその出力（削除した行）をeventにしない。beltは `portool prune` と `sync` を呼ばない。beltのcanonical cloneとattempt workspaceはworkerのstate directoryの中にあり、利用者が単独のfast-worktreeで作ったworktreeとは混ざらない。
 - **`.worktreeinclude`**: 一致するignoredファイルは、親でcaptureして22.3の経路で送る。workerがcanonical cloneからコピーすることはしない。
 - **Linux**: clonefileが効かないため、npmの依存は毎回 `npm ci` になる。add・remove・pool・hookは同じく動く。組み込みなので、Linuxでも別のバイナリは要らない。
 - **手元の開発環境**: 編集を続けるworktree、devサーバー、Composeのポート分離には、従来どおり単独のfast-worktreeとportoolを使う。beltはこれらを扱わない（第3章）。
