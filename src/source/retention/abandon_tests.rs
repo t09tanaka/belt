@@ -447,6 +447,12 @@ fn a_capture_killed_while_registering_loses_what_its_root_names_and_only_that() 
 fn a_capture_whose_owner_is_alive_is_left_whole() {
     let parts = Parts::new();
     let run = parts.captured(&me());
+    // A finished capture leaves nothing of its pending root: the root, its
+    // members and its graph went with the hand-over to the run root.
+    let others = format!(
+        "SELECT (SELECT count(*) FROM root WHERE id<>'{run}')+(SELECT count(*) FROM member WHERE root<>'{run}')+(SELECT count(*) FROM graph WHERE root<>'{run}')"
+    );
+    assert_eq!(parts.count(&others), 0);
     let before = (
         parts.index_rows(),
         parts.stored_files(),
