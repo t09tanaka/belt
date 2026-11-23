@@ -6,7 +6,11 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 mod abandon;
+mod scratch;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+pub(in crate::source) use scratch::Reserved;
+#[cfg(test)]
+pub(super) use scratch::STAGING;
 
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;
