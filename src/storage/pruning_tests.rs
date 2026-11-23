@@ -490,6 +490,7 @@ fn a_file_from_before_the_mark_is_read_as_it_is() {
     f.store
         .db
         .write(move |tx| {
+            tx.execute_batch(schema::UNDO_PRUNE_STEP)?;
             tx.execute_batch(schema::UNDO_CAPTURE_STEP)?;
             tx.execute_batch("ALTER TABLE run DROP COLUMN pruning_at_ms;")?;
             tx.execute(

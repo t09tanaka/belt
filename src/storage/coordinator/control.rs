@@ -293,7 +293,7 @@ fn apply_cancel(
     }
     let (run, task) = resolve(c, &target)?;
     if !capturing && !run_exists(c, &run)? {
-        return Err(not_found(format!("run {run}")));
+        return Err(no_run(&run));
     }
     if revision(c, &run)? != expected {
         return Err(StorageError::Immutable("stale control revision".into()));
@@ -405,7 +405,7 @@ fn completion_on(
     };
     let cancelled = cancelled_at.is_some();
     if !accepted && !cancelled {
-        return Err(not_found(format!("run {run}")));
+        return Err(no_run(&run));
     }
     let mut snapshot = Snapshot::new(
         target,
