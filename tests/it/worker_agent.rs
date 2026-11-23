@@ -2720,7 +2720,11 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
     assert!(r.released);
     // Accepted under the lock: the attempt and its lock are gone (spec 25.6).
     assert!(f.store().get(&a).unwrap().is_none());
-    assert!(!f.state().join("supervisors").join(format!("{a}.lock")).exists());
+    assert!(!f
+        .state()
+        .join("supervisors")
+        .join(format!("{a}.lock"))
+        .exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
