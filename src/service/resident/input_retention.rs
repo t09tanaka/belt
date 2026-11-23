@@ -1,7 +1,9 @@
 //! Parent input retention: one bounded registration OR deletion page per tick.
 //! All filesystem work and cursors stay with the process owner until actual drain.
 use super::*;
-use crate::source::retention::{PreviewCursor, RetentionCursor, VaultCursor};
+use crate::source::retention::{
+    AbandonCursor, AbandonScope, PreviewCursor, RetentionCursor, VaultCursor,
+};
 
 #[derive(Default)]
 struct Driver {
@@ -10,6 +12,7 @@ struct Driver {
     registration: PreviewCursor,
     source: RetentionCursor,
     vault: VaultCursor,
+    abandon: AbandonCursor,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -98,6 +101,30 @@ impl Driver {
         sample: Sample,
     ) -> anyhow::Result<Report> {
         let mut report = Report::default();
+        // Every pass first looks at the owner rows of captures that were not
+        // submitted (spec 25.4 (b)): as many rows as there are captures in
+        // progress or abandoned, usually none. This deletion follows an
+        // event (the owner gave up or is gone), not a period, so it does not
+        // wait for a clock. A pass that deleted files here does no other
+        // page: the bound on paths is one bound for the whole pass.
+        match captured.sources.abandon_captures(
+            owner,
+            &captured.vault,
+            AbandonScope::All,
+            &mut self.abandon,
+        ) {
+            Ok(page) => {
+                report.paths = page.paths;
+                report.unknown = page.unknown;
+                if page.paths > 0 {
+                    return Ok(report);
+                }
+            }
+            // Counted and tried again on the next pass; the pages below are
+            // not held back by it.
+            Err(_) => report.unknown = 1,
+        }
+        let abandoned_unknown = report.unknown;
         let phase = self.phase;
         self.phase = match phase {
             Phase::Registration => Phase::Vault,
@@ -141,6 +168,7 @@ impl Driver {
                 report.unknown = page.unknown;
             }
         }
+        report.unknown += abandoned_unknown;
         Ok(report)
     }
 }
@@ -211,7 +239,11 @@ pub(super) async fn run(
 #[derive(Default)]
 pub(super) struct TestControl {
     cadence_ms: std::sync::atomic::AtomicU64,
+    place_unknown: std::sync::atomic::AtomicBool,
+    pauses: std::sync::Mutex<std::collections::HashMap<&'static str, TestPause>>,
 }
+#[cfg(test)]
+type TestPause = (mpsc::UnboundedSender<()>, mpsc::UnboundedReceiver<()>);
 #[cfg(test)]
 impl TestControl {
     pub(super) fn cadence(&self) -> Duration {
@@ -221,6 +253,32 @@ impl TestControl {
         } else {
             Duration::from_millis(ms)
         }
+    }
+    /// Stop the next request that reaches `point`: it says so on the first
+    /// channel and waits for the second.
+    pub(super) fn pause_at(
+        &self,
+        point: &'static str,
+    ) -> (mpsc::UnboundedReceiver<()>, mpsc::UnboundedSender<()>) {
+        let (entered, wait) = mpsc::unbounded_channel();
+        let (resume, drain) = mpsc::unbounded_channel();
+        self.pauses.lock().unwrap().insert(point, (entered, drain));
+        (wait, resume)
+    }
+    pub(super) async fn reached(&self, point: &'static str) {
+        let pause = self.pauses.lock().unwrap().remove(point);
+        if let Some((entered, mut resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.recv().await;
+        }
+    }
+    /// Make this resident's own place read as unreadable.
+    pub(super) fn place_unknown(&self) {
+        self.place_unknown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(super) fn is_place_unknown(&self) -> bool {
+        self.place_unknown.load(std::sync::atomic::Ordering::SeqCst)
     }
     pub(super) fn fast(&self) {
         self.cadence_ms
@@ -408,6 +466,58 @@ mod tests {
             }
             max_paths
         }
+    }
+
+    /// Spec 25.4 (b), "消す時点" (3): every pass of the driver looks at the
+    /// owner rows. A capture whose owner is gone disappears without any
+    /// request; one whose owner lives stays whole.
+    #[test]
+    fn the_driver_pass_deletes_an_abandoned_capture_and_leaves_one_in_progress() {
+        use crate::platform::owned_temp::OwnerRecord;
+        let f = Fixture::new();
+        let capture = |owner: &OwnerRecord| {
+            let run = RunId::generate();
+            f.captured.sources.own_capture_as(&run, owner).unwrap();
+            crate::secrets::capture::capture_run(
+                &BTreeMap::new(),
+                &f.captured.sources,
+                &f.captured.vault,
+                &crate::secrets::capture::SecretInputs {
+                    key: &f.captured.current_key().unwrap(),
+                    declared: &[],
+                },
+                &run,
+                &SourceRequest::Directory {
+                    dir: f.input.clone(),
+                },
+                &CaptureParams::default(),
+            )
+            .unwrap();
+            run
+        };
+        let me = OwnerRecord::this_process().unwrap();
+        let ended = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            OwnerRecord { pid, ..me.clone() }
+        };
+        let (live, abandoned) = (capture(&me), capture(&ended));
+        let record = |run: &RunId| f.captured.sources.root().join("runs").join(run.as_str());
+        assert!(record(&live).exists() && record(&abandoned).exists());
+        let mut driver = Driver::default();
+        f.ticks(&mut driver, 12, 0);
+        assert!(!record(&abandoned).exists());
+        assert!(f
+            .captured
+            .sources
+            .capture_owner(&abandoned)
+            .unwrap()
+            .is_none());
+        assert!(record(&live).exists());
+        assert!(f.captured.sources.capture_owner(&live).unwrap().is_some());
+        // The files both captures held are the live one's now.
+        assert!(f.manifest_path(&live).exists());
     }
 
     #[test]

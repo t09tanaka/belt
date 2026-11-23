@@ -117,6 +117,19 @@ pub fn capture(
     request: &SourceRequest,
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
+    capture_of(env, store, None, request, params)
+}
+
+/// [`capture`] for the capture of `run`: the owner row of the run, when it
+/// has one, names the pending root from the transaction that creates it
+/// (spec 25.4 (b)).
+fn capture_of(
+    env: &BTreeMap<String, String>,
+    store: &SourceStore,
+    run: Option<&RunId>,
+    request: &SourceRequest,
+    params: &CaptureParams,
+) -> Result<Captured, ApiError> {
     let _mutation = store
         .foreground_guard()
         .map_err(|e| classify::api_error_of(&e))?;
@@ -124,8 +137,9 @@ pub fn capture(
         .ensure_sdk_available()
         .map_err(|e| classify::api_error_of(&e))?;
     let retention_root = store
-        .capture_pending_root()
+        .capture_pending_root(run)
         .map_err(|e| classify::api_error_of(&e))?;
+    retention::stop_point("pending");
     let ctx = ExecContext::new(env.clone());
     let opts = CaptureOptions {
         store: Some(store.root().to_path_buf()),
@@ -265,6 +279,7 @@ pub fn capture_for_run(
     _mutation.ensure_sdk_available().map_err(internal)?;
     // one capture of a run at a time, in this process and in others
     let _lock = store.lock_run(run).map_err(internal)?;
+    retention::stop_point("locked");
     let wanted = RunRecord {
         ci_source_id: String::new(),
         source_kind: request.kind(),
@@ -319,7 +334,7 @@ pub fn capture_for_run(
             _ => {}
         }
     }
-    let mut got = capture(env, store, request, params)?;
+    let mut got = capture_of(env, store, Some(run), request, params)?;
     let record = RunRecord {
         ci_source_id: got.manifest.ci_source_id.clone(),
         ..wanted
@@ -330,6 +345,7 @@ pub fn capture_for_run(
             .copy_root(pending, run.as_str(), "run", &record.ci_source_id)
             .map_err(internal)?;
     }
+    retention::stop_point("copied");
     let bound = match store.bind_run(run, &record) {
         Ok(b) => b,
         Err(e) => {
@@ -337,6 +353,7 @@ pub fn capture_for_run(
             return Err(internal(e));
         }
     };
+    retention::stop_point("bound");
     if bound != record {
         remove_secret_copy(got.secrets.as_deref());
         return Err(ApiError::new(
@@ -353,5 +370,6 @@ pub fn capture_for_run(
             .handoff(&pending, run.as_str())
             .map_err(internal)?;
     }
+    retention::stop_point("handed_off");
     Ok(got)
 }

@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
+mod abandon;
+pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;
 const BYTE_BUDGET: u64 = 64 * 1024 * 1024;
@@ -72,6 +75,12 @@ struct Claim {
     parents: Vec<(u64, u64)>,
     leaf: Identity,
     digest: String,
+    /// The claim of a file that only an abandoned capture held (spec 25.4
+    /// (b)). Its deletion follows an event, not a period, so the pass over
+    /// the abandoned captures replays it without waiting for a clock; every
+    /// other claim is replayed by the page of expired runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    abandoned: bool,
 }
 fn directory(file: &File, private: bool) -> Result<(u64, u64)> {
     let m = file.metadata()?;
@@ -221,6 +230,7 @@ impl Index {
             parents,
             leaf,
             digest,
+            abandoned: false,
         })
     }
     fn drain_claim(&self, c: &mut Connection, claim: &Claim, budget: &mut u64) -> Result<()> {
@@ -243,7 +253,7 @@ impl Index {
             current == Some(claim.incarnation),
             "stale source deletion incarnation"
         );
-        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
         ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
@@ -317,6 +327,62 @@ impl Index {
         fault("before_completion")?;
         tx.commit()?;
         Ok(())
+    }
+}
+/// What became of one membership of a root that is being released.
+pub(super) enum Released {
+    /// Another root holds the object: only the membership was removed.
+    Shared,
+    /// The file could not be proven: the membership and the file stay.
+    Unproven(String),
+    /// The claim is durable and the membership removed; the result of the
+    /// unlink follows (a failed one is replayed from the claim).
+    Claimed(Result<()>),
+}
+impl Index {
+    /// Release the membership `object` of `root`, which the caller proved is
+    /// no longer needed, under source EX: an object another root holds only
+    /// loses this membership; a file no other root holds is proven, claimed
+    /// durably and unlinked. Half of `budget` remains for the revalidation
+    /// of the unlink.
+    pub(super) fn release_member(
+        &self,
+        c: &mut Connection,
+        root: &str,
+        object: &str,
+        path: &str,
+        budget: &mut u64,
+        abandoned: bool,
+    ) -> Result<Released> {
+        let shared: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
+            params![object, root],
+            |r| r.get(0),
+        )?;
+        if shared {
+            c.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![root, object],
+            )?;
+            return Ok(Released::Shared);
+        }
+        // Half the page budget remains for immediate content revalidation.
+        let mut proof_budget = *budget / 2;
+        let claim = match self.proof(object, path, &mut proof_budget) {
+            Ok(claim) => Claim { abandoned, ..claim },
+            Err(error) => return Ok(Released::Unproven(format!("{error:#}"))),
+        };
+        *budget -= claim.leaf.size;
+        let tx = c.transaction()?;
+        tx.execute("INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,?2,?3,0)",params![object,claim.incarnation,serde_json::to_string(&claim)?])?;
+        tx.execute("UPDATE publication SET state='claimed' WHERE object=?1 AND incarnation=?2 AND state='live'",params![object,claim.incarnation])?;
+        tx.execute(
+            "DELETE FROM member WHERE root=?1 AND object=?2",
+            params![root, object],
+        )?;
+        tx.commit()?;
+        fault("after_claim")?;
+        Ok(Released::Claimed(self.drain_claim(c, &claim, budget)))
     }
 }
 impl SourceStore {
@@ -398,7 +464,7 @@ impl SourceStore {
                 ..Default::default()
             });
         };
-        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
         if unknown {
             return Ok(RetentionPage {
                 held: true,
@@ -515,46 +581,25 @@ impl SourceStore {
         report.examined = objects.len() as u32;
         for (object, path) in &objects {
             cursor.object = object.clone();
-            let shared: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
-                params![object, run],
-                |r| r.get(0),
-            )?;
-            if shared {
-                c.execute(
-                    "DELETE FROM member WHERE root=?1 AND object=?2",
-                    params![run, object],
-                )?;
-                report.shared += 1;
-                continue;
-            }
-            // Half the page budget remains for immediate content revalidation.
-            let mut proof_budget = budget / 2;
-            let claim = match self.retention.proof(object, path, &mut proof_budget) {
-                Ok(claim) => claim,
-                Err(error) => {
+            match self
+                .retention
+                .release_member(&mut c, &run, object, path, &mut budget, false)?
+            {
+                Released::Shared => report.shared += 1,
+                Released::Unproven(error) => {
                     report.unknown += 1;
-                    report.errors.push(format!("{error:#}"));
-                    continue;
+                    report.errors.push(error);
                 }
-            };
-            budget -= claim.leaf.size;
-            let tx = c.transaction()?;
-            tx.execute("INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,?2,?3,0)",params![object,claim.incarnation,serde_json::to_string(&claim)?])?;
-            tx.execute("UPDATE publication SET state='claimed' WHERE object=?1 AND incarnation=?2 AND state='live'",params![object,claim.incarnation])?;
-            tx.execute(
-                "DELETE FROM member WHERE root=?1 AND object=?2",
-                params![run, object],
-            )?;
-            tx.commit()?;
-            fault("after_claim")?;
-            report.claimed += 1;
-            report.paths += 1;
-            match self.retention.drain_claim(&mut c, &claim, &mut budget) {
-                Ok(()) => report.removed += 1,
-                Err(error) => {
-                    report.unknown += 1;
-                    report.errors.push(format!("{error:#}"));
+                Released::Claimed(drained) => {
+                    report.claimed += 1;
+                    report.paths += 1;
+                    match drained {
+                        Ok(()) => report.removed += 1,
+                        Err(error) => {
+                            report.unknown += 1;
+                            report.errors.push(format!("{error:#}"));
+                        }
+                    }
                 }
             }
         }

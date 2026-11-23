@@ -13,6 +13,9 @@
 //! readable marker is never touched, and no process is ever signalled here.
 
 use super::{boot_id, process_start_identity, StartIdentity};
+
+mod record;
+pub(crate) use record::{OwnerRecord, OwnerState};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -52,6 +55,12 @@ impl Place {
             boot: boot_id()?,
         })
     }
+}
+
+/// Whether this process cannot read the place it runs in (its machine
+/// identity, PID namespace or boot): then it can prove no owner gone.
+pub(crate) fn own_place_is_unknown() -> bool {
+    Place::here().is_none()
 }
 
 /// One line of a marker: not empty and on one line.

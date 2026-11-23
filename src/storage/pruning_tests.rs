@@ -483,13 +483,14 @@ fn a_file_from_before_the_mark_is_read_as_it_is() {
     let f = fx();
     let steps = schema::steps(DbKind::Coordinator);
     assert!(
-        steps.last().unwrap().contains("pruning_at_ms"),
-        "the mark is the last step: rewind to the step this test means"
+        steps[22].contains("pruning_at_ms"),
+        "the mark is the 23rd step: rewind to the step this test means"
     );
-    let previous = (steps.len() - 1).to_string();
+    let previous = 22.to_string();
     f.store
         .db
         .write(move |tx| {
+            tx.execute_batch(schema::UNDO_CAPTURE_STEP)?;
             tx.execute_batch("ALTER TABLE run DROP COLUMN pruning_at_ms;")?;
             tx.execute(
                 "UPDATE schema_meta SET value=?1 WHERE key='schema_version'",
@@ -543,12 +544,12 @@ fn the_migration_that_adds_the_mark_leaves_every_run_without_it() {
     let root = crate::test_tmp::tempdir().unwrap();
     let path = root.path().join("coordinator.db");
     let steps = schema::steps(DbKind::Coordinator);
+    // The step is the 23rd; the steps after it run on the same file below.
     assert_eq!(
-        steps.last().unwrap(),
+        steps[22],
         "ALTER TABLE run ADD COLUMN pruning_at_ms INTEGER;"
     );
-    assert_eq!(steps.len(), 23);
-    let previous = steps.len() - 1;
+    let previous = 22;
     let run = RunId::generate();
     let old = db::open_with(
         &path,

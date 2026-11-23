@@ -1,7 +1,11 @@
 //! Persistent roots and cross-process exclusion for captured inputs.
 //! Explicit parent retention pages are separate from the nondeleting preview.
+mod capture_owner;
 mod deletion;
 mod foreground;
+pub(crate) use capture_owner::stop_point;
+pub use capture_owner::{inspect_owners, CaptureOwner, CaptureVerdict};
+pub use deletion::{AbandonCursor, AbandonReport, AbandonScope};
 pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
 use super::SourceStore;
@@ -39,6 +43,10 @@ pub(crate) struct Index {
     path: PathBuf,
     database: PathBuf,
     root: Arc<File>,
+    /// The runs whose owner row this handle wrote ([`SourceStore::own_capture`]):
+    /// their pending root is named by that row or is not created. One entry
+    /// for each capture a command owns.
+    owned: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     #[cfg(test)]
     reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -119,6 +127,7 @@ impl Index {
                     .context("open source root")?
                     .into(),
             ),
+            owned: Default::default(),
             #[cfg(test)]
             reads: Default::default(),
             #[cfg(test)]
@@ -144,7 +153,7 @@ impl Index {
         let mut db = self.connect().context("connect source index")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
-            return Ok(());
+            return self.ensure_capture_owner_table(&mut db);
         }
         ensure!(version == 0, "unknown source index version {version}");
         // A new index and an unversioned legacy index use the same idempotent
@@ -170,6 +179,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
+        tx.execute_batch(capture_owner::TABLE)?;
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         Ok(())
@@ -388,7 +398,9 @@ impl Index {
             directory: None,
             metadata: None,
         });
-        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {}
+        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {
+            stop_point("registering");
+        }
         Ok(())
     }
     fn complete(&self, root: &str, id: &str) -> Result<bool> {
@@ -707,7 +719,9 @@ impl Index {
             "source root handoff mismatch"
         );
         tx.commit()?;
-        while !self.handoff_page(pending, run)? {}
+        while !self.handoff_page(pending, run)? {
+            stop_point("handing_off");
+        }
         Ok(())
     }
     fn handoff_page(&self, pending: &str, run: &str) -> Result<bool> {
@@ -734,6 +748,9 @@ impl Index {
         }
         let done = keys.len() < 32;
         if done {
+            // The graph of a root is read only while the root exists: it
+            // goes with the root, not after it (spec 25.1, 4).
+            tx.execute("DELETE FROM graph WHERE root=?1", [pending])?;
             tx.execute("DELETE FROM root WHERE id=?1", [pending])?;
         }
         tx.commit()?;
@@ -901,9 +918,11 @@ impl SourceStore {
         }
         Ok(())
     }
-    pub(crate) fn capture_pending_root(&self) -> Result<String> {
+    /// `run` is the run this capture is made for, if any: its owner row,
+    /// when it has one, names the new root from the same transaction.
+    pub(crate) fn capture_pending_root(&self, run: Option<&crate::ids::RunId>) -> Result<String> {
         let id = format!("capture:{}", ulid::Ulid::new());
-        self.retention.pending(&id)?;
+        self.retention.pending_of_capture(&id, run)?;
         Ok(id)
     }
 }
@@ -1144,7 +1163,7 @@ impl SourceStore {
             });
         }
         let unknown: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned')",
             [],
             |r| r.get(0),
         )?;
@@ -1235,6 +1254,8 @@ impl SourceStore {
     }
 }
 
+#[cfg(test)]
+mod abandon_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1881,6 +1902,7 @@ mod tests {
                         .into(),
                 ),
                 path,
+                owned: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
@@ -1929,6 +1951,7 @@ mod tests {
                         .into(),
                 ),
                 path,
+                owned: Default::default(),
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),

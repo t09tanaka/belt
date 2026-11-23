@@ -601,6 +601,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     std::fs::write(directory.join("data"), "fixed input").unwrap();
     let operation = || {
         let run = RunId::generate();
+        captured.sources.own_capture(&run).unwrap();
         let source = crate::source::capture_for_run(
             &captured.env,
             &captured.sources,
@@ -1440,7 +1441,7 @@ async fn retry_preflight_keeps_admission_and_db_available_and_rechecks_stopping(
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut gate = admission.lock().await;
             tokio::task::spawn_blocking(move || {
-                owner.store().cancel_control(
+                owner.store().cancel_control_of_capture(
                     Target::Run(target),
                     0,
                     RunId::generate().to_string(),

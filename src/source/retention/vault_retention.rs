@@ -64,7 +64,7 @@ impl VaultRegistration {
         );
         Ok(file)
     }
-    fn check(&self, c: &Connection) -> Result<()> {
+    pub(super) fn check(&self, c: &Connection) -> Result<()> {
         let file = self.root_file()?;
         let before =
             rustix::fs::statat(&file, "retention.db", rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -210,6 +210,56 @@ impl Index {
     }
 }
 impl SourceStore {
+    /// What every deletion from the parent Vault establishes first, under
+    /// source EX and the exclusive Vault lease: this coordinator is the
+    /// pinned retention owner of this store, and the Vault is registered to
+    /// this exact index before a claim can name it.
+    pub(super) fn vault_authority(
+        &self,
+        owner: &crate::storage::CoordinatorStore,
+        c: &Connection,
+        lease: &crate::secrets::vault::Lease,
+    ) -> Result<(VaultRegistration, String)> {
+        self.retention.check_anchor()?;
+        let identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
+        let registration = self.retention.vault_registration(c)?;
+        let pinned: Option<String> = c
+            .query_row(
+                "SELECT value FROM meta WHERE key='retention_owner'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            pinned.as_deref().is_none_or(|old| old == identity),
+            "Vault retention owner changed"
+        );
+        c.execute(
+            "INSERT OR IGNORE INTO meta VALUES('retention_owner',?1)",
+            [&identity],
+        )?;
+        let raw = serde_json::to_string(&registration)?;
+        let old: Option<String> = c
+            .query_row(
+                "SELECT value FROM meta WHERE key='vault_registration'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            old.as_ref().is_none_or(|old| old == &raw),
+            "Vault registration changed"
+        );
+        // Persist independent classification before marker publication or claims.
+        c.execute(
+            "INSERT OR IGNORE INTO meta VALUES('vault_registration',?1)",
+            [&raw],
+        )?;
+        lease.register(&registration)?;
+        Ok((registration, identity))
+    }
+}
+impl SourceStore {
     /// Holds source EX → Vault EX throughout proof, durable claim, unlink,
     /// parent fsync and completion. A busy reader or clock Hold consumes no cursor.
     /// No source expiry is created; Vault has its own zero-delay persisted clock.
@@ -259,43 +309,8 @@ impl SourceStore {
         };
         #[cfg(test)]
         self.retention.pause_page();
-        self.retention.check_anchor()?;
-        let identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let c = self.retention.connect()?;
-        let registration = self.retention.vault_registration(&c)?;
-        let pinned: Option<String> = c
-            .query_row(
-                "SELECT value FROM meta WHERE key='retention_owner'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(
-            pinned.as_deref().is_none_or(|old| old == identity),
-            "Vault retention owner changed"
-        );
-        c.execute(
-            "INSERT OR IGNORE INTO meta VALUES('retention_owner',?1)",
-            [&identity],
-        )?;
-        let raw = serde_json::to_string(&registration)?;
-        let old: Option<String> = c
-            .query_row(
-                "SELECT value FROM meta WHERE key='vault_registration'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(
-            old.as_ref().is_none_or(|old| old == &raw),
-            "Vault registration changed"
-        );
-        // Persist independent classification before marker publication or claims.
-        c.execute(
-            "INSERT OR IGNORE INTO meta VALUES('vault_registration',?1)",
-            [&raw],
-        )?;
-        lease.register(&registration)?;
+        let (registration, identity) = self.vault_authority(owner, &c, &lease)?;
         // A crashed publication is not retained data: no run owns the
         // temporary name, and the exclusive lease proves no writer is alive.
         // So this runs before, and regardless of, the clock and legacy Holds.
@@ -356,7 +371,7 @@ impl SourceStore {
             }
             return Ok(report);
         }
-        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
         if unknown {
             return Ok(VaultPage {
                 held: true,

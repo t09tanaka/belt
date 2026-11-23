@@ -142,6 +142,7 @@ pub fn capture_run(
             .adopt(run, &path, entries, key)
             .map_err(|e| e.to_api())?;
     }
+    crate::source::retention::stop_point("adopted");
     Ok(got)
 }
 

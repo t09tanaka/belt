@@ -1029,6 +1029,117 @@ pub fn direct_checks(env: &BTreeMap<String, String>, resident: &Scope) -> Vec<Ch
     out
 }
 
+/// The captures nothing can decide about (spec 25.4 (b), 25.11): owner rows
+/// whose owner was recorded where this host cannot see it, and run records
+/// and in-place bindings that neither a run nor an owner row claims (a
+/// binary from before the owner row left them, or wrote them a moment ago).
+/// They are never deleted automatically; this only counts them. Read-only:
+/// nothing is created, locked or changed.
+pub fn capture_checks(spec: &Spec) -> Vec<Check> {
+    let check = |level, detail: String| Check::new("parent", "unsubmitted_captures", level, detail);
+    // A host without a source index has no capture to count.
+    if !spec
+        .state_dir
+        .join("sources")
+        .join("retention.db")
+        .is_file()
+    {
+        return Vec::new();
+    }
+    let Ok(store) = super::bootstrap::read_only_store(spec) else {
+        return vec![check(
+            Level::NotChecked,
+            "the coordinator database cannot be read".into(),
+        )];
+    };
+    let counted = unjudged_captures(&spec.state_dir, &|run| store.has_run(run).unwrap_or(true));
+    match counted {
+        Ok(None) => Vec::new(),
+        Err(_) => vec![check(
+            Level::NotChecked,
+            "the index of captured inputs cannot be read".into(),
+        )],
+        Ok(Some(UnjudgedCaptures {
+            elsewhere: 0,
+            records: 0,
+            bindings: 0,
+            unnamed: 0,
+        })) => vec![check(
+            Level::Ok,
+            "every capture that was not submitted has an owner this host can judge".into(),
+        )],
+        Ok(Some(counts)) => vec![check(
+            Level::Notice,
+            format!(
+                "kept because nothing proves they are abandoned: {} capture(s) whose owner was recorded on another machine or PID namespace, {} run record(s) and {} in-place binding(s) that no run and no capture owner claims, {} entr(ies) with a name that is not a run's; they are never deleted automatically",
+                counts.elsewhere, counts.records, counts.bindings, counts.unnamed
+            ),
+        )],
+    }
+}
+
+/// What [`capture_checks`] counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnjudgedCaptures {
+    /// Owner rows whose owner cannot be judged from this host.
+    pub(crate) elsewhere: usize,
+    /// `sources/runs/<run>` of no run and no owner row.
+    pub(crate) records: usize,
+    /// `in-place/<run>.json` of no run and no owner row.
+    pub(crate) bindings: usize,
+    /// Entries of those two directories whose name is not a run's.
+    pub(crate) unnamed: usize,
+}
+
+/// One `readdir` of `sources/runs/` and of `in-place/`, and one lookup by
+/// primary key for each entry. `None` when this host holds no source index.
+pub(crate) fn unjudged_captures(
+    state: &Path,
+    has_run: &dyn Fn(&crate::ids::RunId) -> bool,
+) -> anyhow::Result<Option<UnjudgedCaptures>> {
+    let Some(owners) = crate::source::retention::inspect_owners(state)? else {
+        return Ok(None);
+    };
+    let mut counts = UnjudgedCaptures {
+        elsewhere: owners
+            .iter()
+            .filter(|row| row.verdict() == crate::source::retention::CaptureVerdict::Elsewhere)
+            .count(),
+        ..Default::default()
+    };
+    let owned: std::collections::BTreeSet<&str> =
+        owners.iter().map(|row| row.run.as_str()).collect();
+    let mut unclaimed = |dir: PathBuf, suffix: &str| -> usize {
+        let mut found = 0;
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let run = name.to_str().and_then(|name| {
+                if name.ends_with(".lock") {
+                    return Some(None);
+                }
+                let id = name.strip_suffix(suffix)?;
+                crate::ids::RunId::parse(id).ok().map(Some)
+            });
+            match run {
+                // The lock of a run is judged with its record.
+                Some(None) => {}
+                Some(Some(run)) => {
+                    if !owned.contains(run.as_str()) && !has_run(&run) {
+                        found += 1;
+                    }
+                }
+                None => counts.unnamed += 1,
+            }
+        }
+        found
+    };
+    let records = unclaimed(state.join("sources").join("runs"), "");
+    let bindings = unclaimed(state.join("in-place"), ".json");
+    counts.records = records;
+    counts.bindings = bindings;
+    Ok(Some(counts))
+}
+
 /// Everything `doctor` looks at. `env` is the invoking environment (it
 /// locates the user configuration); `spec` is the initialized coordinator.
 pub fn run(
@@ -1092,6 +1203,7 @@ pub fn run(
     }
     checks.extend(evaluate("parent", &local));
     checks.extend(direct_checks(env, &local.worker_scope));
+    checks.extend(capture_checks(spec));
     let leftover = super::leftover_temporaries(env);
     if leftover > 0 {
         checks.push(Check::new(

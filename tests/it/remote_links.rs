@@ -176,6 +176,8 @@ async fn submit_requiring(
     let source_store = open_sources(state);
     let vault = belt::secrets::vault::Vault::open(state).unwrap();
     let key = belt::secrets::key::load(key).unwrap();
+    // A submitting command owns its capture before it makes it (spec 25.4 (b)).
+    source_store.own_capture(&run).unwrap();
     let capture = belt::secrets::capture::capture_run(
         env,
         &source_store,

@@ -14,16 +14,86 @@ pub fn capture(
     run: &RunId,
     revision: Option<&str>,
 ) -> Result<Captured, ApiError> {
-    capture_into(context, run, revision, context.state_dir())
+    capture_at(context, run, revision, context.state_dir(), true)
+}
+
+/// The owner of the capture of `run` will not submit it (spec 25.4 (b)): its
+/// capture failed, its enqueue was refused, or it was interrupted. The row
+/// stays for the resident, which deletes it and what it names. Best effort:
+/// when this cannot be written, the end of this process says the same.
+pub fn give_up(state: &std::path::Path, run: &RunId) {
+    if !state.join("sources").join("retention.db").is_file() {
+        return;
+    }
+    if let Ok((store, _source)) = SourceStore::open_foreground(state) {
+        let _ = store.give_up_capture(run);
+    }
+}
+
+/// [`give_up`] after a submission ended with `error`, off the async thread.
+/// An unconfirmed submission is not given up: its enqueue may still commit.
+pub async fn give_up_after(state: std::path::PathBuf, run: RunId, error: &ApiError) {
+    if error.code == ErrorCode::CommunicationUnknown {
+        return;
+    }
+    give_up_now(state, run).await;
+}
+
+pub async fn give_up_now(state: std::path::PathBuf, run: RunId) {
+    let _ = tokio::task::spawn_blocking(move || give_up(&state, &run)).await;
+}
+
+/// The runs whose capture this process began. A command submits one run, so
+/// this holds one entry for the life of the process.
+static BEGUN: std::sync::Mutex<Vec<RunId>> = std::sync::Mutex::new(Vec::new());
+
+/// The submission of `run` is about to start its capture. Said on the
+/// submitting task itself, before the capture is handed to a blocking
+/// thread: until it is said, nothing of the capture exists and no request
+/// that names the run was sent.
+pub fn capture_begins(run: &RunId) {
+    let mut begun = BEGUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !begun.contains(run) {
+        begun.push(run.clone());
+    }
+}
+
+/// Whether [`capture_begins`] was said for `run`. This is the only thing an
+/// interrupt may read to decide that there is nothing to cancel: the owner
+/// row cannot say it (it is gone once the resident took the run over, and it
+/// cannot be read while a retention pass holds the source lock).
+pub fn capture_begun(run: &RunId) -> bool {
+    BEGUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(run)
 }
 
 /// Use the same capture path with an explicitly owned source/Vault destination.
 /// Authentication and runtime identity continue to come from the original context.
+/// The destination is the owner of what is captured (a plan draft: its
+/// directory is removed as a whole), so no `capture_owner` row is written.
 pub fn capture_into(
     context: &Context,
     run: &RunId,
     revision: Option<&str>,
     input_state: &std::path::Path,
+) -> Result<Captured, ApiError> {
+    capture_at(context, run, revision, input_state, false)
+}
+
+/// `own`: write the owner row of the capture first (spec 25.4 (b)). The
+/// store's own fixed files exist before it; nothing of this capture does:
+/// not the run lock, not the pending root, not an object, not the secret
+/// bundle.
+fn capture_at(
+    context: &Context,
+    run: &RunId,
+    revision: Option<&str>,
+    input_state: &std::path::Path,
+    own: bool,
 ) -> Result<Captured, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     let request = match (context.repo_root.as_ref(), context.config.source_mode.value) {
@@ -57,6 +127,14 @@ pub fn capture_into(
             invalid(error.to_string())
         }
     })?;
+    if own {
+        store.own_capture(run).map_err(|error| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("cannot record the owner of the capture: {error:#}"),
+            )
+        })?;
+    }
     let vault = Vault::open(input_state).map_err(|e| e.to_api())?;
     let key =
         crate::secrets::key::load(&context.bootstrap.cluster_key_path).map_err(|e| e.to_api())?;
