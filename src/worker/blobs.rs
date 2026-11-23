@@ -53,6 +53,7 @@ use crate::platform::{free_bytes, open_beneath, wall_ms};
 use crate::protocol::chunk::clamp_chunk;
 use crate::source::classify::{ci_id_of, source_id_of_ci};
 use crate::source::diff::{is_blob_hash, BlobWant};
+use crate::source::retention::{is_import_token_id, ForgetReport, ImportToken};
 use crate::source::store::{verify_manifest, ImportRef, ObjectsRepo};
 use crate::source::SourceStore;
 use crate::storage::WorkerStore;
@@ -81,11 +82,29 @@ pub trait BlobSink: Send + Sync {
         limits: &BlobLimits,
         r: &BlobVerifyRequest,
     ) -> Result<BlobVerifyResponse, ApiError>;
+    /// Every tick: drop the sources nobody added to for
+    /// [`BlobLimits::stale_ms`] (spec 25.8, 25.10). Waits for no lock.
+    fn drop_stale(&self, _limits: &BlobLimits) {}
+    /// At the agent's start, under `agent.lock` and before anything is
+    /// received: remove the import tokens no receiving directory records
+    /// (spec 25.8, 4). `None`: this sink keeps no tokens.
+    fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {
+        Ok(None)
+    }
 }
 
 /// The file in a source's staging directory that holds its reservation.
 const RESERVED: &str = "reserved";
 const RESERVED_TMP: &str = "reserved.tmp";
+/// The file in a source's staging directory that records the import token
+/// its publication takes (spec 25.8, 1): the directory owns the token.
+const IMPORT_TOKEN: &str = "import-token";
+const IMPORT_TOKEN_TMP: &str = "import-token.tmp";
+/// The refs an unpacked bundle of the source made in its clone, recorded
+/// until the source is published: a directory thrown away before that drops
+/// them the way a refusal does (spec 25.8, 3).
+const MADE_REFS: &str = "made-refs";
+const MADE_REFS_TMP: &str = "made-refs.tmp";
 /// Where the files of a source wait: part-way, and whole.
 const PARTS: &str = "parts";
 const FILES: &str = "files";
@@ -420,6 +439,62 @@ fn read_reserved(dir: &Path) -> Option<Reservation> {
 
 /// The bytes the staged files of a source hold on the disk: what is there,
 /// not what their names announce.
+/// The id of the import token the staging directory `dir` records. `Ok(None)`
+/// when it records none; an error when the record cannot be read or names
+/// no token.
+fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
+    let text = match fs::read_to_string(dir.join(IMPORT_TOKEN)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !is_import_token_id(&text) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the import token record names no token",
+        ));
+    }
+    Ok(Some(text))
+}
+
+/// The record of [`MADE_REFS`]: the repository, then one ref a line
+/// (`name`, the source it is the snapshot of or `-`, its commit or `-`).
+fn made_refs_text(repository_id: &str, refs: &[ImportRef]) -> String {
+    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
+    let mut out = format!("{repository_id}\n");
+    for r in refs {
+        out.push_str(&format!(
+            "{} {} {}\n",
+            r.name,
+            dash(&r.snapshot_of),
+            dash(&r.commit)
+        ));
+    }
+    out
+}
+
+/// `None` when there is no record or it is not one this module wrote.
+fn read_made_refs(dir: &Path) -> Option<(String, Vec<ImportRef>)> {
+    let text = fs::read_to_string(dir.join(MADE_REFS)).ok()?;
+    let mut lines = text.lines();
+    let repository_id = lines.next()?.to_string();
+    let some = |v: &str| (v != "-").then(|| v.to_string());
+    let mut refs = vec![];
+    for line in lines {
+        let mut parts = line.split(' ');
+        let (name, of, commit) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() || !name.starts_with("refs/") {
+            return None;
+        }
+        refs.push(ImportRef {
+            name: name.to_string(),
+            snapshot_of: some(of),
+            commit: some(commit),
+        });
+    }
+    Some((repository_id, refs))
+}
+
 fn staged_bytes(dir: &Path) -> u64 {
     let mut sum = 0u64;
     for d in [dir.to_path_buf(), dir.join(PARTS), dir.join(FILES)] {
@@ -569,13 +644,60 @@ impl Incoming {
     }
 
     /// Remove what we staged for a source, and its directory when nothing
-    /// else is in it. Call under the source's lock.
-    fn discard(&self, source: &str) {
+    /// else is in it. Call under the source's lock, holding no source
+    /// mutation lock. Should the token not be released or the clone be busy,
+    /// everything stays for a later discard (the directory goes stale and
+    /// the next tick tries again).
+    /// Only a request waits for the clone's import lock (`wait`); the
+    /// agent's tick and the stale drop under the lock over all sources only
+    /// try it.
+    fn discard(&self, source: &str, limits: &BlobLimits, wait: bool) {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(source);
         let dir = self.root.join(source);
+        // The owner of the token ends: its rows go first (spec 25.8, 3).
+        // A record that names no token (cut by a crash, garbage) is no
+        // owner: the token it was is unrecorded, and the next start removes
+        // it (25.8, 4). One that cannot be read keeps everything.
+        match recorded_token(&dir) {
+            Ok(Some(id)) => {
+                if self.store.release_import(&id).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(_) => return,
+        }
+        // Not published: the refs its bundle made go, but for those of
+        // sources that are published by now (as a refusal does): a
+        // snapshot, or the index ref of a published source.
+        if let Some((repository_id, made)) = read_made_refs(&dir) {
+            if let Some(repo) = self.objects(&repository_id) {
+                // Under the clone's import lock: another import may have
+                // found a ref of ours there and counted on it.
+                let busy = format!("the clone of {repository_id} is busy");
+                let Ok(_importing) = self.workspaces.import_lock(&repository_id).and_then(|f| {
+                    if wait {
+                        Self::wait_lock(f, limits, &busy)
+                    } else {
+                        f.try_lock().map(|()| f).map_err(|_| overloaded(&busy))
+                    }
+                }) else {
+                    return;
+                };
+                Self::drop_refs(&repo, &made, |r| match r.source() {
+                    Some(id) => self.published(id).unwrap_or(true),
+                    None => true,
+                });
+            }
+        }
+        remove_staged(&dir.join(MADE_REFS_TMP));
+        remove_staged(&dir.join(MADE_REFS));
+        remove_staged(&dir.join(IMPORT_TOKEN_TMP));
+        remove_staged(&dir.join(IMPORT_TOKEN));
         for sub in [dir.join(PARTS), dir.join(FILES), dir.clone()] {
             for f in listing(&sub).unwrap_or_default() {
                 remove_staged(&sub.join(f.name));
@@ -598,9 +720,9 @@ impl Incoming {
     }
 
     /// Nothing of a source that has no staged file stays.
-    fn discard_if_empty(&self, source: &SourceId) {
+    fn discard_if_empty(&self, source: &SourceId, limits: &BlobLimits) {
         if Self::holds_nothing(&self.dir(source)) {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits, true);
         }
     }
 
@@ -695,24 +817,90 @@ impl Incoming {
         if may_stage_source(limits, self.staged_sources()?.len()) {
             return Ok(());
         }
+        self.drop_stale_locked(limits, Some(source))?;
+        if may_stage_source(limits, self.staged_sources()?.len()) {
+            return Ok(());
+        }
+        Err(overloaded("too many sources are being received"))
+    }
+
+    /// Drop the sources nobody added to for a long time, each under its own
+    /// lock and only when that lock is free. The caller holds the lock over
+    /// all sources, and the lock of `held` when it names one.
+    fn drop_stale_locked(
+        &self,
+        limits: &BlobLimits,
+        held: Option<&SourceId>,
+    ) -> Result<(), ApiError> {
         let now = wall_ms();
         for other in self.staged_sources()? {
             if !is_stale(limits, now, Self::newest_ms(&self.root.join(&other))) {
                 continue;
             }
-            if lock_shard(&other) == lock_shard(source.as_str()) {
-                self.discard(&other);
+            if held.is_some_and(|s| lock_shard(&other) == lock_shard(s.as_str())) {
+                self.discard(&other, limits, false);
                 continue;
             }
             let f = self.lock_file(&lock_shard(&other).to_string())?;
             if f.try_lock().is_ok() {
-                self.discard(&other);
+                self.discard(&other, limits, false);
             }
         }
-        if may_stage_source(limits, self.staged_sources()?.len()) {
+        Ok(())
+    }
+
+    /// The token the publication of the source staged in `dir` takes: the
+    /// one the directory records while its row is pending, else a new one,
+    /// recorded before any blob goes in with it (spec 25.8, 1). Call under
+    /// the source's lock.
+    fn import_token(&self, dir: &Path) -> Result<ImportToken, ApiError> {
+        let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
+        // (a record that names no token is no owner: a new token replaces it)
+        let recorded = match recorded_token(dir) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => None,
+            other => other.map_err(io_err)?,
+        };
+        if let Some(id) = recorded {
+            if let Some(token) = self.store.resume_import(&id).map_err(store_err)? {
+                return Ok(token);
+            }
+        }
+        let token = self.store.begin_import().map_err(store_err)?;
+        // durable before any blob goes in with it: a record a power loss
+        // cut would name no token
+        let tmp = dir.join(IMPORT_TOKEN_TMP);
+        let mut f = File::create(&tmp).map_err(io_err)?;
+        f.write_all(SourceStore::import_token_id(&token).as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(io_err)?;
+        fs::rename(&tmp, dir.join(IMPORT_TOKEN)).map_err(io_err)?;
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)?;
+        Ok(token)
+    }
+
+    /// Add `made` to what the directory records its bundles made (an
+    /// unpack after a restart finds the refs there and makes none).
+    fn record_made_refs(
+        &self,
+        dir: &Path,
+        repository_id: &str,
+        made: &[ImportRef],
+    ) -> Result<(), ApiError> {
+        let mut all = match read_made_refs(dir) {
+            Some((id, refs)) if id == repository_id => refs,
+            _ => vec![],
+        };
+        for r in made {
+            if all.iter().all(|a| a.name != r.name) {
+                all.push(r.clone());
+            }
+        }
+        if all.is_empty() {
             return Ok(());
         }
-        Err(overloaded("too many sources are being received"))
+        let tmp = dir.join(MADE_REFS_TMP);
+        fs::write(&tmp, made_refs_text(repository_id, &all)).map_err(io_err)?;
+        fs::rename(&tmp, dir.join(MADE_REFS)).map_err(io_err)
     }
 
     /// Let the source take `total` bytes in all ([`source_total`]) and
@@ -1367,7 +1555,7 @@ impl Incoming {
             }
         }
         if let Some(why) = refused {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(format!("the source is refused: {why}")));
         }
@@ -1379,17 +1567,34 @@ impl Incoming {
         let mut objects = None;
         // (with what the bundle of this call put into the clone, if one did)
         let mut unpacked = None;
+        // the clone's import lock when no bundle of this call took it
+        let mut held = None;
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
             let repo = match Self::bundle_done(&dir)? {
                 Some(bundle) => {
                     let u = self.unpack(limits, &bundle, repository_id, root_id, st)?;
                     let repo = u.repo.clone();
+                    self.record_made_refs(&dir, repository_id, &u.made)?;
                     unpacked = Some((u, repository_id.clone()));
                     repo
                 }
                 None => match self.objects(repository_id) {
-                    Some(repo) if self.commits_here(&repo, st, &carried)? => repo,
-                    _ => return Ok(false),
+                    Some(repo) => {
+                        // Held until the publication ends, as an unpack
+                        // holds it: a discard of another source of the
+                        // repository must not drop a ref this one counts on.
+                        let busy = format!("the clone of {repository_id} is busy");
+                        held = Some(Self::wait_lock(
+                            self.workspaces.import_lock(repository_id)?,
+                            limits,
+                            &busy,
+                        )?);
+                        if !self.commits_here(&repo, st, &carried)? {
+                            return Ok(false);
+                        }
+                        repo
+                    }
+                    None => return Ok(false),
                 },
             };
             objects = Some(repo);
@@ -1405,13 +1610,14 @@ impl Incoming {
                     .is_some_and(|m| m.execution_commit.is_some())
             });
         if homeless {
-            self.discard(source.as_str());
+            self.discard(source.as_str(), limits, true);
             *st = Staged::default();
             return Err(invalid(
                 "the source is refused: it names a commit and no repository to hold it",
             ));
         }
         let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
+        let mut token = None;
         for (hash, size) in &st.wanted {
             let path = waiting(hash, *size);
             if stored.contains(hash) {
@@ -1423,7 +1629,13 @@ impl Incoming {
                 size: *size,
             };
             let mut f = File::open(&path).map_err(io_err)?;
-            self.store.ingest_blob(&want, &mut f).map_err(store_err)?;
+            if token.is_none() {
+                token = Some(self.import_token(&dir)?);
+            }
+            let token = token.as_ref().expect("taken above");
+            self.store
+                .ingest_blob_with_token(token, &want, &mut f)
+                .map_err(store_err)?;
             remove_staged(&path);
         }
         for id in st.leaf_first(root_id) {
@@ -1448,6 +1660,15 @@ impl Incoming {
             // Refused after its bundle was unpacked: the refs the bundle
             // made go again, but for the snapshots of the captures that are
             // published by now (their manifests name those commits).
+            if let Some((repository_id, made)) = read_made_refs(&dir) {
+                if let Some(repo) = self.objects(&repository_id) {
+                    Self::drop_refs(&repo, &made, |r| match &r.snapshot_of {
+                        Some(id) => self.published(id).unwrap_or(true),
+                        None => false,
+                    });
+                }
+            }
+            remove_staged(&dir.join(MADE_REFS));
             if let Some((u, repository_id)) = &unpacked {
                 Self::drop_refs(&u.repo, &u.made, |r| match &r.snapshot_of {
                     Some(id) => self.published(id).unwrap_or(true),
@@ -1459,7 +1680,12 @@ impl Incoming {
             }
             return Err(invalid(format!("the source is refused: {e:#}")));
         }
-        self.discard(source.as_str());
+        // published: the refs are the source's now
+        remove_staged(&dir.join(MADE_REFS));
+        // (the clone's lock first: the discard takes it again)
+        drop(unpacked);
+        drop(held);
+        self.discard(source.as_str(), limits, true);
         Ok(true)
     }
 
@@ -1497,7 +1723,7 @@ impl Incoming {
                         Ok(None) => {}
                         Err(e) => {
                             // Nothing of a source that has nothing staged stays.
-                            self.discard_if_empty(&r.source_id);
+                            self.discard_if_empty(&r.source_id, limits);
                             return Err(e);
                         }
                     }
@@ -1635,7 +1861,7 @@ impl BlobSink for Incoming {
         };
         if self.published(&root_id)? {
             // The source is whole: nothing more is taken for it.
-            self.discard(r.source_id.as_str());
+            self.discard(r.source_id.as_str(), limits, true);
             if r.kind == SourceBlobKind::Content && !self.store.has_blob(hex_of(&r.digest)) {
                 return Err(invalid("no manifest of the source names this blob"));
             }
@@ -1667,6 +1893,47 @@ impl BlobSink for Incoming {
         let result = self.verify_locked(r, &root_id, ready, &st);
         self.keep(&r.source_id, st);
         result
+    }
+
+    fn drop_stale(&self, limits: &BlobLimits) {
+        if !self.root.is_dir() {
+            return;
+        }
+        let Ok(all) = self.lock_file("all") else {
+            return;
+        };
+        // (the next tick looks again)
+        if all.try_lock().is_ok() {
+            let _ = self.drop_stale_locked(limits, None);
+        }
+        // What a dropped or finished source's token still holds (spec 25.8,
+        // 3): a pass that waits for no lock.
+        let _ = self.store.release_abandoned_imports();
+    }
+
+    fn forget_unowned(&self) -> Result<Option<ForgetReport>, ApiError> {
+        // Every record must be read: one that cannot be may name a token
+        // in use, and then nothing is removed (fail closed).
+        let mut owned = BTreeSet::new();
+        if self.root.is_dir() {
+            for source in self.staged_sources()? {
+                // A record that names no token (cut, garbage) protects
+                // nothing: no publication can go on with it. One that
+                // cannot be read at all stops the sweep.
+                match recorded_token(&self.root.join(source)) {
+                    Ok(Some(id)) => {
+                        owned.insert(id);
+                    }
+                    Ok(None) => {}
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+        }
+        self.store
+            .forget_unowned_imports(&owned)
+            .map(Some)
+            .map_err(|e| internal("source store", format!("{e:#}")))
     }
 }
 

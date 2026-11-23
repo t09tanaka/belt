@@ -3,15 +3,18 @@
 mod capture_owner;
 mod deletion;
 mod foreground;
+mod import_owner;
 pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{inspect_corrupt_held, inspect_owners, CaptureOwner, CaptureVerdict};
 #[cfg(test)]
 pub use deletion::set_prune_fault;
 pub(in crate::source) use deletion::Reserved;
+pub use deletion::{abandoned_imports_read_only, ImportReleaseReport};
 pub use deletion::{
     AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, Gate, PruneBudget, PruneInputs,
 };
 pub(crate) use foreground::ForegroundBusy;
+pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
@@ -839,7 +842,10 @@ impl SourceStore {
             [&token.id],
         )?;
         tx.execute(
-            "INSERT INTO root(id,kind) VALUES(?1,'pending')",
+            // A receipt's membership is exact: `import_blob` writes the
+            // object and the member in one claim-checked transaction, before
+            // the file. It is not a root of unknown membership (spec 25.8).
+            "INSERT INTO root(id,kind) VALUES(?1,'receipt')",
             [token.root()],
         )?;
         tx.commit()?;
@@ -1170,7 +1176,7 @@ impl SourceStore {
             });
         }
         let unknown: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned')",
+            "SELECT EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt'))",
             [],
             |r| r.get(0),
         )?;
@@ -3457,6 +3463,8 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"keep").unwrap();
         }
+        // a parent's capture in progress: a root of unknown membership
+        f.store.capture_pending_root(None).unwrap();
         assert!(deletion_tick(&f, &mut cursor).held);
         assert!(f
             .store
@@ -3475,6 +3483,46 @@ mod tests {
                 b"keep"
             );
         }
+        assert!(f.store.has_blob(&want.hash));
+    }
+    #[test]
+    fn deletion_is_not_held_by_a_receipt_and_keeps_its_files() {
+        let f = Fixture::new();
+        let (run, mut cursor) = deletion_ready(&f);
+        let token = f.store.begin_import().unwrap();
+        let want = super::super::diff::BlobWant {
+            hash: format!("{:x}", sha2::Sha256::digest(b"pending")),
+            size: 7,
+        };
+        f.store
+            .ingest_blob_with_token(&token, &want, &mut &b"pending"[..])
+            .unwrap();
+        for relative in [
+            "keys/master",
+            "bundles/cache",
+            "git/objects/sentinel",
+            "unknown",
+        ] {
+            let path = f.store.root().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"keep").unwrap();
+        }
+        // a receipt's membership is exact (spec 25.8): it holds nothing
+        // back but its own files
+        let _ = &run;
+        assert!(!deletion_tick(&f, &mut cursor).held);
+        for relative in [
+            "keys/master",
+            "bundles/cache",
+            "git/objects/sentinel",
+            "unknown",
+        ] {
+            assert_eq!(
+                std::fs::read(f.store.root().join(relative)).unwrap(),
+                b"keep"
+            );
+        }
+        assert!(f.store.has_blob(&want.hash));
     }
     #[test]
     fn deletion_indexed_submodule_graph_is_bounded_without_parent_reload() {

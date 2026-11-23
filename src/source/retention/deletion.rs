@@ -6,9 +6,11 @@ use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 mod abandon;
+mod import_release;
 mod prune;
 mod scratch;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
+pub use import_release::{abandoned_imports_read_only, ImportReleaseReport};
 #[cfg(test)]
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
@@ -41,7 +43,7 @@ impl Gate {
     /// The first gate that is closed in the index `c`, if any.
     pub fn closed(c: &Connection) -> Result<Option<Gate>> {
         let (legacy, capture, graph): (bool, bool, bool) = c.query_row(
-            "SELECT coalesce((SELECT value FROM meta WHERE key='legacy_registration'),'')<>'done', EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned'), EXISTS(SELECT 1 FROM graph WHERE done=0)",
+            "SELECT coalesce((SELECT value FROM meta WHERE key='legacy_registration'),'')<>'done', EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')), EXISTS(SELECT 1 FROM graph WHERE done=0)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -331,7 +333,7 @@ impl Index {
             current == Some(claim.incarnation),
             "stale source deletion incarnation"
         );
-        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
         ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
@@ -563,7 +565,7 @@ impl SourceStore {
                 ..Default::default()
             });
         };
-        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
         if unknown {
             return Ok(RetentionPage {
                 held: true,

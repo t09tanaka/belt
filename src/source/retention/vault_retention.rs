@@ -371,7 +371,7 @@ impl SourceStore {
             }
             return Ok(report);
         }
-        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind<>'abandoned') OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
         if unknown {
             return Ok(VaultPage {
                 held: true,
