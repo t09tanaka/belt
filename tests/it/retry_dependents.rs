@@ -79,7 +79,11 @@ async fn a_retry_of_a_job_is_refused_when_the_job_that_needs_it_ended_with_the_e
 async fn a_retry_of_a_job_is_refused_while_the_job_that_needs_it_runs() {
     let (root, spec, input) = control_fixture();
     let gate = root.path().join("marks/gate");
-    let wait = format!("while [ ! -f {} ]; do sleep 0.2; done", gate.display());
+    let wait = format!(
+        "while [ ! -f {0} ] && [ -d '{1}' ]; do sleep 0.2; done",
+        gate.display(),
+        root.path().display()
+    );
     let marks = ci_project(
         root.path(),
         &input,

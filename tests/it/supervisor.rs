@@ -651,10 +651,11 @@ fn each_heartbeat_publishes_the_output_and_advances_the_stored_position() {
     let f = fx(vec![]);
     let (go, end) = (f.path("go"), f.path("end"));
     let script = format!(
-        "printf one; while [ ! -e '{}' ]; do sleep 0.05; done; printf two; \
-         while [ ! -e '{}' ]; do sleep 0.05; done",
+        "printf one; while [ ! -e '{}' ] && [ -d '{guard}' ]; do sleep 0.05; done; printf two; \
+         while [ ! -e '{}' ] && [ -d '{guard}' ]; do sleep 0.05; done",
         go.display(),
-        end.display()
+        end.display(),
+        guard = go.parent().unwrap().display()
     );
     let mut spec = f.spec.clone();
     spec.nodes = vec![node("n", &script)];
@@ -868,7 +869,7 @@ fn a_finished_attempt_is_not_run_again() {
 
 // ------------------------------------------------------------- A25 cancel
 
-const IGNORES_TERM: &str = "trap '' TERM; sleep 30 & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; while :; do sleep 1; done";
+const IGNORES_TERM: &str = "trap '' TERM; while [ -d \"${BGPID%/*}\" ]; do sleep 0.05; done & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; while [ -d \"${BGPID%/*}\" ]; do sleep 0.05; done";
 
 fn with_pidfiles(f: &Fx, script: &str) -> (NodeSpec, PathBuf, PathBuf) {
     let bg = f.path("bg.pid");
@@ -914,7 +915,7 @@ fn a_cooperative_command_stops_on_term_within_the_grace() {
     let (n, bg, leader) = with_pidfiles(
         &f,
         &crate::fixture_process::script(
-            "sleep 30 & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; wait",
+            "while [ -d \"${BGPID%/*}\" ]; do sleep 0.05; done & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; wait",
         ),
     );
     f.spec.nodes = vec![n];
@@ -1740,7 +1741,7 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(crate::fixture_process::script(
-            "sleep 60 & echo $! > \"$1\"; wait",
+            "while [ -d \"${1%/*}\" ]; do sleep 0.05; done & echo $! > \"$1\"; wait",
         ))
         .arg("sh")
         .arg(&bg)
@@ -2270,7 +2271,9 @@ fn a_descendant_left_behind_by_an_early_exit_is_stopped_before_the_result_is_fix
     let mut f = fx(vec![]);
     let (n, bg, _leader) = with_pidfiles(
         &f,
-        &crate::fixture_process::script("sleep 1000 & echo $! > \"$BGPID\"; exit 0"),
+        &crate::fixture_process::script(
+            "while [ -d \"${BGPID%/*}\" ]; do sleep 0.05; done & echo $! > \"$BGPID\"; exit 0",
+        ),
     );
     f.spec.nodes = vec![n];
     f.spec.term_grace_ms = 500;
@@ -2608,9 +2611,10 @@ fn a_real_nested_cli_runs_under_its_step_and_shares_the_ledger() {
         let started = home.path().join("started");
         let release = home.path().join("release");
         let inner = format!(
-            "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+            "touch {}; while [ ! -e {} ] && [ -d '{guard}' ]; do sleep 0.05; done",
             started.display(),
-            release.display()
+            release.display(),
+            guard = home.path().display()
         );
         let extra = BTreeMap::from([
             ("BELT_TEST_CLI".to_string(), cli.display().to_string()),

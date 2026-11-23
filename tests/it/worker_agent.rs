@@ -609,9 +609,10 @@ fn lines(p: &Path) -> usize {
 pub(crate) fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
     let (marker, pidfile) = (f.path("starts"), f.path("pid"));
     let script = crate::fixture_process::script(&format!(
-        "echo start >> {}; echo $$ > {}; exec sleep 300",
+        "echo start >> {}; echo $$ > {}; while [ -d '{guard}' ]; do sleep 0.05; done",
         marker.display(),
-        pidfile.display()
+        pidfile.display(),
+        guard = pidfile.parent().unwrap().display()
     ));
     (script, marker, pidfile)
 }
@@ -1233,8 +1234,9 @@ async fn a_secret_of_the_bundle_never_reaches_the_spool_the_journal_or_a_file_le
     // Printed whole, on both streams, and split over two writes.
     let script = format!(
         "cat .env; cat .env >&2; printf 'half=%s' s3cr3t-Value-; sleep 0.2; echo 0123456789; \
-         while [ ! -e {} ]; do sleep 0.05; done; echo end-of-output",
-        go.display()
+         while [ ! -e {} ] && [ -d '{guard}' ]; do sleep 0.05; done; echo end-of-output",
+        go.display(),
+        guard = go.parent().unwrap().display()
     );
     let mut p = payload(&script);
     p.has_secret_bundle = true;
