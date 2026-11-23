@@ -6,12 +6,14 @@
 //! its page and in the same blocking job, so a page of the result collection
 //! and the pruning never overlap (25.11). A pass continues the marked runs
 //! first, then marks the runs that became due, then deletes the records that
-//! belong to no run. It is bounded: 32 runs, 32 result paths, 32 input paths
-//! and 64 MiB of validation (the bounds of the deletions it calls), and row
-//! transactions of 1,000 rows.
+//! belong to no run. It is bounded: 32 runs, 32 result paths (claims and
+//! attempt directories), 32 input paths and 64 MiB of validation, each
+//! shared by all the runs of the pass, and row transactions of 1,000 rows.
 //!
 //! Each run goes through the steps in the order of the spec's table. No step
-//! keeps its position anywhere: a pass starts every marked run at step 2 and
+//! needs its position: the sweep of the attempt directories and the roots
+//! remember theirs in memory only to go on, and a pass starts every marked
+//! run at step 2 and
 //! each step finds what is left of its own work (a Vault bundle, a result
 //! reference or claim, a root or a file of the source store, a row), so a
 //! pass after a crash at any point does the rest and ends in the same state.
@@ -19,7 +21,7 @@ use super::*;
 use crate::results::retention::Cursor;
 use crate::results::store::{StoreError, LOCATOR_PREFIX};
 use crate::secrets::vault::Vault;
-use crate::source::retention::AbandonCursor;
+use crate::source::retention::{AbandonCursor, PruneBudget};
 use crate::source::SourceStore;
 use crate::storage::{RowsState, StorageError, ROWS_PER_TRANSACTION};
 
@@ -42,11 +44,20 @@ pub(super) struct Pruning {
     marked_after: Option<RunId>,
     /// Where the page of runs to judge continues.
     candidates_after: Option<RunId>,
-    /// Marked runs whose result directories this process already swept.
-    /// After the mark nothing writes a result of the run, so one sweep
-    /// under the exclusive pin is enough.
-    swept: std::collections::BTreeSet<RunId>,
+    /// Where the sweep of the result directories of a marked run stands,
+    /// so that a pass that reached its bound of paths continues it. After
+    /// the mark nothing writes a result of the run, so one sweep under the
+    /// exclusive pin is enough.
+    sweeps: std::collections::BTreeMap<RunId, Sweep>,
     roots: AbandonCursor,
+}
+
+/// The sweep of the attempt directories of one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sweep {
+    /// The last (task, attempt) whose directory went.
+    After((String, String)),
+    Done,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -80,8 +91,11 @@ impl Sample {
 }
 
 struct Budget {
+    /// Result paths (claims and attempt directories).
     paths: u32,
     transactions: u32,
+    /// Input paths and validation bytes.
+    inputs: PruneBudget,
 }
 
 #[cfg(test)]
@@ -145,6 +159,7 @@ pub(super) fn pass(
     let mut budget = Budget {
         paths: PATHS,
         transactions: TRANSACTIONS,
+        inputs: PruneBudget::pass(),
     };
     for run in &runs {
         match prune(
@@ -194,7 +209,7 @@ fn prune(
     wall: u64,
 ) -> anyhow::Result<bool> {
     // 2. The secret bundle in the parent Vault.
-    if !sources.prune_run_vault(owner, vault, run)?.done {
+    if !sources.prune_run_vault(owner, vault, run, &mut budget.inputs)?.done {
         return Ok(false);
     }
     fault("after_vault")?;
@@ -214,7 +229,7 @@ fn prune(
     }
     fault("after_results")?;
     // 4 and 5. The inputs, then the files and index rows named by the run.
-    let inputs = sources.prune_run_inputs(owner, run, &mut state.roots)?;
+    let inputs = sources.prune_run_inputs(owner, run, &mut state.roots, &mut budget.inputs)?;
     report.unknown += inputs.unknown;
     if !inputs.done {
         return Ok(false);
@@ -241,7 +256,7 @@ fn prune(
     // 8. The pin file goes last. A stop before this line leaves a pin of a
     // run without a row, which the scan at the next start removes.
     gc.forget(run);
-    state.swept.remove(run);
+    state.sweeps.remove(run);
     if let Some(pin) = pin {
         owner.prune_unpin(pin)?;
     }
@@ -295,31 +310,41 @@ fn results(
             return Ok(false);
         }
     }
-    if state.swept.contains(run) {
-        return Ok(true);
+    let mut after = match state.sweeps.get(run) {
+        Some(Sweep::Done) => return Ok(true),
+        Some(Sweep::After(after)) => after.clone(),
+        None => (String::new(), String::new()),
+    };
+    // Forgetting a position costs a sweep again, never a directory.
+    if state.sweeps.len() >= 2 * RUNS && !state.sweeps.contains_key(run) {
+        state.sweeps.clear();
     }
-    let mut after = (String::new(), String::new());
     loop {
-        let page = owner.run_attempts_page(run, after.clone(), ATTEMPTS)?;
+        if budget.paths == 0 {
+            state.sweeps.insert(run.clone(), Sweep::After(after));
+            return Ok(false);
+        }
+        let page = owner.run_attempts_page(run, after.clone(), budget.paths.min(ATTEMPTS))?;
+        let full = page.len() as u32 == budget.paths.min(ATTEMPTS);
         for (task, attempt) in &page {
+            // Each directory is one path of the pass's bound.
+            budget.paths -= 1;
             match files.remove(&format!("{LOCATOR_PREFIX}{attempt}")) {
                 Ok(()) => {}
                 Err(StoreError::Io(_)) => {
                     report.unknown += 1;
+                    state.sweeps.insert(run.clone(), Sweep::After(after));
                     return Ok(false);
                 }
                 Err(e) => return Err(e.into()),
             }
             after = (task.clone(), attempt.to_string());
         }
-        if page.len() < ATTEMPTS as usize {
+        if !full {
             break;
         }
     }
-    if state.swept.len() >= 2 * RUNS {
-        state.swept.clear();
-    }
-    state.swept.insert(run.clone());
+    state.sweeps.insert(run.clone(), Sweep::Done);
     Ok(true)
 }
 

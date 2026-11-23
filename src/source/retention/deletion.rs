@@ -10,7 +10,7 @@ mod prune;
 pub use abandon::{AbandonCursor, AbandonReport, AbandonScope};
 #[cfg(test)]
 pub use prune::set_prune_fault;
-pub use prune::PruneInputs;
+pub use prune::{PruneBudget, PruneInputs};
 
 type OpenedParent = (File, String, Vec<(u64, u64)>);
 const PAGE: usize = 32;

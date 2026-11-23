@@ -651,6 +651,60 @@ fn a_pass_is_bounded_and_the_next_one_continues() {
     f.nothing_left(&made);
 }
 
+/// The bound of result paths is the pass's, not each run's (spec 25.5):
+/// the directories of the attempts count against it with the claims, and
+/// the next pass continues the sweep where this one stopped.
+#[test]
+fn many_runs_share_the_bound_of_result_paths_of_a_pass() {
+    let mut f = Fixture::new();
+    let made: Vec<Made> = (0..20).map(|_| f.run(1, true)).collect();
+    let dirs = |f: &Fixture| {
+        made.iter()
+            .flat_map(|m| &m.attempts)
+            .filter(|attempt| f.state.join(format!("results/{attempt}")).exists())
+            .count()
+    };
+    assert_eq!(dirs(&f), 40);
+    f.pass().unwrap();
+    let report = f.pass().unwrap();
+    assert_eq!(report.marked, 20);
+    assert!(report.continuing > 0, "{report:?}");
+    // Claims and directories together: at most 32 paths in the pass.
+    assert!(40 - dirs(&f) <= 32, "{} directories went", 40 - dirs(&f));
+    assert_eq!(f.prune(), 20 - report.finished);
+    for m in &made {
+        f.nothing_left(m);
+    }
+}
+
+/// The bound of input paths is the pass's too: runs that each hold objects
+/// of their own share 32 paths a pass, and the next passes continue.
+#[test]
+fn many_runs_share_the_bound_of_input_paths_of_a_pass() {
+    let mut f = Fixture::new();
+    let made: Vec<Made> = (0..20)
+        .map(|i| {
+            std::fs::write(f.input.join("file"), format!("version {i}")).unwrap();
+            f.run(0, true)
+        })
+        .collect();
+    f.register();
+    let before = f.regular_files("sources/objects").len()
+        + f.regular_files("sources/manifests").len();
+    assert!(before > 32, "{before} input files");
+    f.pass().unwrap();
+    let report = f.pass().unwrap();
+    assert_eq!(report.marked, 20);
+    let after = f.regular_files("sources/objects").len()
+        + f.regular_files("sources/manifests").len();
+    assert!(before - after <= 32, "{} input files went", before - after);
+    assert!(report.continuing > 0, "{report:?}");
+    assert_eq!(f.prune(), 20 - report.finished);
+    for m in &made {
+        f.nothing_left(m);
+    }
+}
+
 /// The loop of the resident prunes: with the parent's stores it calls the
 /// pass after its page, and not while a version is on trial (25.1, 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -703,11 +757,16 @@ fn nothing_of_a_run_without_the_mark_is_deleted_by_any_step() {
     let (db, inputs) = (f.db(), f.inputs());
     assert!(inputs
         .sources
-        .prune_run_vault(db, &inputs.vault, &made.run)
+        .prune_run_vault(db, &inputs.vault, &made.run, &mut PruneBudget::pass())
         .is_err());
     assert!(inputs
         .sources
-        .prune_run_inputs(db, &made.run, &mut AbandonCursor::default())
+        .prune_run_inputs(
+            db,
+            &made.run,
+            &mut AbandonCursor::default(),
+            &mut PruneBudget::pass()
+        )
         .is_err());
     assert!(db.prune_claim_results(&made.run, 32, 9).is_err());
     assert!(db.prune_pending_results(&made.run, 32).is_err());

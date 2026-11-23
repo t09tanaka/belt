@@ -62,6 +62,7 @@ pub struct AbandonCursor {
     object: String,
 }
 
+#[derive(Debug)]
 pub(super) struct Budget {
     pub(super) paths: u32,
     pub(super) bytes: u64,

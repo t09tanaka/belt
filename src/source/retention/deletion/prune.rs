@@ -34,6 +34,26 @@ pub struct PruneInputs {
     pub errors: Vec<String>,
 }
 
+/// The input bound of one pass of the pruning (spec 25.5): 32 object and
+/// manifest paths and 64 MiB of validation, shared by every run of the pass.
+#[derive(Debug)]
+pub struct PruneBudget(Budget);
+
+impl PruneBudget {
+    /// The bound of one pass.
+    pub fn pass() -> Self {
+        Self(Budget {
+            paths: PAGE as u32,
+            bytes: BYTE_BUDGET,
+        })
+    }
+
+    /// True when the pass can claim no more input path.
+    pub fn exhausted(&self) -> bool {
+        self.0.paths == 0
+    }
+}
+
 impl Index {
     /// The index the pruning finds the import sessions of a run by (spec
     /// 25.5, 25.13). A new index has it from its first open; an index of
@@ -104,6 +124,7 @@ impl SourceStore {
         owner: &crate::storage::CoordinatorStore,
         vault: &Vault,
         run: &RunId,
+        budget: &mut PruneBudget,
     ) -> Result<PruneInputs> {
         let Some((_guard, c)) = self.prune_open(owner, run)? else {
             return Ok(PruneInputs {
@@ -111,8 +132,7 @@ impl SourceStore {
                 ..Default::default()
             });
         };
-        let mut bytes = BYTE_BUDGET;
-        let done = self.abandon_vault(owner, vault, &c, run, &mut bytes, "run_pruned")?;
+        let done = self.abandon_vault(owner, vault, &c, run, &mut budget.0.bytes, "run_pruned")?;
         Ok(PruneInputs {
             busy: !done,
             done,
@@ -129,7 +149,12 @@ impl SourceStore {
         owner: &crate::storage::CoordinatorStore,
         run: &RunId,
         cursor: &mut AbandonCursor,
+        budget: &mut PruneBudget,
     ) -> Result<PruneInputs> {
+        // The bound of the pass is reached: a later pass continues.
+        if budget.exhausted() {
+            return Ok(PruneInputs::default());
+        }
         let Some((_guard, mut c)) = self.prune_open(owner, run)? else {
             return Ok(PruneInputs {
                 busy: true,
@@ -143,15 +168,11 @@ impl SourceStore {
             .capture_owner(run.as_str())?
             .and_then(|row| row.root);
         let mut report = AbandonReport::default();
-        let mut budget = Budget {
-            paths: PAGE as u32,
-            bytes: BYTE_BUDGET,
-        };
         let gone = self.abandon_roots(
             &mut c,
             run,
             pending.as_deref(),
-            &mut budget,
+            &mut budget.0,
             cursor,
             &mut report,
         )?;
