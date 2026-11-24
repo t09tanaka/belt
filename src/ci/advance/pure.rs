@@ -79,6 +79,22 @@ pub fn never_ran(task: &str) -> Input {
     }
 }
 
+/// A task no worker could be placed for (`why`, spec 22.1): a failed job,
+/// not a cancelled one, so the jobs that need it settle as after any
+/// failure.
+pub fn unplaceable(task: &str, why: &str) -> Input {
+    Input::Fence {
+        task: task.to_string(),
+        status: JobStatus::Failure,
+        reason: why.to_string(),
+    }
+}
+
+/// Why the task of `spec` cannot be placed on any worker, if it cannot.
+pub fn unplaceable_reason(spec: &serde_json::Value) -> Option<&str> {
+    spec.pointer("/ci/unplaceable")?.as_str()
+}
+
 /// Why a task cannot be released: its inputs do not fit a payload.
 pub fn oversize_reason() -> String {
     format!("the results of the jobs it needs are larger than {MAX_RELEASED_INPUT_BYTES} bytes")
@@ -193,6 +209,11 @@ pub enum Release {
 }
 
 pub fn release_step(spec: &TaskSpec, inputs: &TaskInputs) -> Result<Release, serde_json::Error> {
+    // A task no worker resolves is never let into the queue, even when a
+    // retry opened it again (spec 22.1).
+    if let Some(why) = spec.ci.as_ref().and_then(|ci| ci.unplaceable.as_ref()) {
+        return Ok(Release::Refuse(why.clone()));
+    }
     if !inputs_fit(inputs) {
         return Ok(Release::Refuse(oversize_reason()));
     }
@@ -500,5 +521,29 @@ mod tests {
             release_step(held, &inputs(MAX_RELEASED_INPUT_BYTES)).unwrap(),
             Release::Refuse(oversize_reason())
         );
+        // A task no worker can be placed for is refused whatever its inputs
+        // are, even after a retry opened it again (spec 22.1).
+        let mut unplaceable = held.clone();
+        unplaceable.ci.as_mut().unwrap().unplaceable = Some("no worker".into());
+        assert_eq!(
+            release_step(&unplaceable, &small).unwrap(),
+            Release::Refuse("no worker".into())
+        );
+    }
+
+    /// A task no worker could be placed for is a failed job with the
+    /// refusal as its reason, not a cancelled one (spec 22.1).
+    #[test]
+    fn an_unplaceable_task_is_a_failure_with_its_reason() {
+        assert_eq!(
+            format!(
+                "{:?}",
+                unplaceable("t", "no coherent worker proposal (rust=1.89)")
+            ),
+            fence("t", "Failure", "no coherent worker proposal (rust=1.89)")
+        );
+        let spec = serde_json::json!({"ci": {"unplaceable": "why"}});
+        assert_eq!(unplaceable_reason(&spec), Some("why"));
+        assert_eq!(unplaceable_reason(&serde_json::json!({"ci": {}})), None);
     }
 }

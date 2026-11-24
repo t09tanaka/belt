@@ -139,48 +139,60 @@ impl CoordinatorStore {
             only.map(|task| task.to_string()),
             reason.to_string(),
         );
-        self.db.write(move |tx| {
-            let tasks: Vec<String> = {
-                let mut query = tx.prepare(
-                    "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
-                     AND t.cancel_requested_at_ms IS NULL
-                     AND json_type(t.spec_json,'$.ci')='object' AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
-                     ORDER BY t.created_at_ms,t.rowid",
-                )?;
-                let rows = query.query_map(params![run, only], |row| row.get(0))?;
-                rows.collect::<std::result::Result<_, _>>()?
-            };
-            let mut failed = Vec::new();
-            for task in tasks {
-                tx.execute(
-                    "UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?2) WHERE task_id=?1",
-                    params![task, reason],
-                )?;
-                let id = TaskId::parse(&task).map_err(|e| StorageError::Invalid(e.to_string()))?;
-                let expected = revision(tx, &run)?;
-                apply_cancel(
-                    tx,
-                    Target::Task(id.clone()),
-                    expected,
-                    RunId::generate().to_string(),
-                    at_ms,
-                    false,
-                )?;
-                common::append_event(
-                    tx,
-                    Some(&run),
-                    None,
-                    "ci_task_unrunnable",
-                    &serde_json::json!({ "task": task, "reason": reason }),
-                    at_ms,
-                )?;
-                failed.push(id);
-            }
-            Ok(failed)
-        })
+        self.db
+            .write(move |tx| fail_ci_tasks_on(tx, &run, only.as_deref(), &reason, at_ms))
     }
+}
 
+/// [`CoordinatorStore::fail_ci_tasks`] in the transaction `tx`.
+pub(super) fn fail_ci_tasks_on(
+    tx: &Connection,
+    run: &str,
+    only: Option<&str>,
+    reason: &str,
+    at_ms: u64,
+) -> Result<Vec<TaskId>> {
+    let tasks: Vec<String> = {
+        let mut query = tx.prepare(
+            "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
+             AND t.cancel_requested_at_ms IS NULL
+             AND json_type(t.spec_json,'$.ci')='object' AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL
+             AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
+             ORDER BY t.created_at_ms,t.rowid",
+        )?;
+        let rows = query.query_map(params![run, only], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut failed = Vec::new();
+    for task in tasks {
+        tx.execute(
+            "UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?2) WHERE task_id=?1",
+            params![task, reason],
+        )?;
+        let id = TaskId::parse(&task).map_err(|e| StorageError::Invalid(e.to_string()))?;
+        let expected = revision(tx, run)?;
+        apply_cancel(
+            tx,
+            Target::Task(id.clone()),
+            expected,
+            RunId::generate().to_string(),
+            at_ms,
+            false,
+        )?;
+        common::append_event(
+            tx,
+            Some(run),
+            None,
+            "ci_task_unrunnable",
+            &serde_json::json!({ "task": task, "reason": reason }),
+            at_ms,
+        )?;
+        failed.push(id);
+    }
+    Ok(failed)
+}
+
+impl CoordinatorStore {
     /// A transport request retains its original identity and expected revision.
     /// A run that has no row is refused (`NOT_FOUND`) and nothing is written
     /// (spec 25.4 (b)); the cancel of a capture in progress is
@@ -438,7 +450,7 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at},json_extract(t.spec_json,'$.ci.core_outcome') FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NOT NULL OR coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0) AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at},coalesce(json_extract(t.spec_json,'$.ci.core_outcome'),CASE WHEN json_extract(t.spec_json,'$.ci.unplaceable') IS NOT NULL AND a.attempt_id IS NULL THEN 'failure' END) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NOT NULL OR coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0) AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;

@@ -271,6 +271,13 @@ pub struct CiSpec {
     /// shown where the task is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrunnable: Option<String>,
+    /// No worker resolves the toolchains this task requires (spec 22.1):
+    /// the refusal, with the requirement. Such a task is never placed (it
+    /// has no bundle, and running it on whatever a worker has would not be
+    /// what it requires): the owner fails it in the transaction that queues
+    /// the run, and it counts as a failed job. The other tasks run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unplaceable: Option<String>,
     /// The task is a shard of this split job of the plan. The progression
     /// looks at the run until the job is joined
     /// (`CoordinatorStore::ci_waiting_runs`).

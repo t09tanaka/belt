@@ -6232,25 +6232,138 @@ async fn ci_accepts_an_alias_the_registry_resolves_beside_one_nothing_resolves()
     shutdown(&load(&spec)).await;
 }
 
-/// A range of a setup step that neither a registry resolves nor this host's
-/// own tool is in is refused when the run is submitted, with the words of a
-/// plain command, also when another job of the run names an alias: nothing is
-/// queued and no step runs.
+/// A job of a setup step whose range neither a registry resolves nor this
+/// host's own tool is in.
+fn ci_node_job(id: &str, version: &str, more: &str) -> String {
+    format!("  {id}:\n{more}    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
+}
+
+/// A job with no toolchain requirement.
+fn ci_plain_job(id: &str, more: &str) -> String {
+    format!("  {id}:\n{more}    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/{id}\n")
+}
+
+/// The line of the report for the job `id`.
+fn ci_job<'a>(value: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    let jobs = value["result"]["jobs"].as_array().unwrap();
+    let named = |job: &&serde_json::Value| {
+        job["job"] == id || job["plan_task"].as_str().is_some_and(|t| t.ends_with(id))
+    };
+    jobs.iter()
+        .find(named)
+        .unwrap_or_else(|| panic!("no job {id}: {value}"))
+}
+
+/// Spec 22.1: a job no worker resolves the toolchains of does not stop the
+/// run. Every other job runs (one that requires nothing, and one whose
+/// alias is no requirement); that job fails without a step, with the
+/// refusal and what it requires as its reason; the run is a failure, not a
+/// cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ci_refuses_a_range_the_native_tool_does_not_satisfy() {
+async fn ci_runs_the_other_jobs_when_one_cannot_be_placed() {
     let (root, spec, input) = control_fixture();
     native_node_profile(root.path(), &spec, "20.11.1");
-    let job = |id: &str, version: &str| {
-        format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n      - run: node --version >> MARKS/{id}\n")
-    };
     let marks = ci_project(
         root.path(),
         &input,
-        &[job("range", "18"), job("alias", "lts/*")].concat(),
+        &[
+            ci_node_job("range", "18", ""),
+            ci_node_job("alias", "lts/*", ""),
+            ci_plain_job("plain", ""),
+        ]
+        .concat(),
     );
     let (code, value) = ci_output(&spec, &input).await;
-    assert_ne!(code, Some(0), "{value}");
     let text = value.to_string();
+    assert!(code.is_some_and(|code| code != 0), "{code:?} {text}");
+    assert_ne!(code, Some(belt::error::exit::CANCELLED), "{text}");
+    assert_eq!(value["ok"], false, "{text}");
+    assert_eq!(value["result"]["state"], "settled", "{text}");
+    assert_eq!(
+        value["result"]["snapshot"]["cancel_requested"], false,
+        "{text}"
+    );
+    let jobs = ci_jobs(&value);
+    assert_eq!(ci_job(&value, "range")["status"], "failure", "{text}");
+    assert_eq!(jobs["alias"].0, "success", "{text}");
+    assert_eq!(jobs["plain"].0, "success", "{text}");
+    assert_eq!(
+        ci_job(&value, "range")["reason"],
+        "toolchain resolve required: no coherent worker proposal (node=>=18.0.0 <19.0.0-0)",
+        "{text}"
+    );
+    assert!(ci_marks(&marks, "range").is_empty(), "a step ran anyway");
+    assert_eq!(ci_marks(&marks, "plain"), ["ran"]);
+    assert_eq!(ci_marks(&marks, "alias"), ["v20.11.1"]);
+    let attempts = ci_attempts(&spec, &value);
+    let placed: Vec<_> = attempts
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(t, _)| t.as_str())
+        .collect();
+    assert!(placed.iter().all(|t| !t.ends_with("range")), "{attempts:?}");
+    assert_eq!(placed.len(), 2, "{attempts:?}");
+    shutdown(&load(&spec)).await;
+}
+
+/// Spec 22.1: the jobs that need a job no worker can be placed for settle
+/// as after any failure: skipped, unless `if: always()` lets them run, and
+/// then they see the job as a failure. The run ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_settles_what_needs_a_job_that_cannot_be_placed_as_after_a_failure() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[
+            ci_node_job("range", "18", ""),
+            ci_plain_job("after", "    needs: range\n"),
+            ci_plain_job("last", "    needs: after\n"),
+            "  report:\n    needs: range\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"range was ${{ needs.range.result }}\" >> MARKS/report\n".to_string(),
+        ]
+        .concat(),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    let text = value.to_string();
+    assert!(code.is_some_and(|code| code != 0), "{code:?} {text}");
+    assert_ne!(code, Some(belt::error::exit::CANCELLED), "{text}");
+    assert_eq!(value["result"]["state"], "settled", "{text}");
+    let jobs = ci_jobs(&value);
+    assert_eq!(ci_job(&value, "range")["status"], "failure", "{text}");
+    assert_eq!(
+        jobs["after"],
+        ("skipped".to_string(), Some("needs failed".to_string())),
+        "{text}"
+    );
+    assert_eq!(jobs["last"].0, "skipped", "{text}");
+    assert_eq!(jobs["report"].0, "success", "{text}");
+    assert_eq!(ci_marks(&marks, "report"), ["range was failure"]);
+    for idle in ["range", "after", "last"] {
+        assert!(ci_marks(&marks, idle).is_empty(), "{idle} ran");
+    }
+    shutdown(&load(&spec)).await;
+}
+
+/// Spec 22.1: when no job of the run can be placed, nothing would run: the
+/// run is refused when it is submitted, with the refusal of the first job,
+/// and nothing is queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_refuses_a_run_of_which_no_job_can_be_placed() {
+    let (root, spec, input) = control_fixture();
+    native_node_profile(root.path(), &spec, "20.11.1");
+    let marks = ci_project(
+        root.path(),
+        &input,
+        &[
+            ci_node_job("range", "18", ""),
+            ci_node_job("other", "19", ""),
+        ]
+        .concat(),
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    let text = value.to_string();
+    assert_eq!(code, Some(76), "{text}");
     assert_eq!(value["ok"], false, "{text}");
     assert!(text.contains("environment_mismatch"), "{text}");
     assert!(
@@ -6260,7 +6373,7 @@ async fn ci_refuses_a_range_the_native_tool_does_not_satisfy() {
         "{text}"
     );
     assert!(ci_marks(&marks, "range").is_empty(), "a step ran anyway");
-    assert!(ci_marks(&marks, "alias").is_empty(), "a step ran anyway");
+    assert!(ci_marks(&marks, "other").is_empty(), "a step ran anyway");
     shutdown(&load(&spec)).await;
 }
 

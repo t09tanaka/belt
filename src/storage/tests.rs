@@ -2832,6 +2832,58 @@ fn queued(store: &CoordinatorStore) -> Vec<TaskId> {
     q.into_iter().map(|t| t.task_id).collect()
 }
 
+/// Spec 22.1: a CI task no worker resolves the toolchains of fails in the
+/// transaction that queues its run, with the refusal as its reason; it is
+/// never placed, it counts as a failed job (not a cancel), and the other
+/// tasks are queued as they are.
+#[test]
+fn an_unplaceable_ci_task_fails_as_its_run_is_queued_and_the_others_wait_to_run() {
+    use crate::service::completion::Target;
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let (ok, refused) = (TaskId::generate(), TaskId::generate());
+    let why = "toolchain resolve required: no coherent worker proposal (rust=>=1.89.0 <1.90.0-0)";
+    let specs = vec![
+        (ok.clone(), json!({ "ci": { "steps": 1 } })),
+        (
+            refused.clone(),
+            json!({ "ci": { "steps": 1, "unplaceable": why } }),
+        ),
+    ];
+    store.enqueue(&run, None, &json!({}), &specs, 5).unwrap();
+    assert_eq!(queued(&store), std::slice::from_ref(&ok));
+    let spec = |task: &TaskId| store.estimate_input(task).unwrap().unwrap().spec;
+    assert_eq!(spec(&refused)["ci"]["unrunnable"], why);
+    assert!(spec(&ok)["ci"].get("unrunnable").is_none());
+    let events = store.events_after(0, 100).unwrap();
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "ci_task_unrunnable")
+        .map(|e| (e.payload["task"].clone(), e.payload["reason"].clone()))
+        .collect();
+    assert_eq!(failed, [(json!(refused.to_string()), json!(why))]);
+    // The run failed of that task; nothing was cancelled.
+    let snapshot = store.completion(Target::Run(run.clone())).unwrap();
+    assert!(!snapshot.cancel_requested, "{snapshot:?}");
+    let failure = snapshot.first_compute_failure.unwrap();
+    assert_eq!(failure.task_id, refused);
+    assert_ne!(failure.exit_code, crate::error::exit::CANCELLED);
+    // Even opened again (a retry takes the cancel away), it is never placed.
+    let task = refused.to_string();
+    store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE task SET cancel_requested_at_ms=NULL WHERE task_id=?1",
+                [&task],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(queued(&store), [ok]);
+}
+
 fn seen(state: AttemptState, termination: Option<Termination>) -> Option<Seen> {
     Some(Seen {
         state,

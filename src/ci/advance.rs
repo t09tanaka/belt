@@ -26,7 +26,8 @@ mod pure;
 
 use pure::{
     all_joined, discovery_project, ended_input, is_held, join_failure, never_ran, plan_agrees,
-    release_step, result_of_kept, stop_step, timing_scope, Release, Stop,
+    release_step, result_of_kept, stop_step, timing_scope, unplaceable, unplaceable_reason,
+    Release, Stop,
 };
 pub use pure::{inputs_fit, standing, status_without_result, Standing, MAX_RELEASED_INPUT_BYTES};
 
@@ -436,7 +437,10 @@ fn ended(
         .as_ref()
         .map(|a| (a.termination.as_ref(), a.collection.as_deref()));
     Ok(match (standing(row.cancelled, attempt), &row.attempt) {
-        (Standing::NeverRan, _) => Some(never_ran(task)),
+        (Standing::NeverRan, _) => Some(match unplaceable_reason(&row.spec) {
+            Some(why) => unplaceable(task, why),
+            None => never_ran(task),
+        }),
         (Standing::Ended(outcome), Some(attempt)) => {
             let kept = store.persisted_artifacts(&attempt.attempt_id)?;
             let read = result_of_kept(&kept, RESULT_ARTIFACT, |digest| {

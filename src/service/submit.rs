@@ -341,14 +341,18 @@ pub(super) async fn freeze_resolved(
 ) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
     let (mut all, _) =
         freeze_resolved_each(context, owner, manifest, digest, requirements, None, guard).await?;
-    Ok(all.pop().flatten())
+    // A plain command is refused as a whole when nothing resolves it.
+    all.pop().transpose().map(Option::flatten)
 }
 
 /// [`freeze_resolved`] for the tasks of a CI plan, in plan order: each task
 /// carries the project's declarations and those of the `setup-*` steps of its
 /// own jobs (spec 22.1). Tasks that freeze to the same bundle are resolved
 /// once. The second value is the notices of the freeze: one line for each
-/// input of a setup step that is no requirement.
+/// input of a setup step that is no requirement. A task whose requirements
+/// no worker resolves is that refusal (spec 22.1): the run goes on without
+/// it. When that is every task of the plan, nothing would run, and the
+/// refusal of the first is the error of the submit.
 pub(super) async fn freeze_resolved_tasks(
     context: &Context,
     owner: &super::resident::Client,
@@ -359,14 +363,27 @@ pub(super) async fn freeze_resolved_tasks(
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
     let plan = Some(plan.clone());
-    freeze_resolved_each(context, owner, manifest, digest, requirements, plan, guard).await
+    let (tasks, notices) =
+        freeze_resolved_each(context, owner, manifest, digest, requirements, plan, guard).await?;
+    Ok((all_unplaceable(tasks)?, notices))
 }
 
-/// The bundle of each task, and the notices of the freeze.
-type Frozen = (
-    Vec<Option<crate::toolchain::contract::FrozenBundle>>,
-    Vec<String>,
-);
+/// The selections of the tasks of a run, or the refusal of the first task
+/// when no task of it can be placed.
+fn all_unplaceable(tasks: Vec<Selection>) -> Result<Vec<Selection>, ApiError> {
+    match tasks.iter().position(Result::is_ok) {
+        None if !tasks.is_empty() => Err(tasks.into_iter().find_map(Result::err).expect("a task")),
+        _ => Ok(tasks),
+    }
+}
+
+/// The toolchain selection of one task: its bundle (`None` when it requires
+/// nothing), or the refusal that no worker resolves its requirements. A
+/// refused task is never one that requires nothing.
+pub(crate) type Selection = Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError>;
+
+/// The selection of each task, and the notices of the freeze.
+type Frozen = (Vec<Selection>, Vec<String>);
 
 async fn freeze_resolved_each(
     context: &Context,
@@ -423,13 +440,7 @@ async fn resolve_each<Freeze, Freezing, Ask, Asking>(
     tasks: usize,
     freeze: Freeze,
     ask: Ask,
-) -> Result<
-    (
-        Vec<Option<crate::toolchain::contract::FrozenBundle>>,
-        Vec<crate::ci::toolchains::Notice>,
-    ),
-    ApiError,
->
+) -> Result<(Vec<Selection>, Vec<crate::ci::toolchains::Notice>), ApiError>
 where
     Freeze: Fn(Vec<Vec<crate::toolchain::versions::ToolId>>) -> Freezing,
     Freezing: std::future::Future<Output = Result<Bundles, ApiError>>,
@@ -442,11 +453,14 @@ where
     // What was already resolved: a bundle that comes back unchanged in a
     // later pass is not asked for again.
     let mut asked = Asked::default();
+    // The bundles nothing resolves, with the refusal: the task is refused by
+    // itself, and the next pass does not ask again.
+    let mut refused: Vec<(crate::toolchain::contract::FrozenBundle, ApiError)> = Vec::new();
     loop {
         // A freeze that fails after an alias was left out fails for a reason
         // of its own, and that is the error.
         let (frozen, aliases, notices, observed) = freeze(dropped.clone()).await?;
-        let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
+        let mut resolved: Vec<Selection> = Vec::new();
         let mut again = false;
         for (index, bundle) in frozen.iter().enumerate() {
             // The same unresolved bundle is the same question to the owner.
@@ -454,9 +468,13 @@ where
                 resolved.push(resolved[earlier].clone());
                 continue;
             }
+            if let Some((_, error)) = refused.iter().find(|(b, _)| Some(b) == bundle.as_ref()) {
+                resolved.push(Err(error.clone()));
+                continue;
+            }
             let unresolved = match asked.resolve(&ask, bundle.clone(), &observed).await {
                 Ok(bundle) => {
-                    resolved.push(bundle);
+                    resolved.push(Ok(bundle));
                     continue;
                 }
                 // No answer about the requirements leaves nothing out.
@@ -490,7 +508,14 @@ where
             }
             let open = left_out(open, &alone);
             if open.is_empty() {
-                return Err(unresolved);
+                // Nothing can be left out: this task is refused, by itself
+                // and with what it requires; the other tasks go on.
+                let unresolved = with_requirements(unresolved, bundle.as_ref());
+                if let Some(bundle) = bundle {
+                    refused.push((bundle.clone(), unresolved.clone()));
+                }
+                resolved.push(Err(unresolved));
+                continue;
             }
             for (other, drop) in frozen.iter().zip(dropped.iter_mut()) {
                 if other == bundle {
@@ -498,12 +523,26 @@ where
                 }
             }
             again = true;
-            resolved.push(None);
+            resolved.push(Ok(None));
         }
         if !again {
             return Ok((resolved, notices));
         }
     }
+}
+
+/// The refusal `error` of `bundle`, saying what the bundle requires.
+fn with_requirements(
+    mut error: ApiError,
+    bundle: Option<&crate::toolchain::contract::FrozenBundle>,
+) -> ApiError {
+    if let Some(bundle) = bundle {
+        let required = bundle.frozen.describe_requirements();
+        if !error.message.contains(&required) {
+            error.message = format!("{} ({required})", error.message);
+        }
+    }
+    error
 }
 
 /// Why a bundle was not resolved.
@@ -1151,6 +1190,9 @@ mod tests {
         )
     }
 
+    /// What a task was resolved to: its requirements, or the refusal.
+    type Described = Result<Option<String>, crate::error::ApiError>;
+
     /// What the owner says of a bundle that holds exactly these tools.
     type Verdict<'a> = dyn Fn(&[&str]) -> Option<super::Refusal> + 'a;
 
@@ -1165,7 +1207,7 @@ mod tests {
         verdict: &Verdict<'_>,
         unfrozen: Option<crate::error::ApiError>,
     ) -> (
-        Result<(Vec<Option<String>>, Vec<String>), crate::error::ApiError>,
+        Result<(Vec<Described>, Vec<String>), crate::error::ApiError>,
         Vec<String>,
     ) {
         use crate::toolchain::versions::ToolId;
@@ -1221,10 +1263,12 @@ mod tests {
             .unwrap();
         let result = runtime.block_on(super::resolve_each(2, freeze, ask));
         let result = result.map(|(resolved, notices)| {
-            let described = |bundle: &Option<crate::toolchain::contract::FrozenBundle>| {
-                bundle
-                    .as_ref()
-                    .map(|bundle| bundle.frozen.describe_requirements())
+            let described = |selection: &super::Selection| {
+                selection.clone().map(|bundle| {
+                    bundle
+                        .as_ref()
+                        .map(|bundle| bundle.frozen.describe_requirements())
+                })
             };
             (
                 resolved.iter().map(described).collect(),
@@ -1252,7 +1296,7 @@ mod tests {
         assert_eq!(
             result,
             Ok((
-                vec![Some("node=lts/*".to_string()), None],
+                vec![Ok(Some("node=lts/*".to_string())), Ok(None)],
                 strings(&["rust"])
             ))
         );
@@ -1264,19 +1308,25 @@ mod tests {
         );
         // One alias: it is left out with no question about it alone.
         let (result, asks) = resolve_steps(&[("rust", "stable")], no_rust, None);
-        assert_eq!(result, Ok((vec![None, None], strings(&["rust"]))));
+        assert_eq!(result, Ok((vec![Ok(None), Ok(None)], strings(&["rust"]))));
         assert_eq!(asks, ["rust=stable"]);
         // Nothing resolves either alias: both are left out.
         let nothing: &Verdict<'_> = &|_| Some(Refusal::Unresolved(refusal()));
         let (result, asks) = resolve_steps(&both, nothing, None);
-        assert_eq!(result, Ok((vec![None, None], strings(&["node", "rust"]))));
+        assert_eq!(
+            result,
+            Ok((vec![Ok(None), Ok(None)], strings(&["node", "rust"])))
+        );
         assert_eq!(asks.len(), 3);
         // Each resolves alone and the two do not together: nothing can be
-        // left out, and the refusal stands.
+        // left out, and the refusal stands for that task alone, with what it
+        // requires. The other task is resolved as before (spec 22.1).
         let apart: &Verdict<'_> =
             &|tools| (tools.len() > 1).then(|| Refusal::Unresolved(refusal()));
         let (result, asks) = resolve_steps(&both, apart, None);
-        assert_eq!(result, Err(refusal()));
+        let mut refused = refusal();
+        refused.message = format!("{} (node=lts/*, rust=stable)", refused.message);
+        assert_eq!(result, Ok((vec![Err(refused), Ok(None)], vec![])));
         assert_eq!(asks.len(), 3);
         // Three aliases, one of them refused alone: the other two stay, and
         // are asked for together once.
@@ -1285,7 +1335,7 @@ mod tests {
         assert_eq!(
             result,
             Ok((
-                vec![Some("go=stable, node=lts/*".to_string()), None],
+                vec![Ok(Some("go=stable, node=lts/*".to_string())), Ok(None)],
                 strings(&["rust"])
             ))
         );
@@ -1389,6 +1439,21 @@ mod tests {
                 "toolchain resolve required (rust=stable)"
             )))
         );
+    }
+
+    /// A run in which some task can be placed goes on without those that
+    /// cannot; a run in which none can is refused as a whole, with the
+    /// refusal of its first task (spec 22.1).
+    #[test]
+    fn only_a_run_of_which_no_task_can_be_placed_is_refused_as_a_whole() {
+        use super::all_unplaceable;
+        use crate::error::{ApiError, BlockedReason};
+        let refused = |n: &str| ApiError::blocked(BlockedReason::EnvironmentMismatch, n);
+        let some = vec![Err(refused("first")), Ok(None), Err(refused("third"))];
+        assert_eq!(all_unplaceable(some.clone()), Ok(some));
+        let none = vec![Err(refused("first")), Err(refused("second"))];
+        assert_eq!(all_unplaceable(none), Err(refused("first")));
+        assert_eq!(all_unplaceable(vec![Ok(None)]), Ok(vec![Ok(None)]));
     }
 
     #[test]

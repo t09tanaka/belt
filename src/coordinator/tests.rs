@@ -316,6 +316,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             hold,
             steps,
             unrunnable: None,
+            unplaceable: None,
             shard_group: None,
             joined: false,
             join_failure: None,

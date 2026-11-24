@@ -391,6 +391,11 @@ pub fn stage(
         let Some((_, spec)) = specs.iter_mut().find(|(name, _)| name == &task.id) else {
             continue;
         };
+        // A task no worker can be placed for is not probed: it fails as it
+        // is queued (spec 22.1).
+        if spec.ci.as_ref().is_some_and(|ci| ci.unplaceable.is_some()) {
+            continue;
+        }
         let mut probe = spec.clone();
         spec.ci.as_mut().expect("CI task").hold = true;
         let ci = probe.ci.as_mut().expect("specs came from a CI plan");

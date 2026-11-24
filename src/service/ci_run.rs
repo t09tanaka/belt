@@ -203,6 +203,7 @@ pub fn task_specs(
                     hold: distributed_matrix || !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
                     unrunnable: None,
+                    unplaceable: None,
                     shard_group: crate::ci::shards::group_of(plan, task)
                         .map(|group| group.id.clone()),
                     joined: false,
@@ -233,10 +234,20 @@ pub fn task_specs(
 /// `toolchains` is in the order of the plan's tasks, as `specs` is.
 pub(crate) fn with_toolchains(
     specs: &mut [(String, TaskSpec)],
-    toolchains: Vec<Option<crate::toolchain::contract::FrozenBundle>>,
+    toolchains: Vec<super::submit::Selection>,
 ) {
-    for ((_, spec), bundle) in specs.iter_mut().zip(toolchains) {
-        spec.toolchains = bundle;
+    for ((_, spec), selection) in specs.iter_mut().zip(toolchains) {
+        match selection {
+            Ok(bundle) => spec.toolchains = bundle,
+            // No requirement is not what the task requires: it keeps none,
+            // carries the refusal, and is never placed (spec 22.1).
+            Err(refused) => {
+                spec.toolchains = None;
+                if let Some(ci) = spec.ci.as_mut() {
+                    ci.unplaceable = Some(refused.message);
+                }
+            }
+        }
     }
 }
 
@@ -740,7 +751,10 @@ fn job_report(
             &row.task_id,
             &ci.task.task_id,
             ci.unrunnable.as_deref(),
-            ci.core_outcome.as_deref(),
+            // A task no worker could be placed for failed (spec 22.1).
+            ci.core_outcome
+                .as_deref()
+                .or(ci.unplaceable.as_ref().map(|_| "failure")),
             result,
         ));
     }
@@ -894,7 +908,7 @@ mod tests {
         .unwrap();
         let bundle = FrozenBundle::seal_exact(frozen).unwrap();
         // Each task takes the bundle frozen for it, in plan order.
-        with_toolchains(&mut specs, vec![None, Some(bundle.clone())]);
+        with_toolchains(&mut specs, vec![Ok(None), Ok(Some(bundle.clone()))]);
         assert_eq!(specs.len(), 2);
         assert!(specs[0].1.toolchains.is_none());
         assert_eq!(specs[1].1.toolchains.as_ref(), Some(&bundle));
@@ -902,9 +916,24 @@ mod tests {
         bundle
             .validate_partial(&specs[1].1.manifest_digest)
             .unwrap();
-        with_toolchains(&mut specs, vec![Some(bundle.clone()), None]);
+        with_toolchains(&mut specs, vec![Ok(Some(bundle.clone())), Ok(None)]);
         assert_eq!(specs[0].1.toolchains.as_ref(), Some(&bundle));
         assert!(specs[1].1.toolchains.is_none());
+        assert!(specs[1].1.ci.as_ref().unwrap().unplaceable.is_none());
+        // A task no worker resolves keeps no bundle and carries the refusal
+        // (spec 22.1); the other task keeps its bundle.
+        let refused = ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "toolchain resolve required: no coherent worker proposal (rust=1.89)",
+        );
+        with_toolchains(&mut specs, vec![Ok(Some(bundle.clone())), Err(refused)]);
+        assert_eq!(specs[0].1.toolchains.as_ref(), Some(&bundle));
+        assert!(specs[0].1.ci.as_ref().unwrap().unplaceable.is_none());
+        assert!(specs[1].1.toolchains.is_none());
+        assert_eq!(
+            specs[1].1.ci.as_ref().unwrap().unplaceable.as_deref(),
+            Some("toolchain resolve required: no coherent worker proposal (rust=1.89)")
+        );
     }
 
     #[test]

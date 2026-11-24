@@ -437,6 +437,7 @@ mod tests {
                 hold: false,
                 steps: 1,
                 unrunnable: None,
+                unplaceable: None,
                 shard_group: None,
                 joined: false,
                 join_failure: None,
