@@ -470,15 +470,24 @@ impl Index {
     /// a publication (the unpack's or its own, waited for with a bound),
     /// the fill (tried, a busy clone sends its root to `clone_ref_retry`).
     /// Under it, the check of `clone_ref`, the git and the row's removal
-    /// here are one step. Lock order (each later lock is tried or bounded,
-    /// so no cycle waits): a publication takes the import lock, then the
-    /// shared source lock; the fill takes the shared source lock, then tries
-    /// the import lock; a drain holds the exclusive source lock and no
-    /// import lock; step 4 holds no source lock and tries the import lock
-    /// (its `held` and `done` only read and write the index). Git in a
-    /// clone (the gc of the next stage included) runs only under that
-    /// clone's import lock, so the lock files a killed git leaves are
-    /// removed under it.
+    /// here are one step. Lock order (review round 4, M-B; each lock taken
+    /// after another is tried or waited for with a bound, and a holder of
+    /// the exclusive lock waits for nothing, so no cycle waits): a
+    /// publication holds its source's lock, then waits for the shared
+    /// source lock, then waits with a bound for the import lock; the fill
+    /// takes the shared source lock, then tries the import lock; a drain
+    /// holds the exclusive source lock and no import lock; step 4 holds no
+    /// source lock and tries the import lock (its `held` and `done` only
+    /// read and write the index).
+    ///
+    /// Gits in a clone and their locks: under the import lock run step 4's
+    /// `update-ref -d`, the bundle unpack of a publication and the removal
+    /// of a discarded source's refs, the only writers of the
+    /// `refs/local-ci/{snapshots,index}/<source>` refs; under the clone's
+    /// own lock run `hold_clone_at`'s `checkout -f` and `settle`'s
+    /// `branch -D` and `worktree prune`; fast-worktree's add and remove
+    /// take neither. So after a killed git only the `.lock` of those
+    /// source refs is removed, never `packed-refs.lock` or `index.lock`.
     fn drop_refs(
         &self,
         rows: Vec<String>,

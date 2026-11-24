@@ -832,7 +832,8 @@ impl SourceStore {
     /// Whether source `id` is in the store: the index has the root
     /// `receive:<id>` and its `source` is `id` (spec 25.8 5b (b)). The file
     /// is not looked at, except that while the legacy registration is
-    /// pending a manifest file with no `m:` row counts as present. Call under
+    /// pending a manifest file with no `m:` row counts as present (unless
+    /// the registration abandoned its root). Call under
     /// a shared mutation lock (`_held`).
     pub fn received(&self, _held: &super::retention::Guard, id: &str) -> Result<bool> {
         if self.retention.received_row(id)? {
@@ -844,6 +845,11 @@ impl SourceStore {
         // (a manifest the legacy registration has not finished may have its
         // `m:` row already: its file decides, as before the registration)
         if !self.retention.legacy_queued(id)? && self.retention.has_object(&format!("m:{id}"))? {
+            return Ok(false);
+        }
+        // (review round 4, L-B: one the registration abandoned, its
+        // manifest invalid or a blob missing, is not here)
+        if self.retention.legacy_abandoned(id)? {
             return Ok(false);
         }
         Ok(self.inner.manifest_path(id).is_file())

@@ -1364,6 +1364,89 @@ fn a_gone_claim_completes_under_every_protection_and_its_holders_fetch_again() {
     }
 }
 
+/// Review round 4 (L-A): 40 undone claims whose files are there sort before
+/// a gone one; the first call reads 32 of them and completes nothing, the
+/// next goes on after its cursor and completes the gone one, and a short
+/// page leaves no cursor behind.
+#[test]
+fn present_claims_ahead_do_not_starve_a_gone_one() {
+    let (env, _fa, object, _, _) = gone_claim("after_unlink");
+    let mut c = env.receiver.retention.connect().unwrap();
+    let (raw, path): (String, String) = c
+        .query_row(
+            "SELECT c.claim_json, (SELECT path FROM object WHERE id LIKE 'b:%' AND id<>?1 LIMIT 1)
+             FROM source_delete_claim c",
+            [&object],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(env.receiver.root().join(&path).is_file());
+    let present: String = c
+        .query_row("SELECT id FROM object WHERE path=?1", [&path], |r| r.get(0))
+        .unwrap();
+    let mut claim: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    claim["object"] = present.into();
+    claim["path"] = path.into();
+    for i in 0..40 {
+        c.execute(
+            "INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,1,?2,0)",
+            params![format!("a{i:02}"), claim.to_string()],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        env.receiver.retention.complete_gone_claims(&mut c).unwrap(),
+        0
+    );
+    assert_eq!(
+        env.receiver.retention.complete_gone_claims(&mut c).unwrap(),
+        1
+    );
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM source_delete_claim WHERE object='{object}'"
+        )),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM meta WHERE key='gone_claim_cursor'"),
+        0
+    );
+}
+
+/// Review round 4 (L-C): a claim whose leaf cannot be shown gone never
+/// completes: its directory unreadable (EACCES), an ancestor replaced by
+/// another directory of the same name, or a symlink at the leaf's name.
+#[test]
+fn a_claim_whose_leaf_is_not_shown_gone_is_not_completed() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["eacces", "replaced", "symlink"] {
+        let (env, fa, _object, _, _) = gone_claim("after_unlink");
+        let parent = fa.parent().unwrap().to_path_buf();
+        match case {
+            "eacces" => {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            "replaced" => {
+                std::fs::rename(&parent, parent.with_extension("old")).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+            }
+            _ => std::os::unix::fs::symlink("/nonexistent", &fa).unwrap(),
+        }
+        let mut c = env.receiver.retention.connect().unwrap();
+        let done = env.receiver.retention.complete_gone_claims(&mut c).unwrap();
+        if case == "eacces" {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(done, 0, "{case}");
+        assert_eq!(
+            env.count("SELECT count(*) FROM source_delete_claim"),
+            1,
+            "{case}"
+        );
+    }
+}
+
 /// Review round 2 (M-a): the file goes while it is hashed (as after an
 /// unlink), and the retake is busy or the gate closes: the claim is not
 /// withdrawn, and a later pass finishes it.

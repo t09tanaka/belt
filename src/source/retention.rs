@@ -737,6 +737,15 @@ impl Index {
     /// root is complete. (Before the manifests are listed no registration
     /// has begun, and an `m:` row is a publication's, which has not
     /// finished.)
+    /// Whether the legacy registration left `receive:<id>` abandoned (its
+    /// manifest invalid, or a blob it names missing: review round 4, L-B).
+    pub(crate) fn legacy_abandoned(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND kind='abandoned')",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
     pub(crate) fn legacy_queued(&self, id: &str) -> Result<bool> {
         Ok(self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM legacy_queue WHERE name=?1)",
@@ -831,6 +840,7 @@ impl Index {
                 pages: 31,
                 loads: 1,
                 mark: true,
+                whole: true,
             };
             self.register_step(&root, "received", &id, options, &mut cache, manifest_limit)
         })();
@@ -1507,7 +1517,21 @@ impl Index {
                         "INSERT OR IGNORE INTO member VALUES(?1,?2)",
                         params![root, key],
                     )?;
-                    self.record_stat(&tx, &key, &path)?;
+                    if options.whole {
+                        // (a hole: the source would be `received` with a
+                        // blob missing; abandoned instead, it is fetched
+                        // again, `INPUT_MISSING`)
+                        let Some(bytes) = self.stat_bytes(&path)? else {
+                            return Err(InvalidManifest(format!(
+                                "source {} names blob {} that is not here",
+                                m.source_id, b.hash
+                            ))
+                            .into());
+                        };
+                        Self::record_bytes(&tx, &key, bytes)?;
+                    } else {
+                        self.record_stat(&tx, &key, &path)?;
+                    }
                 } else if let Some(child) =
                     &m.submodules[position - m.object_manifest.entries.len()].source_id
                 {
@@ -1909,6 +1933,10 @@ struct Step {
     pages: u32,
     loads: u32,
     mark: bool,
+    /// Review round 4 (L-B): every blob the manifests name must be a
+    /// regular file here, or the manifest is invalid (the legacy
+    /// registration, whose manifests were received before the index).
+    whole: bool,
 }
 impl Step {
     fn pages(pages: u32) -> Self {
@@ -1916,6 +1944,7 @@ impl Step {
             pages,
             loads: u32::MAX,
             mark: false,
+            whole: false,
         }
     }
 }
@@ -5256,6 +5285,34 @@ mod tests {
             .unwrap();
         assert!(!listed);
     }
+    /// Review round 4 (L-B): a legacy manifest whose blob file is not here
+    /// is abandoned, not registered `received` with a hole, so it is not in
+    /// the store (fetched again, `INPUT_MISSING`) even while the
+    /// registration is pending.
+    #[test]
+    fn a_legacy_manifest_whose_blob_is_missing_is_abandoned() {
+        let f = Fixture::new();
+        let (receiver, m, _want, _bytes) = received_fixture(&f);
+        let id = m.source_id.clone();
+        assert!(!m.object_manifest.entries.is_empty());
+        let path = receiver.object_store().unwrap().manifest_path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        while !receiver.retention.register_legacy().unwrap() {}
+        let c = receiver.retention.connect().unwrap();
+        let kind: String = c
+            .query_row(
+                "SELECT kind FROM root WHERE id='receive:'||?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "abandoned");
+        assert!(!receiver.retention.received_row(&id).unwrap());
+        assert!(receiver.retention.legacy_registration_pending().unwrap());
+        let held = receiver.mutation_guard().unwrap();
+        assert!(!receiver.received(&held, &id).unwrap());
+    }
     /// A parent source with one submodule source, the parent's id sorting
     /// before the child's, both naming a repository.
     fn family(
@@ -5520,6 +5577,56 @@ mod tests {
             .unwrap());
         // (the fill writes the rows of both roots' clones)
         assert!(count("SELECT count(*) FROM clone_ref") >= rows);
+    }
+    /// Review round 4 (L-C): the same with the product's lock: the clones'
+    /// import locks (`Workspaces::try_import_lock`) held by other
+    /// descriptors (as an import does) send the roots to the retry; once
+    /// they are let go, the retry writes the rows.
+    #[test]
+    fn the_clone_ref_fill_waits_for_a_real_import_lock_held_elsewhere() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let count = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let rows = count("SELECT count(*) FROM clone_ref");
+        assert!(rows > 0);
+        c.execute_batch(
+            "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        let ws = crate::workspace::Workspaces::new(
+            f._root.path().join("ws"),
+            BTreeMap::new(),
+            std::sync::Arc::new(crate::workspace::CliFastWorktree::new(BTreeMap::new())),
+        );
+        let held: Vec<std::fs::File> = ["github:example/parent", "github:example/child"]
+            .iter()
+            .map(|r| {
+                let lock = ws.import_lock(r).unwrap();
+                lock.lock().unwrap();
+                lock
+            })
+            .collect();
+        let lock = |clone: &str| ws.try_import_lock(clone);
+        assert!(!receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &lock)
+            .unwrap());
+        assert_eq!(count("SELECT count(*) FROM clone_ref"), 0);
+        assert!(count("SELECT count(*) FROM clone_ref_retry") >= 1);
+        drop(held);
+        c.execute_batch("UPDATE clone_ref_retry SET next_ms=0;")
+            .unwrap();
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &lock)
+            .unwrap());
+        assert!(count("SELECT count(*) FROM clone_ref") >= rows);
+        assert_eq!(count("SELECT count(*) FROM clone_ref_retry"), 0);
     }
     #[test]
     fn the_clone_ref_fill_keeps_its_budget_and_its_place_on_a_transient_error() {

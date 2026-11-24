@@ -164,9 +164,9 @@ pub(super) fn run_bounded(
     let pid = spawned.id();
     let own = crate::platform::process_group_of(pid) == i32::try_from(pid).ok();
     let mut child = Bounded(Some(spawned), own);
-    // (review round 3, L-3: a git killed with SIGKILL leaves its lock files;
-    // the caller holds the clone's import lock, under which every belt git
-    // on the clone runs, so none of them is another's)
+    // (review round 4, M-A: a git killed with SIGKILL may leave the lock
+    // files of the refs it was writing; only step 4's own ref locks go, see
+    // [`remove_git_locks`])
     let end = |child: &mut Bounded| {
         if child.end() {
             remove_git_locks(git_dir, args);
@@ -250,24 +250,34 @@ impl Drop for Bounded {
     }
 }
 
-/// After a git of [`run_bounded`] was killed and reaped (review round 3,
-/// L-3): the lock files it may have left in `git_dir` go, `packed-refs.lock`,
-/// `index.lock` and `<ref>.lock` for each `refs/` argument, each only when
-/// it is a regular file below directories that are not links. Called only
-/// under the clone's import lock: every belt git on a clone (step 4, the gc
-/// of the next stage) runs under it, so no lock file there is another
-/// live git's.
+/// The ref directories whose `.lock` files a killed git of
+/// [`run_bounded`] leaves to be removed: the refs belt's receiving puts in a
+/// clone for a source (`refs/local-ci/{snapshots,index}/<source>`).
+const OWN_REF_DIRS: [&str; 2] = ["refs/local-ci/snapshots/", "refs/local-ci/index/"];
+
+/// After a git of [`run_bounded`] was killed and reaped (review round 4,
+/// M-A): the `<ref>.lock` it may have left for each argument naming a ref
+/// of [`OWN_REF_DIRS`] (one plain name below it) goes, only when it is a
+/// regular file below directories that are not links. The caller holds the
+/// clone's import lock, and only holders of that lock write those refs:
+/// step 4 (`update-ref -d` here), the bundle unpack of a publication
+/// (`worker/blobs.rs` `unpack`) and the removal of a discarded source's refs
+/// (`worker/blobs.rs` `discard`). Other gits in a clone run without it (the
+/// `checkout -f` of `hold_clone_at` and `settle`'s `branch -D` and
+/// `worktree prune` under the clone's own lock, fast-worktree's add and
+/// remove), so `packed-refs.lock` and `index.lock` may be a live git's and
+/// are never removed: a stale `packed-refs.lock` makes step 4's git fail,
+/// and the row is tried again an hour later (`ref_retry`).
 fn remove_git_locks(git_dir: &Path, args: &[&str]) {
-    let mut names = vec!["packed-refs.lock".to_string(), "index.lock".to_string()];
-    names.extend(
-        args.iter()
-            .filter(|a| {
-                a.starts_with("refs/")
-                    && !a.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+    let names = args.iter().filter(|a| {
+        OWN_REF_DIRS.iter().any(|d| {
+            a.strip_prefix(d).is_some_and(|leaf| {
+                !leaf.is_empty() && leaf != "." && leaf != ".." && !leaf.contains('/')
             })
-            .map(|a| format!("{a}.lock")),
-    );
+        })
+    });
     for name in names {
+        let name = format!("{name}.lock");
         let mut dir = git_dir.to_path_buf();
         let parts: Vec<&str> = name.split('/').collect();
         let (leaf, parents) = parts.split_last().expect("a name");
@@ -424,21 +434,24 @@ wait"#,
         );
     }
 
-    /// Review round 3 (L-3): a git that ignores SIGTERM is killed and
-    /// reaped, and the lock files it left go (`packed-refs.lock`, the
-    /// `.lock` of the ref it was deleting); another file stays.
+    /// Review round 4 (M-A): a git that ignores SIGTERM is killed and
+    /// reaped, and the `.lock` of the source ref it was deleting goes; the
+    /// `packed-refs.lock` and `index.lock` another live git holds stay, as
+    /// does the lock of a ref outside step 4's own.
     #[test]
-    fn a_killed_git_leaves_no_lock_files() {
+    fn a_killed_git_leaves_only_its_own_ref_lock_removed() {
         let (dir, env) = fake_git(
             r#"trap '' TERM
-mkdir -p "$GIT_DIR/refs/a"
-: > "$GIT_DIR/packed-refs.lock"
+mkdir -p "$GIT_DIR/refs/local-ci/snapshots" "$GIT_DIR/refs/a"
+: > "$GIT_DIR/refs/local-ci/snapshots/src-1.lock"
 : > "$GIT_DIR/refs/a/b.lock"
-: > "$GIT_DIR/other.lock"
 : > "$GIT_DIR/../ready"
 while :; do sleep 1; done"#,
         );
         let repo = dir.path().join("repo");
+        // (another git, alive, holds these)
+        std::fs::write(repo.join("packed-refs.lock"), "").unwrap();
+        std::fs::write(repo.join("index.lock"), "").unwrap();
         let ready = dir.path().join("ready");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let stop = || ready.exists();
@@ -446,15 +459,21 @@ while :; do sleep 1; done"#,
             &env,
             &repo,
             dir.path(),
-            &["update-ref", "-d", "refs/a/b"],
+            &[
+                "update-ref",
+                "-d",
+                "refs/local-ci/snapshots/src-1",
+                "refs/a/b",
+            ],
             deadline,
             &stop,
         )
         .unwrap();
         assert_eq!(ended, None);
-        assert!(!repo.join("packed-refs.lock").exists());
-        assert!(!repo.join("refs/a/b.lock").exists());
-        assert!(repo.join("other.lock").exists());
+        assert!(!repo.join("refs/local-ci/snapshots/src-1.lock").exists());
+        assert!(repo.join("packed-refs.lock").exists());
+        assert!(repo.join("index.lock").exists());
+        assert!(repo.join("refs/a/b.lock").exists());
     }
 
     #[test]

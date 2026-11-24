@@ -437,14 +437,47 @@ impl Index {
     /// bytes are lost already, and the claim kept would fence the store's
     /// SDK. A claim that cannot be looked at, or whose file is there, is
     /// left to its own path. Returns how many completed.
+    ///
+    /// Review round 4 (L-A): the 32 are read after `meta`'s
+    /// `gone_claim_cursor` (`object` and `incarnation`, split by a newline),
+    /// so claims whose file is there cannot starve a gone one after them:
+    /// a full page moves the cursor to its last row, a short one (the end
+    /// of the claims) deletes it, so the next call starts over. One row at
+    /// most.
     pub(super) fn complete_gone_claims(&self, c: &mut Connection) -> Result<usize> {
-        let rows: Vec<String> = {
-            let mut s = c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
-            let rows = s.query_map([], |r| r.get(0))?;
+        const PAGE: usize = 32;
+        let cursor: Option<String> = c
+            .query_row(
+                "SELECT value FROM meta WHERE key='gone_claim_cursor'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (after, after_inc) = cursor
+            .as_deref()
+            .and_then(|v| v.split_once('\n'))
+            .and_then(|(o, i)| Some((o.to_string(), i.parse::<i64>().ok()?)))
+            .unwrap_or((String::new(), i64::MIN));
+        let rows: Vec<(String, i64, String)> = {
+            let mut s = c.prepare("SELECT object,incarnation,claim_json FROM source_delete_claim WHERE done=0 AND (object,incarnation)>(?1,?2) ORDER BY object,incarnation LIMIT ?3")?;
+            let rows = s.query_map(params![after, after_inc, PAGE as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
+        match rows.last() {
+            Some((object, incarnation, _)) if rows.len() == PAGE => {
+                c.execute(
+                    "INSERT INTO meta(key,value) VALUES('gone_claim_cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    [format!("{object}\n{incarnation}")],
+                )?;
+            }
+            _ => {
+                c.execute("DELETE FROM meta WHERE key='gone_claim_cursor'", [])?;
+            }
+        }
         let mut done = 0;
-        for raw in rows {
+        for (_, _, raw) in rows {
             let claim: Claim = serde_json::from_str(&raw)?;
             let Ok((parent, name, parents)) = self.open_claim_parent(&claim.object, &claim.path)
             else {
