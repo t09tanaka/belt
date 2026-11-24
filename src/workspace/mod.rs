@@ -211,6 +211,29 @@ impl Workspaces {
         open_lock(&root.join(format!("{name}.import.lock")))
     }
 
+    /// The import lock of the clone `clone` (a name `r-<16 hex>`), tried
+    /// without waiting: `None` when another holds it (review round 3, M-1:
+    /// the `clone_ref` fill writes its rows under it).
+    pub fn try_import_lock(&self, clone: &str) -> anyhow::Result<Option<File>> {
+        anyhow::ensure!(
+            clone.len() == 18
+                && clone.starts_with("r-")
+                && clone[2..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "not a clone name"
+        );
+        let root = self.clones_root();
+        std::fs::create_dir_all(&root)?;
+        let lock = open_lock(&root.join(format!("{clone}.import.lock")))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
     /// Step 4 of the received pass (spec 25.8 5b (e)), called with no source
     /// lock held: under the import lock of the clone `clone` (a name
     /// `r-<16 hex>`) taken without waiting, unless `held()` (the source was

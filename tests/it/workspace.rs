@@ -2074,6 +2074,119 @@ fn imported_refs_stop_ends_a_slow_git_and_keeps_the_row() {
         "{:?}",
         start.elapsed()
     );
+    // (review round 3, M-1: nothing the stopped row leaves blocks a later
+    // `clone_ref` writer: the import lock is free again; a forked child of
+    // a parallel test may hold a copy of its descriptor until its exec)
+    let free_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ws.try_import_lock(&clone).unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < free_by,
+            "the import lock stayed held"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Review round 3 (M-1): a publication of a source whose `ref_drop:` row
+/// exists races step 4. The publication writes its `clone_ref` row under
+/// the clone's import lock, only when the refs it counts on are there; it
+/// comes right after step 4 has checked `clone_ref` (inside `held`). Under
+/// the lock it waits for step 4 to end: the refs go, the row goes, and the
+/// publication, finding no refs, writes no `clone_ref` row (it is
+/// delivered again). Never a `clone_ref` row whose refs are gone.
+#[test]
+fn a_publication_racing_step_4_never_keeps_a_row_without_its_refs() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = Arc::new(f.workspaces(&fw));
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    f.git(repo.dir(), &["fetch", "-q", f.dir.to_str().unwrap(), &head]);
+    let source = format!("src-{}", "f".repeat(32));
+    let snapshot = format!("refs/local-ci/snapshots/{source}");
+    f.git(repo.dir(), &["update-ref", &snapshot, &head]);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let clone_ref = Arc::new(AtomicBool::new(false));
+    let ref_drop = std::cell::Cell::new(true);
+    let dir = repo.dir().to_path_buf();
+    let publish = {
+        let (ws, clone, clone_ref, dir, snapshot) = (
+            ws.clone(),
+            clone.clone(),
+            clone_ref.clone(),
+            dir.clone(),
+            snapshot.clone(),
+        );
+        move || {
+            // (the publication's bounded wait for the import lock)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let _lock = loop {
+                if let Some(lock) = ws.try_import_lock(&clone).unwrap() {
+                    break lock;
+                }
+                assert!(std::time::Instant::now() < deadline, "lock never free");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            let there = Command::new("git")
+                .args([
+                    "-C",
+                    dir.to_str().unwrap(),
+                    "rev-parse",
+                    "-q",
+                    "--verify",
+                    &snapshot,
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            if there {
+                clone_ref.store(true, Ordering::SeqCst);
+            }
+        }
+    };
+    let publisher = std::cell::RefCell::new(None);
+    let held = || -> anyhow::Result<bool> {
+        let seen = clone_ref.load(Ordering::SeqCst);
+        // the publication starts right after the check, and has 300 ms
+        // to finish before step 4 goes on
+        let t = std::thread::spawn(publish.clone());
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while !t.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        *publisher.borrow_mut() = Some(t);
+        Ok(seen)
+    };
+    let ok = ws
+        .drop_imported_refs(
+            &clone,
+            &source,
+            &held,
+            &|| {
+                ref_drop.set(false);
+                Ok(())
+            },
+            &|| false,
+        )
+        .unwrap();
+    assert!(ok);
+    publisher.borrow_mut().take().unwrap().join().unwrap();
+    let refs_there = !f.git(repo.dir(), &["for-each-ref", &snapshot]).is_empty();
+    let row = clone_ref.load(Ordering::SeqCst);
+    assert!(
+        (row && refs_there) || (!row && (ref_drop.get() || !refs_there)),
+        "clone_ref {row}, refs {refs_there}, ref_drop {}",
+        ref_drop.get()
+    );
+    assert!(!row || refs_there, "a clone_ref row whose refs are gone");
 }
 
 /// Review round 2 (L-c): a clone name that is a symlink (to a real clone)

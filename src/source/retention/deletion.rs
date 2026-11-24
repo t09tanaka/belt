@@ -431,6 +431,36 @@ impl Index {
         fault("after_large_claim")?;
         Ok(Some(claim))
     }
+    /// Review round 3 (H-1), under the exclusive lock and before any gate:
+    /// up to 32 undone claims whose file is gone (their ancestors open as
+    /// claimed, and no entry at the name) complete, protected or not: the
+    /// bytes are lost already, and the claim kept would fence the store's
+    /// SDK. A claim that cannot be looked at, or whose file is there, is
+    /// left to its own path. Returns how many completed.
+    pub(super) fn complete_gone_claims(&self, c: &mut Connection) -> Result<usize> {
+        let rows: Vec<String> = {
+            let mut s = c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
+            let rows = s.query_map([], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut done = 0;
+        for raw in rows {
+            let claim: Claim = serde_json::from_str(&raw)?;
+            let Ok((parent, name, parents)) = self.open_claim_parent(&claim.object, &claim.path)
+            else {
+                continue;
+            };
+            let gone = parents == claim.parents
+                && matches!(
+                    rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW),
+                    Err(rustix::io::Errno::NOENT)
+                );
+            if gone && self.drain(c, &claim, None).is_ok() {
+                done += 1;
+            }
+        }
+        Ok(done)
+    }
     /// Whether the file the large claim `claim` names is there now: its
     /// ancestors open and a plain file sits at its name. Absent, or
     /// anything that cannot be looked at, is `false` (the claim is kept).
@@ -540,7 +570,6 @@ impl Index {
         // claimed from)
         let own = claim.root.as_deref().unwrap_or("");
         let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0) OR (?2<>'' AND NOT EXISTS(SELECT 1 FROM root WHERE id=?2 AND kind='abandoned'))",params![claim.object,own],|r|r.get(0))?;
-        ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
         let opened = rustix::fs::openat(
@@ -554,6 +583,7 @@ impl Index {
         );
         match opened {
             Ok(fd) => {
+                ensure!(!protected, "source deletion claim still protected");
                 let file: File = fd.into();
                 ensure!(
                     Identity::of(&file)? == claim.leaf && claim.leaf.leaf(),
@@ -601,7 +631,10 @@ impl Index {
                 rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::empty())?;
                 fault("after_unlink")?;
             }
-            // Only this durable exact claim permits absence.
+            // Only this durable exact claim permits absence. The bytes are
+            // already lost, so the claim completes even while protected
+            // (review round 3, H-1): kept, it would protect nothing and
+            // fence the store's SDK for good. Its holders fetch again.
             Err(rustix::io::Errno::NOENT) => unlinking.set(true),
             Err(error) => return Err(error.into()),
         }
@@ -612,12 +645,10 @@ impl Index {
         ensure!(changed == 1, "source claim completion changed");
         // The file is gone: so is its object row, and its bytes leave the
         // total (spec 25.8 5b (c)). A later import inserts the row again.
-        if let Some(root) = &claim.root {
-            tx.execute(
-                "DELETE FROM member WHERE root=?1 AND object=?2",
-                params![root, claim.object],
-            )?;
-        }
+        // (every membership goes with the object: an unprotected claim has
+        // only its own; a protected one whose file was gone has others,
+        // and their `received` holders are detached, so they fetch again)
+        received::release_holders(&tx, &claim.object)?;
         super::Index::forget_object(&tx, &claim.object, "1")?;
         // The completed claim row is deleted, not kept as `done=1`: the
         // generation lives on in `publication.incarnation`, which this same

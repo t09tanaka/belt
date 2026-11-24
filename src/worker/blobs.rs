@@ -1615,6 +1615,19 @@ impl Incoming {
         let mut unpacked = None;
         // the clone's import lock when no bundle of this call took it
         let mut held = None;
+        // (review round 3, M-1: a root with a repository and no commit of
+        // its own still writes `clone_ref` rows for that clone at its
+        // publication, so the clone's import lock is held for it too,
+        // waited for with a bound; busy, the delivery is answered as busy
+        // and comes again)
+        if let (None, Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
+            let busy = format!("the clone of {repository_id} is busy");
+            held = Some(Self::wait_lock(
+                self.workspaces.import_lock(repository_id)?,
+                limits,
+                &busy,
+            )?);
+        }
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
             let repo = match Self::bundle_done(&dir)? {
                 Some(bundle) => {
@@ -1981,7 +1994,9 @@ impl BlobSink for Incoming {
         // The stage 5b fills of the rows made before it, and the claim rows
         // an older version kept, a bounded page each per tick (spec 25.8 5b
         // (c), (e), (h)3, (h)5): rows left from before need no restart.
-        let _ = self.store.fill_retention_pages();
+        let _ = self
+            .store
+            .fill_retention_pages(&|clone| self.workspaces.try_import_lock(clone));
         let _ = self.store.forget_completed_claims();
     }
 

@@ -586,7 +586,16 @@ impl Index {
     /// marked root is skipped without its manifest being read, so a recount
     /// reads the manifests of the unmarked roots only); a retry row of a
     /// root that was marked meanwhile is dropped.
-    pub(crate) fn fill_clone_refs(&self, limit: u32, budget: u64) -> Result<bool> {
+    pub(crate) fn fill_clone_refs(
+        &self,
+        limit: u32,
+        budget: u64,
+        import_lock: ImportLock<'_>,
+    ) -> Result<bool> {
+        // (the import locks taken, one per clone, held until the
+        // transaction is done)
+        let mut locks: std::collections::HashMap<String, std::fs::File> =
+            std::collections::HashMap::new();
         let mut c = self.connect()?;
         let now = crate::platform::clock::wall_ms() as i64;
         let cursor = Self::fill_cursor(&c, "clone_ref_fill")?;
@@ -653,12 +662,28 @@ impl Index {
             match outcome {
                 Outcome::Done(repository) => {
                     if let Some(repository) = repository {
-                        // (review round 2, L-a: a pair whose refs step 4 is
-                        // removing right now waits; its row's `done` orders
-                        // the two)
-                        if Self::refs_in_flight(&tx, root, repository)? {
-                            Self::defer(&tx, "clone_ref_retry", "root", root, now)?;
-                            continue;
+                        // (review round 3, M-1: under the clone's import
+                        // lock, tried; a busy clone waits for its retry)
+                        let clone = crate::workspace::plan::clone_dir_name(repository);
+                        let taken = if locks.contains_key(&clone) {
+                            Ok(None)
+                        } else {
+                            import_lock(&clone).map(Some)
+                        };
+                        match taken {
+                            Ok(None) => {}
+                            Ok(Some(Some(lock))) => {
+                                locks.insert(clone, lock);
+                            }
+                            Ok(Some(None)) => {
+                                Self::defer(&tx, "clone_ref_retry", "root", root, now)?;
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("source store clone_ref fill of {root}: {e:#}");
+                                Self::defer(&tx, "clone_ref_retry", "root", root, now)?;
+                                continue;
+                            }
                         }
                         tx.execute(
                             "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
@@ -1340,27 +1365,14 @@ impl Index {
             params![root, crate::platform::clock::wall_ms() as i64],
         )?;
         if let Some(repository) = repository {
-            // (review round 2, L-a: a root published without a bundle holds
-            // no import lock, so a pair whose refs step 4 is removing right
-            // now gets no row: its refs are going, as the row would not say)
+            // (review round 3, M-1: the caller holds the clone's import
+            // lock, as step 4 does from its check to its row's removal)
             c.execute(
-                "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,g.source,g.root FROM graph g WHERE g.root=?1
-                 AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key='ref_drop:'||?2||':'||g.source AND m.value='busy')",
+                "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
                 params![root, crate::workspace::plan::clone_dir_name(repository)],
             )?;
         }
         Ok(())
-    }
-    /// Whether step 4 is removing (outside the lock) the refs of one of the
-    /// sources of `root`'s graph from the clone of `repository`: its
-    /// `ref_drop:` row is marked `busy` from when it is read until it is
-    /// done or let go.
-    fn refs_in_flight(c: &Connection, root: &str, repository: &str) -> Result<bool> {
-        Ok(c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM graph g JOIN meta m ON m.key='ref_drop:'||?2||':'||g.source WHERE g.root=?1 AND m.value='busy')",
-            params![root, crate::workspace::plan::clone_dir_name(repository)],
-            |r| r.get(0),
-        )?)
     }
     fn register_step(
         &self,
@@ -1884,6 +1896,11 @@ impl SourceStore {
     }
 }
 
+/// Tries the import lock of the clone named (`r-<16 hex>`) without
+/// waiting: `Some(lock)` held while it lives, `None` when it is busy (review
+/// round 3, M-1: every writer of a clone's `clone_ref` holds it).
+pub(crate) type ImportLock<'a> = &'a dyn Fn(&str) -> Result<Option<std::fs::File>>;
+
 /// How far one call of `register_step` goes: `pages` pages of 32 entries
 /// and `loads` manifest reads; `mark` says the root is a published
 /// `received` root (time and `clone_ref` rows at its completion).
@@ -2247,6 +2264,10 @@ mod received_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// An import lock that is always free (a lock of its own).
+    pub(crate) fn free_lock(_: &str) -> Result<Option<std::fs::File>> {
+        Ok(Some(tempfile::tempfile()?))
+    }
     use crate::ids::{AttemptId, Digest, RunId, TaskId, WorkerId};
     use crate::source::{capture, capture_for_run, CaptureParams, SourceRequest};
     use crate::state::{AttemptState, Outcome, Termination};
@@ -5178,7 +5199,10 @@ mod tests {
             "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
         )
         .unwrap();
-        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         assert_eq!(refs(&c), expected);
     }
     #[test]
@@ -5322,7 +5346,10 @@ mod tests {
         // the first recount of the process runs once the fill is done
         while !receiver.retention.fill_bytes(1000).unwrap() {}
         while !(receiver.retention.fill_bytes(1000).unwrap()
-            & receiver.retention.fill_clone_refs(32, 64 << 20).unwrap()
+            & receiver
+                .retention
+                .fill_clone_refs(32, 64 << 20, &free_lock)
+                .unwrap()
             & receiver.retention.recount_bytes(1).unwrap())
         {}
         assert_eq!(receiver.store_bytes().unwrap(), Some(total));
@@ -5343,7 +5370,10 @@ mod tests {
         assert_eq!(receiver.store_bytes().unwrap(), None);
         // (an invalid total starts a recount at once)
         while !(receiver.retention.fill_bytes(1000).unwrap()
-            & receiver.retention.fill_clone_refs(32, 64 << 20).unwrap()
+            & receiver
+                .retention
+                .fill_clone_refs(32, 64 << 20, &free_lock)
+                .unwrap()
             & receiver.retention.recount_bytes(1).unwrap())
         {}
         assert_eq!(receiver.store_bytes().unwrap(), Some(total - want.size + 5));
@@ -5455,11 +5485,12 @@ mod tests {
             .unwrap();
         assert!(held);
     }
-    /// Review round 2 (L-a): the fill run again (the hourly recount) leaves
-    /// a pair whose refs step 4 is removing (`busy` row) alone and retries
-    /// its root; once the row is let go, the retry writes it.
+    /// Review round 3 (M-1): the fill run again (the hourly recount) finds
+    /// the clone's import lock busy (an import, or step 4, holds it): it
+    /// writes no row and retries the root; once the lock is free, the retry
+    /// writes it.
     #[test]
-    fn the_clone_ref_fill_waits_for_a_pair_step_4_is_removing() {
+    fn the_clone_ref_fill_waits_for_a_busy_import_lock() {
         let f = Fixture::new();
         let (receiver, parent, child, want, bytes) = family(&f);
         receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
@@ -5470,25 +5501,23 @@ mod tests {
         let count = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
         let rows = count("SELECT count(*) FROM clone_ref");
         assert!(rows > 0);
-        for repository in ["github:example/child", "github:example/parent"] {
-            c.execute(
-                "INSERT OR IGNORE INTO meta(key,value) SELECT DISTINCT 'ref_drop:'||?1||':'||source,'busy' FROM graph",
-                [crate::workspace::plan::clone_dir_name(repository)],
-            )
-            .unwrap();
-        }
         c.execute_batch(
             "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
         )
         .unwrap();
-        assert!(!receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        let busy = |_: &str| -> Result<Option<std::fs::File>> { Ok(None) };
+        assert!(!receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &busy)
+            .unwrap());
         assert_eq!(count("SELECT count(*) FROM clone_ref"), 0);
         assert!(count("SELECT count(*) FROM clone_ref_retry") >= 1);
-        c.execute_batch(
-            "DELETE FROM meta WHERE key>='ref_drop:' AND key<'ref_drop;'; UPDATE clone_ref_retry SET next_ms=0;",
-        )
-        .unwrap();
-        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        c.execute_batch("UPDATE clone_ref_retry SET next_ms=0;")
+            .unwrap();
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         // (the fill writes the rows of both roots' clones)
         assert!(count("SELECT count(*) FROM clone_ref") >= rows);
     }
@@ -5515,7 +5544,7 @@ mod tests {
         };
         let dir = receiver.root().join("manifests");
         set_mode(&dir, 0o000);
-        let refused = receiver.retention.fill_clone_refs(32, 64 << 20);
+        let refused = receiver.retention.fill_clone_refs(32, 64 << 20, &free_lock);
         set_mode(&dir, 0o755);
         // (M-c) the page goes on past roots it cannot read now; they wait
         // in `clone_ref_retry` and the fill is not done while they do
@@ -5525,7 +5554,10 @@ mod tests {
             .query_row("SELECT count(*) FROM clone_ref_retry", [], |r| r.get(0))
             .unwrap();
         assert_eq!(retried, 2);
-        assert!(!receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert!(!receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         c.execute("UPDATE clone_ref_retry SET attempts=8,next_ms=0", [])
             .unwrap();
         let state = f._root.path().join("state");
@@ -5537,8 +5569,14 @@ mod tests {
         .unwrap();
         assert_eq!(inspect_retry_failing(&state).unwrap(), (0, 2, 0));
         // a budget of one byte reads one manifest a page
-        assert!(!receiver.retention.fill_clone_refs(32, 1).unwrap());
-        assert!(receiver.retention.fill_clone_refs(32, 1).unwrap());
+        assert!(!receiver
+            .retention
+            .fill_clone_refs(32, 1, &free_lock)
+            .unwrap());
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 1, &free_lock)
+            .unwrap());
         let unused: i64 = c
             .query_row(
                 "SELECT count(*) FROM root WHERE kind='received' AND used_ms IS NULL",
@@ -5614,7 +5652,10 @@ mod tests {
         let step = |r: &SourceStore| {
             for _ in 0..100 {
                 let a = r.retention.fill_bytes(1000).unwrap();
-                let b = r.retention.fill_clone_refs(32, 64 << 20).unwrap();
+                let b = r
+                    .retention
+                    .fill_clone_refs(32, 64 << 20, &free_lock)
+                    .unwrap();
                 if r.retention.recount_bytes(1000).unwrap() && a && b {
                     return;
                 }
@@ -5730,10 +5771,16 @@ mod tests {
         };
         // the first pass marks the roots a publication does not (a carried one)
         restart();
-        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         // every root is marked: the recount's pass reads no manifest
         restart();
-        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         assert_eq!(
             receiver
                 .retention
@@ -5750,7 +5797,10 @@ mod tests {
         )
         .unwrap();
         restart();
-        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert!(receiver
+            .retention
+            .fill_clone_refs(32, 64 << 20, &free_lock)
+            .unwrap());
         assert_eq!(
             receiver
                 .retention

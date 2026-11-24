@@ -1240,59 +1240,127 @@ fn assert_kept_then_finished(env: &Env, file: &std::path::Path) {
     assert_eq!(env.store_bytes(), env.files_on_disk());
 }
 
-/// Review round 2 (M-a): a drain that failed after the unlink leaves the
-/// claim with its file gone; the next pass stops after the hash (or finds
-/// the root protected again): the claim is not withdrawn, and a later pass
-/// finishes it.
+/// A large claim of `drop:a:1` left with its file gone: the drain failed
+/// at `stage`, after the unlink. Returns the env, the file, the object
+/// and the source the blob came from.
+fn gone_claim(stage: &'static str) -> (Env, std::path::PathBuf, String, String, Vec<String>) {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    // (two more sources, made before the claim fences the store)
+    let more = vec![
+        env.source(&[("o", "other")], YOUNG),
+        env.source(&[("p", "parent")], YOUNG),
+    ];
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let object: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT object FROM member WHERE root='drop:a:1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    set_fault(Some(stage));
+    super::deletion::set_budget(1000);
+    let _ = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
+    set_fault(None);
+    super::deletion::set_budget(64 * 1024 * 1024);
+    assert!(!fa.exists(), "{stage}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim"),
+        1,
+        "{stage}"
+    );
+    (env, fa, object, a, more)
+}
+
+/// The gone claim completed while its protection stays: no claim, no
+/// row of the object, the SDK available again, the bytes as on disk.
+fn assert_gone_completed(env: &Env, object: &str, why: &str) {
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim"),
+        0,
+        "{why}"
+    );
+    for table in ["object", "member", "object_bytes"] {
+        let column = if table == "member" { "object" } else { "id" };
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM {table} WHERE {column}='{object}'"
+            )),
+            0,
+            "{why}: {table}"
+        );
+    }
+    let held = env.receiver.mutation_guard().unwrap();
+    held.ensure_sdk_available().expect(why);
+    assert_eq!(env.store_bytes(), env.files_on_disk(), "{why}");
+}
+
+/// Review round 3 (H-1): a drain that failed after the unlink leaves the
+/// claim with its file gone; the next pass completes it although the gate
+/// is closed (a pending root) or its root is protected again (it is no
+/// longer `abandoned`): the bytes are lost, so the claim protects nothing.
 #[test]
-fn a_large_claim_whose_file_is_gone_is_never_withdrawn() {
+fn a_large_claim_whose_file_is_gone_completes_while_protected() {
     for stage in ["after_unlink", "after_fsync", "before_completion"] {
-        for trigger in ["stop", "protected"] {
-            let mut env = Env::new();
-            let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
-            let fa = abandon_blob(&env, &a, "drop:a:1", true);
-            set_fault(Some(stage));
-            super::deletion::set_budget(1000);
-            let _ = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
-            set_fault(None);
-            super::deletion::set_budget(64 * 1024 * 1024);
-            assert!(!fa.exists(), "{stage}");
-            assert_eq!(
-                env.count("SELECT count(*) FROM source_delete_claim"),
-                1,
-                "{stage}"
-            );
-            let probe: StopProbe = match trigger {
-                "stop" => Box::new(|_, n| n >= 2),
-                _ => Box::new(|env, n| {
-                    if n == 2 {
-                        env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
-                    }
-                    false
-                }),
-            };
-            *env.on_stop.borrow_mut() = Some(probe);
-            let report = pass_budget(&env, 1000);
-            *env.on_stop.borrow_mut() = None;
-            if trigger == "protected" && report.unlinked == 1 {
-                // (its file already gone, the drain may complete it: no
-                // claim, no membership, nothing live without its file)
-                assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
-                assert_eq!(
-                    env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
-                    0
-                );
-                continue;
+        for trigger in ["gate", "protected"] {
+            let (env, _fa, object, _, _) = gone_claim(stage);
+            if trigger == "protected" {
+                env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
+            } else {
+                env.sql("INSERT INTO root(id,kind) VALUES('import:x','pending')");
             }
-            assert_eq!(report.unlinked, 0, "{stage} {trigger} {report:?}");
-            assert_eq!(
-                env.count("SELECT count(*) FROM source_delete_claim"),
-                1,
-                "{stage} {trigger}: withdrawn with its file gone"
-            );
-            env.sql("UPDATE root SET kind='abandoned' WHERE id='drop:a:1'");
-            assert_kept_then_finished(&env, &fa);
+            let report = pass_budget(&env, 1000);
+            assert_eq!(report.unlinked, 1, "{stage} {trigger} {report:?}");
+            assert_gone_completed(&env, &object, &format!("{stage} {trigger}"));
         }
+    }
+}
+
+/// Review round 3 (H-1): for each kind of protection, a claim whose file is
+/// gone completes while the protection stays, the SDK is available again,
+/// and the protector fetches the source again: a `received` holder (and a
+/// parent that carries it) is no longer in the store (its next attempt is
+/// refused with `INPUT_MISSING`), and a publication of a manifest naming
+/// the blob answers `InputGone` (`INPUT_MISSING`) instead of a source with
+/// a hole.
+#[test]
+fn a_gone_claim_completes_under_every_protection_and_its_holders_fetch_again() {
+    for kind in ["member", "pending", "graph", "own"] {
+        let (env, _fa, object, a, more) = gone_claim("after_unlink");
+        let (other, parent) = (more[0].clone(), more[1].clone());
+        match kind {
+            "member" => {
+                env.sql(&format!(
+                    "INSERT INTO member(root,object) VALUES('receive:{other}','{object}');
+                     INSERT INTO graph(root,source,done) VALUES('receive:{parent}','{other}',1)"
+                ));
+            }
+            "pending" => env.sql("INSERT INTO root(id,kind) VALUES('import:x','pending')"),
+            "graph" => env.sql(&format!(
+                "INSERT INTO graph(root,source,done) VALUES('receive:{parent}','zz',0)"
+            )),
+            _ => env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'"),
+        }
+        let report = pass_budget(&env, 1000);
+        // (the detached holders' own files may go in the same pass)
+        assert!(report.unlinked >= 1, "{kind} {report:?}");
+        assert_gone_completed(&env, &object, kind);
+        if kind == "member" {
+            assert!(!env.received(&other), "the holder fetches again");
+            assert!(!env.received(&parent), "its carrier fetches again");
+        } else {
+            assert!(env.received(&other) && env.received(&parent), "{kind}");
+        }
+        // (the source of the blob, published again, finds it missing)
+        let m = env.parent.manifest(&a).unwrap().unwrap();
+        let e = env.receiver.publish_received(&m, None).unwrap_err();
+        assert!(
+            crate::source::store::input_gone(&e).is_some(),
+            "{kind}: {e:#}"
+        );
     }
 }
 

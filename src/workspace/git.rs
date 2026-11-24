@@ -158,7 +158,20 @@ pub(super) fn run_bounded(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let mut child = Bounded(Some(cmd.spawn().context("cannot run git")?));
+    let spawned = cmd.spawn().context("cannot run git")?;
+    // (decided now, while the leader is alive and unreaped: its group id
+    // is its pid only if it is still the leader of the group it made)
+    let pid = spawned.id();
+    let own = crate::platform::process_group_of(pid) == i32::try_from(pid).ok();
+    let mut child = Bounded(Some(spawned), own);
+    // (review round 3, L-3: a git killed with SIGKILL leaves its lock files;
+    // the caller holds the clone's import lock, under which every belt git
+    // on the clone runs, so none of them is another's)
+    let end = |child: &mut Bounded| {
+        if child.end() {
+            remove_git_locks(git_dir, args);
+        }
+    };
     loop {
         if let Some(status) = child.try_wait()? {
             return status
@@ -167,11 +180,11 @@ pub(super) fn run_bounded(
                 .with_context(|| format!("git {} was killed", args.join(" ")));
         }
         if stop() {
-            child.end();
+            end(&mut child);
             return Ok(None);
         }
         if std::time::Instant::now() >= deadline {
-            child.end();
+            end(&mut child);
             bail!("git {} did not end in time", args.join(" "));
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -182,7 +195,9 @@ pub(super) fn run_bounded(
 pub(super) const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A git child of [`run_bounded`]: ended and reaped when dropped unreaped.
-struct Bounded(Option<std::process::Child>);
+/// The flag: whether the child leads a process group of its own, decided
+/// right after the spawn (review round 3, L-2).
+struct Bounded(Option<std::process::Child>, bool);
 
 impl Bounded {
     fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
@@ -199,13 +214,14 @@ impl Bounded {
     /// SIGTERM to its group (only when the group is the child's own: it was
     /// spawned as the leader of a new one, and the leader, unreaped, keeps
     /// the group id from being reused), [`TERM_GRACE`] for it to exit, then
-    /// SIGKILL to the group, and the reap.
-    fn end(&mut self) {
+    /// SIGKILL to the group, and the reap. `true`: it had not exited in
+    /// the grace, so SIGKILL ended it (its lock files may be left).
+    fn end(&mut self) -> bool {
         let Some(mut child) = self.0.take() else {
-            return;
+            return false;
         };
         let pid = child.id();
-        let own = crate::platform::process_group_of(pid) == i32::try_from(pid).ok();
+        let own = self.1;
         let signal = |sig| {
             if own {
                 crate::platform::signal_process_group(pid as i32, sig);
@@ -219,16 +235,50 @@ impl Bounded {
         while start.elapsed() < TERM_GRACE && !exited(pid) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let killed = !exited(pid);
         // (the leader may have exited, unreaped: what is left of its group
         // goes too)
         signal(libc::SIGKILL);
         let _ = child.wait();
+        killed
     }
 }
 
 impl Drop for Bounded {
     fn drop(&mut self) {
         self.end();
+    }
+}
+
+/// After a git of [`run_bounded`] was killed and reaped (review round 3,
+/// L-3): the lock files it may have left in `git_dir` go, `packed-refs.lock`,
+/// `index.lock` and `<ref>.lock` for each `refs/` argument, each only when
+/// it is a regular file below directories that are not links. Called only
+/// under the clone's import lock: every belt git on a clone (step 4, the gc
+/// of the next stage) runs under it, so no lock file there is another
+/// live git's.
+fn remove_git_locks(git_dir: &Path, args: &[&str]) {
+    let mut names = vec!["packed-refs.lock".to_string(), "index.lock".to_string()];
+    names.extend(
+        args.iter()
+            .filter(|a| {
+                a.starts_with("refs/")
+                    && !a.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+            })
+            .map(|a| format!("{a}.lock")),
+    );
+    for name in names {
+        let mut dir = git_dir.to_path_buf();
+        let parts: Vec<&str> = name.split('/').collect();
+        let (leaf, parents) = parts.split_last().expect("a name");
+        let plain = parents.iter().all(|p| {
+            dir.push(p);
+            std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())
+        });
+        let path = dir.join(leaf);
+        if plain && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -372,6 +422,39 @@ wait"#,
             !alive(&std::fs::read_to_string(&pid).unwrap()),
             "a child of git outlived it"
         );
+    }
+
+    /// Review round 3 (L-3): a git that ignores SIGTERM is killed and
+    /// reaped, and the lock files it left go (`packed-refs.lock`, the
+    /// `.lock` of the ref it was deleting); another file stays.
+    #[test]
+    fn a_killed_git_leaves_no_lock_files() {
+        let (dir, env) = fake_git(
+            r#"trap '' TERM
+mkdir -p "$GIT_DIR/refs/a"
+: > "$GIT_DIR/packed-refs.lock"
+: > "$GIT_DIR/refs/a/b.lock"
+: > "$GIT_DIR/other.lock"
+: > "$GIT_DIR/../ready"
+while :; do sleep 1; done"#,
+        );
+        let repo = dir.path().join("repo");
+        let ready = dir.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let stop = || ready.exists();
+        let ended = run_bounded(
+            &env,
+            &repo,
+            dir.path(),
+            &["update-ref", "-d", "refs/a/b"],
+            deadline,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(ended, None);
+        assert!(!repo.join("packed-refs.lock").exists());
+        assert!(!repo.join("refs/a/b.lock").exists());
+        assert!(repo.join("other.lock").exists());
     }
 
     #[test]

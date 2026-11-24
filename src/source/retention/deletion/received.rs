@@ -238,6 +238,8 @@ impl SourceStore {
                 report.parent = true;
                 return Ok(report);
             }
+            // (a claim whose file is gone completes whatever the gate)
+            report.unlinked += self.retention.complete_gone_claims(&mut c)?;
             if let Some(gate) = Gate::closed(&c)? {
                 report.gate = Some(gate);
                 return Ok(report);
@@ -438,12 +440,6 @@ impl Index {
     /// `clone_ref` fill (which writes rows without the import lock) is done
     /// and no root waits for its retry; their next tries without a row go.
     fn ref_rows(&self, c: &Connection, now: u64) -> Result<Vec<String>> {
-        // (no step 4 git runs while the lock is held: a `busy` mark is one a
-        // stop or a crash left)
-        c.execute(
-            "UPDATE meta SET value='' WHERE key>='ref_drop:' AND key<'ref_drop;' AND value='busy'",
-            [],
-        )?;
         c.execute(
             "DELETE FROM ref_retry WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=ref_retry.key)",
             [],
@@ -457,18 +453,9 @@ impl Index {
         if !filled {
             return Ok(Vec::new());
         }
-        let rows: Vec<String> = {
-            let mut s = c.prepare(REF_ROWS)?;
-            let rows = s.query_map(params![now as i64, CANDIDATES as i64], |r| r.get(0))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        // (review round 2, L-a: the `clone_ref` fill and a publication
-        // without the import lock leave these pairs alone until they are
-        // done or let go)
-        for key in &rows {
-            c.execute("UPDATE meta SET value='busy' WHERE key=?1", [key])?;
-        }
-        Ok(rows)
+        let mut s = c.prepare(REF_ROWS)?;
+        let rows = s.query_map(params![now as i64, CANDIDATES as i64], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Step 4 with the exclusive lock let go: each row under its clone's
@@ -477,6 +464,21 @@ impl Index {
     /// refs) and the row's removal. A busy lock or a failure keeps the row
     /// and gives it a next try ([`REF_BUSY_MS`], [`RETRY_MS`]), so the rows
     /// after it are not starved.
+    ///
+    /// Review round 3 (M-1): every writer of a clone's `clone_ref` rows
+    /// holds that clone's import lock (a file lock, so across processes):
+    /// a publication (the unpack's or its own, waited for with a bound),
+    /// the fill (tried, a busy clone sends its root to `clone_ref_retry`).
+    /// Under it, the check of `clone_ref`, the git and the row's removal
+    /// here are one step. Lock order (each later lock is tried or bounded,
+    /// so no cycle waits): a publication takes the import lock, then the
+    /// shared source lock; the fill takes the shared source lock, then tries
+    /// the import lock; a drain holds the exclusive source lock and no
+    /// import lock; step 4 holds no source lock and tries the import lock
+    /// (its `held` and `done` only read and write the index). Git in a
+    /// clone (the gc of the next stage included) runs only under that
+    /// clone's import lock, so the lock files a killed git leaves are
+    /// removed under it.
     fn drop_refs(
         &self,
         rows: Vec<String>,
@@ -530,7 +532,6 @@ impl Index {
                 Ok(false) => REF_BUSY_MS,
                 Err(_) => RETRY_MS,
             };
-            c.execute("UPDATE meta SET value='' WHERE key=?1", [&key])?;
             c.execute(
                 "INSERT INTO ref_retry(key,next_ms) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM meta WHERE key=?1)
                  ON CONFLICT(key) DO UPDATE SET next_ms=excluded.next_ms",
@@ -993,34 +994,83 @@ impl Index {
             [root],
             |r| r.get(0),
         )?;
-        let drop = format!("drop:{source}:{}", ulid::Ulid::new());
-        tx.execute(
-            "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',NULL)",
-            [&drop],
-        )?;
-        tx.execute(
-            "UPDATE member SET root=?2 WHERE root=?1",
-            params![root, drop],
-        )?;
-        // (every source the root's clones named: its own and those of the
-        // children it carried)
-        let refs: Vec<(String, String)> = {
-            let mut s = tx.prepare("SELECT DISTINCT clone,source FROM clone_ref WHERE root=?1")?;
-            let rows = s.query_map([root], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        tx.execute("DELETE FROM clone_ref WHERE root=?1", [root])?;
-        for (clone, named) in refs {
-            tx.execute(
-                "INSERT OR IGNORE INTO meta(key,value) SELECT 'ref_drop:'||?1||':'||?2,'' WHERE NOT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
-                params![clone, named],
-            )?;
-        }
-        tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
-        tx.execute("DELETE FROM root WHERE id=?1", [root])?;
+        move_to_drop(&tx, root, source)?;
         tx.commit()?;
         Ok(Some(u64::try_from(freed).unwrap_or(0)))
     }
+}
+
+/// `root` (the `received` root of `source`) leaves, in the caller's
+/// transaction: its members move to a new `abandoned` root
+/// `drop:<source>:<ulid>`, its graph and `clone_ref` rows go, and a
+/// `(clone, source)` with no `clone_ref` row left gets a `ref_drop:` row.
+fn move_to_drop(tx: &Connection, root: &str, source: &str) -> Result<()> {
+    let drop = format!("drop:{source}:{}", ulid::Ulid::new());
+    tx.execute(
+        "INSERT INTO root(id,kind,source) VALUES(?1,'abandoned',NULL)",
+        [&drop],
+    )?;
+    tx.execute(
+        "UPDATE member SET root=?2 WHERE root=?1",
+        params![root, drop],
+    )?;
+    // (every source the root's clones named: its own and those of the
+    // children it carried)
+    let refs: Vec<(String, String)> = {
+        let mut s = tx.prepare("SELECT DISTINCT clone,source FROM clone_ref WHERE root=?1")?;
+        let rows = s.query_map([root], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    tx.execute("DELETE FROM clone_ref WHERE root=?1", [root])?;
+    for (clone, named) in refs {
+        tx.execute(
+            "INSERT OR IGNORE INTO meta(key,value) SELECT 'ref_drop:'||?1||':'||?2,'' WHERE NOT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+            params![clone, named],
+        )?;
+    }
+    tx.execute("DELETE FROM graph WHERE root=?1", [root])?;
+    tx.execute("DELETE FROM root WHERE id=?1", [root])?;
+    Ok(())
+}
+
+/// Review round 3 (H-1): the file of `object` is gone and its claim
+/// completes, in the caller's transaction. Every `received` root that holds
+/// it, and every `received` root whose graph names one of those (a parent
+/// carrying it), leaves as a detach does: its source is no longer in the
+/// store, so the next attempt that names it is refused with
+/// `INPUT_MISSING` and the parent sends it again (spec 25.8 5b (b), (h)8).
+/// Then every membership of `object` goes (a `pending` root's publication
+/// checks its files again and answers `INPUT_MISSING` as well).
+pub(super) fn release_holders(tx: &Connection, object: &str) -> Result<()> {
+    let mut queue: Vec<(String, String)> = {
+        let mut s = tx.prepare(
+            "SELECT DISTINCT r.id,r.source FROM member m JOIN root r ON r.id=m.root
+             WHERE m.object=?1 AND r.kind='received' AND r.source IS NOT NULL",
+        )?;
+        let rows = s.query_map([object], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    while let Some((root, source)) = queue.pop() {
+        let parents: Vec<(String, String)> = {
+            let mut s = tx.prepare(
+                "SELECT DISTINCT r.id,r.source FROM graph g JOIN root r ON r.id=g.root
+                 WHERE g.source=?1 AND g.root<>?2 AND r.kind='received' AND r.source IS NOT NULL",
+            )?;
+            let rows = s.query_map(params![source, root], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let still: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND kind='received')",
+            [&root],
+            |r| r.get(0),
+        )?;
+        if still {
+            move_to_drop(tx, &root, &source)?;
+        }
+        queue.extend(parents);
+    }
+    tx.execute("DELETE FROM member WHERE object=?1", [object])?;
+    Ok(())
 }
 
 /// The root `root` has a member that could not be proven: step 0 reads it

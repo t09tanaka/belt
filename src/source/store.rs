@@ -869,7 +869,12 @@ impl SourceStore {
     /// leaves them for the next tick): 1,000 object rows of `bytes`, 32
     /// roots of `clone_ref`, 32 manifests of the legacy registration.
     /// Returns whether all three are finished.
-    pub fn fill_retention_pages(&self) -> Result<bool> {
+    /// `import_lock` tries a clone's import lock (the `clone_ref` fill
+    /// writes a clone's rows under it).
+    pub fn fill_retention_pages(
+        &self,
+        import_lock: super::retention::ImportLock<'_>,
+    ) -> Result<bool> {
         let _held = self.mutation_guard()?;
         // (each fill goes on its own: one that fails is logged, and the
         // others still run)
@@ -884,7 +889,7 @@ impl SourceStore {
         let recount = page("bytes recount", self.retention.recount_bytes(1000));
         let refs = page(
             "clone_ref fill",
-            self.retention.fill_clone_refs(32, 64 << 20),
+            self.retention.fill_clone_refs(32, 64 << 20, import_lock),
         );
         let legacy = page("legacy registration", self.retention.register_legacy());
         Ok(bytes && recount && refs && legacy)
