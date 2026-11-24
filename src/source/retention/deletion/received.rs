@@ -69,6 +69,8 @@ pub struct RefRow<'a> {
     pub held: &'a dyn Fn() -> Result<bool>,
     /// Removes the row (and its next try), in a short transaction.
     pub done: &'a dyn Fn() -> Result<()>,
+    /// The pass's `stop`: git still running is ended and the row stays.
+    pub stop: &'a dyn Fn() -> bool,
 }
 
 /// What one pass did.
@@ -406,6 +408,7 @@ impl Index {
             // (an older claim cannot be withdrawn; `doctor` shows it)
             return Ok(None);
         }
+        // (a claim whose file is gone stays for a later drain)
         self.withdraw_large(claim, now)?;
         Ok(Some(false))
     }
@@ -413,14 +416,21 @@ impl Index {
     /// The large claim `claim` is withdrawn, under a lock that keeps every
     /// drain out (the exclusive one, or the shared one): its file and
     /// membership stay, and its root waits for its next try. An older claim
-    /// (no root) stays.
-    fn withdraw_large(&self, claim: &Claim, now: u64) -> Result<()> {
+    /// (no root) stays, and so does a claim whose file is not seen there
+    /// right now (review round 2, M-a): a crash or a failed drain after the
+    /// unlink left it, and only its drain may end it (withdrawn, the object
+    /// would be live with no file). `true`: withdrawn.
+    fn withdraw_large(&self, claim: &Claim, now: u64) -> Result<bool> {
         let Some(root) = &claim.root else {
-            return Ok(());
+            return Ok(false);
         };
+        if !self.large_leaf_present(claim) {
+            return Ok(false);
+        }
         let mut c = self.connect()?;
         self.unclaim(&mut c, claim)?;
-        retry_root(&c, root, now)
+        retry_root(&c, root, now)?;
+        Ok(true)
     }
 
     /// Step 4 (spec (e)), under the exclusive lock: up to [`CANDIDATES`]
@@ -428,6 +438,12 @@ impl Index {
     /// `clone_ref` fill (which writes rows without the import lock) is done
     /// and no root waits for its retry; their next tries without a row go.
     fn ref_rows(&self, c: &Connection, now: u64) -> Result<Vec<String>> {
+        // (no step 4 git runs while the lock is held: a `busy` mark is one a
+        // stop or a crash left)
+        c.execute(
+            "UPDATE meta SET value='' WHERE key>='ref_drop:' AND key<'ref_drop;' AND value='busy'",
+            [],
+        )?;
         c.execute(
             "DELETE FROM ref_retry WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=ref_retry.key)",
             [],
@@ -441,9 +457,18 @@ impl Index {
         if !filled {
             return Ok(Vec::new());
         }
-        let mut s = c.prepare(REF_ROWS)?;
-        let rows = s.query_map(params![now as i64, CANDIDATES as i64], |r| r.get(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows: Vec<String> = {
+            let mut s = c.prepare(REF_ROWS)?;
+            let rows = s.query_map(params![now as i64, CANDIDATES as i64], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        // (review round 2, L-a: the `clone_ref` fill and a publication
+        // without the import lock leave these pairs alone until they are
+        // done or let go)
+        for key in &rows {
+            c.execute("UPDATE meta SET value='busy' WHERE key=?1", [key])?;
+        }
+        Ok(rows)
     }
 
     /// Step 4 with the exclusive lock let go: each row under its clone's
@@ -495,6 +520,7 @@ impl Index {
             let row = RefRow {
                 held: &held,
                 done: &done,
+                stop: inputs.stop,
             };
             let wait = match (inputs.refs)(clone, source, &row) {
                 Ok(true) => {
@@ -504,6 +530,7 @@ impl Index {
                 Ok(false) => REF_BUSY_MS,
                 Err(_) => RETRY_MS,
             };
+            c.execute("UPDATE meta SET value='' WHERE key=?1", [&key])?;
             c.execute(
                 "INSERT INTO ref_retry(key,next_ms) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM meta WHERE key=?1)
                  ON CONFLICT(key) DO UPDATE SET next_ms=excluded.next_ms",

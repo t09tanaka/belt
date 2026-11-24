@@ -563,7 +563,7 @@ impl Host for Machine {
             stop,
             refs: &|clone, source, row| {
                 self.workspaces
-                    .drop_imported_refs(clone, source, row.held, row.done)
+                    .drop_imported_refs(clone, source, row.held, row.done, row.stop)
             },
         }))
     }

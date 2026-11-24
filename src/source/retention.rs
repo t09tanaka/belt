@@ -653,6 +653,13 @@ impl Index {
             match outcome {
                 Outcome::Done(repository) => {
                     if let Some(repository) = repository {
+                        // (review round 2, L-a: a pair whose refs step 4 is
+                        // removing right now waits; its row's `done` orders
+                        // the two)
+                        if Self::refs_in_flight(&tx, root, repository)? {
+                            Self::defer(&tx, "clone_ref_retry", "root", root, now)?;
+                            continue;
+                        }
                         tx.execute(
                             "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
                             params![root, crate::workspace::plan::clone_dir_name(repository)],
@@ -1333,12 +1340,27 @@ impl Index {
             params![root, crate::platform::clock::wall_ms() as i64],
         )?;
         if let Some(repository) = repository {
+            // (review round 2, L-a: a root published without a bundle holds
+            // no import lock, so a pair whose refs step 4 is removing right
+            // now gets no row: its refs are going, as the row would not say)
             c.execute(
-                "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,source,root FROM graph WHERE root=?1",
+                "INSERT OR IGNORE INTO clone_ref(clone,source,root) SELECT ?2,g.source,g.root FROM graph g WHERE g.root=?1
+                 AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key='ref_drop:'||?2||':'||g.source AND m.value='busy')",
                 params![root, crate::workspace::plan::clone_dir_name(repository)],
             )?;
         }
         Ok(())
+    }
+    /// Whether step 4 is removing (outside the lock) the refs of one of the
+    /// sources of `root`'s graph from the clone of `repository`: its
+    /// `ref_drop:` row is marked `busy` from when it is read until it is
+    /// done or let go.
+    fn refs_in_flight(c: &Connection, root: &str, repository: &str) -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM graph g JOIN meta m ON m.key='ref_drop:'||?2||':'||g.source WHERE g.root=?1 AND m.value='busy')",
+            params![root, crate::workspace::plan::clone_dir_name(repository)],
+            |r| r.get(0),
+        )?)
     }
     fn register_step(
         &self,
@@ -5432,6 +5454,43 @@ mod tests {
             )
             .unwrap();
         assert!(held);
+    }
+    /// Review round 2 (L-a): the fill run again (the hourly recount) leaves
+    /// a pair whose refs step 4 is removing (`busy` row) alone and retries
+    /// its root; once the row is let go, the retry writes it.
+    #[test]
+    fn the_clone_ref_fill_waits_for_a_pair_step_4_is_removing() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        receiver
+            .publish_received_all(&[child.clone(), parent.clone()], None)
+            .unwrap();
+        let c = receiver.retention.connect().unwrap();
+        let count = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let rows = count("SELECT count(*) FROM clone_ref");
+        assert!(rows > 0);
+        for repository in ["github:example/child", "github:example/parent"] {
+            c.execute(
+                "INSERT OR IGNORE INTO meta(key,value) SELECT DISTINCT 'ref_drop:'||?1||':'||source,'busy' FROM graph",
+                [crate::workspace::plan::clone_dir_name(repository)],
+            )
+            .unwrap();
+        }
+        c.execute_batch(
+            "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
+        )
+        .unwrap();
+        assert!(!receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        assert_eq!(count("SELECT count(*) FROM clone_ref"), 0);
+        assert!(count("SELECT count(*) FROM clone_ref_retry") >= 1);
+        c.execute_batch(
+            "DELETE FROM meta WHERE key>='ref_drop:' AND key<'ref_drop;'; UPDATE clone_ref_retry SET next_ms=0;",
+        )
+        .unwrap();
+        assert!(receiver.retention.fill_clone_refs(32, 64 << 20).unwrap());
+        // (the fill writes the rows of both roots' clones)
+        assert!(count("SELECT count(*) FROM clone_ref") >= rows);
     }
     #[test]
     fn the_clone_ref_fill_keeps_its_budget_and_its_place_on_a_transient_error() {

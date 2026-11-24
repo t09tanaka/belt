@@ -125,49 +125,254 @@ pub(super) fn run_in_worktree(
 /// Git on the repository `git_dir` alone (`GIT_DIR` set, discovery not
 /// above `ceiling`), with hooks off (`core.hooksPath=/dev/null` through
 /// `GIT_CONFIG_*`, which a repository's own config cannot override) and
-/// killed at `limit`: its exit code. Output is not read.
+/// ended at `deadline` or when `stop` says so: its exit code, `None` when
+/// `stop` ended it. Output is not read. No `GIT_*` variable of `env` reaches
+/// it (review round 2: an inherited `GIT_OBJECT_DIRECTORY`,
+/// `GIT_INDEX_FILE` or `GIT_CONFIG_PARAMETERS` would point it elsewhere).
+/// It runs in a process group of its own, which is ended (SIGTERM, so git
+/// removes its lockfiles, then SIGKILL after [`TERM_GRACE`]) on every way
+/// out but its own exit: none of it outlives the call.
 pub(super) fn run_bounded(
     env: &Env,
     git_dir: &Path,
     ceiling: &Path,
     args: &[&str],
-    limit: std::time::Duration,
-) -> Result<i32> {
+    deadline: std::time::Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<i32>> {
+    use std::os::unix::process::CommandExt as _;
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(git_dir)
         .env_clear()
-        .envs(env)
+        .envs(env.iter().filter(|(k, _)| !k.starts_with("GIT_")))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_DIR", git_dir)
         .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().context("cannot run git")?;
-    let start = std::time::Instant::now();
+    let mut child = Bounded(Some(cmd.spawn().context("cannot run git")?));
     loop {
         if let Some(status) = child.try_wait()? {
             return status
                 .code()
+                .map(Some)
                 .with_context(|| format!("git {} was killed", args.join(" ")));
         }
-        if start.elapsed() >= limit {
-            // (our own child: never pid <= 1)
-            crate::platform::signal_pid(child.id(), libc::SIGKILL);
-            let _ = child.wait();
-            bail!("git {} took longer than {limit:?}", args.join(" "));
+        if stop() {
+            child.end();
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.end();
+            bail!("git {} did not end in time", args.join(" "));
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
+/// How long a git that was asked to end (SIGTERM) has before SIGKILL.
+pub(super) const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A git child of [`run_bounded`]: ended and reaped when dropped unreaped.
+struct Bounded(Option<std::process::Child>);
+
+impl Bounded {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.0.as_mut() else {
+            bail!("git was already ended");
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.0 = None;
+        }
+        Ok(status)
+    }
+
+    /// SIGTERM to its group (only when the group is the child's own: it was
+    /// spawned as the leader of a new one, and the leader, unreaped, keeps
+    /// the group id from being reused), [`TERM_GRACE`] for it to exit, then
+    /// SIGKILL to the group, and the reap.
+    fn end(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let pid = child.id();
+        let own = crate::platform::process_group_of(pid) == i32::try_from(pid).ok();
+        let signal = |sig| {
+            if own {
+                crate::platform::signal_process_group(pid as i32, sig);
+            } else {
+                // (our own child: never pid <= 1)
+                crate::platform::signal_pid(pid, sig);
+            }
+        };
+        signal(libc::SIGTERM);
+        let start = std::time::Instant::now();
+        while start.elapsed() < TERM_GRACE && !exited(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // (the leader may have exited, unreaped: what is left of its group
+        // goes too)
+        signal(libc::SIGKILL);
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Bounded {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Whether our child `pid` has exited, leaving it unreaped.
+fn exited(pid: u32) -> bool {
+    // SAFETY: waitid on our own child; WNOWAIT leaves it unreaped.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let observed = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // SAFETY: reads the field waitid filled in.
+    observed != 0 || unsafe { info.si_pid() } == pid as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `git` on PATH that runs `script` (sh), for [`run_bounded`].
+    fn fake_git(script: &str) -> (tempfile::TempDir, Env) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(dir.path().join("repo")).unwrap();
+        let git = bin.join("git");
+        std::fs::write(&git, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut perm = std::fs::metadata(&git).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&git, perm).unwrap();
+        let env: Env = [
+            ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
+            ("GIT_OBJECT_DIRECTORY".into(), "/elsewhere/objects".into()),
+            (
+                "GIT_CONFIG_PARAMETERS".into(),
+                "'core.hooksPath'='/x'".into(),
+            ),
+            ("GIT_INDEX_FILE".into(), "/elsewhere/index".into()),
+            ("GIT_WORK_TREE".into(), "/elsewhere".into()),
+        ]
+        .into_iter()
+        .collect();
+        (dir, env)
+    }
+
+    fn bounded(env: &Env, dir: &Path, within: u64, stop: &dyn Fn() -> bool) -> Result<Option<i32>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(within);
+        run_bounded(env, &dir.join("repo"), dir, &["show-ref"], deadline, stop)
+    }
+
+    /// Whether `pid` is still a live process (not gone, not a zombie).
+    fn alive(pid: &str) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    /// Review round 2 (Env): no inherited `GIT_*` reaches step 4's git; its
+    /// own are set.
+    #[test]
+    fn bounded_git_gets_no_inherited_git_variables() {
+        let (dir, env) = fake_git(r#"env | grep '^GIT_' > "$GIT_DIR/../env"; exit 1"#);
+        assert_eq!(
+            bounded(&env, dir.path(), 10_000, &|| false).unwrap(),
+            Some(1)
+        );
+        let seen = std::fs::read_to_string(dir.path().join("env")).unwrap();
+        for gone in [
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+        ] {
+            assert!(!seen.contains(gone), "{gone} reached git: {seen}");
+        }
+        assert!(seen.contains("GIT_CONFIG_VALUE_0=/dev/null"), "{seen}");
+        assert!(seen.contains("GIT_DIR="), "{seen}");
+    }
+
+    /// Review round 2 (M-b, L-b): `stop` ends a running git at once, with
+    /// SIGTERM first (git removes its lockfile), and nothing of it is left.
+    #[test]
+    fn bounded_git_ends_on_stop_with_sigterm_first() {
+        let (dir, env) = fake_git(
+            r#"trap 'rm -f "$GIT_DIR/x.lock"; exit 143' TERM
+: > "$GIT_DIR/x.lock"
+sleep 30 &
+echo $! > "$GIT_DIR/../pid"
+wait"#,
+        );
+        let lock = dir.path().join("repo").join("x.lock");
+        let pid = dir.path().join("pid");
+        let start = std::time::Instant::now();
+        let stop = || {
+            pid.exists()
+                && lock.exists()
+                && std::fs::read_to_string(&pid).is_ok_and(|p| !p.trim().is_empty())
+        };
+        assert_eq!(bounded(&env, dir.path(), 20_000, &stop).unwrap(), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!lock.exists(), "git's lockfile was left");
+        assert!(
+            !alive(&std::fs::read_to_string(&pid).unwrap()),
+            "a child of git outlived it"
+        );
+    }
+
+    /// Review round 2 (M-b): past its deadline a git that ignores SIGTERM is
+    /// killed with its whole group, and the call is an error.
+    #[test]
+    fn bounded_git_is_killed_with_its_group_past_the_deadline() {
+        let (dir, env) = fake_git(
+            r#"trap '' TERM
+sleep 30 &
+echo $! > "$GIT_DIR/../pid"
+wait"#,
+        );
+        let start = std::time::Instant::now();
+        assert!(bounded(&env, dir.path(), 300, &|| false).is_err());
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(300), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        let pid = dir.path().join("pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pid.exists() {
+            assert!(std::time::Instant::now() < deadline, "no pid written");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !alive(&std::fs::read_to_string(&pid).unwrap()),
+            "a child of git outlived it"
+        );
+    }
 
     #[test]
     fn the_version_is_read_from_what_git_prints() {

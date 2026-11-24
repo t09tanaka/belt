@@ -1219,3 +1219,129 @@ fn a_large_claim_of_a_root_no_longer_abandoned_is_withdrawn() {
     assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
     assert!(fa.exists());
 }
+
+/// Review round 2 (M-a): the large claim is kept (its file gone, its
+/// publication still claimed) and a pass with no trigger then finishes it:
+/// no claim, no membership, the bytes as on disk.
+fn assert_kept_then_finished(env: &Env, file: &std::path::Path) {
+    assert!(!file.exists());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 1);
+    assert_eq!(
+        env.count("SELECT count(*) FROM publication WHERE state='claimed'"),
+        1
+    );
+    let report = pass_budget(env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        0
+    );
+    assert_eq!(env.store_bytes(), env.files_on_disk());
+}
+
+/// Review round 2 (M-a): a drain that failed after the unlink leaves the
+/// claim with its file gone; the next pass stops after the hash (or finds
+/// the root protected again): the claim is not withdrawn, and a later pass
+/// finishes it.
+#[test]
+fn a_large_claim_whose_file_is_gone_is_never_withdrawn() {
+    for stage in ["after_unlink", "after_fsync", "before_completion"] {
+        for trigger in ["stop", "protected"] {
+            let mut env = Env::new();
+            let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+            let fa = abandon_blob(&env, &a, "drop:a:1", true);
+            set_fault(Some(stage));
+            super::deletion::set_budget(1000);
+            let _ = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
+            set_fault(None);
+            super::deletion::set_budget(64 * 1024 * 1024);
+            assert!(!fa.exists(), "{stage}");
+            assert_eq!(
+                env.count("SELECT count(*) FROM source_delete_claim"),
+                1,
+                "{stage}"
+            );
+            let probe: StopProbe = match trigger {
+                "stop" => Box::new(|_, n| n >= 2),
+                _ => Box::new(|env, n| {
+                    if n == 2 {
+                        env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
+                    }
+                    false
+                }),
+            };
+            *env.on_stop.borrow_mut() = Some(probe);
+            let report = pass_budget(&env, 1000);
+            *env.on_stop.borrow_mut() = None;
+            if trigger == "protected" && report.unlinked == 1 {
+                // (its file already gone, the drain may complete it: no
+                // claim, no membership, nothing live without its file)
+                assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+                assert_eq!(
+                    env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+                    0
+                );
+                continue;
+            }
+            assert_eq!(report.unlinked, 0, "{stage} {trigger} {report:?}");
+            assert_eq!(
+                env.count("SELECT count(*) FROM source_delete_claim"),
+                1,
+                "{stage} {trigger}: withdrawn with its file gone"
+            );
+            env.sql("UPDATE root SET kind='abandoned' WHERE id='drop:a:1'");
+            assert_kept_then_finished(&env, &fa);
+        }
+    }
+}
+
+/// Review round 2 (M-a): the file goes while it is hashed (as after an
+/// unlink), and the retake is busy or the gate closes: the claim is not
+/// withdrawn, and a later pass finishes it.
+#[test]
+fn a_large_claim_whose_file_went_during_the_hash_is_not_withdrawn() {
+    for trigger in ["busy", "gate"] {
+        let (env, fa, report) = large_pass(Box::new(move |env, n| {
+            if n == 2 {
+                let c = env.receiver.retention.connect().unwrap();
+                let path: String = c
+                    .query_row(
+                        "SELECT o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root='drop:a:1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                std::fs::remove_file(env.receiver.root().join(path)).unwrap();
+                if trigger == "busy" {
+                    *env.held.borrow_mut() = Some(env.receiver.retention.guard(false).unwrap());
+                } else {
+                    env.sql("UPDATE meta SET value='pending' WHERE key='legacy_registration'");
+                }
+            }
+            false
+        }));
+        assert_eq!(report.unlinked, 0, "{trigger} {report:?}");
+        assert!(report.busy || report.gate.is_some(), "{trigger} {report:?}");
+        env.sql("UPDATE meta SET value='done' WHERE key='legacy_registration'");
+        assert_kept_then_finished(&env, &fa);
+    }
+}
+
+/// Review round 2 (L-d, L5): a file of three hash chunks, the pass told to
+/// stop after the first chunk is read: the hash reads no further (the
+/// calls are 1 at the start, 2 and 3 before the first two reads, 4 after
+/// the retake), and the claim is withdrawn.
+#[test]
+fn a_large_hash_stops_between_its_chunks() {
+    let mut env = Env::new();
+    let big = "a".repeat(3 << 20);
+    let a = env.source(&[("f", &big)], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    *env.on_stop.borrow_mut() = Some(Box::new(|_, n| n >= 3));
+    let report = pass_budget(&env, 4 << 20);
+    *env.on_stop.borrow_mut() = None;
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert_eq!(env.stops.get(), 4, "the hash read on");
+    assert_withdrawn(&env, &fa);
+}

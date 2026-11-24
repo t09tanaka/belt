@@ -431,6 +431,20 @@ impl Index {
         fault("after_large_claim")?;
         Ok(Some(claim))
     }
+    /// Whether the file the large claim `claim` names is there now: its
+    /// ancestors open and a plain file sits at its name. Absent, or
+    /// anything that cannot be looked at, is `false` (the claim is kept).
+    fn large_leaf_present(&self, claim: &Claim) -> bool {
+        let Ok((parent, name, _)) = self.open_claim_parent(&claim.object, &claim.path) else {
+            return false;
+        };
+        match rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => {
+                rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile
+            }
+            Err(_) => false,
+        }
+    }
     /// With no lock held: hash the file the large claim `claim` names,
     /// opened through its checked ancestors and compared with the claimed
     /// identity before and after the read. `Ok(None)`: the file is absent

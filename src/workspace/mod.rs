@@ -48,7 +48,9 @@ use std::sync::Arc;
 // Git removes this private per-worktree ref with the worktree registration.
 // It keeps the admission snapshot reachable even after reproducing the original HEAD.
 /// How long one git of step 4 may run before it is killed.
-const REF_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+const REF_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The bound of one step 4 row, all its git calls together.
+const REF_ROW_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 const CLEANUP_COMMIT: &str = "refs/worktree/belt-cleanup";
 
 /// What kind of workspace this is, and so how it goes away.
@@ -217,14 +219,17 @@ impl Workspaces {
     /// `remove_imported_refs` does, but with hooks off and a time bound),
     /// then `done()`. `false`: the lock is busy (an import is running),
     /// nothing was done. A clone that is not there has no ref to remove; one
-    /// that cannot be looked at, or whose `.git` is not a directory, is an
-    /// error (the row stays).
+    /// that cannot be looked at, or that (or whose `.git`) is not a real
+    /// directory, is an error (the row stays). Git is bounded per call and
+    /// for the row as a whole, and ended when `stop` says so (`false`: the
+    /// row stays).
     pub fn drop_imported_refs(
         &self,
         clone: &str,
         source: &str,
         held: &dyn Fn() -> anyhow::Result<bool>,
         done: &dyn Fn() -> anyhow::Result<()>,
+        stop: &dyn Fn() -> bool,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             clone.len() == 18
@@ -248,7 +253,9 @@ impl Workspaces {
         let lock = match std::fs::symlink_metadata(&dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
-            Ok(_) => {
+            Ok(meta) => {
+                // (`symlink_metadata`: a symlink is not a directory)
+                anyhow::ensure!(meta.is_dir(), "the clone is not a directory");
                 anyhow::ensure!(
                     std::fs::symlink_metadata(&git_dir)?.is_dir(),
                     "the clone's .git is not a directory"
@@ -264,25 +271,22 @@ impl Workspaces {
             }
         };
         if lock.is_some() && !held()? {
+            let row_end = std::time::Instant::now() + REF_ROW_LIMIT;
+            let git = |args: &[&str]| {
+                let deadline = row_end.min(std::time::Instant::now() + REF_GIT_LIMIT);
+                git::run_bounded(&self.env, &git_dir, &root, args, deadline, stop)
+            };
             for r in [
                 format!("refs/local-ci/snapshots/{source}"),
                 format!("refs/local-ci/index/{source}"),
             ] {
-                let there = git::run_bounded(
-                    &self.env,
-                    &git_dir,
-                    &root,
-                    &["show-ref", "--verify", "-q", &r],
-                    REF_GIT_LIMIT,
-                )?;
+                let Some(there) = git(&["show-ref", "--verify", "-q", &r])? else {
+                    return Ok(false);
+                };
                 if there == 0 {
-                    let code = git::run_bounded(
-                        &self.env,
-                        &git_dir,
-                        &root,
-                        &["update-ref", "-d", &r],
-                        REF_GIT_LIMIT,
-                    )?;
+                    let Some(code) = git(&["update-ref", "-d", &r])? else {
+                        return Ok(false);
+                    };
                     anyhow::ensure!(code == 0, "git update-ref -d {r} failed ({code})");
                 } else {
                     anyhow::ensure!(there == 1, "git show-ref {r} failed ({there})");

@@ -1859,10 +1859,16 @@ fn imported_refs_go_only_under_a_free_import_lock() {
     held.lock().unwrap();
     let done = std::cell::Cell::new(0);
     let drop_refs = |clone: &str| {
-        ws.drop_imported_refs(clone, &source, &|| Ok(false), &|| {
-            done.set(done.get() + 1);
-            Ok(())
-        })
+        ws.drop_imported_refs(
+            clone,
+            &source,
+            &|| Ok(false),
+            &|| {
+                done.set(done.get() + 1);
+                Ok(())
+            },
+            &|| false,
+        )
     };
     assert!(!drop_refs(&clone).unwrap());
     assert_eq!(done.get(), 0);
@@ -1926,10 +1932,16 @@ fn imported_refs_go_without_the_clones_hooks() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let ok = ws
-                .drop_imported_refs(&clone, &source, &|| Ok(held), &|| {
-                    done.set(done.get() + 1);
-                    Ok(())
-                })
+                .drop_imported_refs(
+                    &clone,
+                    &source,
+                    &|| Ok(held),
+                    &|| {
+                        done.set(done.get() + 1);
+                        Ok(())
+                    },
+                    &|| false,
+                )
                 .unwrap();
             if ok {
                 break;
@@ -1975,10 +1987,16 @@ fn imported_refs_need_the_clones_own_git_directory() {
     std::fs::rename(&git, &kept).unwrap();
     std::fs::write(&git, "gitdir: elsewhere\n").unwrap();
     let done = std::cell::Cell::new(0);
-    let r = ws.drop_imported_refs(&clone, &source, &|| Ok(false), &|| {
-        done.set(done.get() + 1);
-        Ok(())
-    });
+    let r = ws.drop_imported_refs(
+        &clone,
+        &source,
+        &|| Ok(false),
+        &|| {
+            done.set(done.get() + 1);
+            Ok(())
+        },
+        &|| false,
+    );
     assert!(r.is_err());
     assert_eq!(done.get(), 0);
     // a clone that cannot be looked at (not "absent") is an error too
@@ -1991,12 +2009,96 @@ fn imported_refs_need_the_clones_own_git_directory() {
         std::fs::set_permissions(&clones, perm).unwrap();
     };
     mode(0o000);
-    let r = ws.drop_imported_refs(&clone, &source, &|| Ok(false), &|| {
-        done.set(done.get() + 1);
-        Ok(())
-    });
+    let r = ws.drop_imported_refs(
+        &clone,
+        &source,
+        &|| Ok(false),
+        &|| {
+            done.set(done.get() + 1);
+            Ok(())
+        },
+        &|| false,
+    );
     mode(0o700);
     assert!(r.is_err(), "{r:?}");
     assert_eq!(done.get(), 0);
     let _ = head;
+}
+
+/// Review round 2 (M-b): the pass stops while a step 4 git runs slowly:
+/// the git is ended at once and the row stays (`false`, no `done`).
+#[test]
+fn imported_refs_stop_ends_a_slow_git_and_keeps_the_row() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let repo = f.clone_of(&ws);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bin = f.root.join("slow-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(&git, "#!/bin/sh\nsleep 30 &\nwait\n").unwrap();
+    let mut perm = std::fs::metadata(&git).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&git, perm).unwrap();
+    let mut env = f.env();
+    let path = format!("{}:{}", bin.display(), env["PATH"]);
+    env.insert("PATH".into(), path);
+    let slow = Workspaces::new(f.state.clone(), env, fw.clone());
+    let source = format!("src-{}", "d".repeat(32));
+    let start = std::time::Instant::now();
+    let stop = || start.elapsed() > std::time::Duration::from_millis(200);
+    let done = std::cell::Cell::new(0);
+    let r = slow
+        .drop_imported_refs(
+            &clone,
+            &source,
+            &|| Ok(false),
+            &|| {
+                done.set(done.get() + 1);
+                Ok(())
+            },
+            &stop,
+        )
+        .unwrap();
+    assert!(!r);
+    assert_eq!(done.get(), 0);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// Review round 2 (L-c): a clone name that is a symlink (to a real clone)
+/// is refused, and the row stays.
+#[test]
+fn imported_refs_refuse_a_clone_that_is_a_symlink() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let repo = f.clone_of(&ws);
+    let clones = repo.dir().parent().unwrap().to_path_buf();
+    let link = "r-0123456789abcdef";
+    std::os::unix::fs::symlink(repo.dir(), clones.join(link)).unwrap();
+    let source = format!("src-{}", "e".repeat(32));
+    let done = std::cell::Cell::new(0);
+    let r = ws.drop_imported_refs(
+        link,
+        &source,
+        &|| Ok(false),
+        &|| {
+            done.set(done.get() + 1);
+            Ok(())
+        },
+        &|| false,
+    );
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(done.get(), 0);
 }
