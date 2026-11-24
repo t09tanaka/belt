@@ -1,6 +1,7 @@
 //! Acceptance tests of the deleting pass of received sources (spec 25.8 5b
 //! (d), (g)).
 use super::deletion::set_fault;
+use super::deletion::GC_FAILS_MAX;
 use super::*;
 use crate::source::{capture, CaptureParams, SourceRequest};
 use std::cell::RefCell;
@@ -174,10 +175,11 @@ impl Env {
                     .set(self.refs_under_ex.get() || self.receiver.retention.guard(false).is_err());
                 self.gc.borrow_mut().push(clone.to_string());
                 match self.gc_answer.get() {
-                    0 => Ok(Some(true)),
-                    1 => Ok(Some(false)),
-                    2 => Ok(None),
-                    _ => anyhow::bail!("gc failed"),
+                    0 => Ok(CloneGc::Ran),
+                    1 => Ok(CloneGc::Busy),
+                    2 => Ok(CloneGc::Stopped),
+                    3 => anyhow::bail!("gc failed"),
+                    _ => Ok(CloneGc::Refused),
                 }
             },
         })
@@ -830,7 +832,13 @@ fn a_stopped_pass_runs_no_section() {
             uses: &|_, _| Ok(SourceUse::Ended(None)),
             stop: &|| true,
             refs: &|_, _, _| Ok(true),
-            gc: &|_, stop| Ok(if stop() { None } else { Some(true) }),
+            gc: &|_, stop| {
+                Ok(if stop() {
+                    CloneGc::Stopped
+                } else {
+                    CloneGc::Ran
+                })
+            },
         })
         .unwrap();
     assert_eq!(report.sections, 0, "{report:?}");
@@ -1556,30 +1564,39 @@ fn the_clone_gc_runs_once_a_day_until_its_deadline() {
     assert!(!env.refs_under_ex.get());
     assert_eq!(row("r-1").unwrap(), format!("{NOW}\n{deadline}"));
     assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
-    // busy: r-2 is asked again at the next pass, unchanged
+    // busy: r-2 waits 10 minutes (review round 1, L5), then is asked again
     env.gc_answer.set(1);
     env.pass();
     env.pass();
-    assert_eq!(*env.gc.borrow(), ["r-1", "r-2", "r-2"]);
-    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
-    // stopped: the same
-    env.gc_answer.set(2);
+    assert_eq!(*env.gc.borrow(), ["r-1", "r-2"]);
+    let later = NOW + 600_000;
+    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}\n0\n{later}"));
+    env.wall.set(later);
     env.pass();
-    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
-    // a failure counts as a run: a day later
+    assert_eq!(*env.gc.borrow(), ["r-1", "r-2", "r-2"]);
+    // stopped: unchanged, asked again at the next pass
+    env.gc_answer.set(2);
+    let next = later + 600_000;
+    env.wall.set(next);
+    env.pass();
+    env.pass();
+    assert_eq!(env.gc.borrow().len(), 5);
+    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}\n0\n{next}"));
+    // a failure counts as a run: a day later; it is counted (L6)
     env.gc_answer.set(3);
     env.pass();
-    assert_eq!(row("r-2").unwrap(), format!("{NOW}\n{deadline}"));
+    assert_eq!(row("r-2").unwrap(), format!("{next}\n{deadline}\n1\n0"));
     let calls = env.gc.borrow().len();
     env.pass();
     assert_eq!(env.gc.borrow().len(), calls, "once a day per clone");
-    // a day later, one each
+    // a day later, one each; a run clears the failures
     env.gc_answer.set(0);
-    env.wall.set(NOW + DAY);
+    env.wall.set(next + DAY);
     env.pass();
     env.pass();
     env.pass();
     assert_eq!(env.gc.borrow()[calls..], ["r-1", "r-2"]);
+    assert_eq!(row("r-2").unwrap(), format!("{}\n{deadline}", next + DAY));
     // past the deadline both rows go, and no gc runs
     env.wall.set(deadline);
     env.pass();
@@ -1587,9 +1604,86 @@ fn the_clone_gc_runs_once_a_day_until_its_deadline() {
     assert_eq!(env.gc.borrow().len(), calls + 2);
 }
 
+/// Review round 1, L5: a clone whose import lock stays busy does not stay
+/// at the head: the next pass gives the other clone its turn.
+#[test]
+fn a_busy_clone_lets_the_others_have_their_gc() {
+    let env = Env::new();
+    env.gc_answer.set(1);
+    let deadline = NOW + 86_400_000;
+    env.sql(&format!(
+        "INSERT INTO meta(key,value) VALUES('gc:r-1','0\n{deadline}'),('gc:r-2','0\n{deadline}')"
+    ));
+    env.pass();
+    env.gc_answer.set(0);
+    env.pass();
+    assert_eq!(*env.gc.borrow(), ["r-1", "r-2"]);
+}
+
+/// Review round 1, L6: a gc that fails, or that `extensions.preciousObjects`
+/// keeps from running, is said in the report and counted in its row (up
+/// to a bound); `doctor` counts the clones that failed 3 times in a row.
+#[test]
+fn a_failing_clone_gc_is_reported_and_counted() {
+    const DAY: u64 = 86_400_000;
+    let env = Env::new();
+    let deadline = NOW + 10 * DAY;
+    env.sql(&format!(
+        "INSERT INTO meta(key,value) VALUES('gc:r-1','0\n{deadline}'),('gc:r-2','0\n{deadline}\n{}\n0')",
+        GC_FAILS_MAX
+    ));
+    let state = env.root.path().join("receiver");
+    let failing = || crate::source::retention::inspect_gc_failing(&state).unwrap();
+    assert_eq!(failing(), 1);
+    env.gc_answer.set(3);
+    let report = env.pass();
+    let f = report.gc_failed.unwrap();
+    assert_eq!((f.clone.as_str(), f.failures), ("r-1", 1));
+    assert!(f.message.contains("gc failed"), "{}", f.message);
+    env.gc_answer.set(4);
+    let report = env.pass();
+    let f = report.gc_failed.unwrap();
+    assert_eq!((f.clone.as_str(), f.failures), ("r-2", GC_FAILS_MAX));
+    assert!(f.message.contains("preciousObjects"), "{}", f.message);
+    for day in 1..3 {
+        env.wall.set(NOW + day * DAY);
+        env.pass();
+        env.pass();
+    }
+    assert_eq!(failing(), 2);
+    env.gc_answer.set(0);
+    env.wall.set(NOW + 3 * DAY);
+    assert_eq!(env.pass().gc_failed, None);
+    assert_eq!(failing(), 1);
+}
+
+/// Review round 1, L1: a deadline a little more than 15 days ahead (the
+/// clock stepped back) is brought to 15 days from now; the row stays.
+#[test]
+fn a_clock_step_back_keeps_the_gc_row() {
+    const DAY: u64 = 86_400_000;
+    let env = Env::new();
+    env.gc_answer.set(1);
+    env.sql(&format!(
+        "INSERT INTO meta(key,value) VALUES('gc:r-1','{NOW}\n{}')",
+        NOW + 15 * DAY + 1
+    ));
+    env.pass();
+    let value: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT value FROM meta WHERE key='gc:r-1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(value, format!("{NOW}\n{}", NOW + 15 * DAY));
+}
+
 /// Spec (e): a later ref removal moves the deadline and keeps the last gc;
-/// a row whose deadline is more than 15 days ahead (the clock went back)
-/// or that is not in the form goes.
+/// a row that is not in the form goes, one whose deadline is more than 15
+/// days ahead (the clock went back) stays, brought to 15 days.
 #[test]
 fn a_later_ref_removal_moves_the_gc_deadline() {
     const DAY: u64 = 86_400_000;
@@ -1615,6 +1709,6 @@ fn a_later_ref_removal_moves_the_gc_deadline() {
     assert_eq!(value, format!("{}\n{}", NOW - 1, NOW + 15 * DAY));
     assert_eq!(
         env.count("SELECT COUNT(*) FROM meta WHERE key LIKE 'gc:%'"),
-        1
+        2
     );
 }

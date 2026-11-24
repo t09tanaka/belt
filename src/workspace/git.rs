@@ -261,8 +261,8 @@ const OWN_REF_DIRS: [&str; 2] = ["refs/local-ci/snapshots/", "refs/local-ci/inde
 /// regular file below directories that are not links. The caller holds the
 /// clone's import lock, and only holders of that lock write those refs:
 /// step 4 (`update-ref -d` here), the bundle unpack of a publication
-/// (`worker/blobs.rs` `unpack`) and the removal of a discarded source's refs
-/// (`worker/blobs.rs` `discard`). Other gits in a clone run without it (the
+/// (`worker/blobs.rs` `unpack`) and the removal of the refs a refused or
+/// discarded bundle made (`worker/blobs.rs` `drop_refs`). Other gits in a clone run without it (the
 /// `checkout -f` of `hold_clone_at` and `settle`'s `branch -D` and
 /// `worktree prune` under the clone's own lock, fast-worktree's add and
 /// remove), so `packed-refs.lock` and `index.lock` may be a live git's and

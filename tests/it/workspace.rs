@@ -10,6 +10,7 @@ use crate::common;
 
 use belt::error::{BlockedReason, ErrorCode};
 use belt::ids::AttemptId;
+use belt::source::retention::CloneGc;
 use belt::source::{capture, CaptureParams, ObjectsRepo, SourceRequest, SourceStore};
 use belt::workspace::plan::FwFailure;
 use belt::workspace::{CliFastWorktree, FastWorktree, Workspace, WorkspaceKind, Workspaces};
@@ -2220,9 +2221,9 @@ fn imported_refs_refuse_a_clone_that_is_a_symlink() {
 /// without packing refs: a loose object no ref reaches that is older than
 /// 14 days goes, a newer one stays (a workspace may be about to point a ref
 /// at it), the refs stay loose, a stale `.lock` file is left alone and the
-/// clone directory stays ((g)19). A busy import lock, clone lock or main
-/// lock (fast-worktree holds it shared) skips it; a stop ends it; a clone
-/// that is not there has nothing to do.
+/// clone directory stays ((g)19). A busy import lock skips it, the clone's
+/// own lock and its main lock do not (review round 1, M2); a stop ends it;
+/// a clone that is not there has nothing to do.
 #[test]
 fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
     let f = fixture();
@@ -2270,31 +2271,18 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
     let stale = git_dir.join("refs/local-ci/snapshots/stale.lock");
     std::fs::write(&stale, "").unwrap();
     let gc = |stop: &dyn Fn() -> bool| ws.gc_clone(&clone, stop);
-    // busy: each lock skips it
+    // busy: the import lock skips it (review round 1, M2: it is the only
+    // lock the gc takes)
     let clones = repo.dir().parent().unwrap().to_path_buf();
-    for path in [
-        clones.join(format!("{clone}.import.lock")),
-        clones.join(format!("{clone}.lock")),
-    ] {
-        let held = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        held.lock().unwrap();
-        assert_eq!(gc(&|| false).unwrap(), Some(false), "{}", path.display());
-        drop(held);
-    }
-    let shared = std::fs::File::options()
+    let held = std::fs::File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(git_dir.join("belt-workspace.lock"))
+        .open(clones.join(format!("{clone}.import.lock")))
         .unwrap();
-    shared.lock_shared().unwrap();
-    assert_eq!(gc(&|| false).unwrap(), Some(false));
-    drop(shared);
+    held.lock().unwrap();
+    assert_eq!(gc(&|| false).unwrap(), CloneGc::Busy);
+    drop(held);
     assert!(old.1.exists());
     // (a child forked meanwhile may hold a copy of a lock's descriptor
     // until its exec: the locks are free within a bounded wait)
@@ -2302,7 +2290,7 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let r = gc(stop).unwrap();
-            if r != Some(false) {
+            if r != CloneGc::Busy {
                 return r;
             }
             assert!(std::time::Instant::now() < deadline, "a lock stayed busy");
@@ -2310,8 +2298,25 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         }
     };
     // stopped at once: nothing of it is left running
-    assert_eq!(until_free(&|| true), None);
-    assert_eq!(until_free(&|| false), Some(true));
+    assert_eq!(until_free(&|| true), CloneGc::Stopped);
+    // (the clone's own lock and its main lock, held shared as
+    // fast-worktree does, do not keep it from running)
+    let own = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(clones.join(format!("{clone}.lock")))
+        .unwrap();
+    own.lock().unwrap();
+    let shared = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(git_dir.join("belt-workspace.lock"))
+        .unwrap();
+    shared.lock_shared().unwrap();
+    assert_eq!(until_free(&|| false), CloneGc::Ran);
+    drop((own, shared));
     // (a newer one may have moved into a cruft pack: asked by id)
     assert!(!present(&old.0), "an object older than 14 days stayed");
     assert!(present(&fresh.0), "an object newer than 14 days went");
@@ -2323,7 +2328,236 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
     assert_eq!(
         ws.gc_clone(&format!("r-{}", "0".repeat(16)), &|| false)
             .unwrap(),
-        Some(true)
+        CloneGc::Ran
     );
     assert!(ws.gc_clone("../x", &|| false).is_err());
+}
+
+/// Whether `id` is in the repository `dir`.
+fn has_object(f: &Fixture, dir: &Path, id: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", id])
+        .current_dir(dir)
+        .env_clear()
+        .envs(f.env())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The loose object `id` of the repository whose Git directory is
+/// `git_dir`, made 30 days old.
+fn age_object(git_dir: &Path, id: &str) {
+    let path = git_dir.join("objects").join(&id[..2]).join(&id[2..]);
+    let month = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_modified(month)
+        .unwrap();
+}
+
+/// Review round 1, M1 and L8: belt's clone writes no reflog of the main
+/// checkout, and the gc expires that reflog first, so a commit only an old
+/// checkout reached goes; the reflog of a linked worktree is not touched.
+/// An old commit and tree a ref reaches, and a blob only a linked
+/// worktree's index holds, stay. A clone with `extensions.preciousObjects`
+/// or a `gc.recentObjectsHook` is not collected.
+#[test]
+fn the_clone_gc_takes_what_only_the_main_reflog_reached_and_keeps_the_rest() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    let dir = repo.dir().to_path_buf();
+    let git_dir = dir.join(".git");
+    assert!(
+        !git_dir.join("logs/HEAD").exists(),
+        "the clone wrote a reflog of its HEAD"
+    );
+    let clone = dir.file_name().unwrap().to_str().unwrap().to_string();
+    let tree = f.git(&dir, &["rev-parse", &format!("{head}^{{tree}}")]);
+    // a commit an old checkout reached (the user's git keeps a reflog)
+    f.git(&dir, &["config", "core.logAllRefUpdates", "true"]);
+    let lost = f.git(&dir, &["commit-tree", "-m", "lost", &tree]);
+    f.git(&dir, &["checkout", "-q", "--detach", &lost]);
+    f.git(&dir, &["checkout", "-q", "--detach", &head]);
+    age_object(&git_dir, &lost);
+    // an old commit, tree and blob a ref reaches
+    std::fs::write(dir.join("kept-input"), "kept by a ref").unwrap();
+    let blob = f.git(&dir, &["hash-object", "-w", "kept-input"]);
+    std::fs::remove_file(dir.join("kept-input")).unwrap();
+    let kept_tree = {
+        let out = Command::new("git")
+            .args(["mktree"])
+            .current_dir(&dir)
+            .env_clear()
+            .envs(f.env())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        let mut out = out;
+        writeln!(out.stdin.take().unwrap(), "100644 blob {blob}\tkept").unwrap();
+        let o = out.wait_with_output().unwrap();
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    let kept = f.git(&dir, &["commit-tree", "-m", "kept", &kept_tree]);
+    let snapshot = format!("refs/local-ci/snapshots/src-{}", "e".repeat(32));
+    f.git(&dir, &["update-ref", &snapshot, &kept]);
+    for id in [&blob, &kept_tree, &kept] {
+        age_object(&git_dir, id);
+    }
+    // a linked worktree: its own reflog, and a blob only its index holds
+    let wt = f.root.join("linked");
+    f.git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt.to_str().unwrap(),
+            &head,
+        ],
+    );
+    let wt_lost = f.git(&wt, &["commit-tree", "-m", "wt", &tree]);
+    f.git(&wt, &["checkout", "-q", "--detach", &wt_lost]);
+    f.git(&wt, &["checkout", "-q", "--detach", &head]);
+    std::fs::write(wt.join("staged"), "only in the index").unwrap();
+    f.git(&wt, &["add", "staged"]);
+    let staged = f.git(&wt, &["rev-parse", ":staged"]);
+    age_object(&git_dir, &staged);
+    let wt_log = git_dir.join("worktrees/linked/logs/HEAD");
+    let wt_before = std::fs::read_to_string(&wt_log).unwrap();
+    assert!(wt_before.contains(&wt_lost));
+    // precious: nothing goes
+    f.git(&dir, &["config", "extensions.preciousObjects", "true"]);
+    assert_eq!(ws.gc_clone(&clone, &|| false).unwrap(), CloneGc::Refused);
+    assert!(has_object(&f, &dir, &lost));
+    f.git(&dir, &["config", "--unset", "extensions.preciousObjects"]);
+    // nor one with a hook that would keep objects (it is not run)
+    f.git(&dir, &["config", "gc.recentObjectsHook", "false"]);
+    assert_eq!(ws.gc_clone(&clone, &|| false).unwrap(), CloneGc::Refused);
+    f.git(&dir, &["config", "--unset", "gc.recentObjectsHook"]);
+    assert_eq!(ws.gc_clone(&clone, &|| false).unwrap(), CloneGc::Ran);
+    assert!(
+        !has_object(&f, &dir, &lost),
+        "a commit only the main HEAD's reflog reached stayed"
+    );
+    for id in [&blob, &kept_tree, &kept, &staged, &head] {
+        assert!(has_object(&f, &dir, id), "{id} went");
+    }
+    assert!(
+        has_object(&f, &dir, &wt_lost),
+        "the linked reflog was expired"
+    );
+    assert_eq!(std::fs::read_to_string(&wt_log).unwrap(), wt_before);
+    // the main lock busy (an attempt's setup holds it): the gc runs, the
+    // main reflog is left for the next one
+    let later = f.git(&dir, &["commit-tree", "-m", "later", &tree]);
+    f.git(&dir, &["checkout", "-q", "--detach", &later]);
+    f.git(&dir, &["checkout", "-q", "--detach", &head]);
+    let shared = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(git_dir.join("belt-workspace.lock"))
+        .unwrap();
+    shared.lock_shared().unwrap();
+    assert_eq!(ws.gc_clone(&clone, &|| false).unwrap(), CloneGc::Ran);
+    let log = std::fs::read_to_string(git_dir.join("logs/HEAD")).unwrap();
+    assert!(
+        log.contains(&later),
+        "the reflog was expired under a busy lock"
+    );
+}
+
+/// Review round 1, M2: while the gc runs (a slow git through `PATH`), the
+/// same repository's `ensure_clone` and an attempt's workspace, which moves
+/// the clone's checkout, do not wait for it (the slow git waits, bounded,
+/// for the test to let it go). That checkout writes no reflog (M1).
+#[test]
+fn the_clone_gc_stalls_no_setup() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let marks = f.root.join("slow-git");
+    std::fs::create_dir_all(&marks).unwrap();
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .env_clear()
+            .envs(f.env())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let m = marks.to_str().unwrap();
+    std::fs::write(
+        marks.join("git"),
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = gc ]; then\n    : > '{m}/started'\n    i=0\n    while [ ! -e '{m}/release' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n    '{real}' \"$@\"\n    s=$?\n    : > '{m}/done'\n    exit $s\n  fi\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(marks.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut env = f.env();
+    let path = format!("{m}:{}", env["PATH"]);
+    env.insert("PATH".into(), path);
+    let ws = Workspaces::new(f.state.clone(), env, fw.clone());
+    let store = f.store();
+    f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    // a later commit: the attempt moves the clone's checkout to it
+    f.commit("b", "b");
+    let c = capture(
+        &f.env(),
+        &store,
+        &SourceRequest::Commit {
+            dir: f.dir.clone(),
+            rev: "HEAD".into(),
+        },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let manifest = store.manifest(&c.manifest.ci_source_id).unwrap().unwrap();
+    f.deliver(&store, &repo, &manifest);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    std::thread::scope(|s| {
+        let gc = s.spawn(|| ws.gc_clone(&clone, &|| false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marks.join("started").exists() {
+            if gc.is_finished() {
+                panic!("the gc ended before its git started: {:?}", gc.join());
+            }
+            assert!(std::time::Instant::now() < deadline, "the gc did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ws.ensure_clone("github:example/repo", Some(f.dir.to_str().unwrap()))
+            .unwrap();
+        let w = ws
+            .create(&AttemptId::generate(), &store, &manifest, Some(&repo))
+            .unwrap();
+        assert!(!marks.join("done").exists(), "the setup waited for the gc");
+        std::fs::write(marks.join("release"), "").unwrap();
+        // (M1: belt's checkout writes no reflog of the main HEAD)
+        assert!(!repo.dir().join(".git/logs/HEAD").exists());
+        assert_eq!(
+            f.git(repo.dir(), &["rev-parse", "HEAD"]),
+            manifest.execution_commit.clone().unwrap()
+        );
+        assert_eq!(gc.join().unwrap().unwrap(), CloneGc::Ran);
+        ws.remove(&w).unwrap();
+    });
 }

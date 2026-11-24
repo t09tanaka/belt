@@ -6,7 +6,8 @@ mod foreground;
 mod import_owner;
 pub(crate) use capture_owner::stop_point;
 pub use capture_owner::{
-    inspect_corrupt_held, inspect_owners, inspect_retry_failing, CaptureOwner, CaptureVerdict,
+    inspect_corrupt_held, inspect_gc_failing, inspect_owners, inspect_retry_failing, CaptureOwner,
+    CaptureVerdict,
 };
 #[cfg(test)]
 pub use deletion::set_prune_fault;
@@ -20,7 +21,7 @@ pub use import_owner::{is_import_token_id, ForgetReport};
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
-pub use deletion::{ReceivedPassInputs, ReceivedPassReport, RefRow, SourceUse};
+pub use deletion::{CloneGc, GcFailure, ReceivedPassInputs, ReceivedPassReport, RefRow, SourceUse};
 pub use deletion::{RetentionCursor, RetentionPage};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::fs::{File, TryLockError};

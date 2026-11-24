@@ -247,6 +247,21 @@ pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
 /// (`legacy_retry`, `clone_ref_retry`, `bytes_retry`, spec 25.8 5b (h)5, (c),
 /// (e)); read like
 /// [`inspect_owners`]. Zero when there is no index or no such table.
+/// For `doctor` (review round 1, L6): the clones whose gc of spec 25.8 5b
+/// (e) failed 3 times in a row or more (they are still tried every day).
+pub fn inspect_gc_failing(state: &Path) -> Result<u64> {
+    let database = state.join("sources").join("retention.db");
+    if !database.is_file() {
+        return Ok(0);
+    }
+    let c = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    super::deletion::gc_failing(&c)
+}
+
 pub fn inspect_retry_failing(state: &Path) -> Result<(u64, u64, u64)> {
     let database = state.join("sources").join("retention.db");
     if !database.is_file() {

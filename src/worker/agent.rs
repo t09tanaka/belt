@@ -2453,6 +2453,15 @@ impl Agent {
             // (25.8 5b: a store that holds a parent's roots is left alone,
             // and said so; the journal keeps one such event while nothing
             // changes)
+            // (review round 1, L6: a clone gc that failed, or that
+            // `extensions.preciousObjects` keeps from running)
+            if let Some(f) = &report.gc_failed {
+                self.note_global(
+                    "clone_gc_failed",
+                    &f.clone,
+                    json!({ "message": f.message, "failures": f.failures }),
+                );
+            }
             if report.parent {
                 self.note_global("source_store_shared", "", json!({}));
             } else if !report.busy {
