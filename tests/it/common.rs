@@ -356,3 +356,25 @@ pub fn publish_as_received(store: &belt::source::SourceStore, ci_source_id: &str
     let m = store.manifest(ci_source_id).unwrap().unwrap();
     store.publish_received_one(&m, false, true, None).unwrap();
 }
+
+/// The source store of a worker that is running. Opening takes the store's
+/// mutation lock shared without waiting, and the worker's retention passes
+/// hold it exclusively for a moment: wait (bounded) until none does.
+pub fn open_live_store(state: &std::path::Path) -> belt::source::SourceStore {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match belt::source::SourceStore::open(state) {
+            Ok(store) => return store,
+            Err(e)
+                if std::time::Instant::now() < deadline
+                    && e.chain().any(|c| {
+                        c.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+                    }) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("open the worker's source store: {e:#}"),
+        }
+    }
+}

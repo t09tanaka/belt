@@ -430,14 +430,16 @@ fn remove_entry(
         (opened.st_dev, opened.st_ino) == (stat.st_dev, stat.st_ino),
         ScratchKept::Changed
     );
-    if top == Some(Top::Probed) {
+    let _below_held = if top == Some(Top::Probed) {
         // The capture that stages here holds this lock until it returns.
-        match below.try_lock() {
-            Ok(()) => {}
+        match crate::platform::flock::HeldBorrow::try_lock(&below) {
+            Ok(held) => Some(held),
             Err(TryLockError::WouldBlock) => return Err(ScratchKept::InUse.into()),
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
-    }
+    } else {
+        None
+    };
     for child in names_in(&below)? {
         remove_entry(
             &below,

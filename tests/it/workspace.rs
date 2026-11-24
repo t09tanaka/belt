@@ -2261,23 +2261,10 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         .unwrap();
     held.lock().unwrap();
     assert_eq!(gc(&|| false).unwrap(), CloneGc::Busy);
-    drop(held);
+    held.unlock().unwrap();
     assert!(old.1.exists());
-    // (a child forked meanwhile may hold a copy of a lock's descriptor
-    // until its exec: the locks are free within a bounded wait)
-    let until_free = |stop: &dyn Fn() -> bool| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let r = gc(stop).unwrap();
-            if r != CloneGc::Busy {
-                return r;
-            }
-            assert!(std::time::Instant::now() < deadline, "a lock stayed busy");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    };
     // stopped at once: nothing of it is left running
-    assert_eq!(until_free(&|| true), CloneGc::Stopped);
+    assert_eq!(gc(&|| true).unwrap(), CloneGc::Stopped);
     // (the clone's own lock and its main lock, held shared as
     // fast-worktree does, do not keep it from running)
     let own = std::fs::File::options()
@@ -2294,7 +2281,7 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         .open(git_dir.join("belt-workspace.lock"))
         .unwrap();
     shared.lock_shared().unwrap();
-    assert_eq!(until_free(&|| false), CloneGc::Ran);
+    assert_eq!(gc(&|| false).unwrap(), CloneGc::Ran);
     drop((own, shared));
     // (a newer one may have moved into a cruft pack: asked by id)
     assert!(!present(&old.0), "an object older than 14 days stayed");

@@ -107,7 +107,7 @@ const KEPT_WORKER_DB: &str = "worker.db";
 /// Commit and rollback both hold this while they read and change the record.
 /// It is never held while the new version is checked, so a CLI that waits on
 /// an unresponsive version cannot keep the guard from rolling back.
-fn upgrade_lock(paths: &Paths) -> anyhow::Result<File> {
+fn upgrade_lock(paths: &Paths) -> anyhow::Result<crate::platform::flock::HeldLock> {
     let path = paths.config.join("upgrade.lock");
     match OpenOptions::new()
         .write(true)
@@ -120,9 +120,9 @@ fn upgrade_lock(paths: &Paths) -> anyhow::Result<File> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
-    let lock = resident::secure_file(&path, true)?;
-    lock.lock()?;
-    Ok(lock)
+    Ok(crate::platform::flock::HeldLock::lock(
+        resident::secure_file(&path, true)?,
+    )?)
 }
 
 fn read_record(paths: &Paths) -> anyhow::Result<Option<Record>> {
@@ -481,7 +481,7 @@ pub fn begin<L: Launcher>(
     let init_lock = resident::secure_file(&initial.config.join("init.lock"), true)
         .context("init.lock cannot be opened")?;
     // One upgrade, init or membership change at a time on this machine.
-    init_lock.lock()?;
+    let _init_lock = crate::platform::flock::HeldLock::lock(init_lock)?;
     membership_undo::recover(&initial, launcher)?;
     ensure!(
         !initial.config.join("membership-undo.json").try_exists()?,
@@ -580,7 +580,7 @@ pub fn begin<L: Launcher>(
         backed_up: false,
         phase: Phase::Trial,
     };
-    let recorded = (|| -> anyhow::Result<File> {
+    let recorded = (|| -> anyhow::Result<crate::platform::flock::HeldLock> {
         let lock = upgrade_lock(&paths)?;
         private_dir_with(&upgrade_dir(&paths), &mut NativeDurability)?;
         wsu::copy_private(&paths.journal, &kept(&paths, KEPT_JOURNAL))?;

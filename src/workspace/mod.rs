@@ -240,7 +240,7 @@ impl Workspaces {
     /// The import lock of the clone `clone` (a name `r-<16 hex>`), tried
     /// without waiting: `None` when another holds it (review round 3, M-1:
     /// the `clone_ref` fill writes its rows under it).
-    pub fn try_import_lock(&self, clone: &str) -> anyhow::Result<Option<File>> {
+    pub fn try_import_lock(&self, clone: &str) -> anyhow::Result<Option<HeldLock>> {
         anyhow::ensure!(
             clone.len() == 18
                 && clone.starts_with("r-")
@@ -254,7 +254,7 @@ impl Workspaces {
         let lock = open_lock(&root.join(format!("{clone}.import.lock")))
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(lock)),
+            Ok(()) => Ok(Some(HeldLock::new(lock))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
         }

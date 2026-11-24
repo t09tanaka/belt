@@ -225,7 +225,7 @@ pub(super) async fn initialize<L: Launcher>(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(paths.config.join("init.lock"))?;
-    init_lock.lock()?;
+    let _init_lock = crate::platform::flock::HeldLock::lock(init_lock)?;
     let result = async {
         if loaded == LoadedState::Match {
             launcher.verify_loaded(&enrollment.plan, &enrollment.receipt)?;
@@ -249,7 +249,7 @@ pub(super) async fn initialize<L: Launcher>(
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(worker.state.join("agent.lock"))?;
-        owner.try_lock()?;
+        let owner = crate::platform::flock::HeldLock::try_lock(owner)?;
         drained(&worker, &enrollment)?;
         // `worker --stdio` only connects to agent.sock (run_worker_stdio);
         // it never starts an agent. The switch lock excludes service helpers

@@ -101,7 +101,7 @@ async fn stop_with_live_attempt(pre: &str, tail: &str, bound: Duration) {
         ("HOME".to_string(), home.display().to_string()),
         ("PATH".to_string(), "/usr/bin:/bin".to_string()),
     ]);
-    let worker_sources = belt::source::SourceStore::open(&state).unwrap();
+    let worker_sources = crate::common::open_live_store(&state);
     let captured = belt::source::capture(
         &env,
         &worker_sources,
