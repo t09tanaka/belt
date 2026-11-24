@@ -287,6 +287,8 @@ fn accepts_only_enumerated_diagnostics() {
         "last exit code",
         "spawn type",
         "jetsam priority",
+        "jetsam memory limit (active)",
+        "jetsam memory limit (inactive)",
         "jetsam memory limit (active, soft)",
         "jetsam memory limit (inactive, soft)",
         "jetsamproperties category",
@@ -446,4 +448,46 @@ fn running_process_requires_running_state_and_canonical_safe_pid() {
     assert!(parsed(&sample.replace("\tstate = running\n", ""))
         .running_pid()
         .is_err());
+}
+
+/// The whole `launchctl print` of a running belt LaunchAgent on macOS 27.2.1
+/// (2026-11-24), with names, paths and hashes made neutral. Without a memory
+/// limit macOS 27 prints `jetsam memory limit (active) = (unlimited)` rather
+/// than the `(active, soft)` form of the earlier observations.
+#[test]
+fn macos_27_print_of_a_running_agent_is_accepted_and_verified() {
+    let text = include_str!("macos27_print.txt");
+    let definition = Definition {
+        label: "org.example.worker".into(),
+        mode: Mode::User { uid: 501 },
+        executable: "/Users/example/.config/runner/bin/0000/runner".into(),
+        arguments: vec![
+            "daemon".into(),
+            "--input".into(),
+            "/Users/example/.config/runner/input.json".into(),
+        ],
+        working_directory: "/Users/example/.config/runner".into(),
+        environment: BTreeMap::from([
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+            ("HOME".into(), "/Users/example".into()),
+            ("TMPDIR".into(), "/var/folders/xx/example/T/".into()),
+        ]),
+    };
+    let plan = render(&definition).unwrap();
+    let o = parse(text.as_bytes()).unwrap();
+    for key in [
+        "jetsam memory limit (active)",
+        "jetsam memory limit (inactive)",
+    ] {
+        assert_eq!(o.fields[key], "(unlimited)");
+    }
+    let plist = Path::new("/Users/example/Library/LaunchAgents/org.example.worker.plist");
+    assert_eq!(o.verify(&plan, plist, None), Ok(()));
+    assert_eq!(o.running_pid(), Ok(43544));
+    // Strictness stays: a field outside the observed forms is still refused.
+    let foreign = text.replace(
+        "jetsam memory limit (active) =",
+        "jetsam memory limit (active, hard) =",
+    );
+    assert_eq!(parse(foreign.as_bytes()).err(), Some("unknown field"));
 }

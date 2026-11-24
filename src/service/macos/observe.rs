@@ -1,6 +1,6 @@
 //! Strict adapter for the tab-indented launchctl print layout observed on an
-//! Apple daemon (2026-11-14). Human output is not an API: any unknown layout is
-//! rejected. This is observation under trusted same-UID/root, not atomic removal.
+//! Apple daemon (2026-11-14) and on a belt LaunchAgent under macOS 27
+//! (2026-11-24). Human output is not an API: any unknown layout is rejected. This is observation under trusted same-UID/root, not atomic removal.
 use super::policy::{Mode, Plan};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -51,6 +51,8 @@ fn scalar(key: &str) -> bool {
             | "last exit code"
             | "spawn type"
             | "jetsam priority"
+            | "jetsam memory limit (active)"
+            | "jetsam memory limit (inactive)"
             | "jetsam memory limit (active, soft)"
             | "jetsam memory limit (inactive, soft)"
             | "jetsamproperties category"
