@@ -401,7 +401,7 @@ impl Workspaces {
         let open = |path: PathBuf| open_lock(&path).map_err(|e| anyhow::anyhow!("{e:?}"));
         let try_take =
             |f: File, take: fn(&File) -> Result<(), std::fs::TryLockError>| match take(&f) {
-                Ok(()) => Ok(Some(f)),
+                Ok(()) => Ok(Some(HeldLock::new(f))),
                 Err(std::fs::TryLockError::WouldBlock) => Ok(None),
                 Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::from(e)),
             };
