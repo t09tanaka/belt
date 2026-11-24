@@ -71,6 +71,8 @@ struct DirHost {
     tool_poll_hold: AtomicBool,
     /// What `received_pass` runs, given its `stop`; `None`: no source store.
     pass_hook: Mutex<Option<PassHook>>,
+    /// The reports `received_pass` gives, first to last (then a default one).
+    pass_reports: Mutex<std::collections::VecDeque<belt::source::retention::ReceivedPassReport>>,
 }
 
 type PassHook = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
@@ -100,7 +102,8 @@ impl Host for DirHost {
     ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
         let hook = self.pass_hook.lock().unwrap().clone()?;
         hook(stop);
-        Some(Ok(belt::source::retention::ReceivedPassReport::default()))
+        let next = self.pass_reports.lock().unwrap().pop_front();
+        Some(Ok(next.unwrap_or_default()))
     }
     fn preparation_observation_page(
         &self,
@@ -324,6 +327,7 @@ pub(crate) fn fx_named(worker: &str) -> Fx {
         tool_poll: Mutex::new(None),
         tool_poll_hold: AtomicBool::new(false),
         pass_hook: Mutex::default(),
+        pass_reports: Mutex::default(),
     });
     Fx {
         dir,
@@ -6270,6 +6274,48 @@ async fn received_passes_leave_a_parent_store_alone_and_wait_out_a_trial() {
     control::begin_trial(&state).unwrap();
     assert_eq!(agent.received_passes(), 0);
     control::end_trial(&state).unwrap();
+}
+
+/// #171: the agent writes a `clone_gc_failed` event for a failed gc, once
+/// while the same failure repeats, and again after a gc of that clone ran.
+#[test]
+fn a_clone_gc_failure_after_a_success_is_news_again() {
+    use belt::source::retention::{GcFailure, ReceivedPassReport};
+    let f = fx();
+    *f.host.pass_hook.lock().unwrap() = Some(Arc::new(|_stop| {}));
+    let agent = f.start("boot-a");
+    let failed = || ReceivedPassReport {
+        gc_failed: Some(GcFailure {
+            clone: "c1".into(),
+            message: "boom".into(),
+            failures: 1,
+        }),
+        ..Default::default()
+    };
+    let events = || -> i64 {
+        rusqlite::Connection::open(f.state().join("worker.db"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM event WHERE kind='clone_gc_failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let pass = |report: ReceivedPassReport| {
+        f.host.pass_reports.lock().unwrap().push_back(report);
+        assert_eq!(agent.received_passes(), 1);
+    };
+    pass(failed());
+    assert_eq!(events(), 1);
+    pass(failed());
+    assert_eq!(events(), 1, "the same failure is written once");
+    pass(ReceivedPassReport {
+        gc_ran: Some("c1".into()),
+        ..Default::default()
+    });
+    pass(failed());
+    assert_eq!(events(), 2, "a failure after a success is news again");
 }
 
 /// A pass hook that says it came in, waits for its `stop` to turn true,

@@ -1191,6 +1191,16 @@ fn capture_detail(counts: &UnjudgedCaptures) -> (Level, String) {
             counts.corrupt_held
         ));
     }
+    if !counts.scratch.is_empty() {
+        let s = counts.scratch;
+        detail.push_str(&format!(
+            "; the scratch directories of {} stopped capture(s) were kept: {} not provably ours (another user or device), {} still in use, {} changed while they were removed (belt tries again)",
+            s.not_ours + s.in_use + s.changed,
+            s.not_ours,
+            s.in_use,
+            s.changed
+        ));
+    }
     if counts.retry_failing != (0, 0, 0) {
         detail.push_str(&format!(
             "; {} manifest(s) of the legacy registration, {} received source(s) of the clone ref fill and {} object(s) of the size fill failed to be read 8 times or more (belt keeps retrying them)",
@@ -1265,6 +1275,8 @@ pub(crate) struct UnjudgedCaptures {
     /// Legacy manifests, `clone_ref` fill roots and size fill objects that
     /// failed 8 times or more (they are still retried).
     pub(crate) retry_failing: (usize, usize, usize),
+    /// Capture scratch directories a deletion keeps now, by kind.
+    pub(crate) scratch: crate::source::retention::ScratchCounts,
 }
 
 /// One `readdir` of `sources/runs/` and of `in-place/`, and one lookup by
@@ -1315,6 +1327,7 @@ pub(crate) fn unjudged_captures(
     counts.bindings = bindings;
     counts.corrupt_held = usize::try_from(crate::source::retention::inspect_corrupt_held(state)?)
         .unwrap_or(usize::MAX);
+    counts.scratch = crate::source::retention::inspect_scratch_kept(state)?;
     let (legacy, refs, sizes) = crate::source::retention::inspect_retry_failing(state)?;
     counts.retry_failing = (
         usize::try_from(legacy).unwrap_or(usize::MAX),

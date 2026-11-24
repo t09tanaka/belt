@@ -342,6 +342,23 @@ fn require_attempt(c: &Connection, attempt: &str) -> Result<()> {
     }
 }
 
+/// [`require_attempt`] for a run: an event that names a run without a row
+/// would be deleted by no pruning (#155 (c)).
+fn require_run(c: &Connection, run: &str) -> Result<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+        [run],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StorageError::NotFound {
+            what: format!("run {run}"),
+        })
+    }
+}
+
 /// [`refuse_pruned`] for the run of the matrix group `group`. A group
 /// without a row is left to the caller.
 fn refuse_pruned_group(c: &Connection, group: &str) -> Result<()> {
@@ -1504,6 +1521,7 @@ impl CoordinatorStore {
             // would be a row the pruning has already passed.
             if let Some(run) = &r {
                 refuse_pruned(tx, run)?;
+                require_run(tx, run)?;
             }
             if let Some(attempt) = &a {
                 refuse_pruned_attempt(tx, attempt)?;
@@ -1547,6 +1565,7 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             if let Some(run) = &r {
                 refuse_pruned(tx, run)?;
+                require_run(tx, run)?;
             }
             refuse_pruned_attempt(tx, &a)?;
             require_attempt(tx, &a)?;

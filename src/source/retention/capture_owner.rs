@@ -212,8 +212,8 @@ pub fn inspect_owners(state: &Path) -> Result<Option<Vec<CaptureOwner>>> {
     Ok(Some(rows.collect::<std::result::Result<_, _>>()?))
 }
 
-/// How many wrong-content files a deletion kept because another root held
-/// them (`corrupt_held`), counted since the index was made; read like
+/// How many wrong-content files a deletion kept because another root holds
+/// them (`corrupt_held`), now: a mark goes with its object; read like
 /// [`inspect_owners`]. Zero when there is no index.
 pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
     let database = state.join("sources").join("retention.db");
@@ -225,21 +225,20 @@ pub fn inspect_corrupt_held(state: &Path) -> Result<u64> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     c.busy_timeout(std::time::Duration::from_secs(1))?;
-    let found: Option<String> =
-        match c.query_row("SELECT value FROM meta WHERE key='corrupt_held'", [], |r| {
-            r.get(0)
-        }) {
-            Ok(value) => Some(value),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            // An index from before the table existed has nothing counted.
-            Err(rusqlite::Error::SqliteFailure(_, Some(text)))
-                if text.contains("no such table") =>
-            {
-                None
-            }
-            Err(error) => return Err(error.into()),
-        };
-    Ok(found.and_then(|value| value.parse().ok()).unwrap_or(0))
+    // (only the objects still there: a mark whose object went some other
+    // way counts nothing)
+    match c.query_row(
+        "SELECT count(*) FROM meta WHERE key>'corrupt_held:' AND key<'corrupt_held;' AND substr(key,14) IN (SELECT id FROM object)",
+        [],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(n) => Ok(u64::try_from(n).unwrap_or(0)),
+        // An index from before the table existed has nothing counted.
+        Err(rusqlite::Error::SqliteFailure(_, Some(text))) if text.contains("no such table") => {
+            Ok(0)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// How many legacy manifests, how many roots of the `clone_ref` fill and

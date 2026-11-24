@@ -32,6 +32,9 @@ struct Report {
     unknown: u32,
     /// Leftover Vault publication temporaries the sweep kept (not failures).
     tmp_retained: u32,
+    /// Capture scratch directories the abandonment kept, by kind (also in
+    /// `unknown`).
+    scratch: crate::source::retention::ScratchCounts,
 }
 
 /// What the loop counted so far, and the lines it logs: counts only, never a
@@ -51,10 +54,14 @@ impl Tally {
         let mut lines = Vec::new();
         if report.unknown > 0 {
             self.failures = self.failures.saturating_add(u64::from(report.unknown));
-            lines.push(format!(
+            let mut line = format!(
                 "input retention targets retained; failures={}",
                 self.failures
-            ));
+            );
+            if !report.scratch.is_empty() {
+                line.push_str(&format!("; scratch={}", report.scratch.text()));
+            }
+            lines.push(line);
         }
         if report.tmp_retained > 0 {
             self.leftovers = report.tmp_retained;
@@ -128,6 +135,7 @@ impl Driver {
             Ok(page) => {
                 report.paths = page.paths;
                 report.unknown = page.unknown;
+                report.scratch = page.scratch;
                 if page.paths > 0 {
                     return Ok(report);
                 }
@@ -586,11 +594,27 @@ mod tests {
             paths: 0,
             unknown: 3,
             tmp_retained: 1,
+            scratch: Default::default(),
         };
         assert_eq!(
             tally.page(&both),
             ["input retention targets retained; failures=3"]
         );
+        // (#155 (a)) a kept scratch directory is logged by its kind
+        let scratch = crate::source::retention::ScratchCounts {
+            in_use: 1,
+            ..Default::default()
+        };
+        let kept = Report {
+            unknown: 1,
+            scratch,
+            ..Default::default()
+        };
+        assert_eq!(
+            tally.page(&kept),
+            ["input retention targets retained; failures=4; scratch=not_ours:0,in_use:1,changed:0"]
+        );
+        tally.failures = 3;
         assert_eq!((tally.failures, tally.leftovers), (3, 1));
         // A page without leftovers keeps the last count that had any.
         assert!(tally.page(&Report::default()).is_empty());
