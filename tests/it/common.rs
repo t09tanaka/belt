@@ -356,3 +356,40 @@ pub fn publish_as_received(store: &belt::source::SourceStore, ci_source_id: &str
     let m = store.manifest(ci_source_id).unwrap().unwrap();
     store.publish_received_one(&m, false, true, None).unwrap();
 }
+
+/// The source store of a worker that is running, with its mutation lock held
+/// shared for as long as the returned guard lives. Opening, capturing and
+/// publishing each take that lock shared without waiting, and the worker's
+/// retention passes hold it exclusively for one step (spec 25.8): wait,
+/// bounded, until no pass does, then hold it across the whole seed so no
+/// later step of it meets a pass. The wait is printed so a regression where
+/// a pass holds the lock for seconds shows up.
+pub fn open_live_store(
+    state: &std::path::Path,
+) -> (belt::source::SourceStore, belt::source::retention::Guard) {
+    fn busy(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        })
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(5);
+    loop {
+        let held = belt::source::SourceStore::open(state)
+            .and_then(|store| store.mutation_guard().map(|guard| (store, guard)));
+        match held {
+            Ok(held) => {
+                eprintln!(
+                    "open_live_store: waited {:?} for the worker's retention pass",
+                    started.elapsed()
+                );
+                return held;
+            }
+            Err(e) if std::time::Instant::now() < deadline && busy(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("open the worker's source store: {e:#}"),
+        }
+    }
+}

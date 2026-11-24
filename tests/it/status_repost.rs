@@ -218,6 +218,13 @@ async fn shutdown(spec: &Spec) {
         while client.socket_path().exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // The socket goes first (`Resident::drop`); the database is closed,
+        // and its WAL checkpointed, only when the owner lock is let go.
+        let lock = std::fs::File::open(spec.state_dir.join("coordinator.lock")).unwrap();
+        while lock.try_lock_shared().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lock.unlock().unwrap();
     })
     .await
     .unwrap();

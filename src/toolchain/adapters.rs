@@ -1153,8 +1153,11 @@ pub fn sweep_trash(toolchains: &Path) {
         };
         let lock = match open_dir_at(&dir, root) {
             Ok(root) => match existing_lock(&root) {
-                Some(lock) if lock.try_lock().is_ok() => Some(lock),
-                _ => continue,
+                Some(lock) => match crate::platform::flock::HeldLock::try_lock(lock) {
+                    Ok(held) => Some(held),
+                    Err(_) => continue,
+                },
+                None => continue,
             },
             // No root: no installer can be clearing it.
             Err(Errno::NOENT) => None,
@@ -1193,12 +1196,10 @@ pub fn evict_root(toolchains: &Path, name: &str) -> Result<()> {
         return Err(OTHER_DEVICE);
     }
     let lock = match existing_lock(&root) {
-        Some(lock) => Some(lock),
-        None => Some(open_lock(&root)?),
+        Some(lock) => lock,
+        None => open_lock(&root)?,
     };
-    if let Some(lock) = &lock {
-        lock.try_lock().map_err(|_| "install_lock_busy")?;
-    }
+    let lock = crate::platform::flock::HeldLock::try_lock(lock).map_err(|_| "install_lock_busy")?;
     let trash = format!("{}{}", trash_prefix(name), ulid::Ulid::new());
     renameat(&dir, name, &dir, trash.as_str()).map_err(|_| "root_evict_rename")?;
     drop(root);
@@ -1217,7 +1218,8 @@ pub fn root_install_busy(toolchains: &Path, name: &str) -> bool {
     let Ok(root) = open_dir_at(&dir, name) else {
         return false;
     };
-    existing_lock(&root).is_some_and(|lock| lock.try_lock().is_err())
+    existing_lock(&root)
+        .is_some_and(|lock| crate::platform::flock::HeldLock::try_lock(lock).is_err())
 }
 
 /// The bytes of the files below `root`, not following links and not
@@ -1307,6 +1309,7 @@ pub fn install_admitted(
             Err(_) => return Err("install_lock_wait"),
         }
     }
+    let lock = crate::platform::flock::HeldLock::new(lock);
     let receipt = install_holding(plan, &managed, executor)?;
     drop(lock);
     Ok(receipt)

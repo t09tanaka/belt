@@ -2057,3 +2057,45 @@ fn a_missing_file_releases_a_reservation_and_nothing_else() {
     assert_eq!(parts.passes().finished, 1);
     parts.assert_nothing_left(&run);
 }
+
+/// #174 L3: a note of a kept scratch directory goes with the directory or
+/// the root, however they went; `doctor` never counts it once they are gone.
+#[test]
+fn a_scratch_kept_note_does_not_outlive_its_directory_or_root() {
+    use crate::source::retention::{inspect_scratch_kept, ScratchCounts};
+    let parts = Parts::new();
+    let index = &parts.sources.retention;
+    let c = index.connect().unwrap();
+    let notes = |c: &Connection| -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let kept = |root: &str| {
+        let scratch = index.create_scratch(root).unwrap();
+        let held = std::fs::File::open(&scratch).unwrap();
+        held.try_lock().unwrap();
+        index.remove_scratch_noted(&c, root).unwrap_err();
+        held
+    };
+    // The capture removes its own scratch directory.
+    let own = parts.sources.capture_pending_root(None).unwrap();
+    drop(kept(&own));
+    // The root row goes while its directory stays.
+    let rooted = parts.sources.capture_pending_root(None).unwrap();
+    let _held = kept(&rooted);
+    assert_eq!(inspect_scratch_kept(&parts.state).unwrap().in_use, 2);
+    index.remove_own_scratch(&own).unwrap();
+    c.execute("DELETE FROM root WHERE id=?1", [&rooted])
+        .unwrap();
+    assert_eq!(
+        inspect_scratch_kept(&parts.state).unwrap(),
+        ScratchCounts::default()
+    );
+    assert_eq!(notes(&c), 2);
+    index.prune_scratch_kept(&c).unwrap();
+    assert_eq!(notes(&c), 0);
+}

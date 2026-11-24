@@ -1103,7 +1103,7 @@ fn a_source_that_is_busy_answers_overloaded_and_takes_nothing() {
     );
     assert_eq!(v.unwrap_err().code, ErrorCode::Overloaded);
     assert_eq!(f.staged(&p.source), before);
-    drop(lock);
+    lock.unlock().unwrap();
     assert!(put_all(sink, &l, &p.source, Content, big).unwrap().complete);
 }
 
@@ -2840,7 +2840,7 @@ fn a_root_with_a_repository_and_no_commit_waits_for_the_import_lock() {
     assert_eq!(e.code, ErrorCode::Overloaded, "{e:?}");
     assert!(e.message.contains("the clone of"), "{}", e.message);
     assert!(!verify(sink, &l, &source, vec![]).ready);
-    drop(held);
+    held.unlock().unwrap();
     let b = d.blobs.values().last().unwrap();
     assert!(put_all(sink, &l, &source, Content, b).unwrap().complete);
     assert!(verify(sink, &l, &source, vec![]).ready);
@@ -3008,7 +3008,7 @@ fn a_bundle_waits_for_another_import_into_the_same_clone() {
     // Nothing was unpacked, no clone was made, and the bundle is kept.
     assert!(f.clones().is_empty());
     assert!(f.staged(&p.source).iter().any(|n| n.starts_with("bundle-")));
-    drop(held);
+    held.unlock().unwrap();
     assert!(
         put_all(sink, &l, &p.source, Bundle, bundle)
             .unwrap()

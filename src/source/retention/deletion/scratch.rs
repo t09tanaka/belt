@@ -127,8 +127,10 @@ pub fn inspect_scratch_kept(state: &Path) -> Result<ScratchCounts> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     c.busy_timeout(std::time::Duration::from_secs(1))?;
+    // A row whose root or directory went another way is not counted; the
+    // next pass removes it (`Index::prune_scratch_kept`).
     let mut s = match c.prepare(
-        "SELECT value, count(*) FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;' GROUP BY value",
+        "SELECT substr(key,14), value FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;' AND EXISTS(SELECT 1 FROM root WHERE id=substr(meta.key,14))",
     ) {
         Ok(s) => s,
         Err(rusqlite::Error::SqliteFailure(_, Some(text))) if text.contains("no such table") => {
@@ -136,14 +138,24 @@ pub fn inspect_scratch_kept(state: &Path) -> Result<ScratchCounts> {
         }
         Err(error) => return Err(error.into()),
     };
-    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let store = state.join("sources");
+    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
-        let (kind, n) = row?;
+        let (root, kind) = row?;
         if let Some(kind) = ScratchKept::parse(&kind) {
-            counts.add_n(kind, u32::try_from(n).unwrap_or(u32::MAX));
+            if scratch_present(&store, &root) {
+                counts.add_n(kind, 1);
+            }
         }
     }
     Ok(counts)
+}
+
+/// Whether the scratch directory of `root` (or whatever stands at its name)
+/// is still in the store at `store`.
+fn scratch_present(store: &Path, root: &str) -> bool {
+    name_of(root)
+        .is_ok_and(|name| std::fs::symlink_metadata(store.join(STAGING).join(name)).is_ok())
 }
 
 /// A reservation: the destination local-ci named, and the key of the object
@@ -210,6 +222,28 @@ impl Index {
             (Err(_), None) => {}
         }
         removed
+    }
+
+    /// Drop the `scratch_kept` notes whose directory or root went another
+    /// way (the capture removed its own scratch, or the root row was
+    /// deleted): a note lives no longer than what it counts.
+    pub(in crate::source) fn prune_scratch_kept(&self, c: &Connection) -> Result<()> {
+        let roots: Vec<String> = c
+            .prepare(
+                "SELECT substr(key,14) FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for root in roots {
+            if !scratch_present(&self.path, &root) {
+                c.execute("DELETE FROM meta WHERE key='scratch_kept:'||?1", [&root])?;
+            }
+        }
+        c.execute(
+            "DELETE FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;' AND NOT EXISTS(SELECT 1 FROM root WHERE id=substr(meta.key,14))",
+            [],
+        )?;
+        Ok(())
     }
 
     /// [`Index::remove_scratch`] by the capture that made the directory,
@@ -430,14 +464,16 @@ fn remove_entry(
         (opened.st_dev, opened.st_ino) == (stat.st_dev, stat.st_ino),
         ScratchKept::Changed
     );
-    if top == Some(Top::Probed) {
+    let _below_held = if top == Some(Top::Probed) {
         // The capture that stages here holds this lock until it returns.
-        match below.try_lock() {
-            Ok(()) => {}
+        match crate::platform::flock::HeldBorrow::try_lock(&below) {
+            Ok(held) => Some(held),
             Err(TryLockError::WouldBlock) => return Err(ScratchKept::InUse.into()),
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
-    }
+    } else {
+        None
+    };
     for child in names_in(&below)? {
         remove_entry(
             &below,

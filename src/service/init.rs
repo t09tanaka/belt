@@ -744,9 +744,10 @@ async fn initialize_prepared<L: Launcher>(
     // This operation is blocking filesystem/service IO, including the cooperative lock.
     // CLI runs it in its dedicated runtime; no detached process is created here.
     // Takeover holds this lock through retirement and rollback as well.
-    if enrollment.is_none() {
-        lock.lock()?;
-    }
+    let _lock = match enrollment {
+        None => Some(crate::platform::flock::HeldLock::lock(lock)?),
+        Some(_) => None,
+    };
     let mut jf = JournalFile {
         path: paths.journal.clone(),
         proof: None,
@@ -1067,7 +1068,7 @@ pub(super) fn worker_lifecycle<L: Launcher>(
         Paths::resolve_for(env, launcher.backend()).context("init resident paths unavailable")?;
     let lock = resident::secure_file(&initial.config.join("init.lock"), true)
         .context("init resident lock unavailable")?;
-    lock.lock()?;
+    let _lock = crate::platform::flock::HeldLock::lock(lock)?;
     membership_undo::recover(&initial, &mut launcher)?;
     ensure!(
         !initial.config.join("membership-undo.json").try_exists()?,
@@ -1244,7 +1245,7 @@ pub(crate) fn handover<L: Launcher>(
     let member = request.membership.as_ref().context("membership missing")?;
     let initial_paths = Paths::resolve_for(env, launcher.backend())?;
     let lock = resident::secure_file(&initial_paths.config.join("init.lock"), true)?;
-    lock.lock()?;
+    let _lock = crate::platform::flock::HeldLock::lock(lock)?;
     membership_undo::recover(&initial_paths, &mut launcher)?;
     let spec = super::context::runtime_spec(env).map_err(|e| anyhow::anyhow!(e.message))?;
     let (mut journal, paths) = managed_journal(&spec)?;

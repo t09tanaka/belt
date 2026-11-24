@@ -1258,14 +1258,13 @@ impl SourceStore {
     /// Hold the capture of `run` for the life of the returned file: a second
     /// caller (another thread or process) waits, then finds the record the
     /// first one made.
-    pub fn lock_run(&self, run: &RunId) -> Result<std::fs::File> {
+    pub fn lock_run(&self, run: &RunId) -> Result<crate::platform::flock::HeldLock> {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.inner.root().join("runs").join(format!("{run}.lock")))?;
-        f.lock()?;
-        Ok(f)
+        Ok(crate::platform::flock::HeldLock::lock(f)?)
     }
 
     /// Where local-ci puts the plaintext secret bundle of a capture of this
@@ -1279,14 +1278,13 @@ impl SourceStore {
     /// (two runs) would otherwise write, adopt and remove the same file. The
     /// source id is not known before the capture, so this is one lock for all
     /// captures that carry secret files.
-    pub fn lock_secrets(&self) -> Result<std::fs::File> {
+    pub fn lock_secrets(&self) -> Result<crate::platform::flock::HeldLock> {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.inner.root().join("secrets.lock"))?;
-        f.lock()?;
-        Ok(f)
+        Ok(crate::platform::flock::HeldLock::lock(f)?)
     }
 
     /// Spec 25.4 (a): clear what a killed process left in `tmp/`: single
@@ -1330,9 +1328,9 @@ impl SourceStore {
         else {
             return 0;
         };
-        if lock.try_lock().is_err() {
+        let Ok(_held) = crate::platform::flock::HeldLock::try_lock(lock) else {
             return 0;
-        }
+        };
         let Ok(entries) = std::fs::read_dir(self.inner.root().join("secrets")) else {
             return 0;
         };

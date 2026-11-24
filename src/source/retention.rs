@@ -598,7 +598,7 @@ impl Index {
     ) -> Result<bool> {
         // (the import locks taken, one per clone, held until the
         // transaction is done)
-        let mut locks: std::collections::HashMap<String, std::fs::File> =
+        let mut locks: std::collections::HashMap<String, crate::platform::flock::HeldLock> =
             std::collections::HashMap::new();
         let mut c = self.connect()?;
         let now = crate::platform::clock::wall_ms() as i64;
@@ -993,7 +993,9 @@ impl Index {
             TryLockError::Error(e) => e,
         })
         .context("acquire source mutation lock")?;
-        let opened = rustix::fs::fstat(&file)?;
+        // Unlocked explicitly on every error from here too (see `LockedFile`).
+        let locked = LockedFile(file);
+        let opened = rustix::fs::fstat(&locked.0)?;
         let named = rustix::fs::statat(
             &*self.root,
             "mutation.lock",
@@ -1011,10 +1013,10 @@ impl Index {
         // lock on each request and must not pay two fsyncs (F_FULLFSYNC on
         // macOS) under `submitting`.
         if created {
-            self.sync_lock_created(&file)?;
+            self.sync_lock_created(&locked.0)?;
         }
         Ok(Guard {
-            _file: Arc::new(LockedFile(file)),
+            _file: Arc::new(locked),
             root: self.path.clone(),
             index: self.clone(),
         })
@@ -1927,7 +1929,8 @@ impl SourceStore {
 /// Tries the import lock of the clone named (`r-<16 hex>`) without
 /// waiting: `Some(lock)` held while it lives, `None` when it is busy (review
 /// round 3, M-1: every writer of a clone's `clone_ref` holds it).
-pub(crate) type ImportLock<'a> = &'a dyn Fn(&str) -> Result<Option<std::fs::File>>;
+pub(crate) type ImportLock<'a> =
+    &'a dyn Fn(&str) -> Result<Option<crate::platform::flock::HeldLock>>;
 
 /// How far one call of `register_step` goes: `pages` pages of 32 entries
 /// and `loads` manifest reads; `mark` says the root is a published
@@ -2298,8 +2301,10 @@ mod received_tests;
 mod tests {
     use super::*;
     /// An import lock that is always free (a lock of its own).
-    pub(crate) fn free_lock(_: &str) -> Result<Option<std::fs::File>> {
-        Ok(Some(tempfile::tempfile()?))
+    pub(crate) fn free_lock(_: &str) -> Result<Option<crate::platform::flock::HeldLock>> {
+        Ok(Some(crate::platform::flock::HeldLock::new(
+            tempfile::tempfile()?,
+        )))
     }
     use crate::ids::{AttemptId, Digest, RunId, TaskId, WorkerId};
     use crate::source::{capture, capture_for_run, CaptureParams, SourceRequest};
@@ -5566,7 +5571,7 @@ mod tests {
             "DELETE FROM clone_ref; UPDATE root SET used_ms=NULL; UPDATE meta SET value='' WHERE key='clone_ref_fill';",
         )
         .unwrap();
-        let busy = |_: &str| -> Result<Option<std::fs::File>> { Ok(None) };
+        let busy = |_: &str| -> Result<Option<crate::platform::flock::HeldLock>> { Ok(None) };
         assert!(!receiver
             .retention
             .fill_clone_refs(32, 64 << 20, &busy)
@@ -5607,14 +5612,13 @@ mod tests {
             BTreeMap::new(),
             std::sync::Arc::new(crate::workspace::CliFastWorktree::new(BTreeMap::new())),
         );
-        let held: Vec<std::fs::File> = ["github:example/parent", "github:example/child"]
-            .iter()
-            .map(|r| {
-                let lock = ws.import_lock(r).unwrap();
-                lock.lock().unwrap();
-                lock
-            })
-            .collect();
+        let held: Vec<crate::platform::flock::HeldLock> =
+            ["github:example/parent", "github:example/child"]
+                .iter()
+                .map(|r| {
+                    crate::platform::flock::HeldLock::lock(ws.import_lock(r).unwrap()).unwrap()
+                })
+                .collect();
         let lock = |clone: &str| ws.try_import_lock(clone);
         assert!(!receiver
             .retention

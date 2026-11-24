@@ -1858,6 +1858,9 @@ fn imported_refs_go_only_under_a_free_import_lock() {
         .to_string();
     let held = ws.import_lock("github:example/repo").unwrap();
     held.lock().unwrap();
+    // (released by `LOCK_UN` on drop, not by the last close: a child a
+    // parallel test forks meanwhile does not keep it held)
+    let held = belt::platform::flock::HeldLock::new(held);
     let done = std::cell::Cell::new(0);
     let drop_refs = |clone: &str| {
         ws.drop_imported_refs(
@@ -1875,16 +1878,7 @@ fn imported_refs_go_only_under_a_free_import_lock() {
     assert_eq!(done.get(), 0);
     assert_eq!(f.git(repo.dir(), &["rev-parse", &snapshot]), head);
     drop(held);
-    // (a child forked meanwhile may hold a copy of the lock's descriptor
-    // until its exec: the lock is free within a bounded wait)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !drop_refs(&clone).unwrap() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the import lock stayed busy"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    assert!(drop_refs(&clone).unwrap(), "the import lock stayed busy");
     assert_eq!(done.get(), 1);
     assert!(f
         .git(repo.dir(), &["for-each-ref", "refs/local-ci/"])
@@ -1930,29 +1924,19 @@ fn imported_refs_go_without_the_clones_hooks() {
     // received again: the refs stay, the row goes
     let done = std::cell::Cell::new(0);
     let run = |held: bool| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let ok = ws
-                .drop_imported_refs(
-                    &clone,
-                    &source,
-                    &|| Ok(held),
-                    &|| {
-                        done.set(done.get() + 1);
-                        Ok(())
-                    },
-                    &|| false,
-                )
-                .unwrap();
-            if ok {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the import lock stayed busy"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let ok = ws
+            .drop_imported_refs(
+                &clone,
+                &source,
+                &|| Ok(held),
+                &|| {
+                    done.set(done.get() + 1);
+                    Ok(())
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert!(ok, "the import lock stayed busy");
     };
     run(true);
     assert_eq!(done.get(), 1);
@@ -2076,16 +2060,11 @@ fn imported_refs_stop_ends_a_slow_git_and_keeps_the_row() {
         start.elapsed()
     );
     // (review round 3, M-1: nothing the stopped row leaves blocks a later
-    // `clone_ref` writer: the import lock is free again; a forked child of
-    // a parallel test may hold a copy of its descriptor until its exec)
-    let free_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while ws.try_import_lock(&clone).unwrap().is_none() {
-        assert!(
-            std::time::Instant::now() < free_by,
-            "the import lock stayed held"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // `clone_ref` writer: the import lock is free again)
+    assert!(
+        ws.try_import_lock(&clone).unwrap().is_some(),
+        "the import lock stayed held"
+    );
 }
 
 /// Review round 3 (M-1): a publication of a source whose `ref_drop:` row
@@ -2282,23 +2261,10 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         .unwrap();
     held.lock().unwrap();
     assert_eq!(gc(&|| false).unwrap(), CloneGc::Busy);
-    drop(held);
+    held.unlock().unwrap();
     assert!(old.1.exists());
-    // (a child forked meanwhile may hold a copy of a lock's descriptor
-    // until its exec: the locks are free within a bounded wait)
-    let until_free = |stop: &dyn Fn() -> bool| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let r = gc(stop).unwrap();
-            if r != CloneGc::Busy {
-                return r;
-            }
-            assert!(std::time::Instant::now() < deadline, "a lock stayed busy");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    };
     // stopped at once: nothing of it is left running
-    assert_eq!(until_free(&|| true), CloneGc::Stopped);
+    assert_eq!(gc(&|| true).unwrap(), CloneGc::Stopped);
     // (the clone's own lock and its main lock, held shared as
     // fast-worktree does, do not keep it from running)
     let own = std::fs::File::options()
@@ -2315,7 +2281,7 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         .open(git_dir.join("belt-workspace.lock"))
         .unwrap();
     shared.lock_shared().unwrap();
-    assert_eq!(until_free(&|| false), CloneGc::Ran);
+    assert_eq!(gc(&|| false).unwrap(), CloneGc::Ran);
     drop((own, shared));
     // (a newer one may have moved into a cruft pack: asked by id)
     assert!(!present(&old.0), "an object older than 14 days stayed");

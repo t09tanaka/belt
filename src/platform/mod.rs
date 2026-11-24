@@ -6,6 +6,7 @@
 
 pub mod boot;
 pub mod clock;
+pub mod flock;
 pub mod inhibit;
 pub mod owned_temp;
 pub mod process;

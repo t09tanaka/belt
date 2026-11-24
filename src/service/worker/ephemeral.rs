@@ -254,10 +254,10 @@ fn filesystem_of(dir: &File) -> plan::Filesystem {
 }
 
 /// Whether the lock was taken exclusively, without waiting.
-fn taken(lock: &File) -> std::io::Result<bool> {
-    match lock.try_lock() {
-        Ok(()) => Ok(true),
-        Err(TryLockError::WouldBlock) => Ok(false),
+fn taken(lock: &File) -> std::io::Result<Option<crate::platform::flock::HeldBorrow<'_>>> {
+    match crate::platform::flock::HeldBorrow::try_lock(lock) {
+        Ok(held) => Ok(Some(held)),
+        Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(e),
     }
 }
@@ -510,18 +510,19 @@ fn clear(state: &Path, host: &Host<'_>) -> anyhow::Result<Cleared> {
         (host.resident)()?,
     )
     .map_err(&kept)?;
-    if !taken(&dir)? {
+    let Some(_dir_held) = taken(&dir)? else {
         return Err(kept(format!(
             "another ephemeral start is clearing it right now{by}"
         )));
-    }
+    };
     (host.at)(Step::Examined);
     let open = |name: &str| {
         private_at(&dir, name, OFlags::RDWR | OFlags::CREATE)
             .map_err(|e| kept(format!("its {name} cannot be examined ({e}){by}")))
     };
     let ephemeral_lock = open(LOCK)?;
-    let ephemeral_taken = taken(&ephemeral_lock)?;
+    let ephemeral_held = taken(&ephemeral_lock)?;
+    let ephemeral_taken = ephemeral_held.is_some();
     // agent.lock is only touched once no process of the earlier start is
     // left, so a worker that is starting right now is not disturbed.
     let agent_lock = if ephemeral_taken {
@@ -529,10 +530,11 @@ fn clear(state: &Path, host: &Host<'_>) -> anyhow::Result<Cleared> {
     } else {
         None
     };
-    let agent_taken = match &agent_lock {
+    let agent_held = match &agent_lock {
         Some(lock) => taken(lock)?,
-        None => false,
+        None => None,
     };
+    let agent_taken = agent_held.is_some();
     plan::unused(ephemeral_taken, agent_taken).map_err(|why| kept(format!("{why}{by}")))?;
     (host.at)(Step::Held);
     if examined.read.is_none() || read_marker(&dir).read != examined.read {
@@ -601,11 +603,11 @@ fn unfinished(
         ))
     };
     judge()?.map_err(kept)?;
-    if !taken(dir)? {
+    let Some(_dir_held) = taken(dir)? else {
         return Err(kept(
             "another ephemeral start is clearing it right now".into(),
         ));
-    }
+    };
     (host.at)(Step::Examined);
     let examine = |e: std::io::Error| kept(format!("its {LOCK} cannot be examined ({e})"));
     let (lock, made) = match private_at(dir, LOCK, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL) {
@@ -615,7 +617,8 @@ fn unfinished(
         }
         Err(e) => return Err(examine(e)),
     };
-    let held = taken(&lock)?;
+    let lock_held = taken(&lock)?;
+    let held = lock_held.is_some();
     let proven = (|| {
         if !held {
             return Err(kept(
@@ -863,16 +866,22 @@ fn clean_up(created: &Created, alive: &File, host: &Host<'_>) -> anyhow::Result<
         "worker state was replaced; left in place"
     );
     let (parent, name) = place(&created.path)?;
+    let dir_held = taken(&dir)?;
     anyhow::ensure!(
-        taken(&dir)?,
+        dir_held.is_some(),
         "another ephemeral start is examining the worker state right now; it was left in place, and the next `belt worker --ephemeral` clears it"
     );
     (host.at)(Step::Examined);
     let mut held = Vec::new();
     for name in [OWNER_LOCK, AGENT_LOCK] {
         let lock = private_at(&dir, name, OFlags::RDWR | OFlags::CREATE)?;
+        let lock = match crate::platform::flock::HeldLock::try_lock(lock) {
+            Ok(lock) => Some(lock),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        };
         anyhow::ensure!(
-            taken(&lock)?,
+            lock.is_some(),
             "its {name} is held: a worker still uses this state; it was left in place"
         );
         held.push(lock);
