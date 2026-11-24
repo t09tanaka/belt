@@ -36,6 +36,7 @@ use crate::error::{ApiError, BlockedReason, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform::owned_temp::OwnedTemp;
 use crate::source::classify::api_error_of;
+use crate::source::retention::CloneGc;
 use crate::source::{ObjectsRepo, SourceStore};
 use git::Env;
 use local_ci::source::SourceManifest as CiManifest;
@@ -51,6 +52,24 @@ use std::sync::Arc;
 const REF_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The bound of one step 4 row, all its git calls together.
 const REF_ROW_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// The bound of one gc of (e) in a clone; one past it is ended, and the
+/// clone's next gc is a day later.
+const GC_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// The configuration of the clone gc's command line (review round 1, M2,
+/// L3): no packing of refs (step 4 removes loose refs), no worktree prune,
+/// no reflog expiry (it would take ref
+/// locks in the linked worktrees: with both set to `never` gc skips its
+/// reflog step), no auto gc or maintenance of its own.
+const GC_CONFIG: [&str; 6] = [
+    "gc.packRefs=false",
+    "gc.worktreePruneExpire=never",
+    "gc.reflogExpire=never",
+    "gc.reflogExpireUnreachable=never",
+    "gc.auto=0",
+    "maintenance.auto=false",
+];
+/// For belt's gits that move the main checkout's HEAD (review round 1, M1).
+const NO_REFLOG: &str = "core.logAllRefUpdates=false";
 const CLEANUP_COMMIT: &str = "refs/worktree/belt-cleanup";
 
 /// What kind of workspace this is, and so how it goes away.
@@ -179,8 +198,14 @@ impl Workspaces {
             match seed {
                 Some(s) => {
                     let w = work.to_string_lossy();
-                    git::run(&self.env, tmp.path(), &["clone", "-q", "--", s, &w])
-                        .map_err(internal)?
+                    // (M1: no reflog of the main HEAD or branch: it would keep
+                    // objects past the gc of spec 25.8 5b (e))
+                    git::run(
+                        &self.env,
+                        tmp.path(),
+                        &["-c", NO_REFLOG, "clone", "-q", "--", s, &w],
+                    )
+                    .map_err(internal)?
                 }
                 None => {
                     std::fs::create_dir(&work).map_err(|e| io_err("cannot create the clone", e))?;
@@ -293,32 +318,153 @@ impl Workspaces {
                 Some(lock)
             }
         };
-        if lock.is_some() && !held()? {
-            let row_end = std::time::Instant::now() + REF_ROW_LIMIT;
-            let git = |args: &[&str]| {
-                let deadline = row_end.min(std::time::Instant::now() + REF_GIT_LIMIT);
-                git::run_bounded(&self.env, &git_dir, &root, args, deadline, stop)
-            };
-            for r in [
-                format!("refs/local-ci/snapshots/{source}"),
-                format!("refs/local-ci/index/{source}"),
-            ] {
-                let Some(there) = git(&["show-ref", "--verify", "-q", &r])? else {
-                    return Ok(false);
-                };
-                if there == 0 {
-                    let Some(code) = git(&["update-ref", "-d", &r])? else {
-                        return Ok(false);
-                    };
-                    anyhow::ensure!(code == 0, "git update-ref -d {r} failed ({code})");
-                } else {
-                    anyhow::ensure!(there == 1, "git show-ref {r} failed ({there})");
-                }
-            }
+        if lock.is_some() && !held()? && !self.remove_source_refs(&git_dir, source, stop)? {
+            return Ok(false);
         }
         done()?;
         drop(lock);
         Ok(true)
+    }
+
+    /// With the import lock of the clone whose `.git` is `git_dir` held by
+    /// the caller: remove the refs belt's receiving puts there for `source`
+    /// (`refs/local-ci/{snapshots,index}/<source>`), each only when it is
+    /// there, with the bounded git of step 4 (hooks off, no inherited
+    /// `GIT_*`, its own process group, 10 s a call and 20 s in all).
+    /// `false`: `stop` ended it.
+    fn remove_source_refs(
+        &self,
+        git_dir: &Path,
+        source: &str,
+        stop: &dyn Fn() -> bool,
+    ) -> anyhow::Result<bool> {
+        let root = self.clones_root();
+        let row_end = std::time::Instant::now() + REF_ROW_LIMIT;
+        let git = |args: &[&str]| {
+            let deadline = row_end.min(std::time::Instant::now() + REF_GIT_LIMIT);
+            git::run_bounded(&self.env, git_dir, &root, args, deadline, stop)
+        };
+        for r in [
+            format!("refs/local-ci/snapshots/{source}"),
+            format!("refs/local-ci/index/{source}"),
+        ] {
+            let Some(there) = git(&["show-ref", "--verify", "-q", &r])? else {
+                return Ok(false);
+            };
+            if there == 0 {
+                let Some(code) = git(&["update-ref", "-d", &r])? else {
+                    return Ok(false);
+                };
+                anyhow::ensure!(code == 0, "git update-ref -d {r} failed ({code})");
+            } else {
+                anyhow::ensure!(there == 1, "git show-ref {r} failed ({there})");
+            }
+        }
+        Ok(true)
+    }
+
+    /// The gc of spec 25.8 5b (e) in the clone `clone` (a name
+    /// `r-<16 hex>`), called with no source lock held, under the clone's
+    /// import lock alone, tried without waiting (no unpack, step 4 or
+    /// discard writes packs and refs while gc judges what is reachable).
+    /// Its safety against fast-worktree, the workspaces' git and the users'
+    /// own git in the worktrees rests on Git's 14 days of grace and on the
+    /// worktrees' HEAD and index being reachable, not on a lock (review
+    /// round 1, M2: `ensure_clone`, `hold_clone_at` and the teardown never
+    /// wait for it). The configuration that would make gc touch more is
+    /// pinned on its command line ([`GC_CONFIG`]); a clone with
+    /// `extensions.preciousObjects` or a `gc.recentObjectsHook` set is not
+    /// collected (`Refused`). Before it, the
+    /// reflog of the main checkout's HEAD (only: never a linked worktree's)
+    /// is expired, under the main lock tried without waiting (skipped while
+    /// it is busy), so that what only an old checkout reached can go
+    /// (M1). Its gits are the bounded ones of step 4 (no inherited `GIT_*`,
+    /// hooks off, their own process group, SIGTERM then SIGKILL) with the
+    /// bound [`GC_LIMIT`] for both, ended when `stop` says so. Lock files
+    /// left in the clone are never removed. An error: a git failed, or ran
+    /// past the bound.
+    pub fn gc_clone(&self, clone: &str, stop: &dyn Fn() -> bool) -> anyhow::Result<CloneGc> {
+        anyhow::ensure!(clone_name_ok(clone), "not a clone name");
+        let root = self.clones_root();
+        let dir = root.join(clone);
+        let git_dir = dir.join(".git");
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CloneGc::Ran),
+            Err(e) => return Err(e.into()),
+            Ok(meta) => anyhow::ensure!(meta.is_dir(), "the clone is not a directory"),
+        }
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&git_dir)?.is_dir(),
+            "the clone's .git is not a directory"
+        );
+        let open = |path: PathBuf| open_lock(&path).map_err(|e| anyhow::anyhow!("{e:?}"));
+        let try_take =
+            |f: File, take: fn(&File) -> Result<(), std::fs::TryLockError>| match take(&f) {
+                Ok(()) => Ok(Some(f)),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::from(e)),
+            };
+        let Some(_importing) = try_take(
+            open(root.join(format!("{clone}.import.lock")))?,
+            File::try_lock,
+        )?
+        else {
+            return Ok(CloneGc::Busy);
+        };
+        let deadline = std::time::Instant::now() + GC_LIMIT;
+        let run =
+            |args: &[&str]| git::run_bounded(&self.env, &git_dir, &root, args, deadline, stop);
+        // (any value counts: kept is the safe side; a hook cannot be
+        // unset on the command line, and is not run)
+        let refused = r"^(extensions\.preciousobjects|gc\.recentobjectshook)$";
+        match run(&["config", "--get-regexp", refused])? {
+            None => return Ok(CloneGc::Stopped),
+            Some(0) => return Ok(CloneGc::Refused),
+            Some(1) => {}
+            Some(code) => anyhow::bail!("git config failed ({code})"),
+        }
+        // (the main lock as `lock_exclusive` takes it, through its intent
+        // lock, but tried: a checkout that waits for it is not stalled
+        // longer than the expire takes)
+        // (a clone belt made has no such reflog: nothing to expire)
+        let logged =
+            std::fs::symlink_metadata(git_dir.join("logs/HEAD")).is_ok_and(|m| m.is_file());
+        let main = if !logged {
+            None
+        } else if let Some(_intent) =
+            try_take(open(git_dir.join("belt-workspace.intent"))?, File::try_lock)?
+        {
+            try_take(open(git_dir.join("belt-workspace.lock"))?, File::try_lock)?
+        } else {
+            None
+        };
+        if let Some(main) = main {
+            let expire = [
+                "reflog",
+                "expire",
+                "--expire=now",
+                "--expire-unreachable=now",
+                "HEAD",
+            ];
+            // (its own short bound: the main lock is held meanwhile)
+            let until = deadline.min(std::time::Instant::now() + REF_ROW_LIMIT);
+            match git::run_bounded(&self.env, &git_dir, &root, &expire, until, stop)? {
+                None => return Ok(CloneGc::Stopped),
+                Some(0) => {}
+                Some(code) => anyhow::bail!("git reflog expire failed ({code})"),
+            }
+            drop(main);
+        }
+        let mut args: Vec<&str> = Vec::new();
+        for c in GC_CONFIG {
+            args.extend(["-c", c]);
+        }
+        args.extend(["gc", "--quiet", "--prune=14.days.ago"]);
+        match run(&args)? {
+            None => Ok(CloneGc::Stopped),
+            Some(0) => Ok(CloneGc::Ran),
+            Some(code) => anyhow::bail!("git gc failed ({code})"),
+        }
     }
 
     /// A scratch repository to try a bundle in before it touches the clone
@@ -382,7 +528,7 @@ impl Workspaces {
             git::run(
                 &self.env,
                 clone.dir(),
-                &["fetch", "-q", "--no-tags", "origin"],
+                &["-c", NO_REFLOG, "fetch", "-q", "--no-tags", "origin"],
             )
             .map_err(internal)?;
         }
@@ -506,7 +652,7 @@ impl Workspaces {
             git::run(
                 &self.env,
                 clone,
-                &["checkout", "-q", "-f", "--detach", commit],
+                &["-c", NO_REFLOG, "checkout", "-q", "-f", "--detach", commit],
             )
             .map_err(internal)?;
         }
@@ -1004,4 +1150,13 @@ fn lock_main(clone: &Path, take: fn(&File) -> std::io::Result<()>) -> Result<Fil
     // the intent lock is released when `intent` is dropped, on any return
     take(&main).map_err(err)?;
     Ok(main)
+}
+
+/// A clone's directory name: `r-<16 lowercase hex>`.
+fn clone_name_ok(clone: &str) -> bool {
+    clone.len() == 18
+        && clone.starts_with("r-")
+        && clone[2..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }

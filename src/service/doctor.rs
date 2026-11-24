@@ -176,6 +176,10 @@ pub struct AbandonedImports {
     /// every import into the store until a person looks (spec 25.8 5b).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub large_old_claims: u64,
+    /// Clones of received sources whose gc failed 3 times in a row or more
+    /// (spec 25.8 5b (e), review round 1, L6).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gc_failing: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -196,6 +200,7 @@ fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
             .ok()
             .flatten()
             .unwrap_or(0),
+        gc_failing: crate::source::retention::inspect_gc_failing(worker_state).unwrap_or(0),
     })
 }
 
@@ -733,6 +738,16 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             ));
         }
         out.push(check("abandoned_imports", Level::Notice, text));
+    }
+    if let Some(a) = facts.abandoned_imports.filter(|a| a.gc_failing > 0) {
+        out.push(check(
+            "source_clone_gc",
+            Level::Notice,
+            format!(
+                "the gc of {} clone(s) of received sources failed 3 times in a row or more (or extensions.preciousObjects or gc.recentObjectsHook is set there), so Git objects no ref reaches stay; belt tries again every day (look at the clone_gc_failed events)",
+                a.gc_failing
+            ),
+        ));
     }
     if let Some(a) = facts.abandoned_imports.filter(|a| a.large_old_claims > 0) {
         out.push(check(

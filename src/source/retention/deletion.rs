@@ -15,9 +15,12 @@ pub use import_release::{abandoned_imports_read_only, ImportReleaseReport};
 #[cfg(test)]
 pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
+pub(crate) use received::gc_failing;
+#[cfg(test)]
+pub(crate) use received::GC_FAILS_MAX;
 #[cfg(test)]
 pub(in crate::source::retention) use received::{set_budget, PLANNED};
-pub use received::{ReceivedPassInputs, ReceivedPassReport, RefRow, SourceUse};
+pub use received::{CloneGc, GcFailure, ReceivedPassInputs, ReceivedPassReport, RefRow, SourceUse};
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
 pub(super) use scratch::STAGING;

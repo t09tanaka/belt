@@ -2146,6 +2146,7 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes_truncated: false,
         unreadable_tokens: 0,
         large_old_claims: 0,
+        gc_failing: 0,
     });
     assert!(evaluate("mini-a", &facts)
         .iter()
@@ -2157,6 +2158,7 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes_truncated: false,
         unreadable_tokens: 0,
         large_old_claims: 0,
+        gc_failing: 0,
     });
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "abandoned_imports"), Level::Notice);
@@ -2174,6 +2176,7 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes_truncated: true,
         unreadable_tokens: 3,
         large_old_claims: 0,
+        gc_failing: 0,
     });
     let checks = evaluate("mini-a", &facts);
     let text = detail(&checks, "abandoned_imports");
@@ -2193,10 +2196,30 @@ fn a_large_old_claim_is_shown() {
         bytes_truncated: false,
         unreadable_tokens: 0,
         large_old_claims: 2,
+        gc_failing: 0,
     });
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "source_old_claims"), Level::Notice);
     assert!(detail(&checks, "source_old_claims").contains("2 deletion claim"));
+    assert!(checks.iter().all(|c| c.id != "source_clone_gc"));
+}
+
+/// Review round 1, L6: clones whose gc keeps failing are shown.
+#[test]
+fn a_failing_clone_gc_is_shown() {
+    let mut facts = healthy();
+    facts.abandoned_imports = Some(AbandonedImports {
+        roots: 0,
+        members: 0,
+        bytes: 0,
+        bytes_truncated: false,
+        unreadable_tokens: 0,
+        large_old_claims: 0,
+        gc_failing: 2,
+    });
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "source_clone_gc"), Level::Notice);
+    assert!(detail(&checks, "source_clone_gc").contains("gc of 2 clone(s)"));
 }
 
 #[test]
