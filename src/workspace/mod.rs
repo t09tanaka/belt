@@ -28,6 +28,7 @@ mod git;
 pub mod in_place;
 mod overlay;
 pub mod plan;
+pub mod prepare_tools;
 
 pub use fastwt::{CliFastWorktree, FastWorktree, DEFAULT_TIMEOUT as DEFAULT_PREPARE_TIMEOUT};
 pub use plan::FwFailure;

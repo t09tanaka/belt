@@ -158,3 +158,29 @@ pub fn read_captured_task(
         .map(|unread| unread.code);
     Ok((read, unread))
 }
+
+/// The tools preparing a Git workspace of the captured source runs (spec
+/// 22.1), read from the source's files and its root `.fast-worktree.toml`.
+/// A directory snapshot is unpacked, not prepared: it needs none.
+pub fn read_captured_prepare_tools(
+    store: &SourceStore,
+    manifest: &SourceManifest,
+) -> Result<crate::workspace::prepare_tools::PrepareTools, String> {
+    verify_manifest(manifest).map_err(|_| "invalid_source_manifest".to_string())?;
+    let flavor = crate::workspace::plan::flavor_of(
+        manifest.execution_commit.as_deref(),
+        manifest.repository_id.as_deref(),
+    )
+    .map_err(|e| e.message)?;
+    if flavor == crate::workspace::plan::Flavor::Directory {
+        return Ok(Default::default());
+    }
+    let config = load(store, manifest, ".fast-worktree.toml").map_err(|d| d.code)?;
+    let config = config.map(|doc| doc.text);
+    let paths = manifest
+        .object_manifest
+        .entries
+        .iter()
+        .filter_map(|e| std::str::from_utf8(&e.path.0).ok());
+    crate::workspace::prepare_tools::prepare_tools(paths, config.as_deref())
+}
