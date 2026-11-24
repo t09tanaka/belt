@@ -51,6 +51,16 @@ impl Drop for LockedFile {
         let _ = self.0.unlock();
     }
 }
+/// What only a parent's store holds (review round 1, L4): a `run` or
+/// `import` root, a `legacy:` root, a `capture_owner` row, or an
+/// `import_session` bound to a run. A store with any of them is a parent's:
+/// the legacy registration does not open the gate there, and the worker's
+/// passes change nothing.
+const PARENT_MARKERS: &str =
+    "(EXISTS(SELECT 1 FROM root WHERE kind IN ('run','import') OR id LIKE 'legacy:%')
+     OR EXISTS(SELECT 1 FROM capture_owner)
+     OR EXISTS(SELECT 1 FROM import_session WHERE run_id IS NOT NULL))";
+
 #[derive(Debug, Clone)]
 pub(crate) struct Index {
     path: PathBuf,
@@ -774,9 +784,9 @@ impl Index {
     /// goes on with the next manifest; it is never abandoned for that.
     /// Nothing is done in a store with a parent's root. `true` once the
     /// queue is empty (`legacy_retry` holds only queued names). The marker
-    /// `legacy_registration` is left as it is: turning it `done` opens the
-    /// gate of the deleting passes and is part of the change that brings
-    /// them, which may do so only while neither table has a row.
+    /// `legacy_registration` turns `done` (the gate of the deleting passes
+    /// opens) only by [`Self::finish_legacy`], in the same IMMEDIATE
+    /// transaction that saw the queue empty.
     pub(crate) fn register_legacy(&self) -> Result<bool> {
         if !self.legacy_registration_pending()? || self.holds_parent_roots()? {
             return Ok(true);
@@ -827,9 +837,14 @@ impl Index {
             )
             .optional()?
         else {
-            return Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM legacy_queue)", [], |r| {
-                r.get::<_, bool>(0)
-            })?);
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::finish_legacy(&tx)?;
+            let empty: bool =
+                tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM legacy_queue)", [], |r| {
+                    r.get(0)
+                })?;
+            tx.commit()?;
+            return Ok(empty);
         };
         let manifest_limit = crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes;
         let root = format!("receive:{id}");
@@ -869,6 +884,7 @@ impl Index {
         }
         tx.execute("DELETE FROM legacy_queue WHERE name=?1", [&id])?;
         tx.execute("DELETE FROM legacy_retry WHERE name=?1", [&id])?;
+        Self::finish_legacy(&tx)?;
         let empty: bool =
             tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM legacy_queue)", [], |r| {
                 r.get(0)
@@ -1074,14 +1090,31 @@ impl Index {
         let rows = s.query_map([limit], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
-    /// Whether the store holds a parent's root (`run`, `import`): a worker
-    /// pass then changes nothing (spec 25.8 5b, the store is not shared).
-    pub(crate) fn holds_parent_roots(&self) -> Result<bool> {
-        Ok(self.connect()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM root WHERE kind IN ('run','import'))",
+    /// The end of the legacy registration (spec 25.8 5b (h)5, 段階5bの2の3の5):
+    /// `legacy_registration` turns `done` only when, read inside the
+    /// caller's IMMEDIATE transaction `tx`, the queue was listed
+    /// (`meta.legacy_queue='listed'`), `legacy_queue` and `legacy_retry`
+    /// have no row, and the store holds none of the parent's markers
+    /// ([`PARENT_MARKERS`]). Returns whether it turned `done` now.
+    pub(crate) fn finish_legacy(tx: &rusqlite::Transaction<'_>) -> Result<bool> {
+        Ok(tx.execute(
+            &format!(
+                "UPDATE meta SET value='done' WHERE key='legacy_registration' AND value<>'done'
+                 AND EXISTS(SELECT 1 FROM meta WHERE key='legacy_queue' AND value='listed')
+                 AND NOT EXISTS(SELECT 1 FROM legacy_queue)
+                 AND NOT EXISTS(SELECT 1 FROM legacy_retry)
+                 AND NOT ({PARENT_MARKERS})"
+            ),
             [],
-            |r| r.get(0),
-        )?)
+        )? == 1)
+    }
+    /// Whether the store holds one of the parent's markers
+    /// ([`PARENT_MARKERS`]): a worker pass then changes nothing (spec 25.8
+    /// 5b, the store is not shared).
+    pub(crate) fn holds_parent_roots(&self) -> Result<bool> {
+        Ok(self
+            .connect()?
+            .query_row(&format!("SELECT {PARENT_MARKERS}"), [], |r| r.get(0))?)
     }
     /// An empty receive root whose manifest cannot be proven: abandoned (its
     /// members go by the later passes), and its graph rows removed.
@@ -5274,8 +5307,9 @@ mod tests {
             .query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
             .unwrap();
         assert_eq!(queued, 0);
-        // the marker that opens deletion is not turned here
-        assert!(receiver.retention.legacy_registration_pending().unwrap());
+        // the queue is empty: the marker that opens deletion turns `done`
+        // (段階5bの2の3の5), the unregistrable one does not hold it (g)37
+        assert!(!receiver.retention.legacy_registration_pending().unwrap());
         // a store with a parent's root is left as it is (g)35
         let parent = SourceStore::open(&f._root.path().join("parent")).unwrap();
         let pc = parent.retention.connect().unwrap();
@@ -5318,7 +5352,8 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "abandoned");
         assert!(!receiver.retention.received_row(&id).unwrap());
-        assert!(receiver.retention.legacy_registration_pending().unwrap());
+        // (the registration is over, and the abandoned one is not here)
+        assert!(!receiver.retention.legacy_registration_pending().unwrap());
         let held = receiver.mutation_guard().unwrap();
         assert!(!receiver.received(&held, &id).unwrap());
     }
@@ -5550,6 +5585,94 @@ mod tests {
             )
             .unwrap();
         assert!(held);
+    }
+    /// 段階5bの2の3の5: `legacy_registration` turns `done` only in a
+    /// transaction that sees the queue listed, `legacy_queue` and
+    /// `legacy_retry` empty and no parent's root; each condition alone
+    /// keeps it `pending`.
+    #[test]
+    fn the_legacy_registration_opens_the_gate_only_when_nothing_is_left() {
+        let f = Fixture::new();
+        let (receiver, parent, child, want, bytes) = family(&f);
+        receiver.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        write_manifest(&receiver, &parent);
+        write_manifest(&receiver, &child);
+        let c = receiver.retention.connect().unwrap();
+        let pending = || -> bool { receiver.retention.legacy_registration_pending().unwrap() };
+        let finish = || -> bool {
+            let mut c = receiver.retention.connect().unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let done = Index::finish_legacy(&tx).unwrap();
+            tx.rollback().unwrap();
+            done
+        };
+        // listed, the two manifests queued
+        receiver.retention.register_legacy().unwrap();
+        assert!(pending(), "a manifest is still queued");
+        // a queued manifest that waits for its next try (not due): the call
+        // finds nothing to do, and the gate stays shut
+        let now = crate::platform::clock::wall_ms() as i64;
+        c.execute("DELETE FROM legacy_queue", []).unwrap();
+        c.execute("INSERT INTO legacy_queue VALUES(?1)", [&parent.source_id])
+            .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO legacy_retry(name,next_ms,attempts) VALUES(?1,?2,1)",
+            rusqlite::params![parent.source_id, now + 600_000],
+        )
+        .unwrap();
+        assert!(!receiver.retention.register_legacy().unwrap());
+        assert!(pending(), "a queued manifest keeps the gate shut");
+        assert!(!finish());
+        // a queue row alone
+        c.execute("DELETE FROM legacy_retry", []).unwrap();
+        assert!(!finish(), "a queue row keeps the gate shut");
+        // a retry row alone
+        c.execute(
+            "INSERT INTO legacy_retry(name,next_ms,attempts) VALUES(?1,?2,1)",
+            rusqlite::params![parent.source_id, now + 600_000],
+        )
+        .unwrap();
+        c.execute("DELETE FROM legacy_queue", []).unwrap();
+        assert!(!finish(), "a retry row keeps the gate shut");
+        c.execute("DELETE FROM legacy_retry", []).unwrap();
+        // a parent's root
+        c.execute("INSERT INTO root(id,kind) VALUES('run:x','run')", [])
+            .unwrap();
+        assert!(!finish(), "a parent's root keeps the gate shut");
+        c.execute("DELETE FROM root WHERE id='run:x'", []).unwrap();
+        // the other parent's markers (review round 1, L4), each alone
+        for (marker, undo) in [
+            (
+                "INSERT INTO root(id,kind) VALUES('legacy:x','pending')",
+                "DELETE FROM root WHERE id='legacy:x'",
+            ),
+            (
+                "INSERT INTO capture_owner(run_id,state,root,place,pid,start) VALUES('r','capturing',NULL,'p',2,'s')",
+                "DELETE FROM capture_owner",
+            ),
+            (
+                "INSERT INTO import_session(token,state,source,run_id) VALUES('t','pending',NULL,'run-1')",
+                "DELETE FROM import_session",
+            ),
+        ] {
+            c.execute(marker, []).unwrap();
+            assert!(!finish(), "{marker} keeps the gate shut");
+            assert!(receiver.retention.holds_parent_roots().unwrap(), "{marker}");
+            c.execute(undo, []).unwrap();
+        }
+        assert!(!receiver.retention.holds_parent_roots().unwrap());
+        // not listed yet
+        c.execute("DELETE FROM meta WHERE key='legacy_queue'", [])
+            .unwrap();
+        assert!(!finish(), "a queue never listed keeps the gate shut");
+        c.execute("INSERT INTO meta VALUES('legacy_queue','listed')", [])
+            .unwrap();
+        assert!(pending());
+        // nothing left: the next call opens it
+        assert!(receiver.retention.register_legacy().unwrap());
+        assert!(!pending());
     }
     /// Review round 3 (M-1): the fill run again (the hourly recount) finds
     /// the clone's import lock busy (an import, or step 4, holds it): it

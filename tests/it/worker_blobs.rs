@@ -367,6 +367,10 @@ exec "{real}" "$@"
         ));
         connect(a, client_cfg(&self.cluster)).await.unwrap().client
     }
+    fn is_terminal(&self, a: &AttemptId) -> bool {
+        let store = WorkerStore::open_read_only(&self.state()).unwrap();
+        store.get(a).unwrap().unwrap().state == AttemptState::Terminal
+    }
     fn wait_terminal(&self, a: &AttemptId) -> Outcome {
         let store = WorkerStore::open_read_only(&self.state()).unwrap();
         let start = Instant::now();
@@ -4140,4 +4144,434 @@ fn doctor_counts_staging_dirs_whose_token_record_cannot_be_read() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the count blocked on a FIFO");
     assert_eq!(counted, 3);
+}
+
+// ------------------------------------- the open gate (spec 25.8 5b (g))
+
+fn retention_db(f: &Fx) -> rusqlite::Connection {
+    rusqlite::Connection::open(f.state().join("sources/retention.db")).unwrap()
+}
+
+fn meta_of(f: &Fx, key: &str) -> Option<String> {
+    use rusqlite::OptionalExtension as _;
+    retention_db(f)
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+        .optional()
+        .unwrap()
+}
+
+/// The agent's ticks run the fills, this process's recount and the legacy
+/// registration until the registration turns the gate open
+/// (`legacy_registration='done'`) and the recount is over: the product's
+/// own path, nothing written by hand. (The recount starts at the first
+/// tick after the fills are done, and rewinds them: a few ticks more.)
+fn ticks_open_the_gate(f: &Fx, agent: &Arc<Agent>) {
+    ticks_settle(f, agent, true);
+}
+
+/// The agent's ticks until the fills and the recount are over, and, when
+/// `gate`, the registration has opened the gate.
+fn ticks_settle(f: &Fx, agent: &Arc<Agent>, gate: bool) {
+    let deadline = Instant::now() + T;
+    for n in 0.. {
+        agent.supervise();
+        let done = |k: &str| meta_of(f, k).as_deref() == Some("done");
+        let recounting =
+            meta_of(f, "bytes_recount").is_some() || meta_of(f, "bytes_recount_wait").is_some();
+        if n >= 8
+            && !recounting
+            && (!gate || done("legacy_registration"))
+            && done("bytes_fill")
+            && done("clone_ref_fill")
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the ticks did not settle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The received roots `ids` were last used long ago, and the pass's clock
+/// has been watched for the whole age limit (14 days) on this boot.
+///
+/// Both are written by hand (review round 1, L2): `used_ms` and the
+/// `received_clock` state stand in for 14 days of waiting, which a test
+/// cannot drive. What these tests do not write by hand is the gate (the
+/// agent's own registration opens it) and every deletion (the agent's own
+/// passes make it). The clock-trust rule itself (a clock watched for less
+/// than the age deletes nothing by age) is covered by the lib test
+/// `nothing_goes_by_age_while_the_clock_holds`.
+fn make_old(f: &Fx, ids: &[&str]) {
+    let c = retention_db(f);
+    for id in ids {
+        let n = c
+            .execute("UPDATE root SET used_ms=1 WHERE id='receive:'||?1", [id])
+            .unwrap();
+        assert_eq!(n, 1, "no received root for {id}");
+    }
+    let wall = belt::platform::clock::wall_ms();
+    let state = belt::results::clock_policy::ClockState {
+        boot: belt::platform::boot_id(),
+        effective: wall,
+        observed: wall,
+        mono: belt::platform::clock::monotonic_ms(),
+        ready: 0,
+        retention: 14 * 24 * 3600 * 1000,
+    };
+    c.execute(
+        "INSERT INTO meta(key,value) VALUES('received_clock',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [serde_json::to_string(&state).unwrap()],
+    )
+    .unwrap();
+}
+
+/// Rounds of the agent's received passes until `done` holds.
+fn passes_until(agent: &Arc<Agent>, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + T;
+    loop {
+        agent.received_passes();
+        if done() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: not within {T:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A few more rounds that each ran (none was taken by a scheduled one).
+fn more_passes(agent: &Arc<Agent>, n: usize) {
+    let deadline = Instant::now() + T;
+    let mut ran = 0;
+    while ran < n {
+        ran += agent.received_passes().min(1);
+        assert!(Instant::now() < deadline, "no pass ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The bytes of the files the worker's index has object rows for (what
+/// `store_bytes` counts).
+fn object_bytes_on_disk(f: &Fx) -> u64 {
+    let c = retention_db(f);
+    let mut s = c.prepare("SELECT path FROM object").unwrap();
+    let paths: Vec<String> = s
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let root = f.state().join("sources");
+    paths
+        .iter()
+        .filter_map(|p| std::fs::symlink_metadata(root.join(p)).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn ci(source: &SourceId) -> String {
+    belt::source::classify::ci_id_of(source).unwrap()
+}
+
+fn refs_of(clone: &Path, ci: &str) -> String {
+    git(
+        clone,
+        &[
+            "for-each-ref",
+            &format!("refs/local-ci/snapshots/{ci}"),
+            &format!("refs/local-ci/index/{ci}"),
+        ],
+    )
+}
+
+/// A plain directory whose files are `files` (name, bytes).
+fn dir_of(f: &Fx, name: &str, files: &[(&str, &[u8])]) -> Parcel {
+    let dir = f.path(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (n, b) in files {
+        std::fs::write(dir.join(n), b).unwrap();
+    }
+    f.capture(&SourceRequest::Directory { dir })
+}
+
+/// (g) 2, 4, 13, 16 (staged part), 17 through the product: with the gate
+/// opened by the agent's own registration, an old source nobody uses goes,
+/// and nothing that is still needed does: a source this worker's attempt
+/// is running on (still running through every pass, checked), the files a
+/// receipt has staged (its `receipt` root in the store is covered by the
+/// lib test `a_receipt_in_progress_keeps_its_blobs_through_a_pass`), a
+/// received source its parent names, and the refs of a published source of
+/// the same clone. Afterwards a receipt and a publication are not refused.
+/// (Another member's attempt, (g)3, and a pin alone reach the pass as the
+/// same `Live` answer; they are covered at lib level.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_open_gate_deletes_only_what_nobody_needs() {
+    let f = fx();
+    let shared = noise(901, 3000);
+    let gone = dir_of(
+        &f,
+        "gone",
+        &[("only.bin", &noise(902, 2000)), ("shared.bin", &shared)],
+    );
+    let running = dir_of(&f, "running", &[("run.bin", &noise(903, 2000))]);
+    let coming = dir_of(
+        &f,
+        "coming",
+        &[("shared.bin", &shared), ("own.bin", &noise(904, 2000))],
+    );
+    let repo = project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    std::fs::write(repo.join("a.txt"), "edited again\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let child = first.root.submodules[0].source_id.clone().unwrap();
+    assert_eq!(second.root.submodules[0].source_id.as_ref(), Some(&child));
+
+    let store = f.worker_store();
+    let agent = f.start();
+    let c = f.connect(&agent).await;
+    {
+        let m = f.machine();
+        let (sink, l) = (m.blobs().unwrap(), limits());
+        for p in [&gone, &running, &first, &second] {
+            send_all(sink, &l, p);
+            assert!(verify(sink, &l, &p.source, p.refs()).ready);
+        }
+        // `coming` is part-way: its manifest and its shared file only
+        put_all(sink, &l, &coming.source, Manifest, &coming.manifests[0]).unwrap();
+        put_all(sink, &l, &coming.source, Content, &shared).unwrap();
+    }
+    // an attempt runs on `running` until the test lets it end
+    let release = f.path("release");
+    let a = AttemptId::generate();
+    let submit = Request::SubmitAttempt(
+        SubmitAttemptRequest::new(
+            RequestId::generate(),
+            CoordinatorEpoch(1),
+            a.clone(),
+            payload(
+                &running,
+                &format!(
+                    // it ends only when released: on its own timeout it
+                    // fails, so the test cannot pass on a pass that ran
+                    // after it ended
+                    "i=0; while [ ! -e {0} ]; do [ $i -lt 2400 ] || exit 1; sleep 0.05; i=$((i+1)); done",
+                    release.display()
+                ),
+            ),
+        )
+        .unwrap(),
+    );
+    call(&c, submit).await.unwrap();
+
+    let staged_before = f.staged(&coming.source);
+    eprintln!(
+        "staged: {staged_before:?} shared: {}",
+        coming.blob_of_len(3000).0
+    );
+    assert!(!staged_before.is_empty());
+    ticks_open_the_gate(&f, &agent);
+    let clone = f.clones()[0].clone();
+    let (first_ci, second_ci) = (first.root.source_id.clone(), second.root.source_id.clone());
+    assert!(!refs_of(&clone, &first_ci).is_empty());
+    assert!(!refs_of(&clone, &second_ci).is_empty());
+    // everything is old but `second`, which names the child
+    make_old(
+        &f,
+        &[&ci(&gone.source), &ci(&running.source), &first_ci, &child],
+    );
+    let only = gone.blob_of_len(2000).0.to_string();
+    passes_until(&agent, "the old sources go", || {
+        let state = (
+            !store.has_blob(&only),
+            store.manifest(&first_ci).unwrap().is_none(),
+            refs_of(&clone, &first_ci).is_empty(),
+        );
+        state == (true, true, true)
+    });
+    more_passes(&agent, 3);
+    assert!(!f.is_terminal(&a), "the attempt ended before the pass");
+
+    assert!(store.manifest(&ci(&gone.source)).unwrap().is_none());
+    // the attempt's source, all of it
+    assert!(store.manifest(&ci(&running.source)).unwrap().is_some());
+    assert!(running.blobs.keys().all(|h| store.has_blob(h)));
+    // the source being received: what it staged is untouched. (Its file
+    // shared with the one that went was answered from the store and not
+    // staged; it went with that source, and the receipt fetches it again:
+    // spec 段階5bの2の2b, `blob_verify` answers it missing, checked below.)
+    assert_eq!(f.staged(&coming.source), staged_before);
+    assert!(f.incoming(&coming.source).exists());
+    // the child its parent names, the parent, and the parent's refs
+    assert!(store.manifest(&child).unwrap().is_some());
+    assert!(store.manifest(&second_ci).unwrap().is_some());
+    assert!(second.blobs.keys().all(|h| store.has_blob(h)));
+    assert!(!refs_of(&clone, &second_ci).is_empty());
+    let dest = f.path("unpacked");
+    let root = store.manifest(&second_ci).unwrap().unwrap();
+    store.materialize(&root, &dest).unwrap();
+    assert_eq!(
+        std::fs::read(dest.join("vendor/lib/lib.txt")).unwrap(),
+        b"edited lib\n"
+    );
+    // the receipt goes on and is published
+    {
+        let m = f.machine();
+        let (sink, l) = (m.blobs().unwrap(), limits());
+        assert!(!verify(sink, &l, &coming.source, coming.refs()).ready);
+        send_all(sink, &l, &coming);
+        assert!(verify(sink, &l, &coming.source, coming.refs()).ready);
+        // what went is received again, whole
+        send_all(sink, &l, &gone);
+        assert!(verify(sink, &l, &gone.source, gone.refs()).ready);
+    }
+    assert!(gone.blobs.keys().all(|h| store.has_blob(h)));
+    // (g) 17: the passes after it leave the source received again whole
+    // (its detach left a `drop:` root the passes clear), and it can be
+    // laid out
+    more_passes(&agent, 3);
+    assert!(gone.blobs.keys().all(|h| store.has_blob(h)));
+    let again = store.manifest(&ci(&gone.source)).unwrap().unwrap();
+    store.materialize(&again, &f.path("again")).unwrap();
+    // (g) 13: the counted total is the size of the files there
+    let counted: u64 = meta_of(&f, "store_bytes").unwrap().parse().unwrap();
+    assert_eq!(counted, object_bytes_on_disk(&f));
+    // the attempt was still running through every pass above: its source
+    // was kept because it was in use, not because the attempt had ended
+    assert!(
+        !f.is_terminal(&a),
+        "the attempt ended before the passes were over"
+    );
+    // the explicit release: the attempt succeeds only through it
+    std::fs::write(&release, "").unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+}
+
+/// (g) 23: while a version is on trial the agent's passes delete nothing,
+/// and after the trial they do.
+#[test]
+fn nothing_goes_while_a_version_is_on_trial() {
+    let f = fx();
+    let old = dir_of(&f, "old", &[("old.bin", &noise(911, 2000))]);
+    let agent = f.start();
+    {
+        let m = f.machine();
+        let (sink, l) = (m.blobs().unwrap(), limits());
+        send_all(sink, &l, &old);
+        assert!(verify(sink, &l, &old.source, old.refs()).ready);
+    }
+    let store = f.worker_store();
+    ticks_open_the_gate(&f, &agent);
+    belt::worker::control::begin_trial(&f.state()).unwrap();
+    // (a round already running when the trial began, in the background
+    // or not, stops at its next section; `received_passes` also answers 0
+    // while one holds the flag, so wait until none holds it)
+    let deadline = Instant::now() + T;
+    while agent.received_round_running() {
+        assert!(Instant::now() < deadline, "a round did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    make_old(&f, &[&ci(&old.source)]);
+    for _ in 0..3 {
+        assert_eq!(agent.received_passes(), 0);
+        agent.tick();
+    }
+    assert!(store.manifest(&ci(&old.source)).unwrap().is_some());
+    assert!(old.blobs.keys().all(|h| store.has_blob(h)));
+    belt::worker::control::end_trial(&f.state()).unwrap();
+    passes_until(&agent, "the old source goes after the trial", || {
+        store.manifest(&ci(&old.source)).unwrap().is_none()
+            && old.blobs.keys().all(|h| !store.has_blob(h))
+    });
+}
+
+/// (g) 31, 37 (legacy part): a manifest received before stage 5a (a file
+/// with no index rows) keeps the files it shares with an old source until
+/// the agent's registration takes it, and an invalid legacy manifest does
+/// not keep the gate shut. Then the old source goes and the legacy one
+/// stays, whole.
+#[test]
+fn a_legacy_manifest_keeps_its_files_until_it_is_registered() {
+    let f = fx();
+    let shared = noise(921, 3000);
+    let old = dir_of(
+        &f,
+        "old",
+        &[("shared.bin", &shared), ("x.bin", &noise(922, 2000))],
+    );
+    let legacy = dir_of(
+        &f,
+        "legacy",
+        &[("shared.bin", &shared), ("y.bin", &noise(923, 2000))],
+    );
+    {
+        let m = f.machine();
+        let (sink, l) = (m.blobs().unwrap(), limits());
+        for p in [&old, &legacy] {
+            send_all(sink, &l, p);
+            assert!(verify(sink, &l, &p.source, p.refs()).ready);
+        }
+    }
+    let legacy_ci = ci(&legacy.source);
+    // (as an older version left it: the file, and no rows of its own)
+    let c = retention_db(&f);
+    c.execute_batch(&format!(
+        "DELETE FROM member WHERE root='receive:{legacy_ci}';
+         DELETE FROM graph WHERE root='receive:{legacy_ci}';
+         DELETE FROM root WHERE id='receive:{legacy_ci}';
+         DELETE FROM meta WHERE key='legacy_queue';
+         UPDATE meta SET value='pending' WHERE key='legacy_registration';"
+    ))
+    .unwrap();
+    // an invalid one beside it
+    let bad = ci(&SourceId::generate());
+    let manifests = f.state().join("sources/manifests");
+    std::fs::write(manifests.join(format!("{bad}.json")), b"not json").unwrap();
+    // the legacy manifest waits for its next try (an earlier try failed
+    // with an error that is not "invalid"): the queue stays non-empty
+    let later = belt::platform::clock::wall_ms() as i64 + 600_000;
+    c.execute(
+        "INSERT INTO legacy_retry(name,next_ms,attempts) VALUES(?1,?2,1)",
+        rusqlite::params![legacy_ci, later],
+    )
+    .unwrap();
+    // the old source is old before the registration has run
+    make_old(&f, &[&ci(&old.source)]);
+    let store = f.worker_store();
+    let agent = Agent::start(f.cfg(), Arc::new(RealButCore(f.machine()))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    // the fills and the recount finish, the invalid one is abandoned, and
+    // only the unregistered manifest is left: that alone keeps the gate
+    // shut, and passes that would otherwise delete the old source detach
+    // nothing
+    ticks_settle(&f, &agent, false);
+    more_passes(&agent, 3);
+    let queued: i64 = c
+        .query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(queued, 1, "only the legacy manifest is queued");
+    assert_eq!(
+        meta_of(&f, "legacy_registration").as_deref(),
+        Some("pending")
+    );
+    let detached: i64 = c
+        .query_row(
+            "SELECT count(*) FROM root WHERE id LIKE 'drop:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(detached, 0, "nothing is detached while the gate is shut");
+    assert!(store.has_blob(old.blob_of_len(2000).0));
+    assert!(store.manifest(&ci(&old.source)).unwrap().is_some());
+    assert!(store.has_blob(legacy.blob_of_len(3000).0));
+    // its retry falls due: the registration takes it and opens the gate
+    c.execute("DELETE FROM legacy_retry", []).unwrap();
+    ticks_open_the_gate(&f, &agent);
+    passes_until(&agent, "the old source goes", || {
+        store.manifest(&ci(&old.source)).unwrap().is_none()
+            && !store.has_blob(old.blob_of_len(2000).0)
+    });
+    more_passes(&agent, 2);
+    assert!(store.manifest(&legacy_ci).unwrap().is_some());
+    assert!(legacy.blobs.keys().all(|h| store.has_blob(h)));
+    let held = store.mutation_guard().unwrap();
+    assert!(store.received(&held, &legacy_ci).unwrap());
 }

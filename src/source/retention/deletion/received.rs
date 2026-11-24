@@ -459,11 +459,21 @@ impl SourceStore {
             report.sections += 1;
             let mut budget = section_budget();
             if step0 < STEP0_SECTIONS {
+                // (review round 1, L3: an abandoned `receive:<id>` root
+                // is released only when `<id>` has no live use and no pin:
+                // a legacy manifest an attempt was accepted on while the
+                // gate was shut may be abandoned as invalid afterwards)
+                let in_use = |id: &str| -> bool {
+                    let sid = crate::source::classify::source_id_of_ci(id);
+                    sid.is_none()
+                        || !matches!((inputs.uses)(id, sid.as_ref()), Ok(SourceUse::Ended(_)))
+                };
                 match self.retention.leftovers(
                     &mut c,
                     &mut budget,
                     inputs.wall,
                     large,
+                    &in_use,
                     &mut report,
                 )? {
                     Leftover::None => {}
@@ -568,13 +578,14 @@ impl Index {
         let mut c = self.connect()?;
         let mut budget = budget;
         let mut report = ReceivedPassReport::default();
-        let what = match self.leftovers(&mut c, &mut budget, now_ms(), true, &mut report)? {
-            Leftover::None => "none",
-            Leftover::Progress => "progress",
-            Leftover::Stuck => "stuck",
-            Leftover::Stop => "stop",
-            Leftover::Large(_) => "large",
-        };
+        let what =
+            match self.leftovers(&mut c, &mut budget, now_ms(), true, &|_| false, &mut report)? {
+                Leftover::None => "none",
+                Leftover::Progress => "progress",
+                Leftover::Stuck => "stuck",
+                Leftover::Stop => "stop",
+                Leftover::Large(_) => "large",
+            };
         Ok((what, report))
     }
 
@@ -910,13 +921,16 @@ impl Index {
     }
 
     /// Step 0: claims a crash left, then the members of the abandoned roots
-    /// after the cursor.
+    /// after the cursor. An abandoned `receive:<id>` root for which
+    /// `in_use(<id>)` holds (a live attempt, a pin, or an answer that is an
+    /// error) is kept, and looked at again at its next try.
     fn leftovers(
         &self,
         c: &mut Connection,
         budget: &mut u64,
         now: u64,
         large: bool,
+        in_use: &dyn Fn(&str) -> bool,
         report: &mut ReceivedPassReport,
     ) -> Result<Leftover> {
         // (next tries of roots that are gone go with them)
@@ -1032,9 +1046,18 @@ impl Index {
         let mut unproven_read = 0u64;
         let mut claimed = None;
         let mut retry = std::collections::BTreeSet::new();
+        let mut used = std::collections::BTreeMap::new();
         for (root, object, path, bytes) in &members {
             if unproven_read >= start / 2 {
                 break;
+            }
+            if let Some(id) = root.strip_prefix("receive:") {
+                if *used.entry(root.clone()).or_insert_with(|| in_use(id)) {
+                    cursor = format!("{root}\n{object}");
+                    report.kept += 1;
+                    retry.insert(root.clone());
+                    continue;
+                }
             }
             let shared: bool = c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",

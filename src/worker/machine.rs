@@ -815,6 +815,39 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(250));
         holder.join().unwrap();
     }
+
+    /// (g)15, review round 1: while a deleting pass holds the exclusive
+    /// lock, the readers of another source wait and read on (they do not
+    /// fail): the workspace's unpacking, and the manifest read under the
+    /// waited lock that the CI supervisor takes; the nonblocking lock fails
+    /// at once with the untyped `WouldBlock`.
+    #[test]
+    fn the_readers_wait_for_an_exclusive_step() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let id = f.manifest.source_id.clone();
+        let holder = step(&f.store, 300);
+        let e = f.store.mutation_guard().unwrap_err();
+        assert!(
+            e.chain().any(|c| c
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)),
+            "{e:#}"
+        );
+        let started = Instant::now();
+        f.store
+            .materialize(&f.manifest, &f.area.join("unpacked"))
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
+        let holder = step(&f.store, 300);
+        let started = Instant::now();
+        {
+            let _held = f.store.mutation_guard_waiting().unwrap();
+            assert!(f.store.manifest(&id).unwrap().is_some());
+        }
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
+    }
 }
 
 #[cfg(test)]
