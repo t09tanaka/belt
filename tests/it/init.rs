@@ -1059,3 +1059,84 @@ fn worker_only_init_preserves_membership_and_retires_old_service_or_rolls_back()
         launcher.stop_owned();
     }
 }
+/// A service manager whose loaded job can be observed only once `known` is
+/// set: a print layout the parser did not know reads as Unknown.
+struct UnreadableUntilKnown {
+    owned: OwnedLauncher,
+    known: bool,
+}
+impl Launcher for UnreadableUntilKnown {
+    fn running_identity(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+    ) -> Result<belt::service::macos::RunningIdentity, LaunchError> {
+        self.owned.running_identity(plan, receipt)
+    }
+    fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
+        match self.owned.loaded_state(plan, receipt) {
+            LoadedState::Match if !self.known => LoadedState::Unknown,
+            state => state,
+        }
+    }
+    fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError> {
+        if self.known {
+            self.owned.verify_loaded(plan, receipt)
+        } else {
+            Err(LaunchError::NotApplied("unknown print layout".into()))
+        }
+    }
+    fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
+        self.owned.launchctl(args)
+    }
+}
+/// A failed `init` that left its receipt and a loaded, running service
+/// behind (the state an unknown `launchctl print` field left on macOS 27)
+/// resumes once the job can be observed: it adopts that service, and
+/// starts no second one.
+#[test]
+fn init_resumes_over_the_loaded_service_a_failed_init_left() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let context = context(root.path());
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut launcher = UnreadableUntilKnown {
+        owned: OwnedLauncher(state.clone()),
+        known: false,
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let first = rt
+        .block_on(initialize(context.clone(), &mut launcher))
+        .unwrap_err();
+    assert!(first.to_string().contains("reconciliation"), "{first}");
+    assert_eq!(state.lock().unwrap().starts, 1);
+    assert!(root.path().join("config/belt/init.json").is_file());
+    let again = rt
+        .block_on(initialize(context.clone(), &mut launcher))
+        .unwrap_err();
+    assert!(
+        again
+            .to_string()
+            .contains("loaded service identity unknown"),
+        "{again}"
+    );
+    launcher.known = true;
+    let receipt = rt
+        .block_on(initialize(context, &mut launcher))
+        .unwrap_or_else(|error| {
+            state.lock().unwrap().diagnose();
+            panic!("resumed initialization failed: {error}");
+        });
+    assert_eq!(state.lock().unwrap().starts, 1);
+    let spec = bootstrap::read_input(&root.path().join("config/belt/coordinator.json")).unwrap();
+    assert_eq!(receipt.worker_id, spec.worker_id);
+    rt.block_on(async {
+        assert!(matches!(
+            bootstrap::health(&spec).await.unwrap(),
+            Reply::Health { ready: true, .. }
+        ));
+    });
+}
