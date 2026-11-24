@@ -244,7 +244,7 @@ Docker の結果と、Mac mini（独立した Mac の実機）の確認待ちを
 
 この回でハーネスに入れたもの（製品のバグは見つからなかった）:
 
-- worker の image が空の `/etc/machine-id` で起動し、`systemd-machine-id-setup` は VM の UUID から作るので、どのコンテナも同じ ID になっていた。entrypoint で乱数の ID を書き、A45 で w1・w2 が別の 32 桁の ID を持つことを確かめる。
+- worker の image は空の `/etc/machine-id` を持つ。最初に試した `systemd-machine-id-setup` は VM の UUID から作り、w1 と w2 が同じ ID になった（A45 の新しい検査が赤にした）。entrypoint で乱数の ID を書き、A45 で w1・w2 が別の 32 桁の ID を持つことを確かめる。
 - A34 は「commit の後も元の版の directory が残る」を確かめていたが、第 25 章の段階 4 で、名指すものの無い前の版は commit の直後に消える。rollback では元の executable が変わらないこと、commit では前の版が消えることを確かめるように直した。仕様 §15 の「今は消さない」の一文も段階 4 に合わせた。
 - doctor の `traffic_processes` の `not_checked` を A45 と L06 で見逃していた。今の main では worker・親とも `ok` を返すので、見逃しを外した。L06 は exit 0 と healthy も求める。
 
