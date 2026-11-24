@@ -1361,11 +1361,17 @@ fn import_history(ctx: &ExecContext, git_dir: &Path, root: &Path, head: &str) ->
     {
         return Ok(());
     }
+    // no auto gc or maintenance: it could go on in the background after the
+    // capture returns, outside any lock the caller holds around it
     let args: Vec<OsString> = vec![
         "--git-dir".into(),
         git_dir.into(),
         "-c".into(),
         "uploadpack.allowAnySHA1InWant=true".into(),
+        "-c".into(),
+        "gc.auto=0".into(),
+        "-c".into(),
+        "maintenance.auto=false".into(),
         "fetch".into(),
         "-q".into(),
         "--no-tags".into(),
@@ -2098,6 +2104,8 @@ fn pack_across(ctx: &ExecContext, root: &Path, git_dir: &Path, shas: &[&str]) ->
         .command("git")
         .arg("--git-dir")
         .arg(git_dir)
+        // as for every write into the private repository: no auto gc
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(["unpack-objects", "-q"])
         .stdin(packed)
         .stdout(Stdio::null())

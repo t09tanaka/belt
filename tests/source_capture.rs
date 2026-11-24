@@ -2032,6 +2032,52 @@ fn a_git_that_hangs_is_ended_when_the_context_is_cancelled() {
     assert!(gone(&pid), "the slow git's child still runs");
 }
 
+/// The private repository of `f`, set up so that a fetch that writes a pack
+/// into it would start an auto gc; its
+/// `pre-auto-gc` hook leaves the returned marker (and stops the gc).
+fn private_repo_with_auto_gc(f: &Fixture) -> PathBuf {
+    let private = private_repo_of(&f.home);
+    for kv in [
+        "gc.auto=1",
+        "gc.autoPackLimit=1",
+        "fetch.unpackLimit=1",
+        "gc.autoDetach=false",
+        // a newer Git's default maintenance does not run the gc task
+        "maintenance.gc.enabled=true",
+    ] {
+        let (k, v) = kv.split_once('=').unwrap();
+        git(&private, &["config", k, v]);
+    }
+    git(&private, &["repack", "-adq"]);
+    let marker = f.home.join("private-gc-ran");
+    let hook = private.join("hooks/pre-auto-gc");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    marker
+}
+
+#[test]
+fn the_fetch_of_new_history_into_the_private_repository_starts_no_auto_gc() {
+    let f = fixture();
+    let c = f.ctx();
+    capture_source(&c, &f.dir, &opts()).unwrap();
+    let marker = private_repo_with_auto_gc(&f);
+    // a new commit: its history is fetched into the private repository
+    std::fs::write(f.dir.join("next.txt"), "next\n").unwrap();
+    git(&f.dir, &["add", "next.txt"]);
+    git(&f.dir, &["commit", "-qm", "next"]);
+    capture_source(&c, &f.dir, &opts()).unwrap();
+    assert!(
+        !marker.exists(),
+        "the fetch of the history started an auto gc"
+    );
+}
+
 #[test]
 fn the_fetch_of_an_import_starts_no_auto_gc() {
     let f = fixture();
@@ -2047,6 +2093,8 @@ fn the_fetch_of_an_import_starts_no_auto_gc() {
         "gc.autoPackLimit=1",
         "fetch.unpackLimit=1",
         "gc.autoDetach=false",
+        // a newer Git's default maintenance does not run the gc task
+        "maintenance.gc.enabled=true",
     ] {
         let (k, v) = kv.split_once('=').unwrap();
         git(&fresh, &["config", k, v]);
