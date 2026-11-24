@@ -397,7 +397,8 @@ async fn run(
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
-    let agent_gate = private_lock(&spec.state_dir, "agent.lock")?.into_file();
+    // It stays a `HeldLock` until the hand-over, so every earlier return unlocks it.
+    let agent_gate = private_lock(&spec.state_dir, "agent.lock")?;
     let socket = spec.state_dir.join("agent.sock");
     // Spec 25.4 (a): under `agent.lock`, what a killed process left beside the state files.
     crate::platform::owned_temp::sweep_files(&spec.state_dir);
@@ -429,7 +430,7 @@ async fn run(
             env: spec.env.clone(),
         })?
         .with_instance(boot_id);
-    let agent = tokio::task::spawn_blocking(move || runtime.start_owned(agent_gate))
+    let agent = tokio::task::spawn_blocking(move || runtime.start_owned(agent_gate.into_file()))
         .await?
         .map_err(|e| anyhow::anyhow!(e.message))?;
     let worker = Worker {

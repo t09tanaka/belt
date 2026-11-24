@@ -156,6 +156,10 @@ impl SourceStore {
             }
             Err(error) => return Err(error),
         };
+        if matches!(scope, AbandonScope::All) {
+            self.retention
+                .prune_scratch_kept(&self.retention.connect()?)?;
+        }
         let rows = match scope {
             AbandonScope::All => self.retention.capture_owners()?,
             AbandonScope::Run(run) | AbandonScope::Refused(run) => self

@@ -399,12 +399,13 @@ impl AttemptSpool {
     ) -> Result<Self> {
         let dir = logs_dir(root, attempt);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-        let lock = open_rw(&dir.join("writer.lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(SpoolError::Locked(dir)),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
-        }
+        // Held from here, so every return below unlocks it.
+        let lock =
+            match crate::platform::flock::HeldLock::try_lock(open_rw(&dir.join("writer.lock"))?) {
+                Ok(lock) => lock,
+                Err(TryLockError::WouldBlock) => return Err(SpoolError::Locked(dir)),
+                Err(TryLockError::Error(e)) => return Err(e.into()),
+            };
         if dir.join("closed").exists() {
             return Err(SpoolError::Finished);
         }
@@ -423,7 +424,7 @@ impl AttemptSpool {
             dir,
             stdout,
             stderr,
-            _lock: crate::platform::flock::HeldLock::new(lock),
+            _lock: lock,
         })
     }
 
