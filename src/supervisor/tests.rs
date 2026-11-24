@@ -28,25 +28,6 @@ fn spool(limit: u64) -> (TempDir, AttemptId, AttemptSpool) {
     (dir, a, s)
 }
 
-/// Opens the spool again after the previous writer was dropped. The writer
-/// lock is an `flock`, which belongs to the open file description: another
-/// test's thread that forks a child while this one still holds the file keeps
-/// the lock alive in the child until its `exec` closes the descriptor. On a
-/// loaded runner that window is long enough to see `Locked` right after a
-/// drop, so a reopen waits (bounded) for it; a lock that never frees still
-/// fails the test.
-fn reopen(root: &Path, attempt: &AttemptId, limit: u64) -> AttemptSpool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match AttemptSpool::open(root, attempt, limit) {
-            Err(SpoolError::Locked(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            other => return other.unwrap(),
-        }
-    }
-}
-
 /// Bytes that depend on the absolute offset and are mostly not UTF-8.
 fn pattern(from: u64, len: u64) -> Vec<u8> {
     (from..from + len)
@@ -266,7 +247,7 @@ fn resume_after_a_crash_continues_without_rewinding_or_repeating() {
             seq: 1
         }
     );
-    let s = reopen(dir.path(), &a, 100);
+    let s = AttemptSpool::open(dir.path(), &a, 100).unwrap();
     assert_eq!(s.writer(Stdout).status(), first);
     // The limit still counts what is already stored: 70 used, 30 left.
     let st = s.writer(Stdout).append(&pattern(60, 50)).unwrap();
@@ -357,7 +338,7 @@ fn only_one_writer_at_a_time() {
         Err(SpoolError::Locked(_))
     ));
     drop(s);
-    reopen(dir.path(), &a, BIG);
+    AttemptSpool::open(dir.path(), &a, BIG).unwrap();
 }
 
 #[test]
@@ -1075,7 +1056,7 @@ fn a_stream_that_dropped_keeps_dropping_after_a_resume_with_a_larger_limit() {
         s.writer(Stdout).append(b"0123456789").unwrap();
         // crash: the first drop was published at once
     }
-    let s = reopen(dir.path(), &a, 1000);
+    let s = AttemptSpool::open(dir.path(), &a, 1000).unwrap();
     let st = s.writer(Stdout).append(b"more").unwrap();
     assert_eq!((st.end, st.dropped), (5, 5 + 4));
     // The other stream never dropped: it may use the room the new limit gives.
@@ -1523,7 +1504,7 @@ fn any_crash_point_resumes_with_a_prefix_and_never_goes_back() {
             }
         }
         let limit2 = rng.below(2500);
-        let s = reopen(dir.path(), &a, limit2);
+        let s = AttemptSpool::open(dir.path(), &a, limit2).unwrap();
         let r = SpoolReader::open(dir.path(), &a).unwrap();
         let mut seen = [StreamStatus::default(); 2];
         for (i, st) in ["stdout", "stderr"].iter().enumerate() {

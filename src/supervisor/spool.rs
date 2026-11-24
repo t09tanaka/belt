@@ -375,7 +375,7 @@ pub struct AttemptSpool {
     dir: PathBuf,
     stdout: StreamWriter,
     stderr: StreamWriter,
-    _lock: File,
+    _lock: crate::platform::flock::HeldLock,
 }
 
 impl AttemptSpool {
@@ -423,7 +423,7 @@ impl AttemptSpool {
             dir,
             stdout,
             stderr,
-            _lock: lock,
+            _lock: crate::platform::flock::HeldLock::new(lock),
         })
     }
 

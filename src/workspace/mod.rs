@@ -34,6 +34,7 @@ pub use plan::FwFailure;
 
 use crate::error::{ApiError, BlockedReason, ErrorCode};
 use crate::ids::AttemptId;
+use crate::platform::flock::HeldLock;
 use crate::platform::owned_temp::OwnedTemp;
 use crate::source::classify::api_error_of;
 use crate::source::{ObjectsRepo, SourceStore};
@@ -290,7 +291,7 @@ impl Workspaces {
                     Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
                     Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
                 }
-                Some(lock)
+                Some(HeldLock::new(lock))
             }
         };
         if lock.is_some() && !held()? {
@@ -492,7 +493,7 @@ impl Workspaces {
     /// at the commit the attempt runs. At the right commit already, adds
     /// share the clone (shared lock); moving it is exclusive, and waits for
     /// the adds in flight.
-    fn hold_clone_at(&self, clone: &Path, commit: &str) -> Result<File, ApiError> {
+    fn hold_clone_at(&self, clone: &Path, commit: &str) -> Result<HeldLock, ApiError> {
         let shared = lock_shared(clone)?;
         if self.head_of(clone).as_deref() == Some(commit) {
             return Ok(shared);
@@ -986,22 +987,23 @@ fn open_lock(path: &Path) -> Result<File, ApiError> {
 /// The clone's main lock, shared. A writer that is waiting for it holds the
 /// intent lock, so this queues behind the writer instead of joining the
 /// readers that keep it from ever getting in.
-fn lock_shared(clone: &Path) -> Result<File, ApiError> {
+fn lock_shared(clone: &Path) -> Result<HeldLock, ApiError> {
     lock_main(clone, File::lock_shared)
 }
 
 /// The clone's main lock, exclusive (writer priority: see [`lock_shared`]).
-fn lock_exclusive(clone: &Path) -> Result<File, ApiError> {
+fn lock_exclusive(clone: &Path) -> Result<HeldLock, ApiError> {
     lock_main(clone, File::lock)
 }
 
-fn lock_main(clone: &Path, take: fn(&File) -> std::io::Result<()>) -> Result<File, ApiError> {
+fn lock_main(clone: &Path, take: fn(&File) -> std::io::Result<()>) -> Result<HeldLock, ApiError> {
     let git = clone.join(".git");
     let intent = open_lock(&git.join("belt-workspace.intent"))?;
     let main = open_lock(&git.join("belt-workspace.lock"))?;
     let err = |e| io_err("cannot lock the clone", e);
     intent.lock().map_err(err)?;
-    // the intent lock is released when `intent` is dropped, on any return
+    let _intent = HeldLock::new(intent);
+    // the intent lock is released when `_intent` is dropped, on any return
     take(&main).map_err(err)?;
-    Ok(main)
+    Ok(HeldLock::new(main))
 }
