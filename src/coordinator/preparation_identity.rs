@@ -319,6 +319,7 @@ mod tests {
                                 crate::forecast::COMMAND_FEATURE.into(),
                             ]
                             .into(),
+                            rustup: Vec::new(),
                         }),
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: r.worker_id.clone(),

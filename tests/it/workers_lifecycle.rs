@@ -415,6 +415,7 @@ mod a44 {
             required_tools: Vec::new(),
             profile_digest: Some("sha256:worker".into()),
             policy_digest: None,
+            rustup: Vec::new(),
         }
     }
 

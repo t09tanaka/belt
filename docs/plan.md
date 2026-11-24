@@ -1880,6 +1880,7 @@ WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含む�
 - `ci` のtaskのtoolchain（PR #135）: workflowの `setup-*` の `*-version` 入力を、taskごとの束へ固定する（仕様22.1）。
 - 直接実行のsignal（PR #137・#142）: task-traffic-controller 0.10.5 で、近接した2つのsignalの両方と、待ちに入る直前のsignalを転送する。signalはbitmaskで1回だけ送り、回収済みのpidには送らない。0.10.6 の後は、起動時に無視されていたSIGINT・SIGQUIT・SIGTERM・SIGHUPを、beltもcommandも無視したままにする（`cmd &`・`nohup` と同じ）。integration試験のbinaryは、4つのsignalを既定へ戻してから始める（仕様第16章）。
 - native toolでの充足（PR #138）: registryが満たせない版を、profileのtool自身が同じ版を報告するときに満たす。範囲は、親が観測した版へ固定する（仕様22.1）。
+- 導入済みrustup toolchainの検出: 設定なしで、利用者のrustupにあるそのhost向けtoolchainを読むだけで見つけ（最大16個、bounded probe）、recipeが無いときRustの版を満たす（仕様22.1）。
 - 試験のフレーキーの修正（PR #139）: `warmup_stop` の idle release は、managerが動くまで問い合わせ続ける。`bootstrap` の再起動をまたぐsyncは、原因が分からないので、失敗時に診断を出すだけにした。
 - local-ci 0.18.4（PR #140）: コード変更なし。清掃は local-ci のCLIの経路だけで、belt は読み書きしない。
 - 入力の保持の終点（PR #143）: retire済みのattemptだけが残るrunも、入力を解放する（仕様第25章）。

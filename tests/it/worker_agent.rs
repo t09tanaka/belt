@@ -6379,3 +6379,141 @@ fn a_trial_stops_a_running_received_pass() {
     belt::worker::control::end_trial(&f.state()).unwrap();
     agent.shutdown();
 }
+
+/// A worker with no toolchain registry whose user's rustup (a fake one under
+/// the test directory) has `versions`, served over a connection.
+async fn rustup_worker(f: &Fx, versions: &[&str]) -> Client {
+    use belt::toolchain::profile::Profile;
+    let host = belt::toolchain::profile::rustup_host().unwrap();
+    let home = f.dir.path().join("rustup");
+    std::fs::create_dir_all(home.join("toolchains")).unwrap();
+    for version in versions {
+        let bin = home.join(format!("toolchains/{version}-{host}/bin"));
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["rustc", "cargo"] {
+            let path = bin.join(tool);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho '{tool} {version} (fake)'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), f.dir.path().to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), home.to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(serve_connection(
+        agent,
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    connect(a, client_cfg(&f.cluster)).await.unwrap().client
+}
+
+/// A request to resolve the Rust `constraint` of `p`'s source.
+fn ask_rust(p: &AttemptPayload, constraint: &str) -> Request {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let scope = Scope::project("");
+    let bundle = FrozenBundle::seal_exact(
+        FrozenToolchains::freeze(
+            p.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse(constraint).unwrap(),
+                scope: scope.clone(),
+                location: Location {
+                    path: "rust-toolchain".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Request::ResolveToolchains(ResolveToolchainsRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        bundle,
+        requirements: Default::default(),
+    })
+}
+
+/// A worker with no toolchain registry resolves a Rust range from a
+/// toolchain its user's rustup already has (spec 22.1), read only. The
+/// rustup home is a fake one under the test directory.
+#[tokio::test]
+async fn a_worker_without_recipes_resolves_rust_from_its_installed_rustup_toolchain() {
+    let f = fx();
+    let client = rustup_worker(&f, &["1.89.0", "1.92.0"]).await;
+    let p = payload("exit 0");
+    let Response::ResolveToolchains(resolved) = call(&client, ask_rust(&p, "1.89")).await.unwrap()
+    else {
+        panic!()
+    };
+    resolved.bundle.validate(&p.manifest_digest).unwrap();
+    assert_eq!(resolved.bundle.evidence[0].concrete.to_string(), "1.89.0");
+    // Nothing installed satisfies 1.90: still refused, as a worker without
+    // a registry refused before.
+    assert!(call(&client, ask_rust(&p, "1.90")).await.is_err());
+}
+
+/// Placement names no machine: every worker whose own rustup has 1.89.0 is
+/// a candidate for a ci task that needs `>=1.89 <1.90`. The coordinator asks
+/// each worker to resolve the bundle one of them proposed, and a worker is
+/// eligible when it answers with that same bundle (spec 22.1). A worker
+/// without 1.89 is not.
+#[tokio::test]
+async fn every_worker_with_the_installed_rustup_toolchain_is_a_candidate() {
+    let (f1, f2, f3) = (fx(), fx(), fx());
+    let one = rustup_worker(&f1, &["1.89.0", "1.92.0"]).await;
+    let two = rustup_worker(&f2, &["1.89.0", "1.100.0"]).await;
+    let none = rustup_worker(&f3, &["1.92.0"]).await;
+    let p = payload("exit 0");
+    let Response::ResolveToolchains(proposed) =
+        call(&one, ask_rust(&p, ">=1.89 <1.90")).await.unwrap()
+    else {
+        panic!()
+    };
+    let bundle = proposed.bundle;
+    let again = |bundle: belt::toolchain::contract::FrozenBundle| {
+        Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            bundle,
+            requirements: Default::default(),
+        })
+    };
+    for (name, worker) in [("one", &one), ("two", &two)] {
+        let Response::ResolveToolchains(answer) = call(worker, again(bundle.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("worker {name} refused: {e:?}"))
+        else {
+            panic!()
+        };
+        assert_eq!(answer.bundle, bundle, "worker {name} is no candidate");
+    }
+    assert!(
+        call(&none, again(bundle.clone())).await.is_err(),
+        "a worker without 1.89 was a candidate"
+    );
+}

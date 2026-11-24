@@ -44,7 +44,7 @@ struct Registered {
     catalog: Digest,
 }
 /// What one recipe may install and what is installed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstalledInventory {
     pub inventory: Vec<String>,
     pub installed: Vec<String>,

@@ -143,6 +143,23 @@ pub struct WorkerCapabilities {
     pub profile_fingerprint: Digest,
     pub tools: BTreeMap<String, ToolObservation>,
     pub features: BTreeSet<String>,
+    /// Rust toolchains the user's own rustup already has for this host,
+    /// found read-only (spec 22.1). None when there are none, so a report
+    /// without them serializes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustup: Vec<DetectedRustup>,
+}
+/// Most installed rustup toolchains a worker probes (spec 22.1).
+pub const MAX_DETECTED_RUSTUP: usize = 16;
+/// One toolchain of the user's rustup, as its own `rustc -V` and `cargo -V`
+/// report it. `bin` is the toolchain's `bin` directory on this worker.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DetectedRustup {
+    pub name: String,
+    pub version: String,
+    pub bin: std::path::PathBuf,
+    pub rustc: Digest,
+    pub cargo: Digest,
 }
 impl WorkerCapabilities {
     pub fn validate(&self) -> bool {
@@ -161,6 +178,16 @@ impl WorkerCapabilities {
             })
             && self.features.len() <= FEATURES.len()
             && self.features.iter().all(|v| FEATURES.contains(&v.as_str()))
+            && self.rustup.len() <= MAX_DETECTED_RUSTUP
+            && self.rustup.iter().all(|r| {
+                valid_version(&r.version)
+                    && !r.name.is_empty()
+                    && r.name.len() <= 128
+                    && r.name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    && r.bin.is_absolute()
+            })
     }
 }
 /// The line `missing` writes for an unmet requirement.
@@ -238,7 +265,33 @@ mod tests {
             profile_fingerprint: Digest::of_bytes(b"p"),
             tools: BTreeMap::new(),
             features: [FEATURE.into()].into(),
+            rustup: Vec::new(),
         }
+    }
+    /// A report's detected rustup toolchains are bounded and well formed
+    /// (spec 22.1); each rule refuses alone.
+    #[test]
+    fn detected_rustup_toolchains_are_validated() {
+        let one = |name: &str, version: &str, bin: &str| DetectedRustup {
+            name: name.into(),
+            version: version.into(),
+            bin: bin.into(),
+            rustc: Digest::of_bytes(b"rustc"),
+            cargo: Digest::of_bytes(b"cargo"),
+        };
+        let with = |rustup: Vec<DetectedRustup>| WorkerCapabilities { rustup, ..report() };
+        let good = one("1.89.0-aarch64-apple-darwin", "1.89.0", "/r/bin");
+        assert!(with(vec![good.clone()]).validate());
+        assert!(with(vec![good.clone(); MAX_DETECTED_RUSTUP]).validate());
+        assert!(!with(vec![good.clone(); MAX_DETECTED_RUSTUP + 1]).validate());
+        assert!(!with(vec![one("1.89.0", "not a version", "/r/bin")]).validate());
+        assert!(!with(vec![one("", "1.89.0", "/r/bin")]).validate());
+        assert!(with(vec![one(&"a".repeat(128), "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one(&"a".repeat(129), "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one("1.89.0/x", "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one("1.89.0", "1.89.0", "r/bin")]).validate());
+        // A bad entry after a good one still refuses the report.
+        assert!(!with(vec![good, one("", "1.89.0", "/r/bin")]).validate());
     }
     #[test]
     fn eligible_selected_tool_is_distinct_from_its_native_unavailable_observation() {

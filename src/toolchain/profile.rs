@@ -1,6 +1,7 @@
 //! Private worker-local profiles. No submitted project can supply this file.
 use super::capability::{
-    valid_name, valid_version, ToolObservation, WorkerCapabilities, FEATURES, TOOLS,
+    valid_name, valid_version, DetectedRustup, ToolObservation, WorkerCapabilities, FEATURES,
+    MAX_DETECTED_RUSTUP, TOOLS,
 };
 use crate::ids::Digest;
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,9 @@ pub struct Profile {
     report_identity: Arc<Mutex<Option<ReportIdentity>>>,
     completed_report: Arc<Mutex<Option<CompletedReport>>>,
     report_sequence: Arc<AtomicU64>,
+    /// What each detected rustup toolchain answered, by name, with the file
+    /// identities it answered for: unchanged files are not probed again.
+    rustup_seen: Arc<Mutex<BTreeMap<String, (RustupFiles, DetectedRustup)>>>,
     /// The live deadline of one fixed call; only tests that are not about the
     /// deadline replace it.
     probe_timeout: Duration,
@@ -147,6 +151,10 @@ struct ReportIdentity {
     context: Digest,
     fingerprint: Digest,
     tools: BTreeMap<String, ToolObservation>,
+    /// The rustup toolchains of the first report. Later reports look at
+    /// these only: a toolchain installed after it is not used before a
+    /// restart, and one removed or changed is drift.
+    rustup: Vec<DetectedRustup>,
 }
 
 impl std::fmt::Debug for Profile {
@@ -330,6 +338,7 @@ impl Profile {
             report_identity: Arc::new(Mutex::new(None)),
             completed_report: Arc::new(Mutex::new(None)),
             report_sequence: Arc::new(AtomicU64::new(0)),
+            rustup_seen: Arc::new(Mutex::new(BTreeMap::new())),
             probe_timeout: PROBE_TIMEOUT,
         };
         // Loading is part of startup: a cold required tool gets the startup
@@ -486,6 +495,10 @@ impl Profile {
                 .map(|t| (t.to_string(), self.probe(t)))
                 .collect(),
         };
+        let rustup = self.detect_rustup(match startup {
+            Some(limits) => limits.call,
+            None => self.probe_timeout,
+        });
         let os = match std::env::consts::OS {
             "macos" => "macos",
             other => other,
@@ -513,7 +526,7 @@ impl Profile {
             ))
             .expect("profile context serializes"),
         );
-        let bytes = serde_json::to_vec(&(
+        let mut bytes = serde_json::to_vec(&(
             &shell_identity,
             &self.digest,
             &os,
@@ -522,6 +535,10 @@ impl Profile {
             &tools,
         ))
         .expect("profile report serializes");
+        // A worker without detected toolchains keeps the identity it had.
+        if !rustup.is_empty() {
+            bytes.extend(serde_json::to_vec(&rustup).expect("rustup serializes"));
+        }
         let files = self.executable_identity();
         let observed_fingerprint = Digest::of_bytes(
             &serde_json::to_vec(&(&bytes, &files_before, &files))
@@ -538,8 +555,10 @@ impl Profile {
                     context: context.clone(),
                     fingerprint: observed_fingerprint.clone(),
                     tools: tools.clone(),
+                    rustup: rustup.clone(),
                 });
                 let unchanged = files_before == files
+                    && baseline.rustup == rustup
                     && baseline.files == files
                     && baseline.context == context
                     && tools.iter().all(|(tool, observed)| {
@@ -577,6 +596,7 @@ impl Profile {
             profile_fingerprint,
             tools,
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
+            rustup,
         };
         // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
         #[allow(deprecated)]
@@ -727,6 +747,84 @@ impl Profile {
             &serde_json::to_vec(&(identity(self.shell()), tools))
                 .expect("executable identity serializes"),
         )
+    }
+    /// The rustup home this profile's tools would use: `RUSTUP_HOME`, else
+    /// `~/.rustup` of the profile's `HOME`.
+    fn rustup_home(&self) -> Option<PathBuf> {
+        let env = self.host_environment();
+        let home = match env.get("RUSTUP_HOME") {
+            Some(home) => PathBuf::from(home),
+            None => PathBuf::from(env.get("HOME")?).join(".rustup"),
+        };
+        home.is_absolute().then_some(home)
+    }
+    /// The toolchains the user's rustup already has for this host, read
+    /// only (spec 22.1): a directory listing of `<RUSTUP_HOME>/toolchains`,
+    /// then each candidate's own `bin/rustc -V` and `bin/cargo -V` with a
+    /// bounded probe. Nothing runs rustup, installs or writes. At most
+    /// [`MAX_DETECTED_RUSTUP`] candidates are probed. After the first report
+    /// only the toolchains it found are looked at again, and a toolchain
+    /// whose files did not change is not probed again.
+    fn detect_rustup(&self, call: Duration) -> Vec<DetectedRustup> {
+        let (Some(home), Some(host)) = (self.rustup_home(), rustup_host()) else {
+            return Vec::new();
+        };
+        let baseline = match self.report_identity.lock() {
+            Ok(retained) => retained.as_ref().map(|r| r.rustup.clone()),
+            Err(_) => return Vec::new(),
+        };
+        let candidates: Vec<(String, PathBuf)> = match baseline {
+            Some(baseline) => baseline
+                .into_iter()
+                .map(|r| {
+                    let dir = home.join("toolchains").join(&r.name);
+                    (r.name, dir)
+                })
+                .collect(),
+            None => rustup_candidates(&home.join("toolchains"), &host),
+        };
+        let started = Instant::now();
+        let mut found = Vec::new();
+        for (name, dir) in candidates.into_iter().take(MAX_DETECTED_RUSTUP) {
+            let bin = dir.join("bin");
+            let files = rustup_files(&bin);
+            if files.is_none() {
+                continue;
+            }
+            let seen = self.rustup_seen.lock().ok().and_then(|seen| {
+                seen.get(&name)
+                    .filter(|(at, _)| Some(at) == files.as_ref())
+                    .map(|(_, detected)| detected.clone())
+            });
+            if let Some(detected) = seen {
+                found.push(detected);
+                continue;
+            }
+            // Every probe of the detection shares one bound.
+            let deadline = || {
+                RUSTUP_DETECTION_TOTAL
+                    .saturating_sub(started.elapsed())
+                    .min(call)
+            };
+            if deadline().is_zero() {
+                break;
+            }
+            let mut env = self.host_environment();
+            env.insert("RUSTUP_TOOLCHAIN".into(), name.clone());
+            let Some(detected) = probe_rustup(&name, &bin, &env, &deadline) else {
+                continue;
+            };
+            // The files must be the ones that answered.
+            if rustup_files(&bin) != files {
+                continue;
+            }
+            if let (Ok(mut seen), Some(files)) = (self.rustup_seen.lock(), files) {
+                seen.insert(name, (files, detected.clone()));
+            }
+            found.push(detected);
+        }
+        found.sort();
+        found
     }
     fn probe(&self, tool: &str) -> ToolObservation {
         self.probe_within(tool, &|| self.probe_timeout)
@@ -880,6 +978,128 @@ impl Profile {
             identity: Digest::of_bytes(&bytes),
         })
     }
+}
+/// The whole time one detection of rustup toolchains may take (spec 22.1).
+const RUSTUP_DETECTION_TOTAL: Duration = Duration::from_secs(8);
+/// Entries of the toolchains directory read at most.
+const MAX_RUSTUP_ENTRIES: usize = 1024;
+/// File identities of a toolchain's `rustc` and `cargo`.
+type RustupFiles = (FileStamp, FileStamp);
+type FileStamp = (PathBuf, u64, u64, u64, i64, i64, i64, i64, u32);
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let real = fs::canonicalize(path).ok()?;
+    let m = fs::metadata(&real).ok()?;
+    (m.is_file() && m.mode() & 0o111 != 0).then(|| {
+        (
+            real,
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+            m.mode(),
+        )
+    })
+}
+fn rustup_files(bin: &Path) -> Option<RustupFiles> {
+    Some((
+        file_stamp(&bin.join("rustc"))?,
+        file_stamp(&bin.join("cargo"))?,
+    ))
+}
+/// The rustup host triple of this machine, when belt knows it.
+pub fn rustup_host() -> Option<String> {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    let rest = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        _ => return None,
+    };
+    Some(format!("{arch}-{rest}"))
+}
+/// The toolchain directories of `toolchains` for `host`, in the order they
+/// are probed: names that start with a version, highest first, then the
+/// others (channels) by name. A link, a file, a name that is not UTF-8 or
+/// that is for another host is skipped.
+fn rustup_candidates(toolchains: &Path, host: &str) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(toolchains) else {
+        return Vec::new();
+    };
+    let suffix = format!("-{host}");
+    let mut found: Vec<(Option<node_semver::Version>, String, PathBuf)> = Vec::new();
+    for entry in entries.take(MAX_RUSTUP_ENTRIES).flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(channel) = name.strip_suffix(&suffix) else {
+            continue;
+        };
+        let path = entry.path();
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let version = match channel.split('.').count() {
+            2 => node_semver::Version::parse(format!("{channel}.0")).ok(),
+            _ => node_semver::Version::parse(channel).ok(),
+        };
+        found.push((version, name, path));
+    }
+    found.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => y.cmp(x).then(a.1.cmp(&b.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+    found
+        .into_iter()
+        .take(MAX_DETECTED_RUSTUP)
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+/// What the toolchain in `bin` reports of itself: `rustc -V` and `cargo -V`
+/// must both answer, with the same version.
+fn probe_rustup(
+    name: &str,
+    bin: &Path,
+    env: &BTreeMap<String, String>,
+    deadline: &dyn Fn() -> Duration,
+) -> Option<DetectedRustup> {
+    let answer = |tool: &str| {
+        let path = bin.join(tool);
+        let out = bounded_probe(&path, &["-V"], env, deadline()).ok()?;
+        let version = measured_version(tool, &out)?;
+        let real = fs::canonicalize(&path).ok()?;
+        let m = fs::metadata(&real).ok()?;
+        let identity = Digest::of_bytes(
+            &serde_json::to_vec(&(
+                &real,
+                None::<Digest>,
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                &version,
+            ))
+            .expect("tool identity serializes"),
+        );
+        Some((version, identity))
+    };
+    let (version, rustc) = answer("rustc")?;
+    let (cargo_version, cargo) = answer("cargo")?;
+    (version == cargo_version).then(|| DetectedRustup {
+        name: name.into(),
+        version,
+        bin: bin.to_path_buf(),
+        rustc,
+        cargo,
+    })
 }
 fn measured_version(tool: &str, output: &str) -> Option<String> {
     let text = output.trim();
@@ -2080,5 +2300,148 @@ mod preparation_snapshot_tests {
         assert!(profile
             .preparation_snapshot(&report.profile_fingerprint)
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod rustup_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    fn script(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    /// A toolchain directory of a fake rustup home whose `rustc` and
+    /// `cargo` report `version`.
+    fn toolchain(home: &Path, name: &str, version: &str) -> PathBuf {
+        let bin = home.join("toolchains").join(name).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        script(
+            &bin.join("rustc"),
+            &format!("echo 'rustc {version} (fake)'"),
+        );
+        script(
+            &bin.join("cargo"),
+            &format!("echo 'cargo {version} (fake)'"),
+        );
+        bin
+    }
+    /// A profile whose rustup home is `home` (never the real one).
+    fn profile(root: &Path, home: &Path) -> Profile {
+        let tools = root.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let env: BTreeMap<String, String> = [
+            ("PATH".into(), tools.to_str().unwrap().into()),
+            ("HOME".into(), root.to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), home.to_str().unwrap().into()),
+        ]
+        .into();
+        patient(Profile::load(root, &env).unwrap())
+    }
+    #[test]
+    fn installed_toolchains_of_this_host_are_detected_by_their_own_probe() {
+        let host = rustup_host().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        toolchain(&home, &format!("1.89.0-{host}"), "1.89.0");
+        toolchain(&home, &format!("nightly-{host}"), "1.93.0-nightly");
+        // The name says 1.70.0, the binary says otherwise: the probe decides.
+        toolchain(&home, &format!("1.70.0-{host}"), "1.71.1");
+        // Another host, a link and a file are skipped.
+        toolchain(&home, "1.88.0-x86_64-pc-windows-msvc", "1.88.0");
+        let real = toolchain(&root.path().join("elsewhere"), "x", "1.87.0");
+        symlink(
+            real.parent().unwrap(),
+            home.join(format!("toolchains/1.87.0-{host}")),
+        )
+        .unwrap();
+        fs::write(home.join(format!("toolchains/1.86.0-{host}")), "").unwrap();
+        // A toolchain whose cargo disagrees with its rustc is not one.
+        let odd = toolchain(&home, &format!("1.85.0-{host}"), "1.85.0");
+        script(&odd.join("cargo"), "echo 'cargo 1.84.0 (fake)'");
+        let report = profile(root.path(), &home).startup_report();
+        let found: Vec<_> = report
+            .rustup
+            .iter()
+            .map(|r| (r.name.as_str(), r.version.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (format!("1.70.0-{host}").as_str(), "1.71.1"),
+                (format!("1.89.0-{host}").as_str(), "1.89.0"),
+                (format!("nightly-{host}").as_str(), "1.93.0-nightly"),
+            ]
+        );
+        assert!(report.validate());
+        // Detection only reads: no file was added to the rustup home.
+        let toolchains: BTreeSet<_> = fs::read_dir(home.join("toolchains"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(toolchains.len(), 7);
+    }
+    #[test]
+    fn at_most_sixteen_toolchains_are_probed_highest_version_first() {
+        let host = rustup_host().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        for minor in 70..90 {
+            toolchain(
+                &home,
+                &format!("1.{minor}.0-{host}"),
+                &format!("1.{minor}.0"),
+            );
+        }
+        toolchain(&home, &format!("stable-{host}"), "1.99.0");
+        let candidates = rustup_candidates(&home.join("toolchains"), &host);
+        assert_eq!(candidates.len(), MAX_DETECTED_RUSTUP);
+        assert_eq!(candidates[0].0, format!("1.89.0-{host}"));
+        assert_eq!(candidates[15].0, format!("1.74.0-{host}"));
+        // The probes share one time bound, so a loaded host may find fewer;
+        // never more, and never one outside the candidates.
+        let report = profile(root.path(), &home).startup_report();
+        assert!(!report.rustup.is_empty() && report.rustup.len() <= MAX_DETECTED_RUSTUP);
+        assert!(report.rustup.iter().all(|r| r.version.as_str() >= "1.74.0"));
+    }
+    #[test]
+    fn a_changed_or_removed_toolchain_is_drift_and_a_new_one_waits_for_restart() {
+        let host = rustup_host().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        let bin = toolchain(&home, &format!("1.89.0-{host}"), "1.89.0");
+        let profile = profile(root.path(), &home);
+        let initial = profile.startup_report();
+        assert_eq!(initial.rustup.len(), 1);
+        assert_eq!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+        // Installed after the first report: not used before a restart.
+        toolchain(&home, &format!("1.90.0-{host}"), "1.90.0");
+        let later = profile.report();
+        assert_eq!(later.rustup, initial.rustup);
+        assert_eq!(later.profile_fingerprint, initial.profile_fingerprint);
+        // Its cargo replaced: drift.
+        fs::remove_file(bin.join("cargo")).unwrap();
+        script(&bin.join("cargo"), "echo 'cargo 1.89.0 (other)'");
+        assert_ne!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+        // Removed: drift.
+        fs::remove_dir_all(bin.parent().unwrap()).unwrap();
+        let gone = profile.report();
+        assert!(gone.rustup.is_empty());
+        assert_ne!(gone.profile_fingerprint, initial.profile_fingerprint);
+    }
+    #[test]
+    fn a_worker_without_toolchains_keeps_its_identity() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        let report = profile(root.path(), &home).startup_report();
+        assert!(report.rustup.is_empty());
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("rustup").is_none());
     }
 }
