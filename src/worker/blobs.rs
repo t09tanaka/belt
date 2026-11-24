@@ -492,6 +492,11 @@ fn made_refs_text(repository_id: &str, refs: &[ImportRef]) -> String {
     out
 }
 
+/// The CI id of the work directory named `dir` (a [`SourceId`]).
+fn source_id_of_ci_dir(dir: &str) -> Option<String> {
+    ci_id_of(&SourceId::parse(dir).ok()?)
+}
+
 /// `None` when there is no record or it is not one this module wrote.
 fn read_made_refs(dir: &Path) -> Option<(String, Vec<ImportRef>)> {
     let text = fs::read_to_string(dir.join(MADE_REFS)).ok()?;
@@ -719,10 +724,21 @@ impl Incoming {
                 }) else {
                     return;
                 };
-                Self::drop_refs(&repo, &made, |r| match r.source() {
+                self.drop_refs(&repo, &made, |r| match r.source() {
                     Some(id) => self.published(id).unwrap_or(true),
                     None => true,
                 });
+                // (g)7, (g)29: the snapshot and index refs of this source,
+                // derived from its id, go too unless published or named by
+                // a `clone_ref` row (refs the bundle did not make: an
+                // earlier import's). Step 4 removes them, from a
+                // `ref_drop:` row: no git here (review round 1, L2, L9).
+                if let Some(id) = source_id_of_ci_dir(source) {
+                    if !self.published(&id).unwrap_or(true) {
+                        let clone = clone_dir_name(&repository_id);
+                        let _ = self.store.queue_ref_drop(&clone, &id);
+                    }
+                }
             }
         }
         remove_staged(&dir.join(MADE_REFS_TMP));
@@ -1255,14 +1271,23 @@ impl Incoming {
     /// Remove from `repo` the refs of `made` that `keep` does not ask for,
     /// each only while it is at the commit the import set it to. What does
     /// not go stays: there is nobody to tell.
-    fn drop_refs(repo: &ObjectsRepo, made: &[ImportRef], keep: impl Fn(&ImportRef) -> bool) {
+    fn drop_refs(&self, repo: &ObjectsRepo, made: &[ImportRef], keep: impl Fn(&ImportRef) -> bool) {
+        let mut removed = false;
         for r in made.iter().filter(|r| !keep(r)) {
             let at = match &r.commit {
                 Some(commit) => Some(commit.clone()),
                 None => repo.ref_value(&r.name).ok().flatten(),
             };
             if let Some(at) = at {
-                let _ = repo.drop_ref(&r.name, &at);
+                removed |= repo.drop_ref(&r.name, &at).is_ok();
+            }
+        }
+        // (spec 25.8 5b (e), review round 1, L2: refs went from a clone,
+        // not a scratch repository: its gc is due, as after step 4)
+        let clones = self.workspaces.clones_root();
+        if removed && repo.dir().parent() == Some(clones.as_path()) {
+            if let Some(clone) = repo.dir().file_name().and_then(|n| n.to_str()) {
+                let _ = self.store.note_ref_removal(clone);
             }
         }
     }
@@ -1506,7 +1531,7 @@ impl Incoming {
         if self.commits_here(repo, st, carried)? {
             return Ok(made);
         }
-        Self::drop_refs(repo, &made, |_| false);
+        self.drop_refs(repo, &made, |_| false);
         Err(invalid(
             "the bundle is refused: it does not bring the commits the manifests name",
         ))
@@ -1743,7 +1768,7 @@ impl Incoming {
             // published by now (their manifests name those commits).
             if let Some((repository_id, made)) = read_made_refs(&dir) {
                 if let Some(repo) = self.objects(&repository_id) {
-                    Self::drop_refs(&repo, &made, |r| match &r.snapshot_of {
+                    self.drop_refs(&repo, &made, |r| match &r.snapshot_of {
                         Some(id) => self.published(id).unwrap_or(true),
                         None => false,
                     });
@@ -1751,7 +1776,7 @@ impl Incoming {
             }
             remove_staged(&dir.join(MADE_REFS));
             if let Some((u, repository_id)) = &unpacked {
-                Self::drop_refs(&u.repo, &u.made, |r| match &r.snapshot_of {
+                self.drop_refs(&u.repo, &u.made, |r| match &r.snapshot_of {
                     Some(id) => self.published(id).unwrap_or(true),
                     None => false,
                 });

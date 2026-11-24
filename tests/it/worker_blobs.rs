@@ -3768,6 +3768,166 @@ fn a_record_left_after_the_publication_keeps_the_index_ref_of_the_source() {
     assert_eq!(git(&clones[0], &["for-each-ref"]), refs);
 }
 
+/// Spec (g)7, the third part of (g)29, review round 1, L2: a work
+/// directory thrown away leaves a `ref_drop:` row for the snapshot and index
+/// refs derived from its source's id (even those its bundle did not make)
+/// unless a `clone_ref` row names them, or the source is published; no git
+/// runs then. Step 4 then removes the refs and writes the clone's `gc:`
+/// row. A ref its bundle made goes at once, and writes that row too.
+#[test]
+fn a_discarded_work_directory_takes_its_sources_refs_without_a_clone_ref_row() {
+    use belt::worker::host::Host as _;
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    let clone = clones[0].file_name().unwrap().to_str().unwrap().to_string();
+    let published = git(&clones[0], &["for-each-ref"]);
+    let head = git(
+        &clones[0],
+        &["for-each-ref", "--count=1", "--format=%(objectname)"],
+    );
+    let head = head.trim().to_string();
+    let repository = p.root.repository_id.as_deref().unwrap().to_string();
+    let db = || rusqlite::Connection::open(f.state().join("sources/retention.db")).unwrap();
+    let rows = |like: &str| -> i64 {
+        db().query_row("SELECT count(*) FROM meta WHERE key LIKE ?1", [like], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    // two sources never published, whose refs an earlier import left (their
+    // bundles' records do not list them); one has a `clone_ref` row
+    let other = |named: bool| {
+        let id = SourceId::generate();
+        let ci = belt::source::classify::ci_id_of(&id).unwrap();
+        for kind in ["snapshots", "index"] {
+            git(
+                &clones[0],
+                &["update-ref", &format!("refs/local-ci/{kind}/{ci}"), &head],
+            );
+        }
+        if named {
+            db().execute(
+                "INSERT INTO clone_ref(clone,source,root) VALUES(?1,?2,'receive:x')",
+                [clone.as_str(), &ci],
+            )
+            .unwrap();
+        }
+        // (the bundle of the unnamed one made its index ref)
+        let made = if named {
+            String::new()
+        } else {
+            format!("refs/local-ci/index/{ci} - -\n")
+        };
+        let dir = f.incoming(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("made-refs"), format!("{repository}\n{made}")).unwrap();
+        (dir, ci)
+    };
+    // (the `clone_ref` fill is done, as after the first pass)
+    db().execute_batch(
+        "INSERT INTO meta(key,value) VALUES('clone_ref_fill','done')
+         ON CONFLICT(key) DO UPDATE SET value='done'",
+    )
+    .unwrap();
+    let (gone_dir, gone) = other(false);
+    let (named_dir, named) = other(true);
+    // the published source's own directory, thrown away: no row
+    let own = f.incoming(&p.source);
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("made-refs"), format!("{repository}\n")).unwrap();
+    let l = stale(&l);
+    sink.drop_stale(&l);
+    assert!(!gone_dir.exists() && !named_dir.exists() && !own.exists());
+    // the ref its bundle made went (and the clone's gc is due); for the
+    // others, a row only
+    assert_eq!(rows(&format!("ref_drop:{clone}:{gone}")), 1);
+    assert_eq!(rows("ref_drop:%"), 1);
+    assert_eq!(rows(&format!("gc:{clone}")), 1);
+    db().execute("DELETE FROM meta WHERE key LIKE 'gc:%'", [])
+        .unwrap();
+    let refs = git(&clones[0], &["for-each-ref"]);
+    assert!(
+        !refs.contains(&format!("refs/local-ci/index/{gone}")),
+        "{refs}"
+    );
+    assert!(
+        refs.contains(&format!("refs/local-ci/snapshots/{gone}")),
+        "{refs}"
+    );
+    // step 4 (a pass with the gates open) removes them and marks the gc
+    db().execute(
+        "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+        [],
+    )
+    .unwrap();
+    let report = m
+        .received_pass(&|_| Ok((false, None)), &|| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.refs, 1, "{report:?}");
+    assert_eq!(rows("ref_drop:%"), 0);
+    assert_eq!(rows(&format!("gc:{clone}")), 1);
+    let refs = git(&clones[0], &["for-each-ref"]);
+    assert!(!refs.contains(&gone), "{refs}");
+    assert!(
+        refs.contains(&format!("refs/local-ci/snapshots/{named}")),
+        "{refs}"
+    );
+    assert!(
+        refs.contains(&format!("refs/local-ci/index/{named}")),
+        "{refs}"
+    );
+    for line in published.lines() {
+        assert!(refs.contains(line), "{refs}");
+    }
+}
+
+/// Review round 1, L8: `clone_ref_held`'s other branches keep the refs: no
+/// row while the `clone_ref` fill is not done, or while a root of it waits
+/// for its retry.
+#[test]
+fn a_discarded_work_directory_keeps_its_refs_while_the_clone_ref_rows_are_not_known() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let repository = p.root.repository_id.as_deref().unwrap().to_string();
+    let db = || rusqlite::Connection::open(f.state().join("sources/retention.db")).unwrap();
+    let l = stale(&l);
+    for setup in [
+        "DELETE FROM meta WHERE key='clone_ref_fill'",
+        "INSERT INTO meta(key,value) VALUES('clone_ref_fill','done')
+         ON CONFLICT(key) DO UPDATE SET value='done';
+         INSERT INTO clone_ref_retry(root,next_ms,attempts) VALUES('receive:x',0,1)",
+    ] {
+        db().execute_batch(setup).unwrap();
+        let id = SourceId::generate();
+        let dir = f.incoming(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("made-refs"), format!("{repository}\n")).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        sink.drop_stale(&l);
+        assert!(!dir.exists(), "{setup}");
+        let n: i64 = db()
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key LIKE 'ref_drop:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "{setup}");
+    }
+}
+
 fn stale(l: &BlobLimits) -> BlobLimits {
     std::thread::sleep(Duration::from_millis(1100));
     BlobLimits {

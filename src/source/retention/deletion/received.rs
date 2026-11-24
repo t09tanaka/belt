@@ -59,6 +59,41 @@ pub struct ReceivedPassInputs<'a> {
     /// remove the refs of `source` (CI id), then call `row.done()`.
     /// `Ok(false)` when that lock is busy (the row waits for its next try).
     pub refs: &'a dyn Fn(&str, &str, &RefRow<'_>) -> Result<bool>,
+    /// The gc of (e), called with no source lock held for one clone whose
+    /// `gc:<clone>` row is due (at most one a pass): run
+    /// `git gc --prune=14.days.ago` there under the clone's import lock
+    /// tried without waiting, bounded, ended when the given stop says so.
+    /// `Busy` waits [`GC_BUSY_MS`] (other clones go first meanwhile),
+    /// `Stopped` the next pass; `Ran`, `Refused` and an error (a failure
+    /// or the bound) wait a day, the last two counted as failures.
+    pub gc: &'a GcFn<'a>,
+}
+
+/// The gc of (e) for one clone, given the pass's stop.
+pub type GcFn<'a> = dyn Fn(&str, &dyn Fn() -> bool) -> Result<CloneGc> + 'a;
+
+/// What the gc of (e) did in one clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneGc {
+    /// It ran (or there is no clone).
+    Ran,
+    /// The clone's import lock was busy.
+    Busy,
+    /// The stop ended it.
+    Stopped,
+    /// The clone has `extensions.preciousObjects` or a
+    /// `gc.recentObjectsHook`: nothing is collected.
+    Refused,
+}
+
+/// A gc of (e) that failed (or was not run: `extensions.preciousObjects`),
+/// for the agent's event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcFailure {
+    pub clone: String,
+    pub message: String,
+    /// Failures in a row, up to [`GC_FAILS_MAX`].
+    pub failures: i64,
 }
 
 /// One step 4 row, for the caller's `refs`, which calls both under the
@@ -101,6 +136,10 @@ pub struct ReceivedPassReport {
     /// `ref_drop:` rows done (step 4): the refs went, or the source was
     /// received again and they stay.
     pub refs: usize,
+    /// Clones whose gc of (e) ran (or failed: it waits a day all the same).
+    pub gc: usize,
+    /// The gc of (e) of this pass failed (review round 1, L6).
+    pub gc_failed: Option<GcFailure>,
     /// The pass stopped at its section bound with progress made: the caller
     /// may start the next one at once.
     pub again: bool,
@@ -170,6 +209,111 @@ const REF_ROWS: &str = "SELECT m.key FROM meta m WHERE m.key>='ref_drop:' AND m.
 const REF_HELD: &str = "SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2 LIMIT 1";
 /// How long a step 4 row whose import lock was busy waits.
 const REF_BUSY_MS: i64 = 60_000;
+/// The rows of (e)'s gc: `gc:<clone>`, valued `<last gc ms>\n<deadline
+/// ms>`, followed by `\n<failures in a row>\n<next try ms>` when either is
+/// not 0 (one per clone; a clone whose refs never went has none).
+const GC_ROWS: &str = "SELECT key,value FROM meta WHERE key>='gc:' AND key<'gc;' ORDER BY key";
+/// At most one gc a day per clone.
+const GC_EVERY_MS: i64 = 86_400_000;
+/// A clone's gc rows live this long after its last ref removal (15 days:
+/// Git's 14 days of grace and one daily gc after them).
+const GC_KEEP_MS: i64 = 15 * 86_400_000;
+/// How long a clone whose import lock was busy waits (review round 1, L5:
+/// the other clones get their turn meanwhile).
+const GC_BUSY_MS: i64 = 600_000;
+/// The bound of a row's failure count.
+pub const GC_FAILS_MAX: i64 = 1000;
+/// From this many failures in a row `doctor` shows the clone.
+pub const GC_FAILS_SHOWN: i64 = 3;
+
+/// A `gc:` row's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcRow {
+    last: i64,
+    deadline: i64,
+    fails: i64,
+    next: i64,
+}
+
+fn gc_value(value: &str) -> Option<GcRow> {
+    let fields: Vec<i64> = value
+        .split('\n')
+        .map(|f| f.parse().ok())
+        .collect::<Option<_>>()?;
+    match fields[..] {
+        [last, deadline] => Some(GcRow {
+            last,
+            deadline,
+            fails: 0,
+            next: 0,
+        }),
+        [last, deadline, fails, next] if (0..=GC_FAILS_MAX).contains(&fails) => Some(GcRow {
+            last,
+            deadline,
+            fails,
+            next,
+        }),
+        _ => None,
+    }
+}
+
+/// A failed gc at `now` (review round 1, L6): it waits a day as after a
+/// run, and is counted.
+fn gc_failed_at(r: &mut GcRow, now: i64) {
+    r.last = now;
+    r.fails = (r.fails + 1).min(GC_FAILS_MAX);
+    r.next = 0;
+}
+
+fn gc_text(r: GcRow) -> String {
+    if r.fails == 0 && r.next == 0 {
+        format!("{}\n{}", r.last, r.deadline)
+    } else {
+        format!("{}\n{}\n{}\n{}", r.last, r.deadline, r.fails, r.next)
+    }
+}
+
+/// The clones whose gc failed [`GC_FAILS_SHOWN`] times in a row or more
+/// (`doctor`), in the open index `c`.
+pub(crate) fn gc_failing(c: &Connection) -> Result<u64> {
+    let mut s = c.prepare(GC_ROWS)?;
+    let rows = s.query_map([], |r| r.get::<_, String>(1))?;
+    let mut n = 0;
+    for value in rows {
+        if gc_value(&value?).is_some_and(|r| r.fails >= GC_FAILS_SHOWN) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// A ref removal in `clone` at `now`: its `gc:` row keeps its last gc (none
+/// yet: 0), its failures and next try, and gets the deadline `now` + 15
+/// days. In the caller's transaction.
+fn gc_mark(c: &Connection, clone: &str, now: u64) -> Result<()> {
+    let key = format!("gc:{clone}");
+    let old = c
+        .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .as_deref()
+        .and_then(gc_value);
+    let row = GcRow {
+        deadline: now as i64 + GC_KEEP_MS,
+        ..old.unwrap_or(GcRow {
+            last: 0,
+            deadline: 0,
+            fails: 0,
+            next: 0,
+        })
+    };
+    c.execute(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, gc_text(row)],
+    )?;
+    Ok(())
+}
 /// The queries whose plans a test checks.
 #[cfg(test)]
 pub(in crate::source::retention) const PLANNED: [&str; 7] = [
@@ -204,6 +348,71 @@ impl SourceStore {
     /// One pass (spec 25.8 5b (d)). The caller has checked that no version
     /// is on trial; a store that holds a parent's root is left alone.
     pub fn received_pass(&self, inputs: &ReceivedPassInputs) -> Result<ReceivedPassReport> {
+        let mut report = self.received_sections(inputs)?;
+        // The gc of (e), after the sections, with no source lock held (a
+        // store that holds a parent's roots is left alone, and a stopped
+        // pass does not start one).
+        // (the stop is not asked here: the gc's git asks it at once)
+        if !report.parent {
+            self.retention.gc_clones(inputs, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// Whether `source`'s refs in `clone` are still named (the removal of
+    /// a discarded work directory, (g)7 and (g)29): a `clone_ref` row, or
+    /// rows not known yet (the fill is not `done`, or a root waits for its
+    /// retry: kept, as step 4 keeps its rows then). Its caller holds the
+    /// clone's import lock, which every writer of `clone_ref` holds.
+    pub fn clone_ref_held(&self, clone: &str, source: &str) -> Result<bool> {
+        let c = self.retention.connect()?;
+        Ok(c.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')
+             OR EXISTS(SELECT 1 FROM clone_ref_retry)
+             OR EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+            params![clone, source],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A discarded work directory of `source` (CI id) whose bundle went
+    /// into `clone` (review round 1, L2, L9): unless [`Self::clone_ref_held`]
+    /// says its refs are still named, a `ref_drop:<clone>:<source>` row,
+    /// which step 4 removes the refs for (with its own checks, under the
+    /// import lock) and which writes the clone's `gc:` row. No git runs
+    /// here. Whether a row is there now.
+    pub fn queue_ref_drop(&self, clone: &str, source: &str) -> Result<bool> {
+        let c = self.retention.connect()?;
+        c.execute(
+            "INSERT OR IGNORE INTO meta(key,value) SELECT 'ref_drop:'||?1||':'||?2,''
+             WHERE EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')
+             AND NOT EXISTS(SELECT 1 FROM clone_ref_retry)
+             AND NOT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+            params![clone, source],
+        )?;
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='ref_drop:'||?1||':'||?2)",
+            params![clone, source],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Refs went from `clone` outside step 4 (the refs a refused or
+    /// discarded bundle made): its `gc:` row, as step 4 writes it.
+    pub fn note_ref_removal(&self, clone: &str) -> Result<()> {
+        let c = self.retention.connect()?;
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        match gc_mark(&c, clone, crate::platform::clock::wall_ms()) {
+            Ok(()) => c.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn received_sections(&self, inputs: &ReceivedPassInputs) -> Result<ReceivedPassReport> {
         let mut report = ReceivedPassReport::default();
         if self.retention.holds_parent_roots()? {
             report.parent = true;
@@ -482,7 +691,7 @@ impl Index {
     ///
     /// Gits in a clone and their locks: under the import lock run step 4's
     /// `update-ref -d`, the bundle unpack of a publication and the removal
-    /// of a discarded source's refs, the only writers of the
+    /// of the refs a refused or discarded bundle made, the only writers of the
     /// `refs/local-ci/{snapshots,index}/<source>` refs; under the clone's
     /// own lock run `hold_clone_at`'s `checkout -f` and `settle`'s
     /// `branch -D` and `worktree prune`; fast-worktree's add and remove
@@ -517,6 +726,15 @@ impl Index {
                 let removed = (|| -> Result<()> {
                     c.execute("DELETE FROM meta WHERE key=?1", [&key])?;
                     c.execute("DELETE FROM ref_retry WHERE key=?1", [&key])?;
+                    // (e): refs went from the clone (not received again):
+                    // its gc is due for the next 15 days
+                    let held = c
+                        .query_row(REF_HELD, params![clone, source], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .is_some();
+                    if !held {
+                        gc_mark(&c, clone, inputs.wall)?;
+                    }
                     Ok(())
                 })();
                 match removed {
@@ -546,6 +764,116 @@ impl Index {
                  ON CONFLICT(key) DO UPDATE SET next_ms=excluded.next_ms",
                 params![key, inputs.wall as i64 + wait],
             )?;
+        }
+        Ok(())
+    }
+
+    /// The gc of (e): the `gc:<clone>` rows whose deadline has passed go
+    /// (as do rows not in this form); a deadline more than 15 days ahead
+    /// (the clock went back) is brought to 15 days from now (review round
+    /// 1, L1). Then the clone whose last gc is the oldest of those a day
+    /// old or more (one with a last gc more than a day ahead counts: the
+    /// clock went back) and whose next try is due is given to `inputs.gc`.
+    /// A run writes the time of this pass as its last gc; a failure too,
+    /// counted; a busy lock writes a next try [`GC_BUSY_MS`] on; a stop
+    /// writes nothing (the next pass tries again).
+    fn gc_clones(
+        &self,
+        inputs: &ReceivedPassInputs,
+        report: &mut ReceivedPassReport,
+    ) -> Result<()> {
+        let now = inputs.wall as i64;
+        let c = self.connect()?;
+        let rows: Vec<(String, String)> = {
+            let mut s = c.prepare(GC_ROWS)?;
+            let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut due: Option<(i64, String)> = None;
+        for (key, value) in rows {
+            let Some(mut row) = gc_value(&value).filter(|r| now < r.deadline) else {
+                // (past its deadline, or garbage: the row goes, nothing is
+                // kept for it but Git's objects, which stay)
+                c.execute(
+                    "DELETE FROM meta WHERE key=?1 AND value=?2",
+                    params![key, value],
+                )?;
+                continue;
+            };
+            if row.deadline > now + GC_KEEP_MS {
+                row.deadline = now + GC_KEEP_MS;
+                c.execute(
+                    "UPDATE meta SET value=?3 WHERE key=?1 AND value=?2",
+                    params![key, value, gc_text(row)],
+                )?;
+            }
+            let last = row.last;
+            let ready = last <= 0 || last + GC_EVERY_MS <= now || last > now + GC_EVERY_MS;
+            let next = row.next <= now || row.next > now + GC_BUSY_MS;
+            if ready && next && due.as_ref().is_none_or(|(l, _)| last < *l) {
+                due = Some((last, key));
+            }
+        }
+        let Some((_, key)) = due else {
+            return Ok(());
+        };
+        let clone = &key["gc:".len()..];
+        // (what the row becomes, whether the gc counts as run, its failure)
+        type Change = fn(&mut GcRow, i64);
+        let (change, ran, failure): (Change, bool, Option<String>) =
+            match (inputs.gc)(clone, inputs.stop) {
+                Ok(CloneGc::Stopped) => return Ok(()),
+                Ok(CloneGc::Busy) => (|r, now| r.next = now + GC_BUSY_MS, false, None),
+                Ok(CloneGc::Ran) => (
+                    |r, now| {
+                        r.last = now;
+                        r.fails = 0;
+                        r.next = 0;
+                    },
+                    true,
+                    None,
+                ),
+                Ok(CloneGc::Refused) => (
+                    gc_failed_at,
+                    true,
+                    Some("extensions.preciousObjects or gc.recentObjectsHook is set in the clone: nothing is collected".into()),
+                ),
+                Err(e) => (gc_failed_at, true, Some(format!("{e:#}"))),
+            };
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        let written = (|| -> Result<Option<GcRow>> {
+            let value: Option<String> = c
+                .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0))
+                .optional()?;
+            let Some(mut row) = value.as_deref().and_then(gc_value) else {
+                return Ok(None);
+            };
+            change(&mut row, now);
+            c.execute(
+                "UPDATE meta SET value=?2 WHERE key=?1",
+                params![key, gc_text(row)],
+            )?;
+            Ok(Some(row))
+        })();
+        let row = match written {
+            Ok(row) => {
+                c.execute_batch("COMMIT")?;
+                row
+            }
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        if ran {
+            report.gc += 1;
+        }
+        if let Some(message) = failure {
+            report.gc_failed = Some(GcFailure {
+                clone: clone.to_string(),
+                message,
+                failures: row.map_or(1, |r| r.fails),
+            });
         }
         Ok(())
     }
