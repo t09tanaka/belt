@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- A staged capture releases the `flock` on its scratch directory explicitly when it ends. Closing the descriptor alone left the directory locked while a child that any thread of the process had forked in the meantime was still between fork and exec, so the next capture in the same directory could be refused as "in use by another capture".
+
 ## [0.19.0] - 2026-11-23
 
 - Add opt-in staged publication of a capture for the library. `source::capture_source_staged` and `capture_directory_staged` take a `Staging { scratch_dir, before_install }`, write every new file of the source store (objects, manifests, secret bundle, temporary files) under `scratch_dir` on the store's file system, and install them only after the capture is stable: `before_install` sees the full list once, and each file is installed by a link that never replaces; an existing destination is verified in full and reused, different content is an error. `StagedSnapshot` says which destinations were installed and which reused. An unstable attempt leaves nothing in the store. An install that stops part-way returns a `StagedInstallError` (downcastable) with the destinations it installed and reused, and undoes nothing. The objects and the secret bundle are synced to disk before the manifests are linked. One scratch directory serves one capture at a time (a capture holds a `flock` on it; a second one is refused). The existing entry points and `CaptureOptions` are unchanged; the private Git repository under `git/` and a secret bundle at `CaptureOptions::secret_bundle` are not staged (the caller's path is written before `before_install` and removed if the capture fails).

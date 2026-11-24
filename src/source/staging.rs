@@ -179,7 +179,18 @@ pub(crate) struct Stager {
     scratch: PathBuf,
     state: Mutex<State>,
     /// The `flock` on the scratch directory, held while the capture runs.
-    _lock: std::fs::File,
+    lock: std::fs::File,
+}
+
+impl Drop for Stager {
+    /// Release the `flock` explicitly instead of only closing the file: the
+    /// lock belongs to the open file description, and a child forked by any
+    /// thread of the process keeps a copy of it until its `exec`. Closing our
+    /// descriptor alone would leave the directory locked for that long, and
+    /// the next capture in it would be refused as "in use".
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.lock);
+    }
 }
 
 fn dev_of(p: &Path) -> std::io::Result<u64> {
@@ -247,7 +258,7 @@ impl Stager {
         Ok(Arc::new(Stager {
             scratch,
             state: Mutex::new(State::default()),
-            _lock: lock,
+            lock,
         }))
     }
 
@@ -602,6 +613,67 @@ mod tests {
         // the same device is accepted
         assert!(Stager::with_dev(&staging(&scratch), &store, &|_| Ok(1)).is_ok());
         // and so is the real check, on one file system
+        assert!(Stager::new(&staging(&scratch), &store).is_ok());
+    }
+
+    /// A child forked while a capture held the scratch directory (here one
+    /// that waits between fork and exec) does not keep it locked after the
+    /// capture ends.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_child_forked_during_a_capture_does_not_keep_the_scratch_directory_locked() {
+        use std::os::unix::process::CommandExt;
+        fn pipe() -> (i32, i32) {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for fd in fds {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            (fds[0], fds[1])
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path().join("store")).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let first = Stager::new(&staging(&scratch), &store).unwrap();
+        let (ready_r, ready_w) = pipe();
+        let (go_r, go_w) = pipe();
+        let spawner = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("true");
+            unsafe {
+                cmd.pre_exec(move || {
+                    let b = [1u8];
+                    libc::write(ready_w, b.as_ptr().cast(), 1);
+                    let mut r = [0u8];
+                    libc::read(go_r, r.as_mut_ptr().cast(), 1);
+                    Ok(())
+                });
+            }
+            cmd.spawn().unwrap()
+        });
+        // the child is forked and holds a copy of every descriptor
+        let mut b = [0u8];
+        assert_eq!(unsafe { libc::read(ready_r, b.as_mut_ptr().cast(), 1) }, 1);
+        drop(first);
+        let again = Stager::new(&staging(&scratch), &store);
+        // let the child exec and reap it before asserting
+        assert_eq!(unsafe { libc::write(go_w, [1u8].as_ptr().cast(), 1) }, 1);
+        let mut child = spawner.join().unwrap();
+        assert!(child.wait().unwrap().success());
+        for fd in [ready_r, ready_w, go_r, go_w] {
+            unsafe { libc::close(fd) };
+        }
+        let again = again.unwrap();
+        // and the directory is still refused to a second capture while held
+        let err = Stager::new(&staging(&scratch), &store).unwrap_err();
+        assert!(
+            format!("{err}").contains("in use by another capture"),
+            "{err}"
+        );
+        drop(again);
         assert!(Stager::new(&staging(&scratch), &store).is_ok());
     }
 
