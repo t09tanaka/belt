@@ -49,9 +49,8 @@ use std::sync::Arc;
 
 // Git removes this private per-worktree ref with the worktree registration.
 // It keeps the admission snapshot reachable even after reproducing the original HEAD.
-/// How long one git of step 4 may run before it is killed.
-const REF_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
-/// The bound of one step 4 row, all its git calls together.
+/// The bound of one step 4 row, all its git calls together (local-ci's
+/// deadline; a git still running then has 2 s between SIGTERM and SIGKILL).
 const REF_ROW_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// The bound of one gc of (e) in a clone; one past it is ended, and the
 /// clone's next gc is a day later.
@@ -265,12 +264,13 @@ impl Workspaces {
     /// `r-<16 hex>`) taken without waiting, unless `held()` (the source was
     /// received again), remove the refs belt's receiving put there for
     /// `source` (the snapshot and index refs, as local-ci's
-    /// `remove_imported_refs` does, but with hooks off and a time bound),
+    /// `remove_imported_refs_with` does, hermetic and bounded: see
+    /// [`git::remove_source_refs`]),
     /// then `done()`. `false`: the lock is busy (an import is running),
     /// nothing was done. A clone that is not there has no ref to remove; one
     /// that cannot be looked at, or that (or whose `.git`) is not a real
-    /// directory, is an error (the row stays). Git is bounded per call and
-    /// for the row as a whole, and ended when `stop` says so (`false`: the
+    /// directory, is an error (the row stays). Git is bounded for the row as a
+    /// whole, and ended when `stop` says so (`false`: the
     /// row stays).
     pub fn drop_imported_refs(
         &self,
@@ -319,48 +319,17 @@ impl Workspaces {
                 Some(HeldLock::new(lock))
             }
         };
-        if lock.is_some() && !held()? && !self.remove_source_refs(&git_dir, source, stop)? {
+        // (local-ci 0.20's hermetic, bounded removal; the checks above that
+        // `dir` and its `.git` are real directories stay: it sets no
+        // `GIT_DIR`)
+        if lock.is_some() && !held()? && {
+            let until = std::time::Instant::now() + REF_ROW_LIMIT;
+            !git::remove_source_refs(&self.env, &dir, source, until, stop)?
+        } {
             return Ok(false);
         }
         done()?;
         drop(lock);
-        Ok(true)
-    }
-
-    /// With the import lock of the clone whose `.git` is `git_dir` held by
-    /// the caller: remove the refs belt's receiving puts there for `source`
-    /// (`refs/local-ci/{snapshots,index}/<source>`), each only when it is
-    /// there, with the bounded git of step 4 (hooks off, no inherited
-    /// `GIT_*`, its own process group, 10 s a call and 20 s in all).
-    /// `false`: `stop` ended it.
-    fn remove_source_refs(
-        &self,
-        git_dir: &Path,
-        source: &str,
-        stop: &dyn Fn() -> bool,
-    ) -> anyhow::Result<bool> {
-        let root = self.clones_root();
-        let row_end = std::time::Instant::now() + REF_ROW_LIMIT;
-        let git = |args: &[&str]| {
-            let deadline = row_end.min(std::time::Instant::now() + REF_GIT_LIMIT);
-            git::run_bounded(&self.env, git_dir, &root, args, deadline, stop)
-        };
-        for r in [
-            format!("refs/local-ci/snapshots/{source}"),
-            format!("refs/local-ci/index/{source}"),
-        ] {
-            let Some(there) = git(&["show-ref", "--verify", "-q", &r])? else {
-                return Ok(false);
-            };
-            if there == 0 {
-                let Some(code) = git(&["update-ref", "-d", &r])? else {
-                    return Ok(false);
-                };
-                anyhow::ensure!(code == 0, "git update-ref -d {r} failed ({code})");
-            } else {
-                anyhow::ensure!(there == 1, "git show-ref {r} failed ({there})");
-            }
-        }
         Ok(true)
     }
 
