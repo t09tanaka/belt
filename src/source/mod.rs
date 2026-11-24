@@ -39,7 +39,8 @@ pub use staging::{BeforeInstall, Intent, IntentKind, StagedInstallError, StagedS
 pub use store::{ObjectStore, RelPath};
 pub use transfer::{
     export_from, export_objects, export_with_basis, import_objects, import_objects_for,
-    remove_imported_refs, MAX_DIRTY_SUBMODULES, MAX_HAVE, MAX_NESTED,
+    import_objects_for_with, import_objects_with, remove_imported_refs, remove_imported_refs_with,
+    GitOptions, MAX_DIRTY_SUBMODULES, MAX_HAVE, MAX_NESTED,
 };
 
 use anyhow::Result;

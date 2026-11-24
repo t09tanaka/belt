@@ -670,7 +670,19 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
   `source::MAX_DIRTY_SUBMODULES` = 1024 dirty submodule entries, nested ones
   counted in. The digest of a manifest has no key: it shows that the
   manifest holds together, not who made it, so where a manifest and a bundle
-  come from is for the caller to establish.
+  come from is for the caller to establish. The fetch starts no auto gc or
+  maintenance (`-c gc.auto=0 -c maintenance.auto=false`), so nothing goes
+  on in the clone after an import returns.
+  `source::remove_imported_refs` forgets what an import put in a clone.
+- `source::import_objects_with`, `import_objects_for_with` and
+  `remove_imported_refs_with` take a `source::GitOptions` for a caller that
+  holds a lock around them. `GitOptions::new().hermetic()` runs Git without
+  the context's `GIT_*` variables, without system or global configuration,
+  without hooks, and without looking for a repository above the clone;
+  `.deadline(at)` ends a Git process still running at `at`. Under these
+  functions each Git process has a process group of its own and is ended
+  (SIGTERM, SIGKILL after two seconds, then reaped) on the deadline or when
+  the context's `cancel` handle is cancelled; the call then fails.
 - Not supported yet: shallow clones (`git fetch --unshallow` first) and
   repositories that use SHA-256 object names. Both are refused with an
   explicit error.

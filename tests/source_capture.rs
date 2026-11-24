@@ -6,10 +6,11 @@
 mod common;
 use local_ci::source::{
     capture_directory, capture_directory_staged, capture_source, capture_source_staged,
-    export_objects, export_with_basis, import_objects, import_objects_for, materialize_secrets,
-    materialize_source, publishable, remove_imported_refs, seal_manifest, secret_digest,
-    CaptureOptions, ObjectStore, RelPath, SecretBundle, SecretSpec, SourceError, SourceInfo,
-    SourceKind, SourceManifest, Stage, SubmoduleRef,
+    export_objects, export_with_basis, import_objects, import_objects_for, import_objects_with,
+    materialize_secrets, materialize_source, publishable, remove_imported_refs,
+    remove_imported_refs_with, seal_manifest, secret_digest, CaptureOptions, GitOptions,
+    ObjectStore, RelPath, SecretBundle, SecretSpec, SourceError, SourceInfo, SourceKind,
+    SourceManifest, Stage, SubmoduleRef,
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
@@ -1864,6 +1865,263 @@ fn the_refs_an_import_made_can_be_removed_by_source_id() {
     ] {
         assert!(remove_imported_refs(&c, &fresh, odd).is_err(), "{odd}");
     }
+}
+
+/// The refs of `source_id` in `dir`, one per line.
+fn imported_refs(dir: &Path) -> String {
+    git_out(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/local-ci"],
+    )
+}
+
+/// A `reference-transaction` hook in `dir` that leaves `marker` behind.
+fn marking_hook(dir: &Path, marker: &Path) {
+    let hook = dir.join(".git/hooks/reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn hermetic_git_runs_no_hook_of_the_clone() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let bundle = export_objects(&c, &m).unwrap();
+    let fresh = clone_of(&f, "fresh");
+    let marker = f.home.join("hook-ran");
+    marking_hook(&fresh, &marker);
+    let hermetic = GitOptions::new().hermetic();
+    import_objects_with(&c, &fresh, &bundle, &m, &hermetic).unwrap();
+    assert!(imported_refs(&fresh).contains(&m.source_id));
+    remove_imported_refs_with(&c, &fresh, &m.source_id, &hermetic).unwrap();
+    assert_eq!(imported_refs(&fresh), "");
+    assert!(!marker.exists(), "a hook ran under hermetic git");
+    // the hook is there and would run: without the options it does
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    remove_imported_refs(&c, &fresh, &m.source_id).unwrap();
+    assert!(marker.exists());
+}
+
+#[test]
+fn hermetic_git_ignores_an_inherited_git_dir() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let bundle = export_objects(&c, &m).unwrap();
+    let fresh = clone_of(&f, "fresh");
+    let other = clone_of(&f, "other");
+    for d in [&fresh, &other] {
+        import_objects(&c, d, &bundle, &m).unwrap();
+    }
+    let mut env = c.env().clone();
+    env.insert(
+        "GIT_DIR".into(),
+        other.join(".git").to_string_lossy().into_owned(),
+    );
+    let leaky = ExecContext::new(env);
+    remove_imported_refs_with(&leaky, &fresh, &m.source_id, &GitOptions::new().hermetic()).unwrap();
+    assert_eq!(imported_refs(&fresh), "");
+    assert!(imported_refs(&other).contains(&m.source_id));
+    // without the options the inherited GIT_DIR wins: the other clone loses
+    // its refs and this one keeps them
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    remove_imported_refs(&leaky, &fresh, &m.source_id).unwrap();
+    assert_eq!(imported_refs(&other), "");
+    assert!(imported_refs(&fresh).contains(&m.source_id));
+}
+
+/// A context whose `git` hangs: it starts a `sleep` in its own process
+/// group, writes that pid to `pid_file`, and waits for it.
+fn hanging_git(f: &Fixture, pid_file: &Path) -> ExecContext {
+    let bin = f.home.join("slow-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut env = f.ctx().env().clone();
+    let path = format!("{}:{}", bin.display(), env["PATH"]);
+    env.insert("PATH".into(), path);
+    ExecContext::new(env)
+}
+
+/// Whether the process `pid` is gone, waited for a few seconds.
+fn gone(pid: &str) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        let alive = Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// The pid the slow git wrote, waited for up to `wait`; `None` when it
+/// wrote none. Only a pid above 1 is taken.
+fn read_pid(pid_file: &Path, wait: std::time::Duration) -> Option<String> {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(pid_file) {
+            if let Ok(pid) = s.trim().parse::<u32>() {
+                assert!(pid > 1, "{pid}");
+                return Some(pid.to_string());
+            }
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_git_that_hangs_is_ended_at_the_deadline_with_its_group() {
+    let f = fixture();
+    let pid_file = f.home.join("slow.pid");
+    let c = hanging_git(&f, &pid_file);
+    let id = "src-0000000000000000000000000000000a";
+    let started = std::time::Instant::now();
+    let at = started + std::time::Duration::from_secs(1);
+    let err =
+        remove_imported_refs_with(&c, &f.dir, id, &GitOptions::new().deadline(at)).unwrap_err();
+    assert!(format!("{err:#}").contains("deadline"), "{err:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // a git ended before it wrote its pid has left no child to look for
+    if let Some(pid) = read_pid(&pid_file, std::time::Duration::ZERO) {
+        assert!(gone(&pid), "the slow git's child still runs");
+    }
+}
+
+#[test]
+fn a_git_that_hangs_is_ended_when_the_context_is_cancelled() {
+    let f = fixture();
+    let pid_file = f.home.join("slow.pid");
+    let c = hanging_git(&f, &pid_file);
+    let cancel = c.cancel.clone();
+    let p = pid_file.clone();
+    let stopper = std::thread::spawn(move || {
+        read_pid(&p, std::time::Duration::from_secs(30)).expect("the slow git never started");
+        cancel.cancel();
+    });
+    let id = "src-0000000000000000000000000000000a";
+    let started = std::time::Instant::now();
+    let err = remove_imported_refs_with(&c, &f.dir, id, &GitOptions::new()).unwrap_err();
+    stopper.join().unwrap();
+    assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(40));
+    let pid = read_pid(&pid_file, std::time::Duration::ZERO).unwrap();
+    assert!(gone(&pid), "the slow git's child still runs");
+}
+
+/// The private repository of `f`, set up so that a fetch that writes a pack
+/// into it would start an auto gc; its
+/// `pre-auto-gc` hook leaves the returned marker (and stops the gc).
+fn private_repo_with_auto_gc(f: &Fixture) -> PathBuf {
+    let private = private_repo_of(&f.home);
+    for kv in [
+        "gc.auto=1",
+        "gc.autoPackLimit=1",
+        "fetch.unpackLimit=1",
+        "gc.autoDetach=false",
+        // a newer Git's default maintenance does not run the gc task
+        "maintenance.gc.enabled=true",
+    ] {
+        let (k, v) = kv.split_once('=').unwrap();
+        git(&private, &["config", k, v]);
+    }
+    git(&private, &["repack", "-adq"]);
+    let marker = f.home.join("private-gc-ran");
+    let hook = private.join("hooks/pre-auto-gc");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    marker
+}
+
+#[test]
+fn the_fetch_of_new_history_into_the_private_repository_starts_no_auto_gc() {
+    let f = fixture();
+    let c = f.ctx();
+    capture_source(&c, &f.dir, &opts()).unwrap();
+    let marker = private_repo_with_auto_gc(&f);
+    // a new commit: its history is fetched into the private repository
+    std::fs::write(f.dir.join("next.txt"), "next\n").unwrap();
+    git(&f.dir, &["add", "next.txt"]);
+    git(&f.dir, &["commit", "-qm", "next"]);
+    capture_source(&c, &f.dir, &opts()).unwrap();
+    assert!(
+        !marker.exists(),
+        "the fetch of the history started an auto gc"
+    );
+}
+
+#[test]
+fn the_fetch_of_an_import_starts_no_auto_gc() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let bundle = export_objects(&c, &m).unwrap();
+    let fresh = clone_of(&f, "fresh");
+    // a second pack is past the limit: an auto gc would run (and its hook
+    // leaves a marker, then stops it)
+    for kv in [
+        "gc.auto=1",
+        "gc.autoPackLimit=1",
+        "fetch.unpackLimit=1",
+        "gc.autoDetach=false",
+        // a newer Git's default maintenance does not run the gc task
+        "maintenance.gc.enabled=true",
+    ] {
+        let (k, v) = kv.split_once('=').unwrap();
+        git(&fresh, &["config", k, v]);
+    }
+    git(&fresh, &["repack", "-adq"]);
+    let marker = f.home.join("gc-ran");
+    let hook = fresh.join(".git/hooks/pre-auto-gc");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    assert!(!marker.exists(), "the import's fetch started an auto gc");
+    // the set-up does start one for a plain fetch of the same bundle
+    git(
+        &fresh,
+        &[
+            "fetch",
+            "-q",
+            bundle.to_str().unwrap(),
+            "refs/local-ci/*:refs/again/*",
+        ],
+    );
+    assert!(marker.exists());
 }
 
 #[test]

@@ -1,12 +1,225 @@
 //! Moving the Git objects of a capture to another clone.
 
-use super::capture::{git_run, pg};
+use super::capture::{git_exec, git_run_os_with, git_run_with, pg, GitOut};
 use super::store::ObjectStore;
 use super::*;
 use crate::context::ExecContext;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// How the git processes of one call are run, for a caller that holds a
+/// lock of its own around the call ([`remove_imported_refs_with`],
+/// [`import_objects_with`], [`import_objects_for_with`]).
+///
+/// Whatever the options, each git process runs in a process group of its
+/// own and is ended when the [`ExecContext`]'s cancel handle is cancelled:
+/// SIGTERM to that group, SIGKILL after a short grace, then it is reaped. No
+/// other process or group is ever signalled.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct GitOptions {
+    /// Git sees none of the `GIT_*` variables of the context, no system or
+    /// global configuration, no hooks (`core.hooksPath=/dev/null`), and does
+    /// not look for a repository above the clone.
+    pub hermetic: bool,
+    /// When a git process still runs at this instant it is ended as on a
+    /// cancel, and the call fails.
+    pub deadline: Option<Instant>,
+    ceiling: Option<PathBuf>,
+}
+
+/// How long a git process has between SIGTERM and SIGKILL.
+const GIT_GRACE: Duration = Duration::from_secs(2);
+
+impl GitOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// These options with [`GitOptions::hermetic`] set.
+    pub fn hermetic(mut self) -> Self {
+        self.hermetic = true;
+        self
+    }
+
+    /// These options with [`GitOptions::deadline`] set to `at`.
+    pub fn deadline(mut self, at: Instant) -> Self {
+        self.deadline = Some(at);
+        self
+    }
+
+    /// These options for git working in `dir`: discovery stops at the
+    /// directory that holds it.
+    fn for_repo(&self, dir: &Path) -> Self {
+        let mut o = self.clone();
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        o.ceiling = dir.parent().map(Path::to_path_buf);
+        o
+    }
+
+    /// Put these options on `c`, a git command built from `ctx`.
+    pub(crate) fn apply(&self, ctx: &ExecContext, c: &mut Command) {
+        if !self.hermetic {
+            return;
+        }
+        for k in ctx.env().keys().filter(|k| k.starts_with("GIT_")) {
+            c.env_remove(k);
+        }
+        c.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "/dev/null");
+        if let Some(d) = &self.ceiling {
+            c.env("GIT_CEILING_DIRECTORIES", d);
+        }
+    }
+}
+
+/// Run `c` (git, its pipes set up) in a process group of its own, bounded
+/// by the deadline of `o` and the cancel handle of `ctx`.
+pub(crate) fn bounded_git(
+    ctx: &ExecContext,
+    o: &GitOptions,
+    mut c: Command,
+    stdin: Option<Vec<u8>>,
+) -> Result<GitOut> {
+    use std::os::unix::process::CommandExt;
+    if ctx.cancel.is_cancelled() {
+        bail!("git cancelled");
+    }
+    if o.deadline.is_some_and(|d| Instant::now() >= d) {
+        bail!("git deadline exceeded");
+    }
+    c.process_group(0);
+    // Dropping it kills what is left of the group and reaps the leader.
+    let mut child =
+        crate::cleanup::OwnedGroup(c.spawn().context("failed to run git")?, ctx.cancel.clone());
+    let pid = child.0.id() as i32;
+    ctx.cancel.track_pgid(pid);
+    let out = drive_git(ctx, o, &mut child.0, pid, stdin);
+    ctx.cancel.untrack_pgid(pid);
+    drop(child);
+    out
+}
+
+/// Whether the leader `pid` (our unreaped child) has exited, without
+/// reaping it; its exit code when it has (`None` for a signal).
+fn exited(pid: i32) -> Result<Option<Option<i32>>> {
+    let mut st: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: looks at our own child and leaves it unreaped.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut st,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot wait for git");
+    }
+    // SAFETY: filled in by waitid above.
+    if unsafe { st.si_pid() } == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        (st.si_code == libc::CLD_EXITED).then(|| unsafe { st.si_status() }),
+    ))
+}
+
+fn drive_git(
+    ctx: &ExecContext,
+    o: &GitOptions,
+    child: &mut std::process::Child,
+    pid: i32,
+    stdin: Option<Vec<u8>>,
+) -> Result<GitOut> {
+    use std::io::{Read, Write};
+    if let (Some(data), Some(mut si)) = (stdin, child.stdin.take()) {
+        // not joined: it ends with an error once git is gone
+        std::thread::spawn(move || {
+            let _ = si.write_all(&data);
+        });
+    }
+    let mut stdout = child.stdout.take().context("git has no stdout")?;
+    let mut stderr = child.stderr.take().context("git has no stderr")?;
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        // SAFETY: both are pipes this process owns the read ends of.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error()).context("cannot read git");
+            }
+        }
+    }
+    let (mut out, mut err) = (vec![], vec![]);
+    let mut eof = [false; 2];
+    loop {
+        let why = if ctx.cancel.is_cancelled() {
+            Some("cancelled")
+        } else if o.deadline.is_some_and(|d| Instant::now() >= d) {
+            Some("deadline exceeded")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            if pid > 1 {
+                // SAFETY: the group of our own unreaped child.
+                unsafe {
+                    libc::killpg(pid, libc::SIGTERM);
+                }
+                let grace = Instant::now() + GIT_GRACE;
+                while Instant::now() < grace && exited(pid)?.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            bail!("git {why}");
+        }
+        let mut idle = true;
+        for (i, (pipe, bytes)) in [
+            (&mut stdout as &mut dyn Read, &mut out),
+            (&mut stderr as &mut dyn Read, &mut err),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if eof[i] {
+                continue;
+            }
+            let mut buf = [0; 16384];
+            match pipe.read(&mut buf) {
+                Ok(0) => eof[i] = true,
+                Ok(n) => {
+                    bytes.extend_from_slice(&buf[..n]);
+                    idle = false;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e).context("cannot read git"),
+            }
+        }
+        if eof.iter().all(|e| *e) {
+            if let Some(code) = exited(pid)? {
+                return Ok(GitOut {
+                    code,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+        }
+        if idle {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
 
 fn is_hex40(s: &str) -> bool {
     s.len() == 40
@@ -26,22 +239,23 @@ fn check_source_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The options the git processes of one call run under; `None` runs them as
+/// local-ci always has.
+type Opts<'a> = Option<&'a GitOptions>;
+
 /// Run Git for a question it answers with its exit code: `Some` (what it
 /// printed) for 0, `None` for 1. Anything else it fails with is an error,
 /// not a "no".
 fn git_says(
     ctx: &ExecContext,
+    o: Opts,
     pre: &[std::ffi::OsString],
     args: &[&str],
 ) -> Result<Option<Vec<u8>>> {
-    let out = ctx
-        .command("git")
-        .args(pre)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("failed to run git")?;
-    match out.status.code() {
+    let mut all: Vec<std::ffi::OsString> = pre.to_vec();
+    all.extend(args.iter().map(std::ffi::OsString::from));
+    let out = git_exec(ctx, o, None, &all, &[], None)?;
+    match out.code {
         Some(0) => Ok(Some(out.stdout)),
         Some(1) => Ok(None),
         _ => bail!(
@@ -54,8 +268,13 @@ fn git_says(
 
 /// The commit the ref `r` is at, `None` when there is no such ref. A Git
 /// failure is an error, not a ref that is not there.
-fn ref_value(ctx: &ExecContext, pre: &[std::ffi::OsString], r: &str) -> Result<Option<String>> {
-    Ok(git_says(ctx, pre, &["rev-parse", "--verify", "-q", r])?
+fn ref_value(
+    ctx: &ExecContext,
+    o: Opts,
+    pre: &[std::ffi::OsString],
+    r: &str,
+) -> Result<Option<String>> {
+    Ok(git_says(ctx, o, pre, &["rev-parse", "--verify", "-q", r])?
         .map(|o| String::from_utf8_lossy(&o).trim().to_string()))
 }
 
@@ -128,11 +347,33 @@ fn holder(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -> Result<
 /// source still runs, so the worker that owns the clone calls it from its own
 /// garbage collection.
 pub fn remove_imported_refs(ctx: &ExecContext, clone_dir: &Path, source_id: &str) -> Result<()> {
+    remove_refs(ctx, None, clone_dir, source_id)
+}
+
+/// [`remove_imported_refs`] with its git processes run as `opts` says
+/// (hermetic, bounded by a deadline) and ended when `ctx` is cancelled.
+///
+/// A call ended by the deadline or a cancel can leave refs it made (its
+/// own clean-up runs under the same options and is ended too) and Git's
+/// `*.lock` files behind. Call [`remove_imported_refs_with`] again with a
+/// new deadline, and after a cancel with a context from
+/// [`ExecContext::fresh_attempt`]: under a cancelled context every call fails
+/// before Git starts.
+pub fn remove_imported_refs_with(
+    ctx: &ExecContext,
+    clone_dir: &Path,
+    source_id: &str,
+    opts: &GitOptions,
+) -> Result<()> {
+    remove_refs(ctx, Some(&opts.for_repo(clone_dir)), clone_dir, source_id)
+}
+
+fn remove_refs(ctx: &ExecContext, o: Opts, clone_dir: &Path, source_id: &str) -> Result<()> {
     check_source_id(source_id)?;
     let pre = ["-C".into(), clone_dir.into()];
     for r in [snapshot_ref(source_id), index_ref(source_id)] {
-        if ref_value(ctx, &pre, &r)?.is_some() {
-            git_run(ctx, &pre, &["update-ref", "-d", &r], &[], None)?;
+        if ref_value(ctx, o, &pre, &r)?.is_some() {
+            git_run_with(ctx, o, &pre, &["update-ref", "-d", &r], &[], None)?;
         }
     }
     Ok(())
@@ -244,7 +485,7 @@ pub fn export_with_basis(
 /// exit code 1; anything else it fails with is an error, not a "no".
 fn is_ancestor(ctx: &ExecContext, dir: &Path, a: &str, b: &str) -> Result<bool> {
     let pre = ["--git-dir".into(), dir.into()];
-    Ok(git_says(ctx, &pre, &["merge-base", "--is-ancestor", a, b])?.is_some())
+    Ok(git_says(ctx, None, &pre, &["merge-base", "--is-ancestor", a, b])?.is_some())
 }
 
 /// The `^` arguments of a bundle made over `refs` with the basis `have`
@@ -301,17 +542,19 @@ fn basis_exclusions(
 /// The lines of `git bundle list-heads`: (commit, ref).
 fn bundle_heads(
     ctx: &ExecContext,
+    o: Opts,
     pre: &[std::ffi::OsString],
     bundle: &Path,
 ) -> Result<Vec<(String, String)>> {
-    let o = git_run(
+    let out = git_run_with(
         ctx,
+        o,
         pre,
         &["bundle", "list-heads", &bundle.to_string_lossy()],
         &[],
         None,
     )?;
-    Ok(String::from_utf8_lossy(&o)
+    Ok(String::from_utf8_lossy(&out)
         .lines()
         .filter_map(|l| l.split_once(' '))
         .map(|(c, r)| (c.to_string(), r.to_string()))
@@ -407,7 +650,7 @@ fn export_impl(
     // them)
     let complete = || -> Result<bool> {
         let pre = ["--git-dir".into(), dir.clone().into()];
-        let heads = bundle_heads(ctx, &pre, &tmp).inspect_err(|_| {
+        let heads = bundle_heads(ctx, None, &pre, &tmp).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
         Ok(refs.iter().all(|r| heads.iter().any(|(_, h)| h == r)))
@@ -503,7 +746,14 @@ pub fn import_objects(
     m: &SourceManifest,
 ) -> Result<String> {
     let store = default_store(ctx).ok();
-    import_impl(ctx, clone_dir, bundle, m, Nested::Store(store.as_ref()))
+    import_impl(
+        ctx,
+        None,
+        clone_dir,
+        bundle,
+        m,
+        Nested::Store(store.as_ref()),
+    )
 }
 
 /// Like [`import_objects`], for a receiving host that was sent the manifests
@@ -542,7 +792,63 @@ pub fn import_objects_for(
         );
     }
     let given = reached(m, nested)?;
-    import_impl(ctx, clone_dir, bundle, m, Nested::Given(given))
+    import_impl(ctx, None, clone_dir, bundle, m, Nested::Given(given))
+}
+
+/// [`import_objects`] with its git processes run as `opts` says (hermetic,
+/// bounded by a deadline) and ended when `ctx` is cancelled.
+///
+/// A call ended by the deadline or a cancel can leave refs it made (its
+/// own clean-up runs under the same options and is ended too) and Git's
+/// `*.lock` files behind. Call [`remove_imported_refs_with`] again with a
+/// new deadline, and after a cancel with a context from
+/// [`ExecContext::fresh_attempt`]: under a cancelled context every call fails
+/// before Git starts.
+pub fn import_objects_with(
+    ctx: &ExecContext,
+    clone_dir: &Path,
+    bundle: &Path,
+    m: &SourceManifest,
+    opts: &GitOptions,
+) -> Result<String> {
+    let store = default_store(ctx).ok();
+    let o = opts.for_repo(clone_dir);
+    import_impl(
+        ctx,
+        Some(&o),
+        clone_dir,
+        bundle,
+        m,
+        Nested::Store(store.as_ref()),
+    )
+}
+
+/// [`import_objects_for`] with its git processes run as `opts` says
+/// (hermetic, bounded by a deadline) and ended when `ctx` is cancelled.
+///
+/// A call ended by the deadline or a cancel can leave refs it made (its
+/// own clean-up runs under the same options and is ended too) and Git's
+/// `*.lock` files behind. Call [`remove_imported_refs_with`] again with a
+/// new deadline, and after a cancel with a context from
+/// [`ExecContext::fresh_attempt`]: under a cancelled context every call fails
+/// before Git starts.
+pub fn import_objects_for_with(
+    ctx: &ExecContext,
+    clone_dir: &Path,
+    bundle: &Path,
+    m: &SourceManifest,
+    nested: &[SourceManifest],
+    opts: &GitOptions,
+) -> Result<String> {
+    if nested.len() > MAX_NESTED {
+        bail!(
+            "too many nested manifests: {} (at most {MAX_NESTED})",
+            nested.len()
+        );
+    }
+    let given = reached(m, nested)?;
+    let o = opts.for_repo(clone_dir);
+    import_impl(ctx, Some(&o), clone_dir, bundle, m, Nested::Given(given))
 }
 
 /// The manifests of `nested` in the order they are reached from the dirty
@@ -668,6 +974,7 @@ fn store_walk(
 
 fn import_impl(
     ctx: &ExecContext,
+    o: Opts,
     clone_dir: &Path,
     bundle: &Path,
     m: &SourceManifest,
@@ -713,8 +1020,9 @@ fn import_impl(
         wanted.push((index_ref(&m.source_id), None));
     }
     let pre = ["-C".into(), clone_dir.into()];
-    git_run(
+    git_run_with(
         ctx,
+        o,
         &pre,
         &["bundle", "verify", "-q", &bundle.to_string_lossy()],
         &[],
@@ -725,7 +1033,7 @@ fn import_impl(
     // lacks or has twice, one it has at a commit the manifest does not name,
     // and one that is in the clone with another value are refused while the
     // clone is still as it was.
-    let heads = bundle_heads(ctx, &pre, bundle)?;
+    let heads = bundle_heads(ctx, o, &pre, bundle)?;
     let mut plan: Vec<Planned> = vec![];
     for (r, named) in &wanted {
         let mut found = heads
@@ -754,7 +1062,7 @@ fn import_impl(
                 "the bundle has {r} at {at}, its manifest says {want}"
             )));
         }
-        let here = ref_value(ctx, &pre, r)?;
+        let here = ref_value(ctx, o, &pre, r)?;
         if let Some(c) = here.as_deref().filter(|c| *c != at) {
             return Err(corrupt(match named {
                 Some(want) => format!("{r} is already here at {c}, its manifest says {want}"),
@@ -771,7 +1079,14 @@ fn import_impl(
     // ref.
     let bundle_path = bundle.to_string_lossy();
     let refspecs: Vec<String> = plan.iter().map(|p| format!("{0}:{0}", p.name)).collect();
+    // no auto gc or maintenance: it could go on in the background (packing
+    // refs, among others) after the import returns, outside any lock the
+    // caller holds around it
     let mut fetch = vec![
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
         "fetch",
         "-q",
         "--no-tags",
@@ -780,8 +1095,8 @@ fn import_impl(
     ];
     fetch.push(&bundle_path);
     fetch.extend(refspecs.iter().map(String::as_str));
-    git_run(ctx, &pre, &fetch, &[], None).context("cannot fetch the refs of the bundle")?;
-    let checked = check_imported(ctx, &pre, m, commit, &nested, &known, &plan);
+    git_run_with(ctx, o, &pre, &fetch, &[], None).context("cannot fetch the refs of the bundle")?;
+    let checked = check_imported(ctx, o, &pre, m, commit, &nested, &known, &plan);
     let Err(refused) = checked else {
         return checked;
     };
@@ -789,8 +1104,9 @@ fn import_impl(
     // only while it is still what this call set it to)
     let mut left = vec![];
     for p in plan.iter().filter(|p| !p.was_here) {
-        let gone = git_run(
+        let gone = git_run_with(
             ctx,
+            o,
             &pre,
             &["update-ref", "-d", &p.name, &p.commit],
             &[],
@@ -812,8 +1128,10 @@ fn import_impl(
 
 /// What an import looks at once the fetch is done. Returns the execution
 /// commit.
+#[allow(clippy::too_many_arguments)] // the options ride along with the context
 fn check_imported(
     ctx: &ExecContext,
+    o: Opts,
     pre: &[std::ffi::OsString],
     m: &SourceManifest,
     commit: &str,
@@ -823,7 +1141,7 @@ fn check_imported(
 ) -> Result<String> {
     // every ref is the commit that was looked at before the fetch
     for p in plan {
-        let at = ref_value(ctx, pre, &p.name)?.unwrap_or_default();
+        let at = ref_value(ctx, o, pre, &p.name)?.unwrap_or_default();
         if at != p.commit {
             return Err(corrupt(format!(
                 "{} is {at:?} after the fetch, not {}",
@@ -831,8 +1149,9 @@ fn check_imported(
             )));
         }
     }
-    let got = String::from_utf8_lossy(&git_run(
+    let got = String::from_utf8_lossy(&git_run_with(
         ctx,
+        o,
         pre,
         &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
         &[],
@@ -841,13 +1160,14 @@ fn check_imported(
     .trim()
     .to_string();
     if let Some(tree) = &m.worktree_tree {
-        check_tree(ctx, pre, commit, tree)?;
+        check_tree(ctx, o, pre, commit, tree)?;
     }
     // the index tree came along (in the commit of its own ref) and is the one
     // the manifest names
     if let Some(tree) = &m.index_tree {
-        let c = git_run(
+        let c = git_run_with(
             ctx,
+            o,
             pre,
             &[
                 "rev-parse",
@@ -867,8 +1187,9 @@ fn check_imported(
             )));
         }
         // a commit around the tree and nothing more: no history rides along
-        let n = git_run(
+        let n = git_run_with(
             ctx,
+            o,
             pre,
             &["rev-list", "--count", &index_ref(&m.source_id)],
             &[],
@@ -883,6 +1204,7 @@ fn check_imported(
     }
     let mut links = Gitlinks {
         ctx,
+        o,
         pre,
         read: BTreeMap::new(),
     };
@@ -915,6 +1237,7 @@ fn check_imported(
             for n in list {
                 check_tree(
                     ctx,
+                    o,
                     pre,
                     n.execution_commit.as_deref().unwrap_or_default(),
                     n.worktree_tree.as_deref().unwrap_or_default(),
@@ -951,12 +1274,14 @@ fn check_imported(
 /// `commit` must have the tree `tree`.
 fn check_tree(
     ctx: &ExecContext,
+    o: Opts,
     pre: &[std::ffi::OsString],
     commit: &str,
     tree: &str,
 ) -> Result<()> {
-    let t = String::from_utf8_lossy(&git_run(
+    let t = String::from_utf8_lossy(&git_run_with(
         ctx,
+        o,
         pre,
         &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
         &[],
@@ -977,6 +1302,7 @@ fn check_tree(
 /// [`MAX_DIRTY_SUBMODULES`] of them at most.
 struct Gitlinks<'a> {
     ctx: &'a ExecContext,
+    o: Opts<'a>,
     pre: &'a [std::ffi::OsString],
     read: BTreeMap<(String, Vec<u8>), String>,
 }
@@ -990,7 +1316,7 @@ impl Gitlinks<'_> {
         if self.read.len() >= MAX_DIRTY_SUBMODULES {
             bail!("too many dirty submodules (at most {MAX_DIRTY_SUBMODULES})");
         }
-        let sha = gitlink_here(self.ctx, self.pre, commit, sub)?;
+        let sha = gitlink_here(self.ctx, self.o, self.pre, commit, sub)?;
         self.read.insert(key, sha.clone());
         Ok(sha)
     }
@@ -1001,6 +1327,7 @@ impl Gitlinks<'_> {
 /// commit it names must be here.
 fn gitlink_here(
     ctx: &ExecContext,
+    o: Opts,
     pre: &[std::ffi::OsString],
     commit: &str,
     sub: &SubmoduleRef,
@@ -1013,7 +1340,7 @@ fn gitlink_here(
     args.extend(pre.iter().cloned());
     args.extend(["ls-tree", "-z", "--full-tree", commit, "--"].map(std::ffi::OsString::from));
     args.push(std::ffi::OsString::from_vec(sub.path.0.clone()));
-    let out = super::capture::git_run_os(ctx, None, &args, &[], None)?;
+    let out = git_run_os_with(ctx, o, None, &args, &[], None)?;
     // `<mode> <type> <id>\t<name>\0`, exactly once, and the name is the path
     let records: Vec<&[u8]> = out.split(|c| *c == 0).filter(|r| !r.is_empty()).collect();
     let sha = match records.as_slice() {
@@ -1041,8 +1368,9 @@ fn gitlink_here(
             sub.path.display()
         )));
     };
-    let here = git_run(
+    let here = git_run_with(
         ctx,
+        o,
         pre,
         &["cat-file", "-e", &format!("{sha}^{{commit}}")],
         &[],

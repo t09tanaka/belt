@@ -4,6 +4,7 @@
 use super::secret::{self, SecretBundle};
 use super::staging::{StagedSnapshot, Stager, Staging};
 use super::store::{sha256_hex, write_atomic, ObjectStore, RelPath};
+use super::transfer::GitOptions;
 use super::*;
 use crate::context::ExecContext;
 use anyhow::{bail, Context, Result};
@@ -41,33 +42,34 @@ pub(crate) fn git_run_os(
     envs: &[(&str, &OsStr)],
     stdin: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let mut c = ctx.command("git");
-    c.args(args);
-    if let Some(d) = cwd {
-        c.current_dir(d);
-    }
-    for (k, v) in envs {
-        c.env(k, v);
-    }
-    c.stdin(if stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    })
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-    let mut child = c.spawn().context("failed to run git")?;
-    let writer = stdin.map(|data| {
-        let mut si = child.stdin.take().unwrap();
-        std::thread::spawn(move || {
-            let _ = si.write_all(&data);
-        })
-    });
-    let out = child.wait_with_output().context("failed to run git")?;
-    if let Some(w) = writer {
-        let _ = w.join();
-    }
-    if !out.status.success() {
+    git_run_os_with(ctx, None, cwd, args, envs, stdin)
+}
+
+/// [`git_run`] under `opts` (see [`git_exec`]).
+pub(crate) fn git_run_with(
+    ctx: &ExecContext,
+    opts: Option<&GitOptions>,
+    pre: &[OsString],
+    args: &[&str],
+    envs: &[(&str, &OsStr)],
+    stdin: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut all: Vec<OsString> = pre.to_vec();
+    all.extend(args.iter().map(OsString::from));
+    git_run_os_with(ctx, opts, None, &all, envs, stdin)
+}
+
+/// [`git_run_os`] under `opts` (see [`git_exec`]).
+pub(crate) fn git_run_os_with(
+    ctx: &ExecContext,
+    opts: Option<&GitOptions>,
+    cwd: Option<&Path>,
+    args: &[OsString],
+    envs: &[(&str, &OsStr)],
+    stdin: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let out = git_exec(ctx, opts, cwd, args, envs, stdin)?;
+    if out.code != Some(0) {
         // `-c key=value` pairs (a filter's command line) are not worth repeating
         let mut shown: Vec<String> = vec![];
         let mut it = args.iter();
@@ -85,6 +87,66 @@ pub(crate) fn git_run_os(
         );
     }
     Ok(out.stdout)
+}
+
+/// What one git process left: its exit code (`None` when a signal ended
+/// it) and the whole of what it printed.
+pub(crate) struct GitOut {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Run git once. With `opts` `None` it runs as it always has: the
+/// environment of `ctx` plus `envs`, waited for without a bound. With
+/// `opts`, it runs as [`GitOptions`] says, in a process group of its own,
+/// and is ended (SIGTERM to that group, SIGKILL after a grace) and reaped
+/// when the deadline passes or `ctx` is cancelled.
+pub(crate) fn git_exec(
+    ctx: &ExecContext,
+    opts: Option<&GitOptions>,
+    cwd: Option<&Path>,
+    args: &[OsString],
+    envs: &[(&str, &OsStr)],
+    stdin: Option<Vec<u8>>,
+) -> Result<GitOut> {
+    let mut c = ctx.command("git");
+    if let Some(o) = opts {
+        o.apply(ctx, &mut c);
+    }
+    c.args(args);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(o) = opts {
+        return super::transfer::bounded_git(ctx, o, c, stdin);
+    }
+    let mut child = c.spawn().context("failed to run git")?;
+    let writer = stdin.map(|data| {
+        let mut si = child.stdin.take().unwrap();
+        std::thread::spawn(move || {
+            let _ = si.write_all(&data);
+        })
+    });
+    let out = child.wait_with_output().context("failed to run git")?;
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    Ok(GitOut {
+        code: out.status.code(),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
 }
 
 /// The original repository, read only: no optional locks, so reading never
@@ -1299,11 +1361,17 @@ fn import_history(ctx: &ExecContext, git_dir: &Path, root: &Path, head: &str) ->
     {
         return Ok(());
     }
+    // no auto gc or maintenance: it could go on in the background after the
+    // capture returns, outside any lock the caller holds around it
     let args: Vec<OsString> = vec![
         "--git-dir".into(),
         git_dir.into(),
         "-c".into(),
         "uploadpack.allowAnySHA1InWant=true".into(),
+        "-c".into(),
+        "gc.auto=0".into(),
+        "-c".into(),
+        "maintenance.auto=false".into(),
         "fetch".into(),
         "-q".into(),
         "--no-tags".into(),
@@ -2036,6 +2104,8 @@ fn pack_across(ctx: &ExecContext, root: &Path, git_dir: &Path, shas: &[&str]) ->
         .command("git")
         .arg("--git-dir")
         .arg(git_dir)
+        // as for every write into the private repository: no auto gc
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(["unpack-objects", "-q"])
         .stdin(packed)
         .stdout(Stdio::null())
