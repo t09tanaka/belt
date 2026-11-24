@@ -268,6 +268,31 @@ mod tests {
             rustup: Vec::new(),
         }
     }
+    /// A report's detected rustup toolchains are bounded and well formed
+    /// (spec 22.1); each rule refuses alone.
+    #[test]
+    fn detected_rustup_toolchains_are_validated() {
+        let one = |name: &str, version: &str, bin: &str| DetectedRustup {
+            name: name.into(),
+            version: version.into(),
+            bin: bin.into(),
+            rustc: Digest::of_bytes(b"rustc"),
+            cargo: Digest::of_bytes(b"cargo"),
+        };
+        let with = |rustup: Vec<DetectedRustup>| WorkerCapabilities { rustup, ..report() };
+        let good = one("1.89.0-aarch64-apple-darwin", "1.89.0", "/r/bin");
+        assert!(with(vec![good.clone()]).validate());
+        assert!(with(vec![good.clone(); MAX_DETECTED_RUSTUP]).validate());
+        assert!(!with(vec![good.clone(); MAX_DETECTED_RUSTUP + 1]).validate());
+        assert!(!with(vec![one("1.89.0", "not a version", "/r/bin")]).validate());
+        assert!(!with(vec![one("", "1.89.0", "/r/bin")]).validate());
+        assert!(with(vec![one(&"a".repeat(128), "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one(&"a".repeat(129), "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one("1.89.0/x", "1.89.0", "/r/bin")]).validate());
+        assert!(!with(vec![one("1.89.0", "1.89.0", "r/bin")]).validate());
+        // A bad entry after a good one still refuses the report.
+        assert!(!with(vec![good, one("", "1.89.0", "/r/bin")]).validate());
+    }
     #[test]
     fn eligible_selected_tool_is_distinct_from_its_native_unavailable_observation() {
         use crate::toolchain::{contract::FrozenBundle, versions::*};
