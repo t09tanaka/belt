@@ -251,8 +251,9 @@ impl Drop for Bounded {
 }
 
 /// The ref directories whose `.lock` files a killed git of
-/// [`run_bounded`] leaves to be removed: the refs belt's receiving puts in a
-/// clone for a source (`refs/local-ci/{snapshots,index}/<source>`).
+/// [`run_bounded`] or [`remove_source_refs`] leaves to be removed: the refs
+/// belt's receiving puts in a clone for a source
+/// (`refs/local-ci/{snapshots,index}/<source>`).
 const OWN_REF_DIRS: [&str; 2] = ["refs/local-ci/snapshots/", "refs/local-ci/index/"];
 
 /// After a git of [`run_bounded`] was killed and reaped (review round 4,
@@ -290,6 +291,61 @@ fn remove_git_locks(git_dir: &Path, args: &[&str]) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Step 4's removal of the refs belt's receiving put in the clone `dir`
+/// for `source` (`refs/local-ci/{snapshots,index}/<source>`), each only
+/// when it is there, with local-ci's hermetic, bounded git
+/// (`remove_imported_refs_with`: no inherited `GIT_*`, no system or global
+/// configuration, hooks off, discovery not above the clone's parent, each
+/// git in a process group of its own, SIGTERM then SIGKILL, reaped) and
+/// `deadline` for the call as a whole. `stop` is polled here while the call
+/// runs on a scoped thread and is mapped onto the context's cancel handle
+/// (`false`: `stop` ended it). The caller holds the clone's import lock and
+/// has checked that `dir/.git` is a real directory (local-ci sets no
+/// `GIT_DIR`: git finds that `.git` itself). After a call ended by `stop`
+/// or the deadline, its git is reaped, so the `.lock` files of the two refs
+/// it may have left are removed as [`remove_git_locks`] says (review round
+/// 4, M-A: local-ci leaves them).
+pub(super) fn remove_source_refs(
+    env: &Env,
+    dir: &Path,
+    source: &str,
+    deadline: std::time::Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool> {
+    use local_ci::source::{remove_imported_refs_with, GitOptions};
+    let ctx = local_ci::ExecContext::new(env.clone());
+    let opts = GitOptions::new().hermetic().deadline(deadline);
+    let joined = std::thread::scope(|s| {
+        let call = s.spawn(|| remove_imported_refs_with(&ctx, dir, source, &opts));
+        while !call.is_finished() {
+            if !ctx.cancel.is_cancelled() && stop() {
+                ctx.cancel.cancel();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        call.join()
+    });
+    let Ok(result) = joined else {
+        bail!("step 4's ref removal panicked");
+    };
+    let Err(e) = result else {
+        return Ok(true);
+    };
+    let stopped = ctx.cancel.is_cancelled();
+    if stopped || std::time::Instant::now() >= deadline {
+        let refs = [
+            format!("{}{source}", OWN_REF_DIRS[0]),
+            format!("{}{source}", OWN_REF_DIRS[1]),
+        ];
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        remove_git_locks(&dir.join(".git"), &refs);
+    }
+    if stopped {
+        return Ok(false);
+    }
+    Err(e)
 }
 
 /// Whether our child `pid` has exited, leaving it unreaped.
@@ -474,6 +530,156 @@ while :; do sleep 1; done"#,
         assert!(repo.join("packed-refs.lock").exists());
         assert!(repo.join("index.lock").exists());
         assert!(repo.join("refs/a/b.lock").exists());
+    }
+
+    const SOURCE: &str = "src-0123456789abcdef0123456789abcdef";
+
+    /// Real git in `dir` with the test process's PATH and nothing else.
+    fn real_git(home: &Path, dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap())
+            .env("HOME", home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository at `dir` with both of [`SOURCE`]'s refs set.
+    fn repo_with_refs(home: &Path, dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        real_git(home, dir, &["init", "-q"]);
+        std::fs::write(dir.join("f"), "x").unwrap();
+        let blob = real_git(home, dir, &["hash-object", "-w", "f"]);
+        for d in OWN_REF_DIRS {
+            real_git(home, dir, &["update-ref", &format!("{d}{SOURCE}"), &blob]);
+        }
+    }
+
+    /// Step 4 through local-ci (review round 2, Env; round 1, M2): an
+    /// inherited `GIT_DIR`, `GIT_INDEX_FILE` or `GIT_CONFIG_PARAMETERS`
+    /// does not point its git at another repository, and the clone's
+    /// `reference-transaction` hook does not run.
+    #[test]
+    fn step_4_removes_only_the_clones_refs_with_no_inherited_git_and_no_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let clone = home.join("clones").join("r-0123456789abcdef");
+        let other = home.join("other");
+        repo_with_refs(home, &clone);
+        repo_with_refs(home, &other);
+        let hooks = clone.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let ran = home.join("hook-ran");
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        let mut perm = std::fs::metadata(&hook).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&hook, perm).unwrap();
+        let other_git = other.join(".git");
+        let env: Env = [
+            ("PATH".into(), std::env::var("PATH").unwrap()),
+            ("HOME".into(), home.display().to_string()),
+            ("GIT_DIR".into(), other_git.display().to_string()),
+            ("GIT_INDEX_FILE".into(), "/elsewhere/index".into()),
+            (
+                "GIT_CONFIG_PARAMETERS".into(),
+                "'core.hooksPath'='/x'".into(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        assert!(remove_source_refs(&env, &clone, SOURCE, deadline, &|| false).unwrap());
+        assert!(real_git(home, &clone, &["for-each-ref", "refs/local-ci/"]).is_empty());
+        assert_eq!(
+            real_git(home, &other, &["for-each-ref", "refs/local-ci/"])
+                .lines()
+                .count(),
+            2
+        );
+        assert!(!ran.exists(), "a hook of the clone ran");
+        // nothing there: no error
+        assert!(remove_source_refs(&env, &clone, SOURCE, deadline, &|| false).unwrap());
+    }
+
+    /// A fake `git` for step 4: it ignores SIGTERM, leaves the lock of the
+    /// snapshot ref (and of a ref that is not step 4's) in the repository
+    /// named by `-C`, and runs until it is killed.
+    fn stuck_git() -> (tempfile::TempDir, Env, std::path::PathBuf) {
+        let (dir, env) = fake_git(
+            r#"trap '' TERM
+while [ $# -gt 0 ]; do [ "$1" = -C ] && D="$2"; shift; done
+G="$D/.git"
+mkdir -p "$G/refs/local-ci/snapshots" "$G/refs/a"
+: > "$G/refs/local-ci/snapshots/src-0123456789abcdef0123456789abcdef.lock"
+: > "$G/refs/a/b.lock"
+sleep 30 &
+echo $! > "$D/../pid"
+: > "$D/../ready"
+wait"#,
+        );
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        // (another git, alive, holds it)
+        std::fs::write(repo.join(".git/packed-refs.lock"), "").unwrap();
+        (dir, env, repo)
+    }
+
+    fn only_own_lock_removed(repo: &Path) {
+        let g = repo.join(".git");
+        assert!(!g
+            .join(format!("refs/local-ci/snapshots/{SOURCE}.lock"))
+            .exists());
+        assert!(g.join("packed-refs.lock").exists());
+        assert!(g.join("refs/a/b.lock").exists());
+    }
+
+    /// Review round 2 (M-b), round 4 (M-A): past its deadline step 4's git
+    /// that ignores SIGTERM is killed with its group, the call is an error,
+    /// and only the lock of step 4's own ref goes.
+    #[test]
+    fn step_4_past_its_deadline_is_an_error_and_removes_only_its_own_lock() {
+        let (dir, env, repo) = stuck_git();
+        let start = std::time::Instant::now();
+        // (long enough for the fake git to have left its locks)
+        let deadline = start + std::time::Duration::from_millis(1500);
+        assert!(remove_source_refs(&env, &repo, SOURCE, deadline, &|| false).is_err());
+        let took = start.elapsed();
+        assert!(dir.path().join("ready").exists(), "the fake git never ran");
+        assert!(took >= std::time::Duration::from_millis(1500), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(8), "{took:?}");
+        only_own_lock_removed(&repo);
+        assert!(
+            !alive(&std::fs::read_to_string(dir.path().join("pid")).unwrap()),
+            "a child of git outlived it"
+        );
+    }
+
+    /// Review round 2 (M-b): `stop` ends step 4's git through the cancel
+    /// handle: `false`, nothing of it left, only its own lock removed.
+    #[test]
+    fn step_4_ends_on_stop() {
+        let (dir, env, repo) = stuck_git();
+        let ready = dir.path().join("ready");
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(20);
+        let stop = || ready.exists();
+        assert!(!remove_source_refs(&env, &repo, SOURCE, deadline, &stop).unwrap());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(8),
+            "{:?}",
+            start.elapsed()
+        );
+        only_own_lock_removed(&repo);
+        assert!(
+            !alive(&std::fs::read_to_string(dir.path().join("pid")).unwrap()),
+            "a child of git outlived it"
+        );
     }
 
     #[test]
