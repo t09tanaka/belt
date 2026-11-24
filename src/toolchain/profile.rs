@@ -809,17 +809,15 @@ impl Profile {
             return Ok(ToolObservation::Unknown);
         }
         if tool == "dart" {
-            let mut magic = [0u8; 4];
-            let native = std::fs::File::open(&path)
-                .and_then(|mut f| f.read_exact(&mut magic))
-                .is_ok()
-                && matches!(
-                    magic,
+            let native = matches!(
+                read_magic(&path, deadline())?,
+                Some(
                     [0x7f, b'E', b'L', b'F']
                         | [0xcf, 0xfa, 0xed, 0xfe]
                         | [0xfe, 0xed, 0xfa, 0xcf]
                         | [0xca, 0xfe, 0xba, 0xbe]
-                );
+                )
+            );
             if !native {
                 return Ok(ToolObservation::Unknown);
             }
@@ -911,6 +909,24 @@ fn measured_version(tool: &str, output: &str) -> Option<String> {
         token.into()
     })
 }
+/// The first four bytes of `path`, bounded by `limit`. Opening a file can
+/// block without end (a FIFO, or a macOS privacy prompt for a file under
+/// ~/Documents opened by a LaunchAgent), so the read runs on its own thread
+/// and a read that does not finish in time is a timed-out probe.
+fn read_magic(path: &Path, limit: Duration) -> Result<Option<[u8; 4]>, ProbeMiss> {
+    let (send, receive) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("belt-probe-read".into())
+        .spawn(move || {
+            let mut magic = [0u8; 4];
+            let read = std::fs::File::open(&path).and_then(|mut f| f.read_exact(&mut magic));
+            let _ = send.send(read.ok().map(|()| magic));
+        })
+        .map_err(|_| ProbeMiss::Failed)?;
+    receive.recv_timeout(limit).map_err(|_| ProbeMiss::TimedOut)
+}
+
 fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -1133,6 +1149,17 @@ mod tests {
         assert_eq!(run("unreadable", 10_000), Err(ProbeMiss::Failed));
         assert_eq!(run("missing", 10_000), Err(ProbeMiss::Failed));
         assert_eq!(run("hangs", 100), Err(ProbeMiss::TimedOut));
+        // Opening the file itself can block (a FIFO with no writer, or a
+        // privacy prompt): the read is bounded by the same deadline.
+        let fifo = bin.join("blocks-on-open");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            read_magic(&fifo, Duration::from_millis(100)),
+            Err(ProbeMiss::TimedOut)
+        );
+        let own = read_magic(&std::env::current_exe().unwrap(), Duration::from_secs(10)).unwrap();
+        assert!(own.is_some());
         // No parent to make the directory in: a failed probe, nothing made.
         assert_eq!(
             bounded_probe_in(
