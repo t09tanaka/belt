@@ -22,7 +22,7 @@ impl std::fmt::Display for CleanupIncomplete {
 // Keep the leader unreaped until its entire group has been signalled. Owning
 // this unreaped Child pins its PID/start identity, including after it exits;
 // there is no PID lookup/reuse window. Never signal a caller-provided group.
-struct OwnedGroup(Child, crate::context::CancelHandle);
+pub(crate) struct OwnedGroup(pub(crate) Child, pub(crate) crate::context::CancelHandle);
 impl Drop for OwnedGroup {
     fn drop(&mut self) {
         let pid = self.0.id() as i32;
