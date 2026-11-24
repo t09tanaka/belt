@@ -603,6 +603,9 @@ pub fn begin<L: Launcher>(
     };
     let switched = (|| -> anyhow::Result<Spec> {
         let named = from.plist.clone().context("service receipt missing")?;
+        // The stop below checks the binding; a resident an earlier version
+        // initialized has none yet.
+        super::publish_binding(&paths, &from)?;
         install_guard(&paths, &from, &named, launcher)?;
         let plan = plan(&paths, &from)?;
         match launcher.loaded_state(&plan, &named) {

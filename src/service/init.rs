@@ -1021,6 +1021,7 @@ async fn initialize_prepared<L: Launcher>(
     validate_managed(&j.spec)?;
     j.cluster = Some(cluster_id.clone());
     j.coordinator = Some(coordinator_id.clone());
+    publish_binding(&paths, &j)?;
     jf.save(&j)?;
     Ok(ResultReceipt {
         schema_version: 1,
@@ -1030,6 +1031,29 @@ async fn initialize_prepared<L: Launcher>(
         epoch,
         initialized: true,
     })
+}
+
+/// `init` is the enrollment of its own combined resident: the worker binding
+/// is the journal's group, worker and key. It is published only when absent
+/// (a resident made by an earlier version never wrote one); an existing
+/// binding is left for `verify_binding` to judge.
+fn publish_binding(paths: &Paths, j: &Journal) -> anyhow::Result<()> {
+    let binding = paths.worker.join("worker-binding.json");
+    match fs::symlink_metadata(&binding) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let cluster = j.cluster.as_ref().context("group missing")?;
+    let bytes = super::worker::rotation_binding::expected(
+        &j.spec.cluster_key_path,
+        cluster,
+        &j.spec.worker_id,
+    )
+    .context("worker binding: the group key cannot be read")?;
+    crate::worker::rekey::write(&binding, &bytes)
+        .with_context(|| format!("worker binding cannot be written: {}", binding.display()))?;
+    Ok(())
 }
 
 /// `bin/resident` -> `<digest>`: the binary this host's init resident runs,

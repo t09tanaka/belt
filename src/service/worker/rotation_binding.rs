@@ -15,7 +15,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub(super) fn expected(
+pub(in crate::service) fn expected(
     path: &Path,
     cluster: &ClusterId,
     worker: &WorkerId,

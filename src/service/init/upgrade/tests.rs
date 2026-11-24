@@ -1008,3 +1008,31 @@ async fn upgrade_without_a_resident_journal_says_so_even_when_init_lock_is_there
     };
     assert!(error.contains("no initialized resident"), "{error}");
 }
+
+#[tokio::test]
+async fn a_resident_initialized_without_a_worker_binding_is_upgraded_and_gets_one() {
+    let h = Host::new().await;
+    // An earlier version's init never wrote the combined resident's binding.
+    let binding = h.paths.worker.join("worker-binding.json");
+    fs::remove_file(&binding).unwrap();
+    let mut fake = h.fake.clone();
+    let upgraded = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(upgraded.to, h.new);
+    h.assert_finished();
+    let journal = read_journal(&h.paths.journal).unwrap();
+    let expected = crate::service::worker::rotation_binding::expected(
+        &journal.spec.cluster_key_path,
+        journal.cluster.as_ref().unwrap(),
+        &journal.spec.worker_id,
+    )
+    .unwrap();
+    assert_eq!(fs::read(&binding).unwrap(), expected);
+}
