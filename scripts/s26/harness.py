@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shlex
@@ -315,6 +316,11 @@ class Checks:
                     'test "$(loginctl show-user 1000 -p Linger --value)" = yes')
             if p.returncode:
                 raise RuntimeError(f"{host}: wrong user, PID 1, or lingering")
+        # The sweep proves its files by machine ID; each worker needs its own.
+        ids = {h: ssh(h, "cat /etc/machine-id").stdout.strip() for h in ("w1", "w2")}
+        if not all(re.fullmatch(r"[0-9a-f]{32}", i) for i in ids.values()) \
+                or len(set(ids.values())) != 2:
+            raise RuntimeError(f"workers need distinct non-empty machine IDs: {ids}")
         # A macOS parent and Linux workers always differ in platform and tools,
         # so doctor's environment_diff fails by design here (spec: a different
         # OS or architecture needs its own profile; A45 runs with a Linux
@@ -336,11 +342,11 @@ class Checks:
             if bad:
                 raise RuntimeError(f"doctor failed on {host}: {bad}")
             unchecked = [c for c in checks
-                         if c["level"] == "not_checked" and c["id"] != "traffic_processes"]
+                         if c["level"] == "not_checked"]
             if unchecked:
                 raise RuntimeError(f"doctor could not check {host}: {unchecked}")
         others = [c for c in report.get("checks", [])
-                  if c["host"] not in ("w1", "w2") and c["level"] == "fail"]
+                  if c["host"] not in ("w1", "w2") and c["level"] in ("fail", "not_checked")]
         if others:
             raise RuntimeError(f"doctor failed on the parent: {others}")
         return ("both --install workers active as user services, lingering; doctor passes "

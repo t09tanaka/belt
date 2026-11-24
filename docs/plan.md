@@ -227,6 +227,29 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A57 | R68・WP24e | |
 | A58 | WP24b | |
 
+### S26: Docker での受入の結果（2026-11-24、main `9bdf621`）
+
+手元の Mac（native の親）と Docker Desktop の Linux arm64 コンテナ（systemd PID 1、実 sshd、UID 1000 の lingering user）で、`scripts/s26/` の 5 つの実行を行った: 通常（A02・A45・A01・A34・M1・A57 の 4 つ）、`--peers`、`--linux-parent`、`--a46`、`S26_SYSTEM_WORKER=1`。A57 の N・N+1・壊した N+1 は `build-linux.sh --upgrade HEAD` で作った。31 件すべて PASS、SKIP 0。x86_64 の worker はこの回では回していない。
+
+Docker の結果と、Mac mini（独立した Mac の実機）の確認待ちを分けて書く。Docker は別の Mac 実機ではない。
+
+| 区分 | A |
+|---|---|
+| Docker 緑 | A01、A02、A34（Linux の worker）、A35（Linux の system service）、A45（Linux の user service と doctor）、A46、A51（別マシンからの投入）、A53（実 SSH での鍵の配布・更新・削除）、A54（別マシンの停止）、A57（rollback・commit・試用中の拒否・長い drain） |
+| Docker 緑（前回の計測、今回は再実行していない） | A37（2026-11-22、`15aef9e`。比較用の私的な commit が残っていないため） |
+| Docker 赤 | なし |
+| Mac mini 待ち | A24（本物の reboot と OS の boot ID。コンテナは VM の kernel を共有する）、A26（実機の suspend）、A34・A45 の macOS 部分（launchd）、A35 の login 時の復帰、A51・A54 の Mac 同士 |
+| Docker では未確認（S26 に残るが、今のハーネスに無い） | A42（実 manager と network での導入）、A44（実 worker との差の分類。doctor の `environment_diff` は見ているが、5 分類は見ていない） |
+| Docker の対象外（1 台の自動試験で完結） | 上の表で「自動」「統合検証済み」だけの A。A03〜A23、A25、A27〜A33、A36、A38〜A41、A43、A47〜A50、A52、A55、A56、A58 |
+
+この回でハーネスに入れたもの（製品のバグは見つからなかった）:
+
+- worker の image が空の `/etc/machine-id` で起動し、`systemd-machine-id-setup` は VM の UUID から作るので、どのコンテナも同じ ID になっていた。entrypoint で乱数の ID を書き、A45 で w1・w2 が別の 32 桁の ID を持つことを確かめる。
+- A34 は「commit の後も元の版の directory が残る」を確かめていたが、第 25 章の段階 4 で、名指すものの無い前の版は commit の直後に消える。rollback では元の executable が変わらないこと、commit では前の版が消えることを確かめるように直した。仕様 §15 の「今は消さない」の一文も段階 4 に合わせた。
+- doctor の `traffic_processes` の `not_checked` を A45 と L06 で見逃していた。今の main では worker・親とも `ok` を返すので、見逃しを外した。L06 は exit 0 と healthy も求める。
+
+残り: A57 の rollback は、CLI を止めてから 46 s で戻った（期限 45 s は試用の記録の時刻から数える）。m1 自身が投げて他のメンバーで動く run の、切替をまたぐ adopt は、コンテナ間の SSH が無いため未確認。
+
 ### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
 
 2026-11-17 の調査方法とハーネスの記録を以下に残す。上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列の試験は、試験名と冒頭の説明を仕様 §19 の期待結果と突き合わせて選んだ。期待結果の一部しか試験が無いと分かった A は「一部」にした。assert まで読んだのは `one_host` の全件と A16・A33・A49 の試験で、A05・A26・A42 は試験の説明とこの計画の該当節を読んだ。ほかの行は試験名と説明までで、S26 の受入で期待結果の句ごとに確かめ直す。試験名は代表で、同じ A を確かめる試験がほかにもある。
