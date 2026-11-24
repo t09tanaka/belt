@@ -71,6 +71,9 @@ pub(super) struct PruneReport {
     /// Steps that failed, and files that could not be proven or deleted:
     /// kept, and tried again.
     pub unknown: u32,
+    /// Capture scratch directories kept at step 4, by kind (also in
+    /// `unknown`).
+    pub scratch: crate::source::retention::ScratchCounts,
     /// Runs held at step 4, by the gate that held them.
     pub gates: std::collections::BTreeMap<Gate, u32>,
     /// Events of a pruned run's attempts that name another run: kept.
@@ -242,6 +245,7 @@ fn prune(
     // 4 and 5. The inputs, then the files and index rows named by the run.
     let inputs = sources.prune_run_inputs(owner, run, &mut state.roots, &mut budget.inputs)?;
     report.unknown += inputs.unknown;
+    report.scratch.merge(inputs.scratch);
     if let Some(gate) = inputs.gate {
         *report.gates.entry(gate).or_default() += 1;
     }

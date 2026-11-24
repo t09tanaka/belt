@@ -28,6 +28,124 @@ fn name_of(root: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Why a deletion kept a capture's scratch directory (#155 (a)): it is
+/// counted by kind in the log and in `doctor`, never with its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::source) enum ScratchKept {
+    /// An entry on another device or of another user, or the directory is
+    /// no directory.
+    NotOurs,
+    /// The capture that stages there still holds its lock.
+    InUse,
+    /// An entry changed while it was removed.
+    Changed,
+}
+
+impl ScratchKept {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotOurs => "not_ours",
+            Self::InUse => "in_use",
+            Self::Changed => "changed",
+        }
+    }
+    fn parse(text: &str) -> Option<Self> {
+        [Self::NotOurs, Self::InUse, Self::Changed]
+            .into_iter()
+            .find(|k| k.as_str() == text)
+    }
+}
+
+impl std::fmt::Display for ScratchKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotOurs => "an entry of a capture's scratch directory is not provably ours",
+            Self::InUse => "a capture's scratch directory is in use",
+            Self::Changed => "a capture's scratch directory changed while it was removed",
+        })
+    }
+}
+
+impl std::error::Error for ScratchKept {}
+
+/// Scratch directories kept, by kind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchCounts {
+    pub not_ours: u32,
+    pub in_use: u32,
+    pub changed: u32,
+}
+
+impl ScratchCounts {
+    fn add_n(&mut self, kind: ScratchKept, by: u32) {
+        let n = match kind {
+            ScratchKept::NotOurs => &mut self.not_ours,
+            ScratchKept::InUse => &mut self.in_use,
+            ScratchKept::Changed => &mut self.changed,
+        };
+        *n = n.saturating_add(by);
+    }
+    /// Counts the kind of `error` when it is a kept scratch directory;
+    /// whether it was one.
+    pub(in crate::source) fn count(&mut self, error: &anyhow::Error) -> bool {
+        match error.chain().find_map(|e| e.downcast_ref::<ScratchKept>()) {
+            Some(kind) => {
+                self.add_n(*kind, 1);
+                true
+            }
+            None => false,
+        }
+    }
+    pub fn merge(&mut self, other: Self) {
+        self.not_ours = self.not_ours.saturating_add(other.not_ours);
+        self.in_use = self.in_use.saturating_add(other.in_use);
+        self.changed = self.changed.saturating_add(other.changed);
+    }
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    /// For a log line: counts only.
+    pub fn text(&self) -> String {
+        format!(
+            "not_ours:{},in_use:{},changed:{}",
+            self.not_ours, self.in_use, self.changed
+        )
+    }
+}
+
+/// For `doctor`: the scratch directories the deletions keep now, by kind
+/// (one `meta` row per root, written by the deletion, removed when the
+/// directory goes); read like [`super::super::inspect_owners`].
+pub fn inspect_scratch_kept(state: &Path) -> Result<ScratchCounts> {
+    let database = state.join("sources").join("retention.db");
+    let mut counts = ScratchCounts::default();
+    if !database.is_file() {
+        return Ok(counts);
+    }
+    let c = Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let mut s = match c.prepare(
+        "SELECT value, count(*) FROM meta WHERE key>'scratch_kept:' AND key<'scratch_kept;' GROUP BY value",
+    ) {
+        Ok(s) => s,
+        Err(rusqlite::Error::SqliteFailure(_, Some(text))) if text.contains("no such table") => {
+            return Ok(counts)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (kind, n) = row?;
+        if let Some(kind) = ScratchKept::parse(&kind) {
+            counts.add_n(kind, u32::try_from(n).unwrap_or(u32::MAX));
+        }
+    }
+    Ok(counts)
+}
+
 /// A reservation: the destination local-ci named, and the key of the object
 /// in the index.
 pub(in crate::source) type Reserved = Vec<(PathBuf, String)>;
@@ -67,6 +185,31 @@ impl Index {
     /// dropped here (an installed file keeps its name in the store).
     pub(in crate::source) fn remove_scratch(&self, root: &str) -> Result<()> {
         self.remove_scratch_of(root, Top::Probed)
+    }
+
+    /// [`Self::remove_scratch`] by a deletion that holds `c`: the kind of a
+    /// kept directory is noted for `doctor` (one row per root), and the
+    /// note goes when the directory does.
+    pub(in crate::source) fn remove_scratch_noted(&self, c: &Connection, root: &str) -> Result<()> {
+        let removed = self.remove_scratch(root);
+        let kind = removed.as_ref().err().and_then(|e| {
+            e.chain()
+                .find_map(|e| e.downcast_ref::<ScratchKept>())
+                .copied()
+        });
+        match (&removed, kind) {
+            (Ok(()), _) => {
+                c.execute("DELETE FROM meta WHERE key='scratch_kept:'||?1", [root])?;
+            }
+            (Err(_), Some(kind)) => {
+                c.execute(
+                    "INSERT INTO meta(key,value) VALUES('scratch_kept:'||?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",
+                    params![root, kind.as_str()],
+                )?;
+            }
+            (Err(_), None) => {}
+        }
+        removed
     }
 
     /// [`Index::remove_scratch`] by the capture that made the directory,
@@ -268,13 +411,10 @@ fn remove_entry(
             (stat.st_dev, stat.st_uid),
             (device, rustix::process::geteuid().as_raw())
         ),
-        "an entry of a capture's scratch directory is not provably ours"
+        ScratchKept::NotOurs
     );
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-        ensure!(
-            top.is_none(),
-            "a capture's scratch directory is not a directory"
-        );
+        ensure!(top.is_none(), ScratchKept::NotOurs);
         rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
         return Ok(());
     }
@@ -288,15 +428,13 @@ fn remove_entry(
     let opened = rustix::fs::fstat(&below)?;
     ensure!(
         (opened.st_dev, opened.st_ino) == (stat.st_dev, stat.st_ino),
-        "a capture's scratch directory changed while it was removed"
+        ScratchKept::Changed
     );
     if top == Some(Top::Probed) {
         // The capture that stages here holds this lock until it returns.
         match below.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                anyhow::bail!("a capture's scratch directory is in use")
-            }
+            Err(TryLockError::WouldBlock) => return Err(ScratchKept::InUse.into()),
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
     }

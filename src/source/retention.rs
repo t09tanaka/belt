@@ -13,6 +13,7 @@ pub use capture_owner::{
 pub use deletion::set_prune_fault;
 pub(in crate::source) use deletion::Reserved;
 pub use deletion::{abandoned_imports_read_only, large_old_claims_read_only, ImportReleaseReport};
+pub use deletion::{inspect_scratch_kept, ScratchCounts};
 pub use deletion::{
     AbandonCursor, AbandonReport, AbandonScope, ExclusiveGuard, Gate, PruneBudget, PruneInputs,
 };
@@ -340,6 +341,8 @@ impl Index {
         if gone.is_none() {
             return Ok(());
         }
+        // (a wrong-content file kept for another root is no longer kept)
+        c.execute("DELETE FROM meta WHERE key='corrupt_held:'||?1", [object])?;
         let bytes: Option<i64> = c
             .query_row(
                 "DELETE FROM object_bytes WHERE id=?1 RETURNING bytes",

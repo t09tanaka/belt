@@ -1304,6 +1304,65 @@ fn a_file_that_stopped_an_install_and_another_root_holds_is_kept_and_counted() {
         std::fs::read(&manifest).unwrap(),
         b"not this manifest any more"
     );
+    // (a current count: once the object is gone, it is no longer counted;
+    // a cumulative counter would stay at 1)
+    let c = parts.sources.retention.connect().unwrap();
+    let object = format!("m:{id}");
+    c.execute("DELETE FROM member WHERE object=?1", [&object])
+        .unwrap();
+    crate::source::retention::Index::forget_object(&c, &object, "1").unwrap();
+    let shown = crate::service::doctor::unjudged_captures(&parts.state, &|_| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.corrupt_held, 0);
+    assert_eq!(
+        parts.count("SELECT count(*) FROM meta WHERE key LIKE 'corrupt_held%'"),
+        0,
+        "the mark goes with its object"
+    );
+}
+
+/// #155 (b): a membership another root holds only goes (progress); the
+/// check of a reservation's file for `doctor` reads at most
+/// [`super::deletion::SHARED_LOOK`] of the page's budget, not half of it.
+#[test]
+fn a_shared_reservation_costs_little_of_the_budget() {
+    let parts = Parts::new();
+    let first = RunId::generate();
+    parts.sources.own_capture_as(&first, &me()).unwrap();
+    let id = capture_plain(&parts, &first).unwrap().manifest.ci_source_id;
+    let manifest = parts
+        .state
+        .join("sources/manifests")
+        .join(format!("{id}.json"));
+    let big = vec![b'x'; (2 << 20) + 1];
+    plant(&manifest, &big);
+    let run = RunId::generate();
+    parts.sources.own_capture_as(&run, &gone()).unwrap();
+    capture_plain(&parts, &run).unwrap_err();
+    let object = format!("m:{id}");
+    let mut c = parts.sources.retention.connect().unwrap();
+    let (root, path): (String, String) = c
+        .query_row(
+            "SELECT m.root,o.path FROM member m JOIN object o ON o.id=m.object JOIN root r ON r.id=m.root WHERE m.object=?1 AND r.source IS NULL",
+            [&object],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let start = 64 << 20;
+    let mut budget: u64 = start;
+    let released = parts
+        .sources
+        .retention
+        .release_member(&mut c, &root, &object, &path, &mut budget, true, true)
+        .unwrap();
+    assert!(matches!(released, super::deletion::Released::Shared(_)));
+    assert!(
+        start - budget <= super::deletion::SHARED_LOOK,
+        "spent {}",
+        start - budget
+    );
+    assert_eq!(std::fs::read(&manifest).unwrap(), big);
 }
 
 /// A file a reservation names whose only other holder is the reservation of
@@ -1674,6 +1733,59 @@ fn the_removal_of_a_scratch_directory_follows_no_link_and_takes_none_in_use() {
         assert!(index.create_scratch(bad).is_err(), "{bad}");
     }
     assert!(outside.join("kept").is_file());
+}
+
+/// #155 (a): a scratch directory a deletion keeps is counted by its kind
+/// (never its path), in the deletion's report and for `doctor`, and the
+/// count goes when the directory does.
+#[test]
+fn a_kept_scratch_directory_is_counted_by_kind_until_it_goes() {
+    use crate::source::retention::{inspect_scratch_kept, ScratchCounts};
+    let parts = Parts::new();
+    let index = &parts.sources.retention;
+    let c = index.connect().unwrap();
+    let outside = parts.root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+
+    let root = parts.sources.capture_pending_root(None).unwrap();
+    let scratch = index.create_scratch(&root).unwrap();
+    let held = std::fs::File::open(&scratch).unwrap();
+    held.try_lock().unwrap();
+    let error = index.remove_scratch_noted(&c, &root).unwrap_err();
+    let mut counts = ScratchCounts::default();
+    assert!(counts.count(&error));
+    assert_eq!(counts.in_use, 1);
+    assert!(!counts.text().contains('/'), "{}", counts.text());
+
+    let linked = parts.sources.capture_pending_root(None).unwrap();
+    let name = linked.strip_prefix("capture:").unwrap();
+    std::os::unix::fs::symlink(&outside, parts.state.join("sources/staging").join(name)).unwrap();
+    let error = index.remove_scratch_noted(&c, &linked).unwrap_err();
+    assert!(counts.count(&error));
+    assert_eq!((counts.in_use, counts.not_ours, counts.changed), (1, 1, 0));
+    // the same again is one directory still
+    index.remove_scratch_noted(&c, &root).unwrap_err();
+    assert_eq!(
+        inspect_scratch_kept(&parts.state).unwrap(),
+        ScratchCounts {
+            not_ours: 1,
+            in_use: 1,
+            changed: 0
+        }
+    );
+    // an error of another kind is not counted
+    assert!(!counts.count(&anyhow::anyhow!("other")));
+
+    drop(held);
+    index.remove_scratch_noted(&c, &root).unwrap();
+    assert_eq!(
+        inspect_scratch_kept(&parts.state).unwrap(),
+        ScratchCounts {
+            not_ours: 1,
+            in_use: 0,
+            changed: 0
+        }
+    );
 }
 
 /// The capture removes its scratch directory before it returns, and a
