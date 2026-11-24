@@ -59,7 +59,20 @@ pub struct ReceivedPassInputs<'a> {
     /// remove the refs of `source` (CI id), then call `row.done()`.
     /// `Ok(false)` when that lock is busy (the row waits for its next try).
     pub refs: &'a dyn Fn(&str, &str, &RefRow<'_>) -> Result<bool>,
+    /// The gc of (e), called with no source lock held for one clone whose
+    /// `gc:<clone>` row is due (at most one a pass): run
+    /// `git -c gc.packRefs=false gc --prune=14.days.ago` there under the
+    /// clone's import lock, its own lock and its main lock, each tried
+    /// without waiting, bounded, ended when the given stop says so.
+    /// `Ok(Some(true))`: it ran (or there is no clone); `Ok(Some(false))`:
+    /// a lock was busy (tried again at the next pass); `Ok(None)`: stopped
+    /// (also the next pass); an error (a failure or the bound): the row
+    /// waits a day, as after a run.
+    pub gc: &'a GcFn<'a>,
 }
+
+/// The gc of (e) for one clone, given the pass's stop.
+pub type GcFn<'a> = dyn Fn(&str, &dyn Fn() -> bool) -> Result<Option<bool>> + 'a;
 
 /// One step 4 row, for the caller's `refs`, which calls both under the
 /// clone's import lock.
@@ -101,6 +114,8 @@ pub struct ReceivedPassReport {
     /// `ref_drop:` rows done (step 4): the refs went, or the source was
     /// received again and they stay.
     pub refs: usize,
+    /// Clones whose gc of (e) ran (or failed: it waits a day all the same).
+    pub gc: usize,
     /// The pass stopped at its section bound with progress made: the caller
     /// may start the next one at once.
     pub again: bool,
@@ -170,6 +185,41 @@ const REF_ROWS: &str = "SELECT m.key FROM meta m WHERE m.key>='ref_drop:' AND m.
 const REF_HELD: &str = "SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2 LIMIT 1";
 /// How long a step 4 row whose import lock was busy waits.
 const REF_BUSY_MS: i64 = 60_000;
+/// The rows of (e)'s gc: `gc:<clone>`, valued `<last gc ms>\n<deadline
+/// ms>` (one per clone; a clone whose refs never went has none).
+const GC_ROWS: &str = "SELECT key,value FROM meta WHERE key>='gc:' AND key<'gc;' ORDER BY key";
+/// At most one gc a day per clone.
+const GC_EVERY_MS: i64 = 86_400_000;
+/// A clone's gc rows live this long after its last ref removal (15 days:
+/// Git's 14 days of grace and one daily gc after them).
+const GC_KEEP_MS: i64 = 15 * 86_400_000;
+
+/// `<last>\n<deadline>` of a `gc:` row.
+fn gc_value(value: &str) -> Option<(i64, i64)> {
+    let (last, deadline) = value.split_once('\n')?;
+    Some((last.parse().ok()?, deadline.parse().ok()?))
+}
+
+/// A ref removal in `clone` at `now`: its `gc:` row keeps its last gc (none
+/// yet: 0) and gets the deadline `now` + 15 days. In the caller's
+/// transaction.
+fn gc_mark(c: &Connection, clone: &str, now: u64) -> Result<()> {
+    let key = format!("gc:{clone}");
+    let last = c
+        .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .as_deref()
+        .and_then(gc_value)
+        .map_or(0, |(last, _)| last);
+    let deadline = now as i64 + GC_KEEP_MS;
+    c.execute(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, format!("{last}\n{deadline}")],
+    )?;
+    Ok(())
+}
 /// The queries whose plans a test checks.
 #[cfg(test)]
 pub(in crate::source::retention) const PLANNED: [&str; 7] = [
@@ -204,6 +254,34 @@ impl SourceStore {
     /// One pass (spec 25.8 5b (d)). The caller has checked that no version
     /// is on trial; a store that holds a parent's root is left alone.
     pub fn received_pass(&self, inputs: &ReceivedPassInputs) -> Result<ReceivedPassReport> {
+        let mut report = self.received_sections(inputs)?;
+        // The gc of (e), after the sections, with no source lock held (a
+        // store that holds a parent's roots is left alone, and a stopped
+        // pass does not start one).
+        // (the stop is not asked here: the gc's git asks it at once)
+        if !report.parent {
+            self.retention.gc_clones(inputs, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// Whether `source`'s refs in `clone` are still named (the removal of
+    /// a discarded work directory, (g)7 and (g)29): a `clone_ref` row, or
+    /// rows not known yet (the fill is not `done`, or a root waits for its
+    /// retry: kept, as step 4 keeps its rows then). Its caller holds the
+    /// clone's import lock, which every writer of `clone_ref` holds.
+    pub fn clone_ref_held(&self, clone: &str, source: &str) -> Result<bool> {
+        let c = self.retention.connect()?;
+        Ok(c.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')
+             OR EXISTS(SELECT 1 FROM clone_ref_retry)
+             OR EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+            params![clone, source],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn received_sections(&self, inputs: &ReceivedPassInputs) -> Result<ReceivedPassReport> {
         let mut report = ReceivedPassReport::default();
         if self.retention.holds_parent_roots()? {
             report.parent = true;
@@ -517,6 +595,15 @@ impl Index {
                 let removed = (|| -> Result<()> {
                     c.execute("DELETE FROM meta WHERE key=?1", [&key])?;
                     c.execute("DELETE FROM ref_retry WHERE key=?1", [&key])?;
+                    // (e): refs went from the clone (not received again):
+                    // its gc is due for the next 15 days
+                    let held = c
+                        .query_row(REF_HELD, params![clone, source], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .is_some();
+                    if !held {
+                        gc_mark(&c, clone, inputs.wall)?;
+                    }
                     Ok(())
                 })();
                 match removed {
@@ -546,6 +633,76 @@ impl Index {
                  ON CONFLICT(key) DO UPDATE SET next_ms=excluded.next_ms",
                 params![key, inputs.wall as i64 + wait],
             )?;
+        }
+        Ok(())
+    }
+
+    /// The gc of (e): the `gc:<clone>` rows whose deadline has passed go
+    /// (as do rows not in this form), then the clone whose last gc is the
+    /// oldest of those a day old or more (one with a last gc more than a
+    /// day ahead counts: the clock went back) is given to `inputs.gc`. A
+    /// run or a failure writes the time of this pass as its last gc; a
+    /// busy lock or a stop writes nothing (the next pass tries again).
+    fn gc_clones(
+        &self,
+        inputs: &ReceivedPassInputs,
+        report: &mut ReceivedPassReport,
+    ) -> Result<()> {
+        let now = inputs.wall as i64;
+        let c = self.connect()?;
+        let rows: Vec<(String, String)> = {
+            let mut s = c.prepare(GC_ROWS)?;
+            let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut due: Option<(i64, String)> = None;
+        for (key, value) in rows {
+            let parsed = gc_value(&value);
+            let Some((last, _)) = parsed.filter(|&(_, d)| now < d && d <= now + GC_KEEP_MS) else {
+                // (past its deadline, garbage, or a deadline more than 15
+                // days ahead, the clock went back: the row goes, nothing
+                // is kept for it but Git's objects, which stay)
+                c.execute(
+                    "DELETE FROM meta WHERE key=?1 AND value=?2",
+                    params![key, value],
+                )?;
+                continue;
+            };
+            let ready = last <= 0 || last + GC_EVERY_MS <= now || last > now + GC_EVERY_MS;
+            if ready && due.as_ref().is_none_or(|(l, _)| last < *l) {
+                due = Some((last, key));
+            }
+        }
+        let Some((_, key)) = due else {
+            return Ok(());
+        };
+        let clone = &key["gc:".len()..];
+        let ran = match (inputs.gc)(clone, inputs.stop) {
+            Ok(Some(true)) | Err(_) => true,
+            Ok(Some(false)) | Ok(None) => false,
+        };
+        if ran {
+            report.gc += 1;
+            c.execute_batch("BEGIN IMMEDIATE")?;
+            let written = (|| -> Result<()> {
+                let value: Option<String> = c
+                    .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0))
+                    .optional()?;
+                if let Some((_, deadline)) = value.as_deref().and_then(gc_value) {
+                    c.execute(
+                        "UPDATE meta SET value=?2 WHERE key=?1",
+                        params![key, format!("{now}\n{deadline}")],
+                    )?;
+                }
+                Ok(())
+            })();
+            match written {
+                Ok(()) => c.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

@@ -565,6 +565,7 @@ impl Host for Machine {
                 self.workspaces
                     .drop_imported_refs(clone, source, row.held, row.done, row.stop)
             },
+            gc: &|clone, stop| self.workspaces.gc_clone(clone, stop),
         }))
     }
 

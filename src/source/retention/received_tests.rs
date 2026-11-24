@@ -28,6 +28,11 @@ struct Env {
     on_stop: RefCell<Option<StopProbe>>,
     stops: std::cell::Cell<usize>,
     held: RefCell<Option<Guard>>,
+    /// The gc calls of (e), the clock of the pass, and what the gc answers
+    /// (0: ran, 1: busy, 2: stopped, 3: failed).
+    gc: RefCell<Vec<String>>,
+    wall: std::cell::Cell<u64>,
+    gc_answer: std::cell::Cell<u8>,
 }
 
 type StopProbe = Box<dyn Fn(&Env, usize) -> bool>;
@@ -49,6 +54,9 @@ impl Env {
             on_stop: RefCell::new(None),
             stops: std::cell::Cell::new(0),
             held: RefCell::new(None),
+            gc: RefCell::new(Vec::new()),
+            wall: std::cell::Cell::new(NOW),
+            gc_answer: std::cell::Cell::new(0),
         };
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
@@ -133,7 +141,7 @@ impl Env {
         uses: &dyn Fn(&str, Option<&crate::ids::SourceId>) -> Result<SourceUse>,
     ) -> Result<ReceivedPassReport> {
         self.receiver.received_pass(&ReceivedPassInputs {
-            wall: NOW,
+            wall: self.wall.get(),
             mono: AGE,
             boot: Some("b".into()),
             max_age_ms: AGE,
@@ -159,6 +167,18 @@ impl Env {
                 }
                 (row.done)()?;
                 Ok(true)
+            },
+            gc: &|clone, _| {
+                // (no git under the store's exclusive lock either)
+                self.refs_under_ex
+                    .set(self.refs_under_ex.get() || self.receiver.retention.guard(false).is_err());
+                self.gc.borrow_mut().push(clone.to_string());
+                match self.gc_answer.get() {
+                    0 => Ok(Some(true)),
+                    1 => Ok(Some(false)),
+                    2 => Ok(None),
+                    _ => anyhow::bail!("gc failed"),
+                }
             },
         })
     }
@@ -810,6 +830,7 @@ fn a_stopped_pass_runs_no_section() {
             uses: &|_, _| Ok(SourceUse::Ended(None)),
             stop: &|| true,
             refs: &|_, _, _| Ok(true),
+            gc: &|_, stop| Ok(if stop() { None } else { Some(true) }),
         })
         .unwrap();
     assert_eq!(report.sections, 0, "{report:?}");
@@ -1495,4 +1516,105 @@ fn a_large_hash_stops_between_its_chunks() {
     assert_eq!(report.unlinked, 0, "{report:?}");
     assert_eq!(env.stops.get(), 4, "the hash read on");
     assert_withdrawn(&env, &fa);
+}
+
+/// Spec (e): a ref removal writes the clone's `gc:` row (last gc, deadline
+/// 15 days on); the gc runs at most once a day per clone, one clone a pass,
+/// with no source lock held; a busy lock or a stop tries again at the next
+/// pass, a failure waits a day; the row goes after its deadline; a source
+/// received again (its refs stay) writes no row.
+#[test]
+fn the_clone_gc_runs_once_a_day_until_its_deadline() {
+    const DAY: u64 = 86_400_000;
+    let env = Env::new();
+    env.refs_busy.set(false);
+    env.sql(
+        "INSERT INTO meta(key,value) VALUES('ref_drop:r-1:s1',''),('ref_drop:r-2:s2',''),('ref_drop:r-3:s3','');
+         INSERT INTO clone_ref(clone,source,root) VALUES('r-3','s3','receive:s3')",
+    );
+    let row = |c: &str| -> Option<String> {
+        env.receiver
+            .retention
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [format!("gc:{c}")],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    };
+    let report = env.pass();
+    assert_eq!(report.refs, 3);
+    let deadline = NOW + 15 * DAY;
+    // (r-3 kept its refs: no gc row)
+    assert_eq!(row("r-3"), None);
+    // one gc in the pass, the first by key (both never ran)
+    assert_eq!(*env.gc.borrow(), ["r-1"]);
+    assert_eq!(report.gc, 1);
+    assert!(!env.refs_under_ex.get());
+    assert_eq!(row("r-1").unwrap(), format!("{NOW}\n{deadline}"));
+    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
+    // busy: r-2 is asked again at the next pass, unchanged
+    env.gc_answer.set(1);
+    env.pass();
+    env.pass();
+    assert_eq!(*env.gc.borrow(), ["r-1", "r-2", "r-2"]);
+    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
+    // stopped: the same
+    env.gc_answer.set(2);
+    env.pass();
+    assert_eq!(row("r-2").unwrap(), format!("0\n{deadline}"));
+    // a failure counts as a run: a day later
+    env.gc_answer.set(3);
+    env.pass();
+    assert_eq!(row("r-2").unwrap(), format!("{NOW}\n{deadline}"));
+    let calls = env.gc.borrow().len();
+    env.pass();
+    assert_eq!(env.gc.borrow().len(), calls, "once a day per clone");
+    // a day later, one each
+    env.gc_answer.set(0);
+    env.wall.set(NOW + DAY);
+    env.pass();
+    env.pass();
+    env.pass();
+    assert_eq!(env.gc.borrow()[calls..], ["r-1", "r-2"]);
+    // past the deadline both rows go, and no gc runs
+    env.wall.set(deadline);
+    env.pass();
+    assert_eq!((row("r-1"), row("r-2")), (None, None));
+    assert_eq!(env.gc.borrow().len(), calls + 2);
+}
+
+/// Spec (e): a later ref removal moves the deadline and keeps the last gc;
+/// a row whose deadline is more than 15 days ahead (the clock went back)
+/// or that is not in the form goes.
+#[test]
+fn a_later_ref_removal_moves_the_gc_deadline() {
+    const DAY: u64 = 86_400_000;
+    let env = Env::new();
+    env.refs_busy.set(false);
+    env.gc_answer.set(1);
+    env.sql(&format!(
+        "INSERT INTO meta(key,value) VALUES('gc:r-1','{}\n{}'),('gc:r-2','x'),('gc:r-3','0\n{}'),('ref_drop:r-1:s1','')",
+        NOW - 1,
+        NOW + DAY,
+        NOW + 16 * DAY
+    ));
+    env.pass();
+    let value: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT value FROM meta WHERE key='gc:r-1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(value, format!("{}\n{}", NOW - 1, NOW + 15 * DAY));
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM meta WHERE key LIKE 'gc:%'"),
+        1
+    );
 }

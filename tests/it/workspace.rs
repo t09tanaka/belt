@@ -2215,3 +2215,115 @@ fn imported_refs_refuse_a_clone_that_is_a_symlink() {
     assert!(r.is_err(), "{r:?}");
     assert_eq!(done.get(), 0);
 }
+
+/// Spec 25.8 5b (e): the gc of a clone runs `git gc --prune=14.days.ago`
+/// without packing refs: a loose object no ref reaches that is older than
+/// 14 days goes, a newer one stays (a workspace may be about to point a ref
+/// at it), the refs stay loose, a stale `.lock` file is left alone and the
+/// clone directory stays ((g)19). A busy import lock, clone lock or main
+/// lock (fast-worktree holds it shared) skips it; a stop ends it; a clone
+/// that is not there has nothing to do.
+#[test]
+fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    f.git(repo.dir(), &["fetch", "-q", f.dir.to_str().unwrap(), &head]);
+    let snapshot = format!("refs/local-ci/snapshots/src-{}", "d".repeat(32));
+    f.git(repo.dir(), &["update-ref", &snapshot, &head]);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let git_dir = repo.dir().join(".git");
+    let object = |text: &str, old: bool| {
+        let file = repo.dir().join("blob-input");
+        std::fs::write(&file, text).unwrap();
+        let id = f.git(repo.dir(), &["hash-object", "-w", file.to_str().unwrap()]);
+        std::fs::remove_file(&file).unwrap();
+        let path = git_dir.join("objects").join(&id[..2]).join(&id[2..]);
+        if old {
+            let month = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(month)
+                .unwrap();
+        }
+        (id, path)
+    };
+    let present = |id: &str| {
+        std::process::Command::new("git")
+            .args(["cat-file", "-e", id])
+            .current_dir(repo.dir())
+            .envs(f.env())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let old = object("old and unreachable", true);
+    let fresh = object("fresh and unreachable", false);
+    let stale = git_dir.join("refs/local-ci/snapshots/stale.lock");
+    std::fs::write(&stale, "").unwrap();
+    let gc = |stop: &dyn Fn() -> bool| ws.gc_clone(&clone, stop);
+    // busy: each lock skips it
+    let clones = repo.dir().parent().unwrap().to_path_buf();
+    for path in [
+        clones.join(format!("{clone}.import.lock")),
+        clones.join(format!("{clone}.lock")),
+    ] {
+        let held = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        held.lock().unwrap();
+        assert_eq!(gc(&|| false).unwrap(), Some(false), "{}", path.display());
+        drop(held);
+    }
+    let shared = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(git_dir.join("belt-workspace.lock"))
+        .unwrap();
+    shared.lock_shared().unwrap();
+    assert_eq!(gc(&|| false).unwrap(), Some(false));
+    drop(shared);
+    assert!(old.1.exists());
+    // (a child forked meanwhile may hold a copy of a lock's descriptor
+    // until its exec: the locks are free within a bounded wait)
+    let until_free = |stop: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let r = gc(stop).unwrap();
+            if r != Some(false) {
+                return r;
+            }
+            assert!(std::time::Instant::now() < deadline, "a lock stayed busy");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    // stopped at once: nothing of it is left running
+    assert_eq!(until_free(&|| true), None);
+    assert_eq!(until_free(&|| false), Some(true));
+    // (a newer one may have moved into a cruft pack: asked by id)
+    assert!(!present(&old.0), "an object older than 14 days stayed");
+    assert!(present(&fresh.0), "an object newer than 14 days went");
+    assert_eq!(f.git(repo.dir(), &["rev-parse", &snapshot]), head);
+    assert!(git_dir.join(&snapshot).is_file(), "the refs were packed");
+    assert!(stale.exists(), "a lock file was removed");
+    assert!(repo.dir().is_dir());
+    // a clone that is not there: nothing to do; a bad name is refused
+    assert_eq!(
+        ws.gc_clone(&format!("r-{}", "0".repeat(16)), &|| false)
+            .unwrap(),
+        Some(true)
+    );
+    assert!(ws.gc_clone("../x", &|| false).is_err());
+}

@@ -492,6 +492,11 @@ fn made_refs_text(repository_id: &str, refs: &[ImportRef]) -> String {
     out
 }
 
+/// The CI id of the work directory named `dir` (a [`SourceId`]).
+fn source_id_of_ci_dir(dir: &str) -> Option<String> {
+    ci_id_of(&SourceId::parse(dir).ok()?)
+}
+
 /// `None` when there is no record or it is not one this module wrote.
 fn read_made_refs(dir: &Path) -> Option<(String, Vec<ImportRef>)> {
     let text = fs::read_to_string(dir.join(MADE_REFS)).ok()?;
@@ -723,6 +728,18 @@ impl Incoming {
                     Some(id) => self.published(id).unwrap_or(true),
                     None => true,
                 });
+                // (g)7, (g)29: the snapshot and index refs of this source, derived
+                // from its id, go too unless a `clone_ref` row names them
+                // (refs the bundle did not make: an earlier import's)
+                if let Some(id) = source_id_of_ci_dir(source) {
+                    let clone = clone_dir_name(&repository_id);
+                    let _ = self
+                        .workspaces
+                        .remove_discarded_refs(&repository_id, &id, &|| {
+                            Ok(self.published(&id).unwrap_or(true)
+                                || self.store.clone_ref_held(&clone, &id)?)
+                        });
+                }
             }
         }
         remove_staged(&dir.join(MADE_REFS_TMP));

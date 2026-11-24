@@ -3768,6 +3768,79 @@ fn a_record_left_after_the_publication_keeps_the_index_ref_of_the_source() {
     assert_eq!(git(&clones[0], &["for-each-ref"]), refs);
 }
 
+/// Spec (g)7, the third part of (g)29: a work directory thrown away takes
+/// the snapshot and index refs derived from its source's id, even those its
+/// bundle did not make, unless a `clone_ref` row names them; the refs of a
+/// published source stay.
+#[test]
+fn a_discarded_work_directory_takes_its_sources_refs_without_a_clone_ref_row() {
+    let mut f = fx();
+    f.git_shim();
+    let (_repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &p);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    let published = git(&clones[0], &["for-each-ref"]);
+    let head = git(
+        &clones[0],
+        &["for-each-ref", "--count=1", "--format=%(objectname)"],
+    );
+    let head = head.trim().to_string();
+    let repository = p.root.repository_id.as_deref().unwrap().to_string();
+    // two sources never published, whose refs an earlier import left (their
+    // bundles' records do not list them); one has a `clone_ref` row
+    let other = |named: bool| {
+        let id = SourceId::generate();
+        let ci = belt::source::classify::ci_id_of(&id).unwrap();
+        for kind in ["snapshots", "index"] {
+            git(
+                &clones[0],
+                &["update-ref", &format!("refs/local-ci/{kind}/{ci}"), &head],
+            );
+        }
+        if named {
+            let c = rusqlite::Connection::open(f.state().join("sources/retention.db")).unwrap();
+            c.execute(
+                "INSERT INTO clone_ref(clone,source,root) VALUES(?1,?2,'receive:x')",
+                [clones[0].file_name().unwrap().to_str().unwrap(), &ci],
+            )
+            .unwrap();
+        }
+        let dir = f.incoming(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("made-refs"), format!("{repository}\n")).unwrap();
+        (dir, ci)
+    };
+    // (the `clone_ref` fill is done, as after the first pass)
+    rusqlite::Connection::open(f.state().join("sources/retention.db"))
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO meta(key,value) VALUES('clone_ref_fill','done')
+             ON CONFLICT(key) DO UPDATE SET value='done'",
+        )
+        .unwrap();
+    let (gone_dir, gone) = other(false);
+    let (named_dir, named) = other(true);
+    let l = stale(&l);
+    sink.drop_stale(&l);
+    assert!(!gone_dir.exists() && !named_dir.exists());
+    let refs = git(&clones[0], &["for-each-ref"]);
+    assert!(!refs.contains(&gone), "{refs}");
+    assert!(
+        refs.contains(&format!("refs/local-ci/snapshots/{named}")),
+        "{refs}"
+    );
+    assert!(
+        refs.contains(&format!("refs/local-ci/index/{named}")),
+        "{refs}"
+    );
+    for line in published.lines() {
+        assert!(refs.contains(line), "{refs}");
+    }
+}
+
 fn stale(l: &BlobLimits) -> BlobLimits {
     std::thread::sleep(Duration::from_millis(1100));
     BlobLimits {
