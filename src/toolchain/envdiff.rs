@@ -64,6 +64,11 @@ pub struct EnvReport {
     /// `None` until a real digest of the task-traffic-controller policy
     /// exists: then it is `not_measured`, never `same`.
     pub policy_digest: Option<String>,
+    /// The toolchains the user's rustup has for this host, as
+    /// `<version> (<toolchain>)` (spec 22.1). Shown only: an attempt that
+    /// needs one of these versions uses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustup: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -375,6 +380,18 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
         ),
         Some(b) => item("disk", Class::Same, None, Some(&b.to_string()), None),
     });
+    if !want.rustup.is_empty() || !have.rustup.is_empty() {
+        // Shown, never a failure: which versions a machine already has is
+        // what the rustc row and placement use.
+        let list = |r: &EnvReport| (!r.rustup.is_empty()).then(|| r.rustup.join(", "));
+        items.push(Item {
+            subject: "rustup".into(),
+            class: Class::Same,
+            parent: list(want),
+            worker: list(have),
+            steps: None,
+        });
+    }
     items.push(profile_item(want, have));
     items.push(policy_item(want, have));
     items
@@ -462,6 +479,7 @@ mod tests {
             required_tools: vec!["node".into()],
             profile_digest: Some("sha256:p".into()),
             policy_digest: Some("sha256:t".into()),
+            rustup: Vec::new(),
         }
     }
     /// The item for one tool when the parent has `want` and the worker `have`.
@@ -935,6 +953,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
             features: [capability::FEATURE.to_string()].into(),
+            rustup: Vec::new(),
         }
     }
 
@@ -1003,5 +1022,20 @@ mod tests {
             Some(&caps),
         );
         assert_eq!(out[1], waiting_hint("node", false));
+    }
+    #[test]
+    fn detected_rustup_toolchains_are_shown_and_never_fail() {
+        let parent = report();
+        let mut worker = report();
+        assert!(diff(&parent, &worker).iter().all(|i| i.subject != "rustup"));
+        worker.rustup = vec!["1.89.0 (1.89.0-aarch64-apple-darwin)".into()];
+        let items = diff(&parent, &worker);
+        let row = items.iter().find(|i| i.subject == "rustup").unwrap();
+        assert_eq!(row.class, Class::Same);
+        assert_eq!(row.parent, None);
+        assert_eq!(
+            row.worker.as_deref(),
+            Some("1.89.0 (1.89.0-aarch64-apple-darwin)")
+        );
     }
 }

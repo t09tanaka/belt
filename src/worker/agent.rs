@@ -1717,23 +1717,45 @@ impl Agent {
             if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
                 continue;
             }
-            let registry = self
-                .toolchains
+            // A recipe of the registry wins. Where none serves the version,
+            // a toolchain the user's rustup already has may (spec 22.1).
+            let refused = match self.toolchains.as_ref() {
+                Some(registry) => match registry.request(&bundle.frozen, &requirement.tool, None) {
+                    Ok(request) => {
+                        bundle.frozen = request.frozen;
+                        bundle.evidence.push(request.evidence);
+                        continue;
+                    }
+                    Err(e) => Some(e),
+                },
+                None => None,
+            };
+            let detected = refused
                 .as_ref()
-                .ok_or_else(|| invalid("proposal registry unavailable"))?;
-            let request = registry
-                .request(&bundle.frozen, &requirement.tool, None)
-                .map_err(|e| {
-                    ApiError::blocked(
+                .is_none_or(|e| e.allows_native())
+                .then(|| {
+                    crate::toolchain::contract::detected_rustup_evidence(
+                        &bundle.frozen,
+                        &requirement,
+                        &report,
+                    )
+                })
+                .flatten();
+            let Some(evidence) = detected else {
+                return Err(match refused {
+                    Some(e) => ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
                         format!(
                             "toolchain resolve required: {e:?} ({})",
                             requirement.describe()
                         ),
-                    )
-                })?;
-            bundle.frozen = request.frozen;
-            bundle.evidence.push(request.evidence);
+                    ),
+                    None => invalid("proposal registry unavailable"),
+                });
+            };
+            bundle.frozen =
+                crate::toolchain::adapters::resolve(&bundle.frozen, &evidence).map_err(invalid)?;
+            bundle.evidence.push(evidence);
         }
         bundle
             .validate(&bundle.frozen.source_manifest)

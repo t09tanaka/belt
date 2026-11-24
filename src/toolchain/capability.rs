@@ -143,6 +143,23 @@ pub struct WorkerCapabilities {
     pub profile_fingerprint: Digest,
     pub tools: BTreeMap<String, ToolObservation>,
     pub features: BTreeSet<String>,
+    /// Rust toolchains the user's own rustup already has for this host,
+    /// found read-only (spec 22.1). None when there are none, so a report
+    /// without them serializes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustup: Vec<DetectedRustup>,
+}
+/// Most installed rustup toolchains a worker probes (spec 22.1).
+pub const MAX_DETECTED_RUSTUP: usize = 16;
+/// One toolchain of the user's rustup, as its own `rustc -V` and `cargo -V`
+/// report it. `bin` is the toolchain's `bin` directory on this worker.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DetectedRustup {
+    pub name: String,
+    pub version: String,
+    pub bin: std::path::PathBuf,
+    pub rustc: Digest,
+    pub cargo: Digest,
 }
 impl WorkerCapabilities {
     pub fn validate(&self) -> bool {
@@ -161,6 +178,16 @@ impl WorkerCapabilities {
             })
             && self.features.len() <= FEATURES.len()
             && self.features.iter().all(|v| FEATURES.contains(&v.as_str()))
+            && self.rustup.len() <= MAX_DETECTED_RUSTUP
+            && self.rustup.iter().all(|r| {
+                valid_version(&r.version)
+                    && !r.name.is_empty()
+                    && r.name.len() <= 128
+                    && r.name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    && r.bin.is_absolute()
+            })
     }
 }
 /// The line `missing` writes for an unmet requirement.
@@ -238,6 +265,7 @@ mod tests {
             profile_fingerprint: Digest::of_bytes(b"p"),
             tools: BTreeMap::new(),
             features: [FEATURE.into()].into(),
+            rustup: Vec::new(),
         }
     }
     #[test]

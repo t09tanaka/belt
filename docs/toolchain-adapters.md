@@ -155,6 +155,22 @@ file, at most 64 KiB; recipes are limited to 32 and each inventory to 256 versio
 A missing file yields an unconfigured registry; malformed supplied configuration fails
 closed. Manager/dependency identities are captured and revalidated when planning.
 
+### Installed rustup toolchains (no configuration)
+
+Without any recipe, a worker counts a Rust version as available when the user's
+own rustup already has that toolchain for the worker's host (spec 22.1). The
+profile lists `$RUSTUP_HOME/toolchains` (default `~/.rustup`) read-only, skips
+links, non-directories and other hosts, and probes at most 16 candidates
+(version-named highest first, then channels) with the bounded `rustc -V` /
+`cargo -V` probe, sharing one 8 s bound. It never runs `rustup`, installs,
+updates or writes there. The toolchains and their rustc/cargo identities are part
+of the profile report and fingerprint; the first report's set is the baseline,
+so a removed or changed toolchain is drift and a new one waits for a restart.
+A recipe wins: only when the registry is absent or refuses with a native-allowing
+reason does worker resolution pick the highest detected version in range
+(`worker_detected_rustup_v1` evidence). Activation puts that toolchain's `bin`
+first on PATH (after managed installs) and sets `RUSTUP_TOOLCHAIN` to its name.
+
 Inventory is operator authorization to prepare a concrete version, not evidence that
 it is installed or available from a remote server. Local resolution chooses the highest
 matching authorized version and binds evidence to the recipe's inventory authority digest;

@@ -1599,16 +1599,30 @@ fn compose_activation(
             .iter()
             .find(|s| s.tool == tool.tool)
             .is_some_and(|s| s.concrete == tool.version);
+        // A rustup toolchain was matched to the selection by its own probe;
+        // a tool on the profile path must still report it.
         if !selected
             || !tools.insert(tool.tool.clone())
-            || MatchPolicy::Exact.compare(
-                &VersionObservation::Known(tool.version.clone()),
-                base_observations
-                    .get(&tool.tool)
-                    .unwrap_or(&VersionObservation::Unknown),
-            ) != Match::Match
+            || tool.rustup.is_none()
+                && MatchPolicy::Exact.compare(
+                    &VersionObservation::Known(tool.version.clone()),
+                    base_observations
+                        .get(&tool.tool)
+                        .unwrap_or(&VersionObservation::Unknown),
+                ) != Match::Match
         {
             return Err("activation_native_mismatch");
+        }
+        if let Some((bin, name)) = &tool.rustup {
+            if !clean_absolute(bin) {
+                return Err("activation_native_mismatch");
+            }
+            paths.push(bin.clone());
+            if let Some(previous) = overrides.insert("RUSTUP_TOOLCHAIN".into(), name.clone()) {
+                if previous != *name {
+                    return Err("conflicting_activation_environment");
+                }
+            }
         }
         receipts.push((tool.tool.clone(), tool.identity.clone()));
     }

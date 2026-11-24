@@ -1552,6 +1552,7 @@ fn parent_report() -> EnvReport {
         required_tools: Vec::new(),
         profile_digest: None,
         policy_digest: None,
+        rustup: Vec::new(),
     }
 }
 

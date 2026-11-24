@@ -326,6 +326,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
         required_tools: vec![],
         profile_digest: None,
         policy_digest: None,
+        rustup: Vec::new(),
     }});
     fx.ssh(&format!(
         "case \"$*\" in\n*\"'worker-service' 'doctor'\") printf '%s\\n' '{doctor}';;\n*\"'worker-service' 'env'\") printf '%s\\n' '{env}';;\n*) exit 1;;\nesac"

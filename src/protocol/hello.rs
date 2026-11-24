@@ -432,6 +432,7 @@ mod tests {
             profile_fingerprint: Digest::of_bytes(b"p"),
             tools: Default::default(),
             features: [FEATURE.into(), "private-feature".into()].into(),
+            rustup: Vec::new(),
         });
         let mut n = Negotiated {
             version: 1,

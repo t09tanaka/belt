@@ -1371,6 +1371,14 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 **native toolによる充足（PR #138）。** 管理されたinstall（registry）が満たせない固定した版（registryが無い、非対応、在庫に無い）は、profileのPATHにあるtool自身が、profileのprobeでちょうどその版を報告するときに限り、そのtoolで満たす。何も導入せず、private pathも足さない。activationには、installの領収の代わりに、観測した版とprobeのidentityを記録し、その実行ファイルに結び付ける。後でそのtoolが別の版を報告したworkerは、そのrunの候補から外れる。registryが満たせるときの挙動は変わらない。親は、既存の経路（exactなpin、手元のregistry、workerの提案）で解決できなかった要件について、全制約が親の観測した版を許すとき、その版に固定する（根拠の領域tagは `parent_observed_version_v1`。wire・保存形式は変わらない）。channelとaliasは、観測から解決せず、従来どおり拒否する。native toolを満たせるworkerは候補になり、満たせるworkerが無ければ従来の行 `toolchain <tool>=<version> unavailable` を出す。`exec` と `ci` は同じ経路を使う。
 
+**導入済みのrustup toolchainによる充足。** 設定なしで、workerの利用者のrustupに、そのworker自身のhost向けに既に入っているtoolchainを、そのRustの具体版を満たすものとして数える。理由: 利用者は機械ごとの設定なしに普段の環境で `belt ci` を使いたい。MSRVのjob（例 `toolchain: "1.89"`）は、既定のRustが違う機械でも、その版のtoolchainが入っていれば動かせる。
+- 見つけ方は読むだけとする。`$RUSTUP_HOME/toolchains/`（未設定ならprofileの `HOME` の `.rustup`）をdirectoryとして列挙する。`rustup` は実行せず、導入・更新・network・`~/.rustup` への書き込みはしない。名前がhostで終わらないもの、symlink、directoryでないもの、UTF-8でない名前は飛ばす。読む項目は最大1024とする。
+- 候補は、名前が版で始まるものを版の降順、その後にchannel（`stable` など）を名前順に並べ、最大16個をprobeする。各候補の `bin/rustc -V` と `bin/cargo -V` を既存のbounded probe（固定argv、環境の消去、deadline）で呼び、両方が同じ版を答えたときだけ、その版のtoolchainとする。名前だけでは決めない。nightly・betaは版がprereleaseになるので、releaseの固定には一致しない。1回の検出のprobeは合わせて最大8秒（1回の呼び出しは起動時2秒、それ以外300ms）とし、使い切れば残りは検出しない。
+- 検出したtoolchainの名前・版・`rustc` と `cargo` のbyte identityはworker profileの報告（`rustup`）に入り、fingerprintに含まれる（無ければfingerprintは従来と同じ）。最初の報告で見つけた集合を基準とし、以後はその集合だけを見直す。ファイルが変わらなければprobeし直さない。消えた・変わったtoolchainはprofile drift（既存の規則）となる。後から入れたtoolchainは、residentの再起動まで使わない。
+- 優先: `toolchains.toml` のrecipeが満たせるならそれを使う。registryが無い、またはregistryが満たせない（native toolを許す拒否）ときだけ、範囲を満たす検出済みtoolchainの最高版で解決する（根拠の領域tagは `worker_detected_rustup_v1`。wire・保存形式は変わらない）。
+- activationは、そのtoolchainの `bin` をPATHの先頭（管理されたinstallの後、profileのPATHの前）に置き、`RUSTUP_TOOLCHAIN` にtoolchain名を設定する。何も導入しない。identityはinstallの領収の代わりになる。
+- `workers diff` と `doctor` は検出したtoolchainを `rustup` の行に示す（失敗にはしない）。検出した版は `rustc`／`cargo` の行で導入済みの版として数える。
+
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
 
 公開 command submit は検証済み capture から版指定・必要 baseline を固定し、完全な resolution evidence とともに `FrozenBundle` として保持する。worker-local registry・既存 setup admission/singleflight・attempt ごとの activation 経路は [private adapter API](toolchain-adapters.md) に記録する。実 manager による受入確認と installed-version 一覧・diff/sync は別の検証範囲とする。

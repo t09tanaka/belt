@@ -1403,6 +1403,7 @@ mod environment_diff {
             required_tools: vec![],
             profile_digest: None,
             policy_digest: Some("sha256:t".into()),
+            rustup: Vec::new(),
         }
     }
 

@@ -224,6 +224,15 @@ fn measure(
     } else {
         BTreeMap::new()
     };
+    // A toolchain of the user's rustup is installed under a version
+    // manager too: an attempt that needs its version activates it.
+    let mut managed = managed;
+    for detected in &report.rustup {
+        let rust = managed.entry("rust".to_string()).or_default();
+        if !rust.installed.contains(&detected.version) {
+            rust.installed.push(detected.version.clone());
+        }
+    }
     let tools = TOOLS
         .iter()
         .filter(|name| crate::workspace::embedded::version(name).is_none())
@@ -294,6 +303,11 @@ fn measure(
         required_tools: profile.required_tools().iter().cloned().collect(),
         profile_digest: Some(report.profile_digest.to_string()),
         policy_digest: policy_digest(env),
+        rustup: report
+            .rustup
+            .iter()
+            .map(|r| format!("{} ({})", r.version, r.name))
+            .collect(),
     }
 }
 
@@ -689,5 +703,29 @@ mod tests {
         assert_eq!(managed("cargo"), Some(rust));
         assert_eq!(managed("pnpm"), None);
         assert_eq!(managed("git"), None);
+    }
+    #[test]
+    fn detected_rustup_toolchains_count_as_installed_rust() {
+        let (_t, state, bin) = state();
+        let host = crate::toolchain::profile::rustup_host().unwrap();
+        let home = state.parent().unwrap().join("rustup");
+        let tc = home.join(format!("toolchains/1.89.0-{host}/bin"));
+        std::fs::create_dir_all(&tc).unwrap();
+        for tool in ["rustc", "cargo"] {
+            shim(&tc, tool, &format!("echo '{tool} 1.89.0 (fake)'"));
+        }
+        // The worker's own retained environment, with no profiles.toml.
+        std::fs::remove_file(state.join("profiles.toml")).unwrap();
+        let env: BTreeMap<String, String> = [
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), state.to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), home.to_str().unwrap().into()),
+        ]
+        .into();
+        let report = collect_with(&state, &env, SHORT).unwrap();
+        assert_eq!(report.rustup, [format!("1.89.0 (1.89.0-{host})")]);
+        let installed = |tool: &str| report.tools[tool].managed.clone().unwrap().installed;
+        assert_eq!(installed("rustc"), ["1.89.0"]);
+        assert_eq!(installed("cargo"), ["1.89.0"]);
     }
 }

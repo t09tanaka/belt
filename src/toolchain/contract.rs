@@ -144,6 +144,10 @@ pub struct NativeTool {
     pub tool: super::versions::ToolId,
     pub version: node_semver::Version,
     pub identity: Digest,
+    /// A toolchain of the user's rustup (spec 22.1): its `bin` goes first on
+    /// the attempt's PATH and `RUSTUP_TOOLCHAIN` names it. `None` for a tool
+    /// on the profile path.
+    pub rustup: Option<(std::path::PathBuf, String)>,
 }
 /// The native tool that serves the selection of `tool`, if the profile probe
 /// reports exactly the selected version.
@@ -160,7 +164,7 @@ pub fn native_tool(
         observed.get(tool).unwrap_or(&VersionObservation::Unknown),
     ) != Match::Match
     {
-        return None;
+        return detected_rustup(&selection.concrete, tool, report);
     }
     let probes: Vec<_> = report
         .tools
@@ -174,7 +178,61 @@ pub fn native_tool(
             &serde_json::to_vec(&("native_observed_v1", &selection.concrete, &probes))
                 .expect("native identity serializes"),
         ),
+        rustup: None,
     })
+}
+/// The rustup toolchain of `report` that reports exactly `version`, as the
+/// native tool for `rust`. A channel's prerelease (nightly, beta) never
+/// equals a release.
+fn detected_rustup(
+    version: &node_semver::Version,
+    tool: &super::versions::ToolId,
+    report: &super::capability::WorkerCapabilities,
+) -> Option<NativeTool> {
+    if tool.as_str() != "rust" {
+        return None;
+    }
+    let found = report
+        .rustup
+        .iter()
+        .find(|r| node_semver::Version::parse(&r.version).ok().as_ref() == Some(version))?;
+    Some(NativeTool {
+        tool: tool.clone(),
+        version: version.clone(),
+        identity: Digest::of_bytes(
+            &serde_json::to_vec(&("rustup_detected_v1", version, found))
+                .expect("detected identity serializes"),
+        ),
+        rustup: Some((found.bin.clone(), found.name.clone())),
+    })
+}
+/// The highest version of the user's rustup toolchains in `report` that
+/// every constraint of `requirement` accepts, as resolution evidence
+/// (domain `worker_detected_rustup_v1`). Only `rust` is detected.
+pub fn detected_rustup_evidence(
+    frozen: &FrozenToolchains,
+    requirement: &super::versions::EffectiveRequirement,
+    report: &super::capability::WorkerCapabilities,
+) -> Option<ResolutionEvidence> {
+    use super::versions::{Match, VersionObservation};
+    if requirement.tool.as_str() != "rust" {
+        return None;
+    }
+    let best = report
+        .rustup
+        .iter()
+        .filter_map(|r| node_semver::Version::parse(&r.version).ok())
+        .filter(|v| {
+            let seen = VersionObservation::Known(v.clone());
+            requirement
+                .constraints
+                .iter()
+                .all(|c| c.matches(&seen) == Match::Match)
+        })
+        .max()?;
+    let evidence = proof(frozen, requirement, best, "worker_detected_rustup_v1");
+    adapters::resolve(frozen, &evidence).ok()?;
+    Some(evidence)
 }
 
 /// Trusted worker-local execution context; never accepted from the wire.
@@ -458,6 +516,7 @@ mod tests {
             profile_fingerprint: id.clone(),
             tools: Default::default(),
             features: Default::default(),
+            rustup: Vec::new(),
         };
         let mut frozen = bundle("20.0.0").frozen;
         assert_eq!(check_baselines(&frozen, None), Ok(()));
@@ -767,6 +826,7 @@ mod tests {
                 })
                 .collect(),
             features: Default::default(),
+            rustup: Vec::new(),
         }
     }
     #[test]
@@ -827,5 +887,65 @@ mod tests {
         assert_eq!(native.version.to_string(), "1.89.0");
         assert_ne!(both("1.89.0", b"d").unwrap().identity, native.identity);
         assert_eq!(both("1.88.0", b"c"), None);
+    }
+    fn rustup_report(
+        versions: &[(&str, &str)],
+    ) -> crate::toolchain::capability::WorkerCapabilities {
+        let mut report = native_report(&[("rustc", "1.92.0", b"r"), ("cargo", "1.92.0", b"c")]);
+        report.rustup = versions
+            .iter()
+            .map(
+                |(name, version)| crate::toolchain::capability::DetectedRustup {
+                    name: (*name).into(),
+                    version: (*version).into(),
+                    bin: format!("/rustup/toolchains/{name}/bin").into(),
+                    rustc: Digest::of_bytes(name.as_bytes()),
+                    cargo: Digest::of_bytes(version.as_bytes()),
+                },
+            )
+            .collect();
+        report
+    }
+    #[test]
+    fn an_installed_rustup_toolchain_resolves_and_serves_a_range_the_profile_rust_does_not() {
+        let rust = ToolId::parse("rust").unwrap();
+        let open = bundle_for("rust", "1.89");
+        assert!(open.evidence.is_empty());
+        let requirement = open.frozen.requirements[0].clone();
+        let report = rustup_report(&[
+            ("1.89.0-host", "1.89.0"),
+            ("1.89.1-host", "1.89.1"),
+            ("1.90.0-host", "1.90.0"),
+            ("nightly-host", "1.89.2-nightly"),
+        ]);
+        // The highest installed release the range accepts; never a nightly.
+        let evidence = detected_rustup_evidence(&open.frozen, &requirement, &report).unwrap();
+        assert_eq!(evidence.concrete.to_string(), "1.89.1");
+        let mut sealed = open.clone();
+        sealed.frozen = adapters::resolve(&open.frozen, &evidence).unwrap();
+        sealed.evidence.push(evidence);
+        sealed.validate(&sealed.frozen.source_manifest).unwrap();
+        // The profile's own rust is 1.92.0: the toolchain serves it, by its bin.
+        let native = native_tool(&sealed.frozen, &rust, &report).unwrap();
+        assert_eq!(
+            native.rustup,
+            Some((
+                "/rustup/toolchains/1.89.1-host/bin".into(),
+                "1.89.1-host".into()
+            ))
+        );
+        // Nothing installed in range: no evidence, no native tool.
+        let none = rustup_report(&[
+            ("1.90.0-host", "1.90.0"),
+            ("nightly-host", "1.89.2-nightly"),
+        ]);
+        assert!(detected_rustup_evidence(&open.frozen, &requirement, &none).is_none());
+        assert!(native_tool(&sealed.frozen, &rust, &none).is_none());
+        // Only rust is detected.
+        let node = bundle_for("node", "20");
+        let report = rustup_report(&[("20.0.0-host", "20.0.0")]);
+        assert!(
+            detected_rustup_evidence(&node.frozen, &node.frozen.requirements[0], &report).is_none()
+        );
     }
 }
