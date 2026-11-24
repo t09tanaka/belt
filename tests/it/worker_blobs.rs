@@ -367,6 +367,10 @@ exec "{real}" "$@"
         ));
         connect(a, client_cfg(&self.cluster)).await.unwrap().client
     }
+    fn is_terminal(&self, a: &AttemptId) -> bool {
+        let store = WorkerStore::open_read_only(&self.state()).unwrap();
+        store.get(a).unwrap().unwrap().state == AttemptState::Terminal
+    }
     fn wait_terminal(&self, a: &AttemptId) -> Outcome {
         let store = WorkerStore::open_read_only(&self.state()).unwrap();
         let start = Instant::now();
@@ -4162,6 +4166,12 @@ fn meta_of(f: &Fx, key: &str) -> Option<String> {
 /// own path, nothing written by hand. (The recount starts at the first
 /// tick after the fills are done, and rewinds them: a few ticks more.)
 fn ticks_open_the_gate(f: &Fx, agent: &Arc<Agent>) {
+    ticks_settle(f, agent, true);
+}
+
+/// The agent's ticks until the fills and the recount are over, and, when
+/// `gate`, the registration has opened the gate.
+fn ticks_settle(f: &Fx, agent: &Arc<Agent>, gate: bool) {
     let deadline = Instant::now() + T;
     for n in 0.. {
         agent.supervise();
@@ -4170,19 +4180,27 @@ fn ticks_open_the_gate(f: &Fx, agent: &Arc<Agent>) {
             meta_of(f, "bytes_recount").is_some() || meta_of(f, "bytes_recount_wait").is_some();
         if n >= 8
             && !recounting
-            && done("legacy_registration")
+            && (!gate || done("legacy_registration"))
             && done("bytes_fill")
             && done("clone_ref_fill")
         {
             return;
         }
-        assert!(Instant::now() < deadline, "the gate did not open");
+        assert!(Instant::now() < deadline, "the ticks did not settle");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 /// The received roots `ids` were last used long ago, and the pass's clock
 /// has been watched for the whole age limit (14 days) on this boot.
+///
+/// Both are written by hand (review round 1, L2): `used_ms` and the
+/// `received_clock` state stand in for 14 days of waiting, which a test
+/// cannot drive. What these tests do not write by hand is the gate (the
+/// agent's own registration opens it) and every deletion (the agent's own
+/// passes make it). The clock-trust rule itself (a clock watched for less
+/// than the age deletes nothing by age) is covered by the lib test
+/// `nothing_goes_by_age_while_the_clock_holds`.
 fn make_old(f: &Fx, ids: &[&str]) {
     let c = retention_db(f);
     for id in ids {
@@ -4274,12 +4292,16 @@ fn dir_of(f: &Fx, name: &str, files: &[(&str, &[u8])]) -> Parcel {
     f.capture(&SourceRequest::Directory { dir })
 }
 
-/// (g) 2-4, 16, 26 through the product: with the gate opened by the agent's
-/// own registration, an old source nobody uses goes, and nothing that is
-/// still needed does: a source an attempt is running on, a source being
-/// received (its files, one shared with the source that goes), a received
-/// source its parent names, and the refs of a published source of the same
-/// clone. Afterwards a receipt and a publication are not refused.
+/// (g) 2, 4, 13, 16 (staged part), 17 through the product: with the gate
+/// opened by the agent's own registration, an old source nobody uses goes,
+/// and nothing that is still needed does: a source this worker's attempt
+/// is running on (still running through every pass, checked), the files a
+/// receipt has staged (its `receipt` root in the store is covered by the
+/// lib test `a_receipt_in_progress_keeps_its_blobs_through_a_pass`), a
+/// received source its parent names, and the refs of a published source of
+/// the same clone. Afterwards a receipt and a publication are not refused.
+/// (Another member's attempt, (g)3, and a pin alone reach the pass as the
+/// same `Live` answer; they are covered at lib level.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_open_gate_deletes_only_what_nobody_needs() {
     let f = fx();
@@ -4327,7 +4349,10 @@ async fn the_open_gate_deletes_only_what_nobody_needs() {
             payload(
                 &running,
                 &format!(
-                    "i=0; while [ ! -e {0} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+                    // it ends only when released: on its own timeout it
+                    // fails, so the test cannot pass on a pass that ran
+                    // after it ended
+                    "i=0; while [ ! -e {0} ]; do [ $i -lt 2400 ] || exit 1; sleep 0.05; i=$((i+1)); done",
                     release.display()
                 ),
             ),
@@ -4362,6 +4387,7 @@ async fn the_open_gate_deletes_only_what_nobody_needs() {
         state == (true, true, true)
     });
     more_passes(&agent, 3);
+    assert!(!f.is_terminal(&a), "the attempt ended before the pass");
 
     assert!(store.manifest(&ci(&gone.source)).unwrap().is_none());
     // the attempt's source, all of it
@@ -4407,6 +4433,13 @@ async fn the_open_gate_deletes_only_what_nobody_needs() {
     // (g) 13: the counted total is the size of the files there
     let counted: u64 = meta_of(&f, "store_bytes").unwrap().parse().unwrap();
     assert_eq!(counted, object_bytes_on_disk(&f));
+    // the attempt was still running through every pass above: its source
+    // was kept because it was in use, not because the attempt had ended
+    assert!(
+        !f.is_terminal(&a),
+        "the attempt ended before the passes were over"
+    );
+    // the explicit release: the attempt succeeds only through it
     std::fs::write(&release, "").unwrap();
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
 }
@@ -4427,11 +4460,13 @@ fn nothing_goes_while_a_version_is_on_trial() {
     let store = f.worker_store();
     ticks_open_the_gate(&f, &agent);
     belt::worker::control::begin_trial(&f.state()).unwrap();
-    // (a round already running when the trial began stops at its next
-    // section; wait until none runs)
+    // (a round already running when the trial began, in the background
+    // or not, stops at its next section; `received_passes` also answers 0
+    // while one holds the flag, so wait until none holds it)
     let deadline = Instant::now() + T;
-    while agent.received_passes() != 0 {
-        assert!(Instant::now() < deadline);
+    while agent.received_round_running() {
+        assert!(Instant::now() < deadline, "a round did not stop");
+        std::thread::sleep(Duration::from_millis(20));
     }
     make_old(&f, &[&ci(&old.source)]);
     for _ in 0..3 {
@@ -4489,22 +4524,46 @@ fn a_legacy_manifest_keeps_its_files_until_it_is_registered() {
     let bad = ci(&SourceId::generate());
     let manifests = f.state().join("sources/manifests");
     std::fs::write(manifests.join(format!("{bad}.json")), b"not json").unwrap();
+    // the legacy manifest waits for its next try (an earlier try failed
+    // with an error that is not "invalid"): the queue stays non-empty
+    let later = belt::platform::clock::wall_ms() as i64 + 600_000;
+    c.execute(
+        "INSERT INTO legacy_retry(name,next_ms,attempts) VALUES(?1,?2,1)",
+        rusqlite::params![legacy_ci, later],
+    )
+    .unwrap();
     // the old source is old before the registration has run
     make_old(&f, &[&ci(&old.source)]);
     let store = f.worker_store();
     let agent = Agent::start(f.cfg(), Arc::new(RealButCore(f.machine()))).unwrap();
     f.agents.lock().unwrap().push(agent.clone());
-    // (the passes before the registration delete nothing)
-    for _ in 0..3 {
-        agent.received_passes();
-    }
+    // the fills and the recount finish, the invalid one is abandoned, and
+    // only the unregistered manifest is left: that alone keeps the gate
+    // shut, and passes that would otherwise delete the old source detach
+    // nothing
+    ticks_settle(&f, &agent, false);
+    more_passes(&agent, 3);
+    let queued: i64 = c
+        .query_row("SELECT count(*) FROM legacy_queue", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(queued, 1, "only the legacy manifest is queued");
     assert_eq!(
         meta_of(&f, "legacy_registration").as_deref(),
         Some("pending")
     );
+    let detached: i64 = c
+        .query_row(
+            "SELECT count(*) FROM root WHERE id LIKE 'drop:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(detached, 0, "nothing is detached while the gate is shut");
     assert!(store.has_blob(old.blob_of_len(2000).0));
     assert!(store.manifest(&ci(&old.source)).unwrap().is_some());
     assert!(store.has_blob(legacy.blob_of_len(3000).0));
+    // its retry falls due: the registration takes it and opens the gate
+    c.execute("DELETE FROM legacy_retry", []).unwrap();
     ticks_open_the_gate(&f, &agent);
     passes_until(&agent, "the old source goes", || {
         store.manifest(&ci(&old.source)).unwrap().is_none()

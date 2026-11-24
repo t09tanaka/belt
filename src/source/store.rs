@@ -1052,6 +1052,7 @@ impl SourceStore {
         // publication refused above leaves no empty `receive:<S>` behind. It
         // is still made before the manifest file, which it protects.
         self.retention.pending(root)?;
+        publish_fault("after_receive_root")?;
         let bytes = serde_json::to_vec_pretty(m)?;
         let mut tmp = crate::platform::owned_temp::file_in(self.inner.root().join("tmp"))?;
         tmp.write_all(&bytes)?;
@@ -1579,4 +1580,20 @@ mod temp_sweep_tests {
         assert_eq!(store.sweep_secret_tmp_if_free(), 1);
         assert!(!tmp.exists() && bundle.exists());
     }
+}
+
+#[cfg(test)]
+thread_local! { static PUBLISH_FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
+/// A crash injected at `stage` of a publication (tests only).
+#[cfg(test)]
+pub(crate) fn set_publish_fault(stage: Option<&'static str>) {
+    PUBLISH_FAULT.set(stage);
+}
+fn publish_fault(stage: &str) -> Result<()> {
+    #[cfg(test)]
+    if PUBLISH_FAULT.get() == Some(stage) {
+        anyhow::bail!("injected {stage}")
+    }
+    let _ = stage;
+    Ok(())
 }

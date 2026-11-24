@@ -108,6 +108,7 @@ fn validate(spec: &Spec) -> anyhow::Result<()> {
 fn validate_paths(spec: &Spec) -> anyhow::Result<()> {
     resident::check_private_dir(&spec.state_dir)?;
     resident::check_private_dir(&spec.worker_state_dir)?;
+    distinct_state_dirs(&spec.state_dir, &spec.worker_state_dir)?;
     resident::validate_components(&spec.executable)?;
     anyhow::ensure!(
         spec.repo_root.as_ref().is_none_or(|p| p.is_absolute()),
@@ -118,6 +119,18 @@ fn validate_paths(spec: &Spec) -> anyhow::Result<()> {
     if spec.expected_cluster.is_some() {
         let _ = read_cluster(spec)?;
     }
+    Ok(())
+}
+
+/// The worker's state directory is not the parent's (review round 1, L4):
+/// the worker's received pass deletes sources of its own store, and the
+/// parent's store must never be taken for one. Compared as canonical
+/// paths, as init compares its journal's paths.
+fn distinct_state_dirs(state: &Path, worker: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        std::fs::canonicalize(state)? != std::fs::canonicalize(worker)?,
+        "the worker state directory is the parent's state directory"
+    );
     Ok(())
 }
 
@@ -373,5 +386,27 @@ pub async fn health(spec: &Spec) -> anyhow::Result<Reply> {
             ..
         } if cluster_id == client.cluster_id() && worker_id == &spec.worker_id => Ok(reply),
         _ => anyhow::bail!("resident identity/readiness unconfirmed"),
+    }
+}
+
+#[cfg(test)]
+mod state_dir_tests {
+    use super::distinct_state_dirs;
+
+    /// Review round 1, L4: a worker state directory that resolves to the
+    /// parent's (the same path, or another path to it) is refused.
+    #[test]
+    fn the_worker_state_dir_may_not_be_the_parents() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let state = root.path().join("state");
+        let worker = root.path().join("worker");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&worker).unwrap();
+        distinct_state_dirs(&state, &worker).unwrap();
+        assert!(distinct_state_dirs(&state, &state).is_err());
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        assert!(distinct_state_dirs(&state, &alias).is_err());
+        assert!(distinct_state_dirs(&state, &state.join("../state")).is_err());
     }
 }

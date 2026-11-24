@@ -4,6 +4,7 @@ use super::deletion::set_fault;
 use super::deletion::GC_FAILS_MAX;
 use super::*;
 use crate::source::{capture, CaptureParams, SourceRequest};
+use local_ci::source::SourceManifest as CiManifest;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -116,6 +117,38 @@ impl Env {
             m.source_id
         ));
         m.source_id.clone()
+    }
+    /// A source captured by the parent and not yet received.
+    fn captured(&mut self, files: &[(&str, &str)]) -> CiManifest {
+        self.n += 1;
+        let dir = self.root.path().join(format!("in-{}", self.n));
+        std::fs::create_dir(&dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        let m = capture(
+            &BTreeMap::new(),
+            &self.parent,
+            &SourceRequest::Directory { dir },
+            &CaptureParams::default(),
+        )
+        .unwrap()
+        .manifest;
+        let ci = crate::source::classify::ci_id_of(&m.source_id).unwrap();
+        self.parent.manifest(&ci).unwrap().unwrap()
+    }
+    /// Its blobs, through the receipt `token`.
+    fn ingest_with(&self, token: &ImportToken, m: &CiManifest) {
+        for e in &m.object_manifest.entries {
+            let want = crate::source::diff::BlobWant {
+                hash: e.hash.clone(),
+                size: e.size,
+            };
+            let bytes = self.parent.read_blob(&e.hash).unwrap();
+            self.receiver
+                .ingest_blob_with_token(token, &want, &mut &bytes[..])
+                .unwrap();
+        }
     }
     fn received(&self, id: &str) -> bool {
         let held = self.receiver.mutation_guard().unwrap();
@@ -1711,4 +1744,265 @@ fn a_later_ref_removal_moves_the_gc_deadline() {
         env.count("SELECT COUNT(*) FROM meta WHERE key LIKE 'gc:%'"),
         2
     );
+}
+
+/// Review round 1, L3: an abandoned `receive:<id>` root (a legacy manifest
+/// abandoned as invalid after an attempt was accepted on its file while
+/// the gate was shut) keeps its files while `<id>` is in use, pinned, or
+/// the answer is an error; once nothing uses it, step 0 releases it.
+#[test]
+fn an_abandoned_received_root_in_use_keeps_its_files() {
+    let mut env = Env::new();
+    let id = env.source(&[("a", "accepted on a legacy file")], OLD);
+    let hash = env
+        .receiver
+        .manifest(&id)
+        .unwrap()
+        .unwrap()
+        .object_manifest
+        .entries[0]
+        .hash
+        .clone();
+    let members = env.count(&format!(
+        "SELECT count(*) FROM member WHERE root='receive:{id}'"
+    ));
+    env.sql(&format!(
+        "UPDATE root SET kind='abandoned',source=NULL WHERE id='receive:{id}';
+         DELETE FROM graph WHERE root='receive:{id}'"
+    ));
+    let asked = RefCell::new(Vec::new());
+    for answer in [0u8, 1] {
+        env.sql("DELETE FROM drop_retry; DELETE FROM meta WHERE key LIKE 'drop_cursor%'");
+        let report = env
+            .pass_with(u64::MAX, &|s, sid| {
+                asked.borrow_mut().push((s.to_string(), sid.is_some()));
+                if answer == 0 {
+                    Ok(SourceUse::Live)
+                } else {
+                    anyhow::bail!("worker.db is busy")
+                }
+            })
+            .unwrap();
+        assert!(env.receiver.has_blob(&hash), "answer {answer}: {report:?}");
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM member WHERE root='receive:{id}'"
+            )),
+            members,
+            "answer {answer}"
+        );
+    }
+    assert!(asked.borrow().iter().any(|(s, sid)| *s == id && *sid));
+    // nobody uses it: it goes at its next try
+    env.sql("DELETE FROM drop_retry");
+    for _ in 0..3 {
+        env.pass();
+    }
+    assert!(!env.receiver.has_blob(&hash));
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM root WHERE id='receive:{id}'"
+        )),
+        0
+    );
+}
+
+/// (g)16, review round 1 L1(a): a receipt in progress (its `receipt` root
+/// holds the blobs it took, before `complete()` publishes them) keeps them
+/// through a pass that detaches an old source; afterwards the receipt is
+/// published, and `begin_import` is not refused.
+#[test]
+fn a_receipt_in_progress_keeps_its_blobs_through_a_pass() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old and unused")], OLD);
+    let coming = env.captured(&[("b", "on its way"), ("c", "also on its way")]);
+    let token = env.receiver.begin_import().unwrap();
+    env.ingest_with(&token, &coming);
+    env.trust_clock();
+    let report = env.pass();
+    assert_eq!(report.detached, 1, "{report:?}");
+    assert!(!env.received(&old));
+    assert!(coming
+        .object_manifest
+        .entries
+        .iter()
+        .all(|e| env.receiver.has_blob(&e.hash)));
+    env.receiver
+        .publish_received_with_token(&token, &coming, None)
+        .unwrap();
+    assert!(env.receiver.manifest(&coming.source_id).unwrap().is_some());
+    drop(env.receiver.begin_import().unwrap());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+}
+
+/// (g)26, review round 1 L1(c): a released token whose members' files
+/// were never written (a hash mismatch left only the rows) is finished in
+/// one pass: the rows go, and `store_bytes` does not grow.
+#[test]
+fn a_token_left_with_rows_only_is_finished_in_one_pass() {
+    let env = Env::new();
+    let token = env.receiver.begin_import().unwrap();
+    for i in 0..40u32 {
+        let hash = format!("{:064x}", 0xabc0_0000u64 + u64::from(i));
+        env.receiver.retention.import_blob(&token, &hash).unwrap();
+    }
+    let id = SourceStore::import_token_id(&token).to_string();
+    // (released as a crash leaves it: abandoned, its absent members not
+    // yet forgotten)
+    env.sql(&format!(
+        "UPDATE root SET kind='abandoned' WHERE id='import:{id}'"
+    ));
+    let before = env.store_bytes();
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM member WHERE root='import:{id}'"
+        )),
+        40
+    );
+    let report = env.pass();
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM member WHERE root='import:{id}'"
+        )),
+        0,
+        "{report:?}"
+    );
+    assert_eq!(
+        env.count(&format!("SELECT count(*) FROM root WHERE id='import:{id}'")),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM object WHERE id LIKE 'b:%abc%'"),
+        0
+    );
+    assert!(env.store_bytes() <= before);
+    assert_eq!(env.store_bytes(), env.files_on_disk());
+}
+
+/// (g)27, review round 1: sources a parent names are not candidates (the
+/// candidate SQL leaves them out), so 33 of them do not use up a section's
+/// 32 slots: the old source nobody names is the only one asked, and goes.
+#[test]
+fn named_children_do_not_use_up_the_candidate_slots() {
+    let mut env = Env::new();
+    let parent = env.source(&[("p", "the parent")], YOUNG);
+    let mut children = Vec::new();
+    for i in 0..33 {
+        children.push(env.source(&[("c", &format!("child {i}"))], OLD - 1));
+    }
+    for child in &children {
+        env.sql(&format!(
+            "INSERT INTO graph(root,source,done) VALUES('receive:{parent}','{child}',1)"
+        ));
+    }
+    let lone = env.source(&[("l", "nobody names it")], OLD);
+    env.trust_clock();
+    let asked = RefCell::new(Vec::new());
+    let report = env
+        .pass_with(u64::MAX, &|s, _| {
+            asked.borrow_mut().push(s.to_string());
+            Ok(SourceUse::Ended(None))
+        })
+        .unwrap();
+    assert_eq!(report.detached, 1, "{report:?}");
+    assert_eq!(*asked.borrow(), vec![lone.clone()]);
+    assert!(!env.received(&lone));
+    assert!(children.iter().all(|c| env.received(c)));
+}
+
+/// (g)30, review round 1: with a small section budget, a source of more
+/// than 1,000 members shared with another root is detached a page of 1,000
+/// rows a section, and a blob larger than half the budget goes by the
+/// large-blob path; nothing shared goes, and `store_bytes` matches.
+#[test]
+fn shared_members_go_a_page_at_a_time_and_a_large_blob_by_the_large_path() {
+    let mut env = Env::new();
+    let files: Vec<(String, String)> = (0..1100)
+        .map(|i| (format!("f{i}"), format!("shared {i}")))
+        .collect();
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut kept = refs.clone();
+    kept.push(("own", "only the kept one"));
+    let keep = env.source(&kept, YOUNG);
+    let gone = env.source(&refs, OLD);
+    let big = env.source(&[("big", &"z".repeat(300_000))], YOUNG);
+    let large = abandon_blob(&env, &big, "drop:big:1", true);
+    env.trust_clock();
+    let mut sections = 0;
+    let mut unlinked = 0;
+    for _ in 0..10 {
+        let report = pass_budget(&env, 400_000);
+        sections += report.sections;
+        unlinked += report.unlinked;
+        if !env.received(&gone)
+            && env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:%'") == 0
+        {
+            break;
+        }
+    }
+    assert!(!env.received(&gone));
+    assert!(env.received(&keep));
+    assert!(!large.exists(), "the large blob went by its own path");
+    assert!(unlinked >= 1);
+    // more than one section: 1,100 shared rows are more than one page
+    assert!(sections >= 2, "{sections}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:%'"),
+        0
+    );
+    let m = env.receiver.manifest(&keep).unwrap().unwrap();
+    assert!(m
+        .object_manifest
+        .entries
+        .iter()
+        .all(|e| env.receiver.has_blob(&e.hash)));
+    assert_eq!(env.store_bytes(), env.files_on_disk());
+}
+
+/// (g)25, review round 1: a crash between the publication's checks and
+/// its claim (the `receive:<S>` root made, no manifest file yet) leaves an
+/// empty root that the start settles; the token's release then leaves no
+/// claim, and the publication is not refused afterwards.
+#[test]
+fn a_crash_after_the_publication_check_is_finished_by_the_next_start() {
+    let mut env = Env::new();
+    let m = env.captured(&[("a", "crashes once")]);
+    let token = env.receiver.begin_import().unwrap();
+    env.ingest_with(&token, &m);
+    crate::source::store::set_publish_fault(Some("after_receive_root"));
+    let e = env
+        .receiver
+        .publish_received_with_token(&token, &m, None)
+        .unwrap_err();
+    crate::source::store::set_publish_fault(None);
+    assert!(format!("{e:#}").contains("injected"), "{e:#}");
+    let root = format!("receive:{}", SourceStore::import_token_id(&token));
+    assert_eq!(
+        env.count(&format!("SELECT count(*) FROM root WHERE id='{root}'")),
+        1,
+        "the crash left the root"
+    );
+    // the next start settles it, and the owner's end releases the token
+    assert!(env.receiver.settle_empty_receive_roots().unwrap().is_some());
+    env.receiver
+        .release_import(SourceStore::import_token_id(&token))
+        .unwrap();
+    for _ in 0..3 {
+        env.pass();
+    }
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count(&format!("SELECT count(*) FROM root WHERE id='{root}'")),
+        0
+    );
+    // published again: not refused
+    let token = env.receiver.begin_import().unwrap();
+    env.ingest_with(&token, &m);
+    env.receiver
+        .publish_received_with_token(&token, &m, None)
+        .unwrap();
+    assert!(env.receiver.manifest(&m.source_id).unwrap().is_some());
 }

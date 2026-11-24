@@ -2421,6 +2421,13 @@ impl Agent {
         self.run_received_passes()
     }
 
+    /// Whether a round of received passes (scheduled or not) holds the
+    /// flag now. For the tests.
+    #[doc(hidden)]
+    pub fn received_round_running(&self) -> bool {
+        self.deleting.load(Ordering::SeqCst)
+    }
+
     /// The round, with `deleting` held by the caller.
     fn run_received_passes(&self) -> usize {
         *self.deleted_at.lock().unwrap() = Some(Instant::now());
