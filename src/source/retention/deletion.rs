@@ -24,6 +24,7 @@ pub use received::{CloneGc, GcFailure, ReceivedPassInputs, ReceivedPassReport, R
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
 pub(super) use scratch::STAGING;
+pub use scratch::{inspect_scratch_kept, ScratchCounts};
 
 /// The gate that holds every deletion of an object of the source store
 /// (spec 25.5, step 4): nothing is unlinked while an unindexed manifest, a
@@ -733,6 +734,9 @@ impl std::fmt::Display for Untouched {
 }
 /// What [`Index::hash_outside`] reads at a time, `stop` asked before each.
 const HASH_CHUNK: usize = 1 << 20;
+/// What a membership another root holds may read to tell whether a
+/// reservation's file is wrong content (for `doctor` only).
+pub(super) const SHARED_LOOK: u64 = 1 << 20;
 /// What became of one membership of a root that is being released.
 pub(super) enum Released {
     /// Another root holds the object: only the membership was removed. The
@@ -774,11 +778,14 @@ impl Index {
             |r| r.get(0),
         )?;
         if shared {
-            let half = *budget / 2;
-            let mut look = half;
+            // Only progress (the membership goes) and a count for `doctor`:
+            // a file larger than [`SHARED_LOOK`] is not read for it, so the
+            // page's budget stays for the deletions (#155 (b)).
+            let cap = (*budget / 2).min(SHARED_LOOK);
+            let mut look = cap;
             let corrupt =
                 reservation && matches!(self.examine(object, path, &mut look), Ok((_, Err(_))));
-            *budget -= half - look;
+            *budget -= cap - look;
             c.execute(
                 "DELETE FROM member WHERE root=?1 AND object=?2",
                 params![root, object],

@@ -20,7 +20,7 @@
 //! read) is kept.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -195,7 +195,7 @@ fn on_trial(places: &Places) -> Result<bool, Held> {
 }
 
 /// The lock at `path` (made when it is not there), taken without waiting.
-fn try_lock(path: &Path) -> Result<File, Held> {
+fn try_lock(path: &Path) -> Result<crate::platform::flock::HeldLock, Held> {
     use std::os::fd::AsRawFd;
     let file = match OpenOptions::new()
         .read(true)
@@ -211,7 +211,7 @@ fn try_lock(path: &Path) -> Result<File, Held> {
     };
     // SAFETY: `file` is an open descriptor owned here.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        Ok(file)
+        Ok(crate::platform::flock::HeldLock::new(file))
     } else {
         Err(Held::Placing)
     }

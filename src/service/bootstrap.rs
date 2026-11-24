@@ -203,6 +203,7 @@ pub async fn ensure(spec: Spec) -> anyhow::Result<Client> {
             Err(e) => return Err(anyhow::anyhow!("resident startup lock: {e}")),
         }
     }
+    let _lock = crate::platform::flock::HeldLock::new(lock);
     let copy = spec.clone();
     let existing = tokio::task::spawn_blocking(move || load_client(&copy)).await?;
     if let Ok(client) = existing {

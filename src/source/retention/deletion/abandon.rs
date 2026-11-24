@@ -56,6 +56,8 @@ pub struct AbandonReport {
     /// Files a reservation named that another root holds and that are not
     /// their content: kept, for `doctor`.
     pub corrupt_held: u32,
+    /// Scratch directories kept (each also counted in `unknown`), by kind.
+    pub scratch: super::ScratchCounts,
     pub errors: Vec<String>,
     /// The gate that held the deletion of the objects, if one did.
     pub gate: Option<super::Gate>,
@@ -154,6 +156,10 @@ impl SourceStore {
             }
             Err(error) => return Err(error),
         };
+        if matches!(scope, AbandonScope::All) {
+            self.retention
+                .prune_scratch_kept(&self.retention.connect()?)?;
+        }
         let rows = match scope {
             AbandonScope::All => self.retention.capture_owners()?,
             AbandonScope::Run(run) | AbandonScope::Refused(run) => self
@@ -210,6 +216,7 @@ impl SourceStore {
                 Ok(None) => {}
                 Err(error) => {
                     report.continuing += 1;
+                    report.scratch.count(&error);
                     if report.unknown == before {
                         report.unknown += 1;
                     }
@@ -295,7 +302,7 @@ impl SourceStore {
         // the store: a file whose install was cut short still has its staged
         // name, and a file with two names is not provably ours.
         if let Some(root) = row.root.as_deref() {
-            self.retention.remove_scratch(root)?;
+            self.retention.remove_scratch_noted(c, root)?;
         }
         fault("abandon_after_scratch")?;
         // 7. The run root and the pending root, with what only they hold.
@@ -505,11 +512,13 @@ impl SourceStore {
                         Released::Shared(corrupt) => {
                             if corrupt {
                                 report.corrupt_held += 1;
-                                // One row, for `doctor`, which reads the
-                                // index and not this report.
+                                // One row per object, for `doctor`, which
+                                // reads the index and not this report; it
+                                // goes with the object's row, so the count
+                                // is of the files kept now.
                                 c.execute(
-                                    "INSERT INTO meta VALUES('corrupt_held','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
-                                    [],
+                                    "INSERT OR IGNORE INTO meta VALUES('corrupt_held:'||?1,'1')",
+                                    [object],
                                 )?;
                             }
                         }

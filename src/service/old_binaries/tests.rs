@@ -58,7 +58,7 @@ impl Fixture {
     /// Placed an hour ago.
     fn age(&self, v: &str) {
         let then = SystemTime::now() - Duration::from_secs(3600);
-        File::open(self.version(v))
+        std::fs::File::open(self.version(v))
             .unwrap()
             .set_modified(then)
             .unwrap();

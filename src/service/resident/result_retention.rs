@@ -28,6 +28,9 @@ pub(super) fn pruning_held(report: &run_pruning::PruneReport) -> String {
     if report.kept_events > 0 {
         line.push_str(&format!("; kept_events={}", report.kept_events));
     }
+    if !report.scratch.is_empty() {
+        line.push_str(&format!("; scratch={}", report.scratch.text()));
+    }
     if !report.gates.is_empty() {
         let gates: Vec<String> = report
             .gates

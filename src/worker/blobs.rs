@@ -49,6 +49,7 @@ use super::host::Host;
 use super::policy::MAX_VERIFY_DIGESTS;
 use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{Digest, SourceId};
+use crate::platform::flock::HeldLock;
 use crate::platform::{free_bytes, open_beneath, wall_ms};
 use crate::protocol::chunk::clamp_chunk;
 use crate::source::classify::{ci_id_of, source_id_of_ci};
@@ -163,7 +164,7 @@ struct Unpacked {
     repo: ObjectsRepo,
     made: Vec<ImportRef>,
     fresh: bool,
-    _importing: File,
+    _importing: HeldLock,
 }
 
 fn private_dir(dir: &Path) -> io::Result<()> {
@@ -443,11 +444,27 @@ fn read_reserved(dir: &Path) -> Option<Reservation> {
 /// when it records none; an error when the record cannot be read or names
 /// no token.
 fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
-    let text = match fs::read_to_string(dir.join(IMPORT_TOKEN)) {
-        Ok(t) => t,
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // (no link is followed, and a FIFO does not block the open; only a
+    // regular file is read: any other inode cannot be read, so it keeps
+    // everything, and `doctor` counts it)
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(IMPORT_TOKEN))
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "the import token record is no regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
     if !is_import_token_id(&text) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -629,11 +646,11 @@ impl Incoming {
 
     /// `f` locked, held until it is dropped. Whoever holds it (any
     /// connection or process) is waited for, but not for ever.
-    fn wait_lock(f: File, limits: &BlobLimits, busy: &str) -> Result<File, ApiError> {
+    fn wait_lock(f: File, limits: &BlobLimits, busy: &str) -> Result<HeldLock, ApiError> {
         let start = Instant::now();
         loop {
             match f.try_lock() {
-                Ok(()) => return Ok(f),
+                Ok(()) => return Ok(HeldLock::new(f)),
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(e)) => return Err(io_err(e)),
             }
@@ -645,7 +662,7 @@ impl Incoming {
     }
 
     /// The lock of `source`: one request on a source at a time.
-    fn lock(&self, source: &SourceId, limits: &BlobLimits) -> Result<File, ApiError> {
+    fn lock(&self, source: &SourceId, limits: &BlobLimits) -> Result<HeldLock, ApiError> {
         let f = self.lock_file(&lock_shard(source.as_str()).to_string())?;
         let busy = format!("source {source} is busy with another transfer");
         Self::wait_lock(f, limits, &busy)
@@ -655,7 +672,7 @@ impl Incoming {
     /// reserved is read and changed only under it. Taken after a source's
     /// own lock, never before; whoever holds it only tries other sources'
     /// locks, and never waits for one.
-    fn lock_all(&self, limits: &BlobLimits) -> Result<File, ApiError> {
+    fn lock_all(&self, limits: &BlobLimits) -> Result<HeldLock, ApiError> {
         let f = self.lock_file("all")?;
         Self::wait_lock(f, limits, "the incoming sources are busy")
     }
@@ -719,7 +736,9 @@ impl Incoming {
                     if wait {
                         Self::wait_lock(f, limits, &busy)
                     } else {
-                        f.try_lock().map(|()| f).map_err(|_| overloaded(&busy))
+                        f.try_lock()
+                            .map(|()| HeldLock::new(f))
+                            .map_err(|_| overloaded(&busy))
                     }
                 }) else {
                     return;
@@ -890,6 +909,7 @@ impl Incoming {
             }
             let f = self.lock_file(&lock_shard(&other).to_string())?;
             if f.try_lock().is_ok() {
+                let _held = HeldLock::new(f);
                 self.discard(&other, limits, false);
             }
         }
@@ -2010,7 +2030,9 @@ impl BlobSink for Incoming {
             return;
         };
         // (the next tick looks again)
-        if all.try_lock().is_ok() {
+        // (held to the end of the tick, as before)
+        let all = HeldLock::try_lock(all).ok();
+        if all.is_some() {
             let _ = self.drop_stale_locked(limits, None);
         }
         // What a dropped or finished source's token still holds (spec 25.8,

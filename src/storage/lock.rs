@@ -52,6 +52,9 @@ impl ProcessLock {
     /// The path must identify this exact owned regular file, never another gate.
     pub(crate) fn adopt_private(file: File, path: PathBuf) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
+        // Every refusal below ends the caller's lock: release it explicitly,
+        // since a forked child may still share this open file description.
+        let file = crate::platform::flock::HeldLock::new(file);
         let actual = file.metadata()?;
         let named = std::fs::symlink_metadata(&path)?;
         if !actual.is_file()
@@ -70,7 +73,10 @@ impl ProcessLock {
         }
         // Re-locking the same descriptor never releases its existing ownership.
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file, path }),
+            Ok(()) => Ok(Self {
+                _file: file.into_file(),
+                path,
+            }),
             Err(TryLockError::WouldBlock) => Err(StorageError::Locked(path)),
             Err(TryLockError::Error(e)) => Err(e.into()),
         }
@@ -129,6 +135,30 @@ mod tests {
         assert!(first.path().ends_with("x.lock"));
         drop(first);
         ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+    }
+
+    #[test]
+    fn a_refused_transfer_releases_the_lock_a_forked_copy_still_shares() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let path = dir.path().join("agent.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Group-readable: the transfer refuses it.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
+        file.try_lock().unwrap();
+        // What a child forked between our lock and its exec holds.
+        let forked = file.try_clone().unwrap();
+        ProcessLock::adopt_private(file, path.clone()).unwrap_err();
+        let next = File::open(&path).unwrap();
+        next.try_lock()
+            .expect("the refused transfer still holds the lock");
+        drop(forked);
     }
 
     fn open_shared(dir: &Path) -> File {

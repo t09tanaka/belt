@@ -21,7 +21,7 @@ pub(crate) fn install_key(staged: &Path, target: &Path) -> anyhow::Result<()> {
         return publish();
     }
     let lock = resident::secure_file(&parent.join("init.lock"), true)?;
-    lock.try_lock()
+    let _lock = crate::platform::flock::HeldLock::try_lock(lock)
         .context("managed service change in progress")?;
     let mut jf = JournalFile {
         path: journal_path.clone(),
@@ -83,14 +83,14 @@ fn clear_leftover(spec: &Spec, skip_if_busy: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let lock = resident::secure_file(&path.with_file_name("init.lock"), true)?;
-    match lock.try_lock() {
-        Ok(()) => {}
+    let _lock = match crate::platform::flock::HeldLock::try_lock(lock) {
+        Ok(held) => held,
         Err(fs::TryLockError::WouldBlock) if skip_if_busy => return Ok(()),
         Err(fs::TryLockError::WouldBlock) => {
             anyhow::bail!("managed service change in progress")
         }
         Err(fs::TryLockError::Error(e)) => return Err(e.into()),
-    }
+    };
     let (mut journal, _) = managed_journal(spec)?;
     if skip_if_busy {
         settle_held(path, &mut journal)

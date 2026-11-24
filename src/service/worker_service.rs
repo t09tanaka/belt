@@ -283,7 +283,7 @@ const LOCK_PATIENCE: Duration = Duration::from_millis(if cfg!(test) { 250 } else
 const STATUS_PATIENCE: Duration = Duration::from_millis(250);
 
 /// The host's switch lock, held for as long as this value lives.
-pub(crate) struct SwitchLock(#[allow(dead_code)] File);
+pub(crate) struct SwitchLock(#[allow(dead_code)] crate::platform::flock::HeldLock);
 
 /// Take the switch lock, waiting no longer than `patience`. `None`: another
 /// helper holds it. Every action that changes the journal holds it
@@ -312,7 +312,9 @@ pub(crate) fn switch_lock(
     loop {
         // SAFETY: `file` is an open descriptor owned by this function.
         if unsafe { libc::flock(file.as_raw_fd(), kind | libc::LOCK_NB) } == 0 {
-            return Ok(Some(SwitchLock(file)));
+            return Ok(Some(SwitchLock(crate::platform::flock::HeldLock::new(
+                file,
+            ))));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::WouldBlock {

@@ -264,7 +264,7 @@ pub(crate) fn open_with(
 
 /// Block until this process holds the setup lock of the database at `path`.
 /// It is released when the returned file is dropped or the process dies.
-fn init_lock(path: &Path) -> Result<std::fs::File> {
+fn init_lock(path: &Path) -> Result<crate::platform::flock::HeldLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -276,8 +276,7 @@ fn init_lock(path: &Path) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(PathBuf::from(name))?;
-    file.lock()?;
-    Ok(file)
+    Ok(crate::platform::flock::HeldLock::lock(file)?)
 }
 
 fn open_once(

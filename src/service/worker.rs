@@ -107,11 +107,10 @@ pub fn read_input(path: &Path) -> anyhow::Result<WorkerSpec> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn private_lock(state: &Path, name: &str) -> anyhow::Result<File> {
+fn private_lock(state: &Path, name: &str) -> anyhow::Result<crate::platform::flock::HeldLock> {
     let file = open_private_lock(state, name)?;
-    file.try_lock()
-        .map_err(|e| anyhow::anyhow!("worker owner already held or unsafe: {e}"))?;
-    Ok(file)
+    crate::platform::flock::HeldLock::try_lock(file)
+        .map_err(|e| anyhow::anyhow!("worker owner already held or unsafe: {e}"))
 }
 
 /// The private lock file `name` of a worker state, created when missing and
@@ -344,7 +343,7 @@ impl AgentListener {
 
 struct Worker {
     agent: Arc<Agent>,
-    _owner: File,
+    _owner: crate::platform::flock::HeldLock,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -398,6 +397,7 @@ async fn run(
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
+    // It stays a `HeldLock` until the hand-over, so every earlier return unlocks it.
     let agent_gate = private_lock(&spec.state_dir, "agent.lock")?;
     let socket = spec.state_dir.join("agent.sock");
     // Spec 25.4 (a): under `agent.lock`, what a killed process left beside the state files.
@@ -430,7 +430,7 @@ async fn run(
             env: spec.env.clone(),
         })?
         .with_instance(boot_id);
-    let agent = tokio::task::spawn_blocking(move || runtime.start_owned(agent_gate))
+    let agent = tokio::task::spawn_blocking(move || runtime.start_owned(agent_gate.into_file()))
         .await?
         .map_err(|e| anyhow::anyhow!(e.message))?;
     let worker = Worker {
