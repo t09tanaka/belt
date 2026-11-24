@@ -140,6 +140,9 @@ pub struct ReceivedPassReport {
     pub gc: usize,
     /// The gc of (e) of this pass failed (review round 1, L6).
     pub gc_failed: Option<GcFailure>,
+    /// The clone whose gc of (e) ran in this pass and succeeded: a later
+    /// failure of it is news again.
+    pub gc_ran: Option<String>,
     /// The pass stopped at its section bound with progress made: the caller
     /// may start the next one at once.
     pub again: bool,
@@ -867,6 +870,9 @@ impl Index {
         };
         if ran {
             report.gc += 1;
+        }
+        if ran && failure.is_none() {
+            report.gc_ran = Some(clone.to_string());
         }
         if let Some(message) = failure {
             report.gc_failed = Some(GcFailure {

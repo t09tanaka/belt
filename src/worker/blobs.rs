@@ -443,11 +443,27 @@ fn read_reserved(dir: &Path) -> Option<Reservation> {
 /// when it records none; an error when the record cannot be read or names
 /// no token.
 fn recorded_token(dir: &Path) -> io::Result<Option<String>> {
-    let text = match fs::read_to_string(dir.join(IMPORT_TOKEN)) {
-        Ok(t) => t,
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // (no link is followed, and a FIFO does not block the open; only a
+    // regular file is read: any other inode cannot be read, so it keeps
+    // everything, and `doctor` counts it)
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(IMPORT_TOKEN))
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "the import token record is no regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
     if !is_import_token_id(&text) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

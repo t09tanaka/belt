@@ -2887,37 +2887,94 @@ fn a_real_publication_racing_step_4_keeps_its_refs_with_its_rows() {
         .unwrap()
     };
     let ws = Workspaces::new(f.state(), f.env(), Arc::new(CliFastWorktree::new(f.env())));
+    let store = SourceStore::open(&f.state()).unwrap();
+    // (the `clone_ref` fill is done, so step 4 runs its rows)
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !store
+        .fill_retention_pages(&|clone| ws.try_import_lock(clone))
+        .unwrap()
+    {
+        assert!(Instant::now() < deadline, "the fills did not finish");
+    }
+    // (the deletion gate is closed in this version: the fixture opens it,
+    // so the product's step 4 runs)
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('legacy_registration','done') ON CONFLICT(key) DO UPDATE SET value='done'",
+            [],
+        )
+        .unwrap();
+    // the row step 4 runs: the source has no `clone_ref` row yet
+    assert!(!row());
+    assert!(store.queue_ref_drop(&clone, &source).unwrap());
     let bundle = p.bundle.as_ref().unwrap();
-    std::thread::scope(|s| {
+    let report = std::thread::scope(|s| {
         let publisher = std::cell::RefCell::new(None);
-        let held = || -> anyhow::Result<bool> {
-            let seen = row();
-            let t = s.spawn(|| put_all(sink, &l, &p.source, Bundle, bundle));
-            // (it waits for the lock step 4 holds)
-            std::thread::sleep(Duration::from_millis(300));
-            *publisher.borrow_mut() = Some(t);
-            Ok(seen)
+        let seen = std::cell::Cell::new(None);
+        // The product's step 4 (`received_pass` with the machine's `refs`):
+        // its own `held` (the index), `done` and git. The publication starts
+        // right after `held` answered, and waits for the import lock step 4
+        // holds.
+        let refs = |clone: &str, source: &str, r: &belt::source::retention::RefRow<'_>| {
+            let held = || -> anyhow::Result<bool> {
+                let answer = (r.held)()?;
+                seen.set(Some(answer));
+                let t = s.spawn(|| put_all(sink, &l, &p.source, Bundle, bundle));
+                // (it cannot finish while step 4 holds the lock: given 2 s,
+                // well inside its 5 s wait, a publication that did not wait
+                // would be done, and its refs would then go)
+                let until = Instant::now() + Duration::from_secs(2);
+                while !t.is_finished() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                *publisher.borrow_mut() = Some(t);
+                Ok(answer)
+            };
+            ws.drop_imported_refs(clone, source, &held, r.done, r.stop)
         };
-        let ok = ws
-            .drop_imported_refs(&clone, &source, &held, &|| Ok(()), &|| false)
+        let report = store
+            .received_pass(&belt::source::retention::ReceivedPassInputs {
+                wall: belt::platform::clock::wall_ms(),
+                mono: belt::platform::clock::monotonic_ms(),
+                boot: belt::platform::boot_id(),
+                max_age_ms: u64::MAX / 4,
+                cap_bytes: u64::MAX / 4,
+                uses: &|_, _| Ok(belt::source::retention::SourceUse::Live),
+                stop: &|| false,
+                refs: &refs,
+                gc: &|_, _| Ok(belt::source::retention::CloneGc::Busy),
+            })
             .unwrap();
-        assert!(ok);
-        let answer = publisher.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(seen.get(), Some(false), "step 4 found no row: {report:?}");
+        let answer = publisher
+            .borrow_mut()
+            .take()
+            .expect("step 4 ran the row")
+            .join()
+            .unwrap();
         assert!(answer.unwrap().complete);
+        report
     });
+    assert_eq!(report.refs, 1, "{report:?}");
     assert!(verify(sink, &l, &p.source, vec![]).ready);
+    // Exactly: the publication's row, its refs, and no step 4 row left.
+    assert!(row(), "the publication wrote its clone_ref row");
     let refs = git(
         &f.clones()[0],
         &[
             "for-each-ref",
+            "--format=%(refname)",
             &format!("refs/local-ci/snapshots/{source}"),
             &format!("refs/local-ci/index/{source}"),
         ],
     );
     assert!(
-        !row() || !refs.trim().is_empty(),
-        "a clone_ref row whose refs are gone"
+        refs.lines()
+            .any(|r| r.starts_with(&format!("refs/local-ci/snapshots/{source}"))),
+        "the snapshot ref of the publication: {refs:?}"
     );
+    assert!(!store.queue_ref_drop(&clone, &source).unwrap());
 }
 
 #[test]
@@ -4061,4 +4118,26 @@ fn doctor_counts_staging_dirs_whose_token_record_cannot_be_read() {
         belt::worker::blobs::unreadable_import_tokens(state.path()),
         1
     );
+    // a FIFO and a symbolic link where the record should be are not read
+    // (the FIFO would block): both are counted, never followed
+    let fifo = incoming.join("fifo");
+    std::fs::create_dir_all(&fifo).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(fifo.join("import-token"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let link = incoming.join("link");
+    std::fs::create_dir_all(&link).unwrap();
+    std::fs::write(state.path().join("target"), "not a token").unwrap();
+    std::os::unix::fs::symlink(state.path().join("target"), link.join("import-token")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = state.path().to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(belt::worker::blobs::unreadable_import_tokens(&at));
+    });
+    let counted = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the count blocked on a FIFO");
+    assert_eq!(counted, 3);
 }

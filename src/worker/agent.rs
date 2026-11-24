@@ -2462,6 +2462,11 @@ impl Agent {
                     json!({ "message": f.message, "failures": f.failures }),
                 );
             }
+            if let Some(clone) = &report.gc_ran {
+                // (a gc that ran again ends the failure: the next one is
+                // news, even with the same message)
+                lock(&self.noted).remove(&format!("/clone_gc_failed/{clone}"));
+            }
             if report.parent {
                 self.note_global("source_store_shared", "", json!({}));
             } else if !report.busy {

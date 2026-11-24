@@ -789,6 +789,24 @@ fn an_event_of_an_attempt_without_a_row_is_refused() {
     assert_eq!(count(&store, "SELECT count(*) FROM event"), before);
 }
 
+/// #155 (c): an event that names a run without a row is refused too.
+#[test]
+fn an_event_of_a_run_without_a_row_is_refused() {
+    let (_dir, store) = store();
+    let before = count(&store, "SELECT count(*) FROM event");
+    assert!(matches!(
+        store.append_event(
+            Some(&RunId::generate()),
+            None,
+            "ci_run_stalled",
+            &json!({}),
+            1
+        ),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert_eq!(count(&store, "SELECT count(*) FROM event"), before);
+}
+
 /// An event of an attempt of a pruned run that names another run is that
 /// run's: it stays, and is counted. (No writer of this version makes one;
 /// without the restriction the trigger of the journal would abort every

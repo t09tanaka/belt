@@ -31,6 +31,8 @@ pub struct PruneInputs {
     pub paths: u32,
     /// What could not be proven or deleted: kept, and counted.
     pub unknown: u32,
+    /// Scratch directories kept (also in `unknown`), by kind.
+    pub scratch: super::ScratchCounts,
     pub errors: Vec<String>,
     /// The gate that held step 4, if one did.
     pub gate: Option<super::Gate>,
@@ -199,7 +201,20 @@ impl SourceStore {
         // short still has its staged name, and a file with two names is not
         // provably ours.
         if let Some(root) = pending.as_deref() {
-            self.retention.remove_scratch(root)?;
+            if let Err(error) = self.retention.remove_scratch_noted(&c, root) {
+                // (a kept directory is counted by its kind; the run waits
+                // for a later pass)
+                let mut scratch = super::ScratchCounts::default();
+                if !scratch.count(&error) {
+                    return Err(error);
+                }
+                return Ok(PruneInputs {
+                    unknown: 1,
+                    scratch,
+                    errors: vec![format!("{error:#}")],
+                    ..Default::default()
+                });
+            }
         }
         let mut report = AbandonReport::default();
         let gone = self.abandon_roots(
