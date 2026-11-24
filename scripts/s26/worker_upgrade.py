@@ -17,6 +17,11 @@ def verify(checks, run, original, host, command, ssh, sha256, save):
         return ssh(host, 'p="$HOME/.config/belt/bin/' + digest
                    + '/belt"; stat -c "%i %s %a" "$p" && sha256sum "$p"').stdout
 
+    def gone(digest):
+        # Spec 25 stage 4: a commit removes the version nothing names.
+        p = ssh(host, 'test ! -e "$HOME/.config/belt/bin/' + digest + '"', check=False)
+        return p.returncode == 0
+
     kept = installed(before)
     probe = run / "upgrade-health-ssh"
     probe.mkdir(mode=0o700, exist_ok=True)
@@ -44,12 +49,15 @@ def verify(checks, run, original, host, command, ssh, sha256, save):
     repeated = checks.belt(*args, timeout=300)
     if (switched["outcome"], switched["from"], switched["to"]) != ("upgraded", before, after):
         raise RuntimeError(f"worker did not switch from {before} to {after}")
-    if repeated["outcome"] != "already_current" or installed(before) != kept:
-        raise RuntimeError("repeat upgrade failed or replaced the original executable")
+    if not gone(before):
+        raise RuntimeError(f"the commit kept the unnamed previous version {before}")
+    if repeated["outcome"] != "already_current":
+        raise RuntimeError("repeat upgrade did not report already_current")
     restored = checks.belt("workers", "upgrade", host, "--binary", str(original), timeout=300)
     if restored["to"] != before or not restored["status"]["ready"]:
         raise RuntimeError("worker was not serving its original build after verification")
     save(run / "evidence/worker-upgrade.json",
          {"host": host, "from": before, "to": after, "rollback": error["message"],
           "upgrade": switched["outcome"], "repeat": repeated["outcome"]})
-    return f"{host} rolled back, upgraded on retry and kept the original executable"
+    return (f"{host} rolled back keeping the original executable, upgraded on retry, "
+            "removed the unnamed previous version and reinstalled the original")

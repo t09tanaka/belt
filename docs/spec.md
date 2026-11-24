@@ -995,7 +995,7 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 
 親が送るバイナリは、workerのOSとarchが親と同じときだけ親自身のものとする。違うときは `--binary <path>` で指定されたbuildを送り、指定が無ければ必要なtarget triple（例: `x86_64-unknown-linux-gnu`）を示して何も送らずに断る。releaseの成果物を自動で取得することはしない。送ったバイナリは、導入・切替の前にworker上で `--version` を実行させ、親と同じversionであることを確かめる。違う場合は送ったcopyを消して断り、導入済みのversionには触れない。
 
-バイナリはversion別directoryへ配置し、実行中supervisorのファイルを上書きしない。（前の版のdirectoryは、今は消さない。第25章の段階4で、名指すものの無い版を消す。）更新はdrain、配置、互換検査、service切替、health check、resumeの順に行う。失敗時は元versionへ戻せる。古いattemptの結果とspoolを読み取れるmigrationを含める。更新の単位はマシン（1つのbinary、両方の役割）で、drainはworker全体に対して行う。自分のマシンは `belt upgrade` で更新し、commitまでの制限と、親DB・worker DBを一緒に戻すrollbackは24.8に従う。
+バイナリはversion別directoryへ配置し、実行中supervisorのファイルを上書きしない。（前の版のdirectoryは、commitの直後に、名指すものが無ければ消す。第25章の段階4。）更新はdrain、配置、互換検査、service切替、health check、resumeの順に行う。失敗時は元versionへ戻せる。古いattemptの結果とspoolを読み取れるmigrationを含める。更新の単位はマシン（1つのbinary、両方の役割）で、drainはworker全体に対して行う。自分のマシンは `belt upgrade` で更新し、commitまでの制限と、親DB・worker DBを一緒に戻すrollbackは24.8に従う。
 
 # 16. task-traffic-controllerに必要な仕様変更
 

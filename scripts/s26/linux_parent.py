@@ -243,18 +243,13 @@ class Parent:
         p = self.belt("doctor", check=False, timeout=180)
         value = json.loads(p.stdout)["result"]
         checks = value["checks"]
-        # Same tolerance as A45: traffic_processes is `not_checked` by design
-        # whenever the task-traffic-controller scope exists (doctor.rs), which
-        # makes the report unhealthy and the exit code 1. Nothing else may be.
-        bad = [c for c in checks if c["level"] == "fail"
-               or (c["level"] == "not_checked" and c["id"] != "traffic_processes")]
+        # Every check must be verified: a not_checked result is not a pass.
+        bad = [c for c in checks if c["level"] in ("fail", "not_checked")]
         mine = [c for c in checks if c.get("host") == WORKER]
-        if bad or not mine or (p.returncode and p.returncode != 1):
+        if bad or not mine or p.returncode or not value.get("healthy"):
             raise RuntimeError(f"doctor exit {p.returncode}: failures {bad}; worker checks {len(mine)}")
-        if p.returncode and value["failed"]:
-            raise RuntimeError("doctor exited 1 with failures")
         save(RUN / "evidence/lp-doctor.json", value)
-        return f"doctor exit {p.returncode}, {len(checks)} checks ({len(mine)} for w1); only traffic_processes is not_checked"
+        return f"doctor exit 0, healthy, {len(checks)} checks ({len(mine)} for w1), none failed or unchecked"
 
     def resident_restart(self):
         task, token, attempt_id = self.place_on_worker()
