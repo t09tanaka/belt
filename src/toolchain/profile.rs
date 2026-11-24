@@ -809,17 +809,15 @@ impl Profile {
             return Ok(ToolObservation::Unknown);
         }
         if tool == "dart" {
-            let mut magic = [0u8; 4];
-            let native = std::fs::File::open(&path)
-                .and_then(|mut f| f.read_exact(&mut magic))
-                .is_ok()
-                && matches!(
-                    magic,
+            let native = matches!(
+                read_magic(&path, deadline())?,
+                Some(
                     [0x7f, b'E', b'L', b'F']
                         | [0xcf, 0xfa, 0xed, 0xfe]
                         | [0xfe, 0xed, 0xfa, 0xcf]
                         | [0xca, 0xfe, 0xba, 0xbe]
-                );
+                )
+            );
             if !native {
                 return Ok(ToolObservation::Unknown);
             }
@@ -911,6 +909,66 @@ fn measured_version(tool: &str, output: &str) -> Option<String> {
         token.into()
     })
 }
+/// The first four bytes of `path`, bounded by `limit`. Opening a file can
+/// block without end (a FIFO, or a macOS privacy prompt for a file under
+/// ~/Documents opened by a LaunchAgent), so the read runs on its own thread
+/// and a read that does not finish in time is a timed-out probe.
+///
+/// A blocked open cannot be cancelled, so its thread stays until the open
+/// returns. Bound: at most one reader per path at a time. A probe of a path
+/// whose read is still in flight starts no thread: it waits for that same
+/// reader, up to its own `limit`. Repeated probes (startup repeats, drift
+/// probes) therefore never pile up stuck threads: there are at most as many
+/// as distinct probed paths, and a slow open that does return still answers
+/// a later repeat.
+fn read_magic(path: &Path, limit: Duration) -> Result<Option<[u8; 4]>, ProbeMiss> {
+    type Answer = Option<Option<[u8; 4]>>;
+    type Slot = std::sync::Arc<(std::sync::Mutex<Answer>, std::sync::Condvar)>;
+    static IN_FLIGHT: std::sync::Mutex<BTreeMap<PathBuf, Slot>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    fn in_flight() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Slot>> {
+        IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    let path = path.to_path_buf();
+    let (slot, start) = {
+        let mut readers = in_flight();
+        match readers.get(&path) {
+            Some(slot) => (slot.clone(), false),
+            None => {
+                let slot = Slot::default();
+                readers.insert(path.clone(), slot.clone());
+                (slot, true)
+            }
+        }
+    };
+    if start {
+        #[cfg(test)]
+        tests::note_reader_spawned(&path);
+        let reader = path.clone();
+        let answer = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("belt-probe-read".into())
+            .spawn(move || {
+                let mut magic = [0u8; 4];
+                let read = std::fs::File::open(&reader).and_then(|mut f| f.read_exact(&mut magic));
+                in_flight().remove(&reader);
+                let (value, ready) = &*answer;
+                *value.lock().unwrap_or_else(|e| e.into_inner()) = Some(read.ok().map(|()| magic));
+                ready.notify_all();
+            });
+        if spawned.is_err() {
+            in_flight().remove(&path);
+            return Err(ProbeMiss::Failed);
+        }
+    }
+    let (value, ready) = &*slot;
+    let value = value.lock().unwrap_or_else(|e| e.into_inner());
+    let (value, _) = ready
+        .wait_timeout_while(value, limit, |v| v.is_none())
+        .unwrap_or_else(|e| e.into_inner());
+    value.ok_or(ProbeMiss::TimedOut)
+}
+
 fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -1050,6 +1108,47 @@ fn patient(profile: Profile) -> Profile {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    /// How many readers [`read_magic`] started for each path.
+    pub(super) static READERS_SPAWNED: std::sync::Mutex<BTreeMap<PathBuf, usize>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    pub(super) fn note_reader_spawned(path: &Path) {
+        *READERS_SPAWNED
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+    #[test]
+    fn repeated_probes_of_a_blocking_file_start_at_most_one_reader() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let fifo = root.path().join("dart");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let spawned = || READERS_SPAWNED.lock().unwrap().get(&fifo).copied();
+        for _ in 0..5 {
+            assert_eq!(
+                read_magic(&fifo, Duration::from_millis(50)),
+                Err(ProbeMiss::TimedOut)
+            );
+        }
+        assert_eq!(spawned(), Some(1));
+        // A probe made while the read is in flight waits for that same
+        // reader: a writer lets the blocked open return, and it answers.
+        let opener = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(OpenOptions::new().write(true).open(&opener).unwrap());
+        });
+        assert_eq!(read_magic(&fifo, Duration::from_secs(10)), Ok(None));
+        writer.join().unwrap();
+        assert_eq!(spawned(), Some(1));
+        // The path is free again: the next probe starts one new reader.
+        assert_eq!(
+            read_magic(&fifo, Duration::from_millis(50)),
+            Err(ProbeMiss::TimedOut)
+        );
+        assert_eq!(spawned(), Some(2));
+    }
     fn fake(dir: &Path, name: &str, body: &str, mode: u32) {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1133,6 +1232,17 @@ mod tests {
         assert_eq!(run("unreadable", 10_000), Err(ProbeMiss::Failed));
         assert_eq!(run("missing", 10_000), Err(ProbeMiss::Failed));
         assert_eq!(run("hangs", 100), Err(ProbeMiss::TimedOut));
+        // Opening the file itself can block (a FIFO with no writer, or a
+        // privacy prompt): the read is bounded by the same deadline.
+        let fifo = bin.join("blocks-on-open");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            read_magic(&fifo, Duration::from_millis(100)),
+            Err(ProbeMiss::TimedOut)
+        );
+        let own = read_magic(&std::env::current_exe().unwrap(), Duration::from_secs(10)).unwrap();
+        assert!(own.is_some());
         // No parent to make the directory in: a failed probe, nothing made.
         assert_eq!(
             bounded_probe_in(
