@@ -561,6 +561,10 @@ impl Host for Machine {
             cap_bytes: RECEIVED_CAP_BYTES,
             uses: &uses,
             stop,
+            refs: &|clone, source, row| {
+                self.workspaces
+                    .drop_imported_refs(clone, source, row.held, row.done, row.stop)
+            },
         }))
     }
 

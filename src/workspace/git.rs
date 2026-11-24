@@ -122,9 +122,359 @@ pub(super) fn run_in_worktree(
     )
 }
 
+/// Git on the repository `git_dir` alone (`GIT_DIR` set, discovery not
+/// above `ceiling`), with hooks off (`core.hooksPath=/dev/null` through
+/// `GIT_CONFIG_*`, which a repository's own config cannot override) and
+/// ended at `deadline` or when `stop` says so: its exit code, `None` when
+/// `stop` ended it. Output is not read. No `GIT_*` variable of `env` reaches
+/// it (review round 2: an inherited `GIT_OBJECT_DIRECTORY`,
+/// `GIT_INDEX_FILE` or `GIT_CONFIG_PARAMETERS` would point it elsewhere).
+/// It runs in a process group of its own, which is ended (SIGTERM, so git
+/// removes its lockfiles, then SIGKILL after [`TERM_GRACE`]) on every way
+/// out but its own exit: none of it outlives the call.
+pub(super) fn run_bounded(
+    env: &Env,
+    git_dir: &Path,
+    ceiling: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<i32>> {
+    use std::os::unix::process::CommandExt as _;
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(git_dir)
+        .env_clear()
+        .envs(env.iter().filter(|(k, _)| !k.starts_with("GIT_")))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_DIR", git_dir)
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let spawned = cmd.spawn().context("cannot run git")?;
+    // (decided now, while the leader is alive and unreaped: its group id
+    // is its pid only if it is still the leader of the group it made)
+    let pid = spawned.id();
+    let own = crate::platform::process_group_of(pid) == i32::try_from(pid).ok();
+    let mut child = Bounded(Some(spawned), own);
+    // (review round 4, M-A: a git killed with SIGKILL may leave the lock
+    // files of the refs it was writing; only step 4's own ref locks go, see
+    // [`remove_git_locks`])
+    let end = |child: &mut Bounded| {
+        if child.end() {
+            remove_git_locks(git_dir, args);
+        }
+    };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return status
+                .code()
+                .map(Some)
+                .with_context(|| format!("git {} was killed", args.join(" ")));
+        }
+        if stop() {
+            end(&mut child);
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            end(&mut child);
+            bail!("git {} did not end in time", args.join(" "));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// How long a git that was asked to end (SIGTERM) has before SIGKILL.
+pub(super) const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A git child of [`run_bounded`]: ended and reaped when dropped unreaped.
+/// The flag: whether the child leads a process group of its own, decided
+/// right after the spawn (review round 3, L-2).
+struct Bounded(Option<std::process::Child>, bool);
+
+impl Bounded {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.0.as_mut() else {
+            bail!("git was already ended");
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.0 = None;
+        }
+        Ok(status)
+    }
+
+    /// SIGTERM to its group (only when the group is the child's own: it was
+    /// spawned as the leader of a new one, and the leader, unreaped, keeps
+    /// the group id from being reused), [`TERM_GRACE`] for it to exit, then
+    /// SIGKILL to the group, and the reap. `true`: it had not exited in
+    /// the grace, so SIGKILL ended it (its lock files may be left).
+    fn end(&mut self) -> bool {
+        let Some(mut child) = self.0.take() else {
+            return false;
+        };
+        let pid = child.id();
+        let own = self.1;
+        let signal = |sig| {
+            if own {
+                crate::platform::signal_process_group(pid as i32, sig);
+            } else {
+                // (our own child: never pid <= 1)
+                crate::platform::signal_pid(pid, sig);
+            }
+        };
+        signal(libc::SIGTERM);
+        let start = std::time::Instant::now();
+        while start.elapsed() < TERM_GRACE && !exited(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let killed = !exited(pid);
+        // (the leader may have exited, unreaped: what is left of its group
+        // goes too)
+        signal(libc::SIGKILL);
+        let _ = child.wait();
+        killed
+    }
+}
+
+impl Drop for Bounded {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The ref directories whose `.lock` files a killed git of
+/// [`run_bounded`] leaves to be removed: the refs belt's receiving puts in a
+/// clone for a source (`refs/local-ci/{snapshots,index}/<source>`).
+const OWN_REF_DIRS: [&str; 2] = ["refs/local-ci/snapshots/", "refs/local-ci/index/"];
+
+/// After a git of [`run_bounded`] was killed and reaped (review round 4,
+/// M-A): the `<ref>.lock` it may have left for each argument naming a ref
+/// of [`OWN_REF_DIRS`] (one plain name below it) goes, only when it is a
+/// regular file below directories that are not links. The caller holds the
+/// clone's import lock, and only holders of that lock write those refs:
+/// step 4 (`update-ref -d` here), the bundle unpack of a publication
+/// (`worker/blobs.rs` `unpack`) and the removal of a discarded source's refs
+/// (`worker/blobs.rs` `discard`). Other gits in a clone run without it (the
+/// `checkout -f` of `hold_clone_at` and `settle`'s `branch -D` and
+/// `worktree prune` under the clone's own lock, fast-worktree's add and
+/// remove), so `packed-refs.lock` and `index.lock` may be a live git's and
+/// are never removed: a stale `packed-refs.lock` makes step 4's git fail,
+/// and the row is tried again an hour later (`ref_retry`).
+fn remove_git_locks(git_dir: &Path, args: &[&str]) {
+    let names = args.iter().filter(|a| {
+        OWN_REF_DIRS.iter().any(|d| {
+            a.strip_prefix(d).is_some_and(|leaf| {
+                !leaf.is_empty() && leaf != "." && leaf != ".." && !leaf.contains('/')
+            })
+        })
+    });
+    for name in names {
+        let name = format!("{name}.lock");
+        let mut dir = git_dir.to_path_buf();
+        let parts: Vec<&str> = name.split('/').collect();
+        let (leaf, parents) = parts.split_last().expect("a name");
+        let plain = parents.iter().all(|p| {
+            dir.push(p);
+            std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())
+        });
+        let path = dir.join(leaf);
+        if plain && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Whether our child `pid` has exited, leaving it unreaped.
+fn exited(pid: u32) -> bool {
+    // SAFETY: waitid on our own child; WNOWAIT leaves it unreaped.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let observed = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // SAFETY: reads the field waitid filled in.
+    observed != 0 || unsafe { info.si_pid() } == pid as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `git` on PATH that runs `script` (sh), for [`run_bounded`].
+    fn fake_git(script: &str) -> (tempfile::TempDir, Env) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(dir.path().join("repo")).unwrap();
+        let git = bin.join("git");
+        std::fs::write(&git, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut perm = std::fs::metadata(&git).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&git, perm).unwrap();
+        let env: Env = [
+            ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
+            ("GIT_OBJECT_DIRECTORY".into(), "/elsewhere/objects".into()),
+            (
+                "GIT_CONFIG_PARAMETERS".into(),
+                "'core.hooksPath'='/x'".into(),
+            ),
+            ("GIT_INDEX_FILE".into(), "/elsewhere/index".into()),
+            ("GIT_WORK_TREE".into(), "/elsewhere".into()),
+        ]
+        .into_iter()
+        .collect();
+        (dir, env)
+    }
+
+    fn bounded(env: &Env, dir: &Path, within: u64, stop: &dyn Fn() -> bool) -> Result<Option<i32>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(within);
+        run_bounded(env, &dir.join("repo"), dir, &["show-ref"], deadline, stop)
+    }
+
+    /// Whether `pid` is still a live process (not gone, not a zombie).
+    fn alive(pid: &str) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    /// Review round 2 (Env): no inherited `GIT_*` reaches step 4's git; its
+    /// own are set.
+    #[test]
+    fn bounded_git_gets_no_inherited_git_variables() {
+        let (dir, env) = fake_git(r#"env | grep '^GIT_' > "$GIT_DIR/../env"; exit 1"#);
+        assert_eq!(
+            bounded(&env, dir.path(), 10_000, &|| false).unwrap(),
+            Some(1)
+        );
+        let seen = std::fs::read_to_string(dir.path().join("env")).unwrap();
+        for gone in [
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+        ] {
+            assert!(!seen.contains(gone), "{gone} reached git: {seen}");
+        }
+        assert!(seen.contains("GIT_CONFIG_VALUE_0=/dev/null"), "{seen}");
+        assert!(seen.contains("GIT_DIR="), "{seen}");
+    }
+
+    /// Review round 2 (M-b, L-b): `stop` ends a running git at once, with
+    /// SIGTERM first (git removes its lockfile), and nothing of it is left.
+    #[test]
+    fn bounded_git_ends_on_stop_with_sigterm_first() {
+        let (dir, env) = fake_git(
+            r#"trap 'rm -f "$GIT_DIR/x.lock"; exit 143' TERM
+: > "$GIT_DIR/x.lock"
+sleep 30 &
+echo $! > "$GIT_DIR/../pid"
+wait"#,
+        );
+        let lock = dir.path().join("repo").join("x.lock");
+        let pid = dir.path().join("pid");
+        let start = std::time::Instant::now();
+        let stop = || {
+            pid.exists()
+                && lock.exists()
+                && std::fs::read_to_string(&pid).is_ok_and(|p| !p.trim().is_empty())
+        };
+        assert_eq!(bounded(&env, dir.path(), 20_000, &stop).unwrap(), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!lock.exists(), "git's lockfile was left");
+        assert!(
+            !alive(&std::fs::read_to_string(&pid).unwrap()),
+            "a child of git outlived it"
+        );
+    }
+
+    /// Review round 2 (M-b): past its deadline a git that ignores SIGTERM is
+    /// killed with its whole group, and the call is an error.
+    #[test]
+    fn bounded_git_is_killed_with_its_group_past_the_deadline() {
+        let (dir, env) = fake_git(
+            r#"trap '' TERM
+sleep 30 &
+echo $! > "$GIT_DIR/../pid"
+wait"#,
+        );
+        let start = std::time::Instant::now();
+        assert!(bounded(&env, dir.path(), 300, &|| false).is_err());
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(300), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        let pid = dir.path().join("pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pid.exists() {
+            assert!(std::time::Instant::now() < deadline, "no pid written");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !alive(&std::fs::read_to_string(&pid).unwrap()),
+            "a child of git outlived it"
+        );
+    }
+
+    /// Review round 4 (M-A): a git that ignores SIGTERM is killed and
+    /// reaped, and the `.lock` of the source ref it was deleting goes; the
+    /// `packed-refs.lock` and `index.lock` another live git holds stay, as
+    /// does the lock of a ref outside step 4's own.
+    #[test]
+    fn a_killed_git_leaves_only_its_own_ref_lock_removed() {
+        let (dir, env) = fake_git(
+            r#"trap '' TERM
+mkdir -p "$GIT_DIR/refs/local-ci/snapshots" "$GIT_DIR/refs/a"
+: > "$GIT_DIR/refs/local-ci/snapshots/src-1.lock"
+: > "$GIT_DIR/refs/a/b.lock"
+: > "$GIT_DIR/../ready"
+while :; do sleep 1; done"#,
+        );
+        let repo = dir.path().join("repo");
+        // (another git, alive, holds these)
+        std::fs::write(repo.join("packed-refs.lock"), "").unwrap();
+        std::fs::write(repo.join("index.lock"), "").unwrap();
+        let ready = dir.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let stop = || ready.exists();
+        let ended = run_bounded(
+            &env,
+            &repo,
+            dir.path(),
+            &[
+                "update-ref",
+                "-d",
+                "refs/local-ci/snapshots/src-1",
+                "refs/a/b",
+            ],
+            deadline,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(ended, None);
+        assert!(!repo.join("refs/local-ci/snapshots/src-1.lock").exists());
+        assert!(repo.join("packed-refs.lock").exists());
+        assert!(repo.join("index.lock").exists());
+        assert!(repo.join("refs/a/b.lock").exists());
+    }
 
     #[test]
     fn the_version_is_read_from_what_git_prints() {

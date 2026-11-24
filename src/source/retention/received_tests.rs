@@ -16,7 +16,21 @@ struct Env {
     parent: SourceStore,
     receiver: SourceStore,
     n: usize,
+    /// Step 4's calls, and whether the clone's import lock is busy.
+    refs: RefCell<Vec<String>>,
+    refs_busy: std::cell::Cell<bool>,
+    /// Step 4's removal fails; step 4 was called while the store's
+    /// exclusive lock was held.
+    refs_fail: std::cell::Cell<bool>,
+    refs_under_ex: std::cell::Cell<bool>,
+    /// What `stop` answers at its n-th call (from 1) in a pass, and does
+    /// meanwhile (the large tests use it to act during the hash).
+    on_stop: RefCell<Option<StopProbe>>,
+    stops: std::cell::Cell<usize>,
+    held: RefCell<Option<Guard>>,
 }
+
+type StopProbe = Box<dyn Fn(&Env, usize) -> bool>;
 
 impl Env {
     fn new() -> Self {
@@ -28,6 +42,13 @@ impl Env {
             parent,
             receiver,
             n: 0,
+            refs: RefCell::new(Vec::new()),
+            refs_busy: std::cell::Cell::new(true),
+            refs_fail: std::cell::Cell::new(false),
+            refs_under_ex: std::cell::Cell::new(false),
+            on_stop: RefCell::new(None),
+            stops: std::cell::Cell::new(0),
+            held: RefCell::new(None),
         };
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
@@ -118,7 +139,27 @@ impl Env {
             max_age_ms: AGE,
             cap_bytes: cap,
             uses,
-            stop: &|| false,
+            stop: &|| {
+                let n = self.stops.get() + 1;
+                self.stops.set(n);
+                self.on_stop.borrow().as_ref().is_some_and(|f| f(self, n))
+            },
+            refs: &|clone, source, row| {
+                // (M2: no git under the store's exclusive lock)
+                self.refs_under_ex
+                    .set(self.refs_under_ex.get() || self.receiver.retention.guard(false).is_err());
+                if self.refs_busy.get() {
+                    return Ok(false);
+                }
+                if !(row.held)()? {
+                    if self.refs_fail.get() && clone.starts_with('f') {
+                        anyhow::bail!("git failed");
+                    }
+                    self.refs.borrow_mut().push(format!("{clone}:{source}"));
+                }
+                (row.done)()?;
+                Ok(true)
+            },
         })
     }
     fn pass(&self) -> ReceivedPassReport {
@@ -599,8 +640,8 @@ fn unproven_reads_spend_the_section_budget() {
     assert!(files.iter().all(|f| f.exists()));
 }
 
-/// Review L3: a claim the rest of the section cannot verify waits for the
-/// next section; the pass does not stop on it.
+/// Review L3: a claim the section cannot verify is not drained inside it;
+/// the pass does not stop on it.
 #[test]
 fn a_claim_larger_than_the_rest_of_the_budget_waits() {
     let mut env = Env::new();
@@ -612,8 +653,10 @@ fn a_claim_larger_than_the_rest_of_the_budget_waits() {
     assert!(failed.is_err());
     let pending = env.count("SELECT count(*) FROM source_delete_claim WHERE done=0");
     assert!(pending > 0);
+    // (a claim the whole section cannot hash is hashed with the lock let
+    // go, spec (d) 「claimの再実行」)
     let (what, _) = env.receiver.retention.leftovers_with(1).unwrap();
-    assert_eq!(what, "progress");
+    assert_eq!(what, "large");
     assert_eq!(
         env.count("SELECT count(*) FROM source_delete_claim WHERE done=0"),
         pending
@@ -677,19 +720,20 @@ fn abandon_blob(env: &Env, id: &str, root: &str, counted: bool) -> std::path::Pa
     env.receiver.root().join(path)
 }
 
-/// Review round 2 (b): before a member of unknown size, a section with less
-/// than half of its budget left ends, the cursor before that member.
+/// Review round 2 (b), as changed by the large-blob rule: a member whose
+/// size is not counted is looked at (`lstat` through its checked
+/// ancestors) before it is read, so it is read only when it fits.
 #[test]
-fn an_unknown_size_waits_for_half_a_section() {
+fn an_unknown_size_is_looked_at_before_it_is_read() {
     let mut env = Env::new();
     let a = env.source(&[("f", &"a".repeat(200))], YOUNG);
     let b = env.source(&[("f", &"b".repeat(100))], YOUNG);
-    let c = env.source(&[("f", &"c".repeat(10))], YOUNG);
+    let c = env.source(&[("f", &"c".repeat(300))], YOUNG);
     let fa = abandon_blob(&env, &a, "drop:a:1", true);
     let fb = abandon_blob(&env, &b, "drop:b:1", true);
     let fc = abandon_blob(&env, &c, "drop:c:1", false);
-    // 1,000: the two known files (200, then 100; each read twice, to
-    // claim and to drain) leave 400, under half
+    // 1,000: the two known files (200, then 100; each read twice) leave
+    // 400; the uncounted one is 300, more than half of that: it waits
     let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
     assert_eq!(what, "progress");
     assert_eq!(report.unlinked, 2, "{report:?}");
@@ -765,6 +809,7 @@ fn a_stopped_pass_runs_no_section() {
             cap_bytes: u64::MAX,
             uses: &|_, _| Ok(SourceUse::Ended(None)),
             stop: &|| true,
+            refs: &|_, _, _| Ok(true),
         })
         .unwrap();
     assert_eq!(report.sections, 0, "{report:?}");
@@ -793,4 +838,661 @@ fn empty_roots_go_a_bounded_number_a_section() {
         env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:e:%'"),
         0
     );
+}
+
+/// A pass whose section budget is `bytes` (64 MiB in production).
+fn pass_budget(env: &Env, bytes: u64) -> ReceivedPassReport {
+    super::deletion::set_budget(bytes);
+    let report = env.pass();
+    super::deletion::set_budget(64 * 1024 * 1024);
+    report
+}
+
+/// (g)14, (g)41: a blob larger than the in-lock proof may read (half a
+/// section) is claimed, hashed with the lock let go and unlinked, one per
+/// pass; no claim is left between passes.
+#[test]
+fn a_large_blob_goes_one_per_pass() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    let b = env.source(&[("f", &"b".repeat(600))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let fb = abandon_blob(&env, &b, "drop:b:1", true);
+    let report = pass_budget(&env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert!(!fa.exists() && fb.exists());
+    let report = pass_budget(&env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fb.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM root WHERE id LIKE 'drop:%'"),
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(env.store_bytes(), env.files_on_disk());
+}
+
+/// A large blob whose content is not its name withdraws its claim: the
+/// file and its membership stay, no claim is left, the root waits for its
+/// next try, and `begin_import` is not refused.
+#[test]
+fn a_large_blob_that_is_not_its_content_stays() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let mut perm = std::fs::metadata(&fa).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+    std::fs::set_permissions(&fa, perm).unwrap();
+    std::fs::write(&fa, "x".repeat(600)).unwrap();
+    let report = pass_budget(&env, 1000);
+    assert_eq!((report.unlinked, report.kept), (0, 1), "{report:?}");
+    assert!(fa.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        1
+    );
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM publication WHERE state='claimed'"),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM drop_retry WHERE root='drop:a:1'"),
+        1
+    );
+    drop(env.receiver.begin_import().unwrap());
+}
+
+/// (g)39: a large claim left by a crash is finished by the next pass, and
+/// `begin_import` is not refused after it.
+#[test]
+fn a_large_claim_left_by_a_crash_is_finished_by_the_next_pass() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    set_fault(Some("after_large_claim"));
+    super::deletion::set_budget(1000);
+    let failed = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
+    set_fault(None);
+    assert!(failed.is_err());
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim WHERE done=0"),
+        1
+    );
+    // (the membership stays until the claim completes)
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        1
+    );
+    let report = pass_budget(&env, 1000);
+    assert!(!report.stuck, "{report:?}");
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fa.exists());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        0
+    );
+    drop(env.receiver.begin_import().unwrap());
+}
+
+/// A root with an unproven member is read again only when its next try is
+/// due (spec 25.8 5b, rootごとの次に試す時刻).
+#[test]
+fn an_unproven_root_waits_for_its_next_try() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(30))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let mut perm = std::fs::metadata(&fa).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+    std::fs::set_permissions(&fa, perm).unwrap();
+    std::fs::write(&fa, "x".repeat(30)).unwrap();
+    let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!((what, report.kept), ("stuck", 1));
+    assert_eq!(
+        env.count("SELECT count(*) FROM drop_retry WHERE root='drop:a:1'"),
+        1
+    );
+    // not due: nothing is read
+    let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!((what, report.kept), ("none", 0));
+    // due: read again
+    env.sql("UPDATE drop_retry SET next_ms=0");
+    let (what, report) = env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!((what, report.kept), ("stuck", 1));
+    // the row goes with its root
+    env.sql("DELETE FROM member WHERE root='drop:a:1'");
+    env.receiver.retention.leftovers_with(1000).unwrap();
+    assert_eq!(env.count("SELECT count(*) FROM drop_retry"), 0);
+}
+
+/// Spec 25.8 5b: the agent tick's token patrol takes no exclusive lock: a
+/// file only an abandoned token holds is left to step 0 of the pass.
+#[test]
+fn the_tick_leaves_unshared_token_files_to_the_pass() {
+    let mut env = Env::new();
+    let a = env.source(&[("f", "token")], YOUNG);
+    let fa = abandon_blob(&env, &a, "import:01ARZ3NDEKTSV4RRFFQ69G5FAV", true);
+    let report = env.receiver.release_abandoned_imports().unwrap();
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert!(fa.exists());
+    let report = env.pass();
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fa.exists());
+}
+
+/// (e) step 4, (g)18, (g)29: a `ref_drop:` row removes the refs once the
+/// clone's import lock is free; a busy lock keeps the row for a later
+/// section; a source received again keeps its refs and only the row goes.
+#[test]
+fn step_4_removes_orphaned_refs_unless_received_again() {
+    let mut env = Env::new();
+    let old = env.source(&[("a", "old")], OLD);
+    env.sql(&format!(
+        "INSERT INTO clone_ref(clone,source,root) VALUES('c1','{old}','receive:{old}');
+         INSERT INTO meta(key,value) VALUES('ref_drop:c2:again','');
+         INSERT INTO clone_ref(clone,source,root) VALUES('c2','again','receive:again')"
+    ));
+    env.trust_clock();
+    // busy: both rows stay (the check of `clone_ref` is made under the
+    // import lock), with a next try
+    let report = env.pass();
+    assert_eq!(report.detached, 1, "{report:?}");
+    let key = format!("SELECT count(*) FROM meta WHERE key='ref_drop:c1:{old}'");
+    assert_eq!(env.count(&key), 1);
+    let again = "SELECT count(*) FROM meta WHERE key='ref_drop:c2:again'";
+    assert_eq!(env.count(again), 1);
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 2);
+    // free (and its next try come): removed, never under the exclusive lock
+    env.refs_busy.set(false);
+    env.sql("UPDATE ref_retry SET next_ms=0");
+    let report = env.pass();
+    assert!(!env.refs_under_ex.get());
+    assert_eq!(report.refs, 2, "{report:?}");
+    assert_eq!(env.count(&key), 0);
+    assert_eq!(env.count(again), 0);
+    assert_eq!(*env.refs.borrow(), vec![format!("c1:{old}")]);
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 0);
+}
+
+/// Review round 1 (L2): rows whose removal failed wait for their next try,
+/// so the rows after them are reached in the same pass.
+#[test]
+fn failing_ref_rows_do_not_starve_the_rest() {
+    let env = Env::new();
+    // 32 rows whose removal fails (clones `f..`), then 8 that work
+    let rows: String = (0..40)
+        .map(|i| format!("('ref_drop:{}{i:02}:s','')", if i < 32 { "f" } else { "g" }))
+        .collect::<Vec<_>>()
+        .join(",");
+    env.sql(&format!("INSERT INTO meta(key,value) VALUES{rows}"));
+    env.refs_busy.set(false);
+    env.refs_fail.set(true);
+    let report = env.pass();
+    assert_eq!(report.refs, 8, "{report:?}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM meta WHERE key>='ref_drop:g' AND key<'ref_drop;'"),
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 32);
+    // the failed ones are not tried again before their time
+    env.refs_fail.set(false);
+    assert_eq!(env.pass().refs, 0);
+}
+
+/// Review round 1 (M2): step 4 waits for the `clone_ref` fill, which writes
+/// rows without the import lock.
+#[test]
+fn step_4_waits_for_the_clone_ref_fill() {
+    let env = Env::new();
+    env.sql(
+        "INSERT INTO meta(key,value) VALUES('ref_drop:c1:s','');
+         UPDATE meta SET value='' WHERE key='clone_ref_fill'",
+    );
+    env.refs_busy.set(false);
+    assert_eq!(env.pass().refs, 0);
+    env.sql("UPDATE meta SET value='done' WHERE key='clone_ref_fill'");
+    assert_eq!(env.pass().refs, 1);
+}
+
+/// Review round 1 (L3): `doctor` counts the large undone claims of the
+/// older shape (no root), and no other claim.
+#[test]
+fn doctor_counts_large_old_claims() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = SourceStore::open(dir.path()).unwrap();
+    let c = store.retention.connect().unwrap();
+    c.execute_batch(
+        r#"INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES
+           ('b:1',1,'{"leaf":{"size":100000000}}',0),
+           ('b:2',1,'{"leaf":{"size":100000000},"root":"drop:x"}',0),
+           ('b:3',1,'{"leaf":{"size":10}}',0)"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::source::retention::large_old_claims_read_only(dir.path()).unwrap(),
+        Some(1)
+    );
+}
+
+/// A pass of budget 1,000 over one abandoned 600-byte blob (large), with
+/// `probe` as its `stop`: the calls are 1 at the section's start, 2 and 3
+/// before each read of the hash, 4 after the lock is taken again.
+fn large_pass(probe: StopProbe) -> (Env, std::path::PathBuf, ReceivedPassReport) {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    *env.on_stop.borrow_mut() = Some(probe);
+    let report = pass_budget(&env, 1000);
+    *env.on_stop.borrow_mut() = None;
+    *env.held.borrow_mut() = None;
+    (env, fa, report)
+}
+
+/// The claim was withdrawn: no claim, the publication live again, the file
+/// and its membership kept, the root waiting for its next try.
+fn assert_withdrawn(env: &Env, file: &std::path::Path) {
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM publication WHERE state='claimed'"),
+        0
+    );
+    assert!(file.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM drop_retry WHERE root='drop:a:1'"),
+        1
+    );
+}
+
+/// Review round 1 (M1): the gate closes while the large file is hashed:
+/// under the lock taken again the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_gate_closes_during_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            env.sql("UPDATE meta SET value='pending' WHERE key='legacy_registration'");
+        }
+        false
+    }));
+    assert!(report.gate.is_some(), "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): the lock cannot be taken again (a shared holder):
+/// the claim is withdrawn under the shared lock.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_retake_is_busy() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            *env.held.borrow_mut() = Some(env.receiver.retention.guard(false).unwrap());
+        }
+        false
+    }));
+    assert!(report.busy, "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): with the exclusive lock held elsewhere (no lock to
+/// be had), the claim stays for the next pass, which finishes it.
+#[test]
+fn a_large_claim_stays_only_while_no_lock_can_be_had() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            *env.held.borrow_mut() = Some(env.receiver.retention.guard(true).unwrap());
+        }
+        false
+    }));
+    assert!(report.busy, "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 1);
+    let report = pass_budget(&env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fa.exists());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+}
+
+/// Review round 1 (M1): the agent stops after the hash: the claim is
+/// withdrawn under the lock taken again.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_pass_stops_after_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|_, n| n >= 4));
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (L5): the agent stops during the hash: the hash ends
+/// there and the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_pass_stops_during_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|_, n| n >= 2));
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert!(
+        env.stops.get() <= 3,
+        "the hash read on: {}",
+        env.stops.get()
+    );
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): the file changes between the hash and the retake
+/// (the same content length, so only its identity shows it): nothing is
+/// unlinked, the file stays and the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_file_changes_after_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 4 {
+            let c = env.receiver.retention.connect().unwrap();
+            let path: String = c
+                .query_row(
+                    "SELECT o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root='drop:a:1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let file = env.receiver.root().join(path);
+            let mut perm = std::fs::metadata(&file).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+            std::fs::set_permissions(&file, perm).unwrap();
+            std::fs::write(&file, "x".repeat(600)).unwrap();
+        }
+        false
+    }));
+    assert_eq!((report.unlinked, report.stuck), (0, false), "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (L4): a large claim whose root is no longer abandoned
+/// (a crash left it, then the root changed) is not drained but withdrawn.
+#[test]
+fn a_large_claim_of_a_root_no_longer_abandoned_is_withdrawn() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 4 {
+            env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
+        }
+        false
+    }));
+    assert_eq!((report.unlinked, report.stuck), (0, false), "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert!(fa.exists());
+}
+
+/// Review round 2 (M-a): the large claim is kept (its file gone, its
+/// publication still claimed) and a pass with no trigger then finishes it:
+/// no claim, no membership, the bytes as on disk.
+fn assert_kept_then_finished(env: &Env, file: &std::path::Path) {
+    assert!(!file.exists());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 1);
+    assert_eq!(
+        env.count("SELECT count(*) FROM publication WHERE state='claimed'"),
+        1
+    );
+    let report = pass_budget(env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        0
+    );
+    assert_eq!(env.store_bytes(), env.files_on_disk());
+}
+
+/// A large claim of `drop:a:1` left with its file gone: the drain failed
+/// at `stage`, after the unlink. Returns the env, the file, the object
+/// and the source the blob came from.
+fn gone_claim(stage: &'static str) -> (Env, std::path::PathBuf, String, String, Vec<String>) {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    // (two more sources, made before the claim fences the store)
+    let more = vec![
+        env.source(&[("o", "other")], YOUNG),
+        env.source(&[("p", "parent")], YOUNG),
+    ];
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    let object: String = env
+        .receiver
+        .retention
+        .connect()
+        .unwrap()
+        .query_row("SELECT object FROM member WHERE root='drop:a:1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    set_fault(Some(stage));
+    super::deletion::set_budget(1000);
+    let _ = env.pass_with(u64::MAX, &|_, _| Ok(SourceUse::Ended(None)));
+    set_fault(None);
+    super::deletion::set_budget(64 * 1024 * 1024);
+    assert!(!fa.exists(), "{stage}");
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim"),
+        1,
+        "{stage}"
+    );
+    (env, fa, object, a, more)
+}
+
+/// The gone claim completed while its protection stays: no claim, no
+/// row of the object, the SDK available again, the bytes as on disk.
+fn assert_gone_completed(env: &Env, object: &str, why: &str) {
+    assert_eq!(
+        env.count("SELECT count(*) FROM source_delete_claim"),
+        0,
+        "{why}"
+    );
+    for table in ["object", "member", "object_bytes"] {
+        let column = if table == "member" { "object" } else { "id" };
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM {table} WHERE {column}='{object}'"
+            )),
+            0,
+            "{why}: {table}"
+        );
+    }
+    let held = env.receiver.mutation_guard().unwrap();
+    held.ensure_sdk_available().expect(why);
+    assert_eq!(env.store_bytes(), env.files_on_disk(), "{why}");
+}
+
+/// Review round 3 (H-1): a drain that failed after the unlink leaves the
+/// claim with its file gone; the next pass completes it although the gate
+/// is closed (a pending root) or its root is protected again (it is no
+/// longer `abandoned`): the bytes are lost, so the claim protects nothing.
+#[test]
+fn a_large_claim_whose_file_is_gone_completes_while_protected() {
+    for stage in ["after_unlink", "after_fsync", "before_completion"] {
+        for trigger in ["gate", "protected"] {
+            let (env, _fa, object, _, _) = gone_claim(stage);
+            if trigger == "protected" {
+                env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
+            } else {
+                env.sql("INSERT INTO root(id,kind) VALUES('import:x','pending')");
+            }
+            let report = pass_budget(&env, 1000);
+            assert_eq!(report.unlinked, 1, "{stage} {trigger} {report:?}");
+            assert_gone_completed(&env, &object, &format!("{stage} {trigger}"));
+        }
+    }
+}
+
+/// Review round 3 (H-1): for each kind of protection, a claim whose file is
+/// gone completes while the protection stays, the SDK is available again,
+/// and the protector fetches the source again: a `received` holder (and a
+/// parent that carries it) is no longer in the store (its next attempt is
+/// refused with `INPUT_MISSING`), and a publication of a manifest naming
+/// the blob answers `InputGone` (`INPUT_MISSING`) instead of a source with
+/// a hole.
+#[test]
+fn a_gone_claim_completes_under_every_protection_and_its_holders_fetch_again() {
+    for kind in ["member", "pending", "graph", "own"] {
+        let (env, _fa, object, a, more) = gone_claim("after_unlink");
+        let (other, parent) = (more[0].clone(), more[1].clone());
+        match kind {
+            "member" => {
+                env.sql(&format!(
+                    "INSERT INTO member(root,object) VALUES('receive:{other}','{object}');
+                     INSERT INTO graph(root,source,done) VALUES('receive:{parent}','{other}',1)"
+                ));
+            }
+            "pending" => env.sql("INSERT INTO root(id,kind) VALUES('import:x','pending')"),
+            "graph" => env.sql(&format!(
+                "INSERT INTO graph(root,source,done) VALUES('receive:{parent}','zz',0)"
+            )),
+            _ => env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'"),
+        }
+        let report = pass_budget(&env, 1000);
+        // (the detached holders' own files may go in the same pass)
+        assert!(report.unlinked >= 1, "{kind} {report:?}");
+        assert_gone_completed(&env, &object, kind);
+        if kind == "member" {
+            assert!(!env.received(&other), "the holder fetches again");
+            assert!(!env.received(&parent), "its carrier fetches again");
+        } else {
+            assert!(env.received(&other) && env.received(&parent), "{kind}");
+        }
+        // (the source of the blob, published again, finds it missing)
+        let m = env.parent.manifest(&a).unwrap().unwrap();
+        let e = env.receiver.publish_received(&m, None).unwrap_err();
+        assert!(
+            crate::source::store::input_gone(&e).is_some(),
+            "{kind}: {e:#}"
+        );
+    }
+}
+
+/// Review round 4 (L-A): 40 undone claims whose files are there sort before
+/// a gone one; the first call reads 32 of them and completes nothing, the
+/// next goes on after its cursor and completes the gone one, and a short
+/// page leaves no cursor behind.
+#[test]
+fn present_claims_ahead_do_not_starve_a_gone_one() {
+    let (env, _fa, object, _, _) = gone_claim("after_unlink");
+    let mut c = env.receiver.retention.connect().unwrap();
+    let (raw, path): (String, String) = c
+        .query_row(
+            "SELECT c.claim_json, (SELECT path FROM object WHERE id LIKE 'b:%' AND id<>?1 LIMIT 1)
+             FROM source_delete_claim c",
+            [&object],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(env.receiver.root().join(&path).is_file());
+    let present: String = c
+        .query_row("SELECT id FROM object WHERE path=?1", [&path], |r| r.get(0))
+        .unwrap();
+    let mut claim: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    claim["object"] = present.into();
+    claim["path"] = path.into();
+    for i in 0..40 {
+        c.execute(
+            "INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,1,?2,0)",
+            params![format!("a{i:02}"), claim.to_string()],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        env.receiver.retention.complete_gone_claims(&mut c).unwrap(),
+        0
+    );
+    assert_eq!(
+        env.receiver.retention.complete_gone_claims(&mut c).unwrap(),
+        1
+    );
+    assert_eq!(
+        env.count(&format!(
+            "SELECT count(*) FROM source_delete_claim WHERE object='{object}'"
+        )),
+        0
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM meta WHERE key='gone_claim_cursor'"),
+        0
+    );
+}
+
+/// Review round 4 (L-C): a claim whose leaf cannot be shown gone never
+/// completes: its directory unreadable (EACCES), an ancestor replaced by
+/// another directory of the same name, or a symlink at the leaf's name.
+#[test]
+fn a_claim_whose_leaf_is_not_shown_gone_is_not_completed() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["eacces", "replaced", "symlink"] {
+        let (env, fa, _object, _, _) = gone_claim("after_unlink");
+        let parent = fa.parent().unwrap().to_path_buf();
+        match case {
+            "eacces" => {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            "replaced" => {
+                std::fs::rename(&parent, parent.with_extension("old")).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+            }
+            _ => std::os::unix::fs::symlink("/nonexistent", &fa).unwrap(),
+        }
+        let mut c = env.receiver.retention.connect().unwrap();
+        let done = env.receiver.retention.complete_gone_claims(&mut c).unwrap();
+        if case == "eacces" {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(done, 0, "{case}");
+        assert_eq!(
+            env.count("SELECT count(*) FROM source_delete_claim"),
+            1,
+            "{case}"
+        );
+    }
+}
+
+/// Review round 2 (M-a): the file goes while it is hashed (as after an
+/// unlink), and the retake is busy or the gate closes: the claim is not
+/// withdrawn, and a later pass finishes it.
+#[test]
+fn a_large_claim_whose_file_went_during_the_hash_is_not_withdrawn() {
+    for trigger in ["busy", "gate"] {
+        let (env, fa, report) = large_pass(Box::new(move |env, n| {
+            if n == 2 {
+                let c = env.receiver.retention.connect().unwrap();
+                let path: String = c
+                    .query_row(
+                        "SELECT o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root='drop:a:1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                std::fs::remove_file(env.receiver.root().join(path)).unwrap();
+                if trigger == "busy" {
+                    *env.held.borrow_mut() = Some(env.receiver.retention.guard(false).unwrap());
+                } else {
+                    env.sql("UPDATE meta SET value='pending' WHERE key='legacy_registration'");
+                }
+            }
+            false
+        }));
+        assert_eq!(report.unlinked, 0, "{trigger} {report:?}");
+        assert!(report.busy || report.gate.is_some(), "{trigger} {report:?}");
+        env.sql("UPDATE meta SET value='done' WHERE key='legacy_registration'");
+        assert_kept_then_finished(&env, &fa);
+    }
+}
+
+/// Review round 2 (L-d, L5): a file of three hash chunks, the pass told to
+/// stop after the first chunk is read: the hash reads no further (the
+/// calls are 1 at the start, 2 and 3 before the first two reads, 4 after
+/// the retake), and the claim is withdrawn.
+#[test]
+fn a_large_hash_stops_between_its_chunks() {
+    let mut env = Env::new();
+    let big = "a".repeat(3 << 20);
+    let a = env.source(&[("f", &big)], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    *env.on_stop.borrow_mut() = Some(Box::new(|_, n| n >= 3));
+    let report = pass_budget(&env, 4 << 20);
+    *env.on_stop.borrow_mut() = None;
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert_eq!(env.stops.get(), 4, "the hash read on");
+    assert_withdrawn(&env, &fa);
 }

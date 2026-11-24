@@ -389,6 +389,13 @@ impl Host for RealButCore {
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         Ok(())
     }
+    fn received_pass(
+        &self,
+        attempts: &belt::worker::host::SourceAttempts,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<anyhow::Result<belt::source::retention::ReceivedPassReport>> {
+        self.0.received_pass(attempts, stop)
+    }
     fn sweep_store_copies(&self) -> Result<(), ApiError> {
         self.0.sweep_store_copies()
     }
@@ -2796,6 +2803,123 @@ async fn a_dirty_submodule_inside_a_dirty_submodule_reaches_the_worker_at_every_
     assert_eq!(f.clones().len(), 1);
 }
 
+/// Review round 4 (L-C): a root that names a repository and has no commit
+/// of its own is published under the clone's import lock (it writes
+/// `clone_ref` rows for that clone): held past the bound by another
+/// descriptor, the publication is answered `OVERLOADED` and takes nothing;
+/// sent again (as the sender's next delivery does) once the lock is free,
+/// it is published.
+#[test]
+fn a_root_with_a_repository_and_no_commit_waits_for_the_import_lock() {
+    use belt::source::classify::source_id_of_ci;
+    use local_ci::source::seal_manifest;
+    let f = fx();
+    let d = f.directory("d", 91);
+    let mut root = d.root.clone();
+    assert!(root.execution_commit.is_none());
+    root.repository_id = Some("github:example/commitless".into());
+    let root = seal_manifest(root);
+    let source = source_id_of_ci(&root.source_id).unwrap();
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    let l = BlobLimits {
+        lock_wait_ms: 50,
+        ..limits()
+    };
+    let workspaces = Workspaces::new(f.state(), f.env(), Arc::new(CliFastWorktree::new(f.env())));
+    let held = workspaces
+        .import_lock(root.repository_id.as_ref().unwrap())
+        .unwrap();
+    held.lock().unwrap();
+    let manifest = serde_json::to_vec(&root).unwrap();
+    let mut last = put_all(sink, &l, &source, Manifest, &manifest);
+    for b in d.blobs.values() {
+        last = put_all(sink, &l, &source, Content, b);
+    }
+    let e = last.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded, "{e:?}");
+    assert!(e.message.contains("the clone of"), "{}", e.message);
+    assert!(!verify(sink, &l, &source, vec![]).ready);
+    drop(held);
+    let b = d.blobs.values().last().unwrap();
+    assert!(put_all(sink, &l, &source, Content, b).unwrap().complete);
+    assert!(verify(sink, &l, &source, vec![]).ready);
+}
+
+/// Review round 4 (L-C): the real publication (its bundle unpacked and its
+/// `clone_ref` rows written by `mark_published`) races step 4
+/// (`Workspaces::drop_imported_refs`, its check reading the worker's
+/// index): it starts right after step 4 found no `clone_ref` row for the
+/// source, and waits for the import lock step 4 holds. Afterwards a
+/// `clone_ref` row of the source has its refs in the clone.
+#[test]
+fn a_real_publication_racing_step_4_keeps_its_refs_with_its_rows() {
+    let f = fx();
+    let repo = project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    let l = limits();
+    send_all(sink, &l, &first);
+    assert!(verify(sink, &l, &first.source, vec![]).ready);
+    let clone = f.clones()[0]
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(repo.join("race.txt"), "race\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "race"]);
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    send_but_bundle(sink, &l, &p);
+    let source = p.root.source_id.clone();
+    let db = f.state().join("sources/retention.db");
+    let row = || -> bool {
+        let c =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
+            [&clone, &source],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let ws = Workspaces::new(f.state(), f.env(), Arc::new(CliFastWorktree::new(f.env())));
+    let bundle = p.bundle.as_ref().unwrap();
+    std::thread::scope(|s| {
+        let publisher = std::cell::RefCell::new(None);
+        let held = || -> anyhow::Result<bool> {
+            let seen = row();
+            let t = s.spawn(|| put_all(sink, &l, &p.source, Bundle, bundle));
+            // (it waits for the lock step 4 holds)
+            std::thread::sleep(Duration::from_millis(300));
+            *publisher.borrow_mut() = Some(t);
+            Ok(seen)
+        };
+        let ok = ws
+            .drop_imported_refs(&clone, &source, &held, &|| Ok(()), &|| false)
+            .unwrap();
+        assert!(ok);
+        let answer = publisher.borrow_mut().take().unwrap().join().unwrap();
+        assert!(answer.unwrap().complete);
+    });
+    assert!(verify(sink, &l, &p.source, vec![]).ready);
+    let refs = git(
+        &f.clones()[0],
+        &[
+            "for-each-ref",
+            &format!("refs/local-ci/snapshots/{source}"),
+            &format!("refs/local-ci/index/{source}"),
+        ],
+    );
+    assert!(
+        !row() || !refs.trim().is_empty(),
+        "a clone_ref row whose refs are gone"
+    );
+}
+
 #[test]
 fn a_bundle_waits_for_another_import_into_the_same_clone() {
     let f = fx();
@@ -3544,6 +3668,18 @@ fn a_source_nobody_added_to_goes_at_the_next_pass_with_its_token() {
     std::fs::write(f.incoming(&fresh.source).join("touch"), "now").unwrap();
     agent.supervise();
     assert!(!f.incoming(&p.source).exists());
+    // (the files only the token held go in step 0 of the received pass,
+    // which the agent runs on its own thread: the tick takes no exclusive
+    // lock, spec 25.8 5b). A round the tick scheduled may be running: this
+    // one starts after it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while agent.received_passes() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no received pass ran within 30 s (a scheduled round never ended, or the host has no store)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // the token's rows went, and with them what that failed receipt put
     // into the store
     assert_eq!(index_rows(&f, "").0, 0);

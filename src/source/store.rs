@@ -832,7 +832,8 @@ impl SourceStore {
     /// Whether source `id` is in the store: the index has the root
     /// `receive:<id>` and its `source` is `id` (spec 25.8 5b (b)). The file
     /// is not looked at, except that while the legacy registration is
-    /// pending a manifest file with no `m:` row counts as present. Call under
+    /// pending a manifest file with no `m:` row counts as present (unless
+    /// the registration abandoned its root). Call under
     /// a shared mutation lock (`_held`).
     pub fn received(&self, _held: &super::retention::Guard, id: &str) -> Result<bool> {
         if self.retention.received_row(id)? {
@@ -844,6 +845,11 @@ impl SourceStore {
         // (a manifest the legacy registration has not finished may have its
         // `m:` row already: its file decides, as before the registration)
         if !self.retention.legacy_queued(id)? && self.retention.has_object(&format!("m:{id}"))? {
+            return Ok(false);
+        }
+        // (review round 4, L-B: one the registration abandoned, its
+        // manifest invalid or a blob missing, is not here)
+        if self.retention.legacy_abandoned(id)? {
             return Ok(false);
         }
         Ok(self.inner.manifest_path(id).is_file())
@@ -869,7 +875,12 @@ impl SourceStore {
     /// leaves them for the next tick): 1,000 object rows of `bytes`, 32
     /// roots of `clone_ref`, 32 manifests of the legacy registration.
     /// Returns whether all three are finished.
-    pub fn fill_retention_pages(&self) -> Result<bool> {
+    /// `import_lock` tries a clone's import lock (the `clone_ref` fill
+    /// writes a clone's rows under it).
+    pub fn fill_retention_pages(
+        &self,
+        import_lock: super::retention::ImportLock<'_>,
+    ) -> Result<bool> {
         let _held = self.mutation_guard()?;
         // (each fill goes on its own: one that fails is logged, and the
         // others still run)
@@ -884,7 +895,7 @@ impl SourceStore {
         let recount = page("bytes recount", self.retention.recount_bytes(1000));
         let refs = page(
             "clone_ref fill",
-            self.retention.fill_clone_refs(32, 64 << 20),
+            self.retention.fill_clone_refs(32, 64 << 20, import_lock),
         );
         let legacy = page("legacy registration", self.retention.register_legacy());
         Ok(bytes && recount && refs && legacy)

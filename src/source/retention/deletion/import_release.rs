@@ -201,6 +201,11 @@ impl Index {
         };
         for raw in replay {
             let claim: Claim = serde_json::from_str(&raw)?;
+            // (a large claim is the received pass's: it hashes it with the
+            // lock let go)
+            if claim.root.is_some() {
+                continue;
+            }
             if self.drain_claim(&mut c, &claim, &mut budget).is_err() {
                 report.stopped = true;
                 return Ok(report);

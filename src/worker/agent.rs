@@ -2459,7 +2459,7 @@ impl Agent {
                 // (a later share is news again)
                 lock(&self.noted).remove("/source_store_shared/");
             }
-            let progress = report.detached + report.unlinked + report.forgotten > 0;
+            let progress = report.detached + report.unlinked + report.forgotten + report.refs > 0;
             if !progress || report.busy || report.parent || report.stuck || report.gate.is_some() {
                 return passes;
             }
