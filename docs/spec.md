@@ -1362,6 +1362,14 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 `ci` のtaskも、通常のtaskと同じく、提出時に固定したtoolchain（`FrozenBundle`）を持つ。宣言した版を用意できるworkerが無ければ、そのtaskは配置されない。配置の判断に残る理由の行は、`toolchain <tool>=<version> unavailable` の形（例: `toolchain node=20.0.0 unavailable`）とする。
 
+**解決できないtaskだけを失敗にする（`ci`）。** 提出時の解決で、どのworkerも要件を満たせないと答えたtask（持ち主の答えが `toolchain resolve required: no coherent worker proposal (<要件>)`）は、そのtaskだけを失敗にし、runの他のtaskは実行する。理由: workerごとの設定なしで普通に使えることを優先し、一部のjobの結果でも役に立つから。
+
+- そのtaskは「要件なし」にはしない（既定のtoolchainで走らせない）。束を持たず、拒否の文と要件を `ci.unplaceable` に持つ。親はrunを積むのと同じtransactionで、そのtaskを `ci.unrunnable` に同じ文を書いてcancelし、`ci_task_unrunnable` を記録する。配置の対象（queue）にも、retryで開き直されたときの解放にも入れない。runner discoveryの探索も作らない。
+- そのtaskはjobの失敗として数える（cancelではない）。runの結果はfailureで、exit codeは失敗のもの（cancelの130ではない）とする。`ci` の報告では、そのjobの行がstatus `failure` で、`reason` に拒否の文（要件を含む）を持つ。
+- そのtaskを `needs:` で待つjobは、他の失敗の後と同じに決まる（`skipped`、`if: always()` なら実行し、`needs.<job>.result` は `failure`）。runは閉じる。
+- 対象は、どのworkerも解決できないという拒否だけとする。持ち主が答えない（停止中、fence、過負荷、通信失敗）などの他の拒否は、従来どおりrun全体の拒否である。`exec` は従来どおりで、解決できなければ拒否する。
+- runのtaskが1つも配置できないときは、何も走らないので、従来どおり提出時にrun全体を拒否する（`BLOCKED`、`environment_mismatch`、exit code 76。最初のtaskの拒否の文）。
+
 **`ci` のtaskが固定するtoolchain（PR #135）。** `ci` は、taskごとに1つの束を固定する。プロジェクトの版指定ファイルに、そのtaskが走らせるjobの `setup-*` stepの `*-version` 入力（と `*-version-file` が指すファイル）を足したものである。親とworkerは同じ関数（`ci::toolchains`）で導出する。stepが要件を作るのは、beltが入力を読めるときだけである。
 - 版、範囲、`${{ matrix.<key> }}`（そのtask自身のmatrixの値。脚ごとに別の要件になる）、`${{ env.<NAME> }}`（stepとjobとworkflowの `env:` の順に見つかるリテラル）。`dtolnay/rust-toolchain@1.89` は、`toolchain:` 入力が無ければその版を宣言する。満たせない要件は、既存の拒否・blockedの経路に入る。
 - `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する。解決できなければ何も要求せず、noticeを出す。

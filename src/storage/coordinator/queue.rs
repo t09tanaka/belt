@@ -25,12 +25,14 @@ pub const MAX_TASKS_PER_RUN: usize = 10_000;
 /// A task that may be placed. A task of a run that carries the mark of a
 /// pruned run (spec 25.3 (b)) is never one.
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
+    AND json_extract(t.spec_json,'$.ci.unplaceable') IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL AND r.pruning_at_ms IS NULL)
     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))
     AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
 
 /// [`QUEUED`] for a file from before the mark, read as it is.
 const QUEUED_V2: &str = "t.cancel_requested_at_ms IS NULL
+    AND json_extract(t.spec_json,'$.ci.unplaceable') IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))
     AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
@@ -295,6 +297,21 @@ impl CoordinatorStore {
                 &serde_json::json!({"tasks": tasks.len()}),
                 at_ms,
             )?;
+            // A task no worker resolves the toolchains of fails here, in the
+            // transaction that queues it: it is never placed, and the other
+            // tasks of the run go on (spec 22.1).
+            let unplaceable: Vec<(String, String)> = {
+                let mut query = tx.prepare(
+                    "SELECT task_id,json_extract(spec_json,'$.ci.unplaceable') FROM task
+                     WHERE run_id=?1 AND json_extract(spec_json,'$.ci.unplaceable') IS NOT NULL
+                     ORDER BY rowid",
+                )?;
+                let rows = query.query_map([&run], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (task, why) in unplaceable {
+                super::control::fail_ci_tasks_on(tx, &run, Some(&task), &why, at_ms)?;
+            }
             Ok(())
         })
     }
