@@ -171,6 +171,15 @@ pub struct AbandonedImports {
     /// person looks (the record is kept, not guessed at).
     #[serde(default)]
     pub unreadable_tokens: u64,
+    /// Undone deletion claims of an older shape too large for a section:
+    /// one whose file is not its content cannot be withdrawn and refuses
+    /// every import into the store until a person looks (spec 25.8 5b).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub large_old_claims: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
@@ -183,6 +192,10 @@ fn abandoned_imports(worker_state: &Path) -> Option<AbandonedImports> {
         bytes,
         bytes_truncated,
         unreadable_tokens: crate::worker::blobs::unreadable_import_tokens(worker_state),
+        large_old_claims: crate::source::retention::large_old_claims_read_only(worker_state)
+            .ok()
+            .flatten()
+            .unwrap_or(0),
     })
 }
 
@@ -720,6 +733,16 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             ));
         }
         out.push(check("abandoned_imports", Level::Notice, text));
+    }
+    if let Some(a) = facts.abandoned_imports.filter(|a| a.large_old_claims > 0) {
+        out.push(check(
+            "source_old_claims",
+            Level::Notice,
+            format!(
+                "{} deletion claim(s) of an older version, too large to check under the store's lock, may never finish: while one stays, every import into this worker's source store is refused; look at sources/retention.db (source_delete_claim)",
+                a.large_old_claims
+            ),
+        ));
     }
     out
 }

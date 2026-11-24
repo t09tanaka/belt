@@ -47,6 +47,8 @@ use std::sync::Arc;
 
 // Git removes this private per-worktree ref with the worktree registration.
 // It keeps the admission snapshot reachable even after reproducing the original HEAD.
+/// How long one git of step 4 may run before it is killed.
+const REF_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 const CLEANUP_COMMIT: &str = "refs/worktree/belt-cleanup";
 
 /// What kind of workspace this is, and so how it goes away.
@@ -207,13 +209,23 @@ impl Workspaces {
         open_lock(&root.join(format!("{name}.import.lock")))
     }
 
-    /// Step 4 of the received pass (spec 25.8 5b (e)): remove the refs
-    /// belt's receiving put on the clone `clone` (a name `r-<16 hex>`) for
-    /// `source` (local-ci's `remove_imported_refs`: the snapshot and index
-    /// refs), under the clone's import lock taken without waiting. `false`:
-    /// the lock is busy (an import is running), nothing was done. A clone
-    /// that is not there has no ref to remove.
-    pub fn drop_imported_refs(&self, clone: &str, source: &str) -> anyhow::Result<bool> {
+    /// Step 4 of the received pass (spec 25.8 5b (e)), called with no source
+    /// lock held: under the import lock of the clone `clone` (a name
+    /// `r-<16 hex>`) taken without waiting, unless `held()` (the source was
+    /// received again), remove the refs belt's receiving put there for
+    /// `source` (the snapshot and index refs, as local-ci's
+    /// `remove_imported_refs` does, but with hooks off and a time bound),
+    /// then `done()`. `false`: the lock is busy (an import is running),
+    /// nothing was done. A clone that is not there has no ref to remove; one
+    /// that cannot be looked at, or whose `.git` is not a directory, is an
+    /// error (the row stays).
+    pub fn drop_imported_refs(
+        &self,
+        clone: &str,
+        source: &str,
+        held: &dyn Fn() -> anyhow::Result<bool>,
+        done: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             clone.len() == 18
                 && clone.starts_with("r-")
@@ -222,23 +234,63 @@ impl Workspaces {
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "not a clone name"
         );
+        anyhow::ensure!(
+            source.len() == 36
+                && source.starts_with("src-")
+                && source[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "not a source id"
+        );
         let root = self.clones_root();
         let dir = root.join(clone);
-        if std::fs::symlink_metadata(&dir).is_err() {
-            return Ok(true);
+        let git_dir = dir.join(".git");
+        let lock = match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(&git_dir)?.is_dir(),
+                    "the clone's .git is not a directory"
+                );
+                let lock = open_lock(&root.join(format!("{clone}.import.lock")))
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                match lock.try_lock() {
+                    Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+                    Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                }
+                Some(lock)
+            }
+        };
+        if lock.is_some() && !held()? {
+            for r in [
+                format!("refs/local-ci/snapshots/{source}"),
+                format!("refs/local-ci/index/{source}"),
+            ] {
+                let there = git::run_bounded(
+                    &self.env,
+                    &git_dir,
+                    &root,
+                    &["show-ref", "--verify", "-q", &r],
+                    REF_GIT_LIMIT,
+                )?;
+                if there == 0 {
+                    let code = git::run_bounded(
+                        &self.env,
+                        &git_dir,
+                        &root,
+                        &["update-ref", "-d", &r],
+                        REF_GIT_LIMIT,
+                    )?;
+                    anyhow::ensure!(code == 0, "git update-ref -d {r} failed ({code})");
+                } else {
+                    anyhow::ensure!(there == 1, "git show-ref {r} failed ({there})");
+                }
+            }
         }
-        let lock = open_lock(&root.join(format!("{clone}.import.lock")))
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
-        local_ci::source::remove_imported_refs(
-            &local_ci::ExecContext::new(self.env.clone()),
-            &dir,
-            source,
-        )?;
+        done()?;
+        drop(lock);
         Ok(true)
     }
 

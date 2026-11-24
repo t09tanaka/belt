@@ -17,7 +17,7 @@ pub use prune::set_prune_fault;
 pub use prune::{ExclusiveGuard, PruneBudget, PruneInputs};
 #[cfg(test)]
 pub(in crate::source::retention) use received::{set_budget, PLANNED};
-pub use received::{ReceivedPassInputs, ReceivedPassReport, SourceUse};
+pub use received::{ReceivedPassInputs, ReceivedPassReport, RefRow, SourceUse};
 pub(in crate::source) use scratch::Reserved;
 #[cfg(test)]
 pub(super) use scratch::STAGING;
@@ -436,7 +436,7 @@ impl Index {
     /// identity before and after the read. `Ok(None)`: the file is absent
     /// (only this claim permits that, as in the replay). An error, or a
     /// digest other than the object's name, withdraws the claim.
-    fn hash_outside(&self, claim: &Claim) -> Result<Option<String>> {
+    fn hash_outside(&self, claim: &Claim, stop: &dyn Fn() -> bool) -> Result<Option<String>> {
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
         let opened = rustix::fs::openat(
@@ -457,8 +457,23 @@ impl Index {
             Identity::of(&file)? == claim.leaf,
             "source deletion leaf changed"
         );
+        // (in chunks, asking `stop` before each: a stopping agent does not
+        // wait for a whole large file)
         let mut digest = Sha256::new();
-        let read = std::io::copy(&mut (&file).take(claim.leaf.size + 1), &mut digest)?;
+        let mut reader = (&file).take(claim.leaf.size + 1);
+        let mut chunk = vec![0u8; HASH_CHUNK];
+        let mut read = 0u64;
+        loop {
+            ensure!(!stop(), "stopped during the large hash");
+            let n = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            digest.update(&chunk[..n]);
+            read += n as u64;
+        }
         ensure!(
             read == claim.leaf.size && Identity::of(&file)? == claim.leaf,
             "source changed during validation"
@@ -471,6 +486,22 @@ impl Index {
     /// ancestors are checked once more: the claim fenced every belt writer
     /// meanwhile, and any other change shows in the identity.
     fn drain(&self, c: &mut Connection, claim: &Claim, budget: Option<&mut u64>) -> Result<()> {
+        let unlinking = std::cell::Cell::new(false);
+        self.drain_inner(c, claim, budget, &unlinking).map_err(|e| {
+            if unlinking.get() {
+                e
+            } else {
+                e.context(Untouched)
+            }
+        })
+    }
+    fn drain_inner(
+        &self,
+        c: &mut Connection,
+        claim: &Claim,
+        budget: Option<&mut u64>,
+        unlinking: &std::cell::Cell<bool>,
+    ) -> Result<()> {
         ensure!(
             claim.incarnation > 0 && claim.incarnation < i64::MAX,
             "source incarnation overflow"
@@ -491,8 +522,10 @@ impl Index {
             "stale source deletion incarnation"
         );
         // (a large claim's own membership stays until completion)
+        // (and a large claim's root must still be the abandoned one it was
+        // claimed from)
         let own = claim.root.as_deref().unwrap_or("");
-        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",params![claim.object,own],|r|r.get(0))?;
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL AND kind NOT IN ('abandoned','receipt')) OR EXISTS(SELECT 1 FROM graph WHERE done=0) OR (?2<>'' AND NOT EXISTS(SELECT 1 FROM root WHERE id=?2 AND kind='abandoned'))",params![claim.object,own],|r|r.get(0))?;
         ensure!(!protected, "source deletion claim still protected");
         let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
         ensure!(parents == claim.parents, "source deletion ancestor changed");
@@ -550,10 +583,12 @@ impl Index {
                 // The held descriptors and final pathname identity are checked
                 // immediately before unlink. No directory is ever removed.
                 fault("before_unlink")?;
+                unlinking.set(true);
                 rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::empty())?;
                 fault("after_unlink")?;
             }
-            Err(rustix::io::Errno::NOENT) => {} // Only this durable exact claim permits absence.
+            // Only this durable exact claim permits absence.
+            Err(rustix::io::Errno::NOENT) => unlinking.set(true),
             Err(error) => return Err(error.into()),
         }
         parent.sync_all()?;
@@ -583,6 +618,40 @@ impl Index {
         Ok(())
     }
 }
+/// For `doctor` (review round 1, L3): the undone claims of the older shape
+/// (no root) larger than a section may hash. Such a claim is hashed with
+/// the lock let go; when its file is not its content it cannot be withdrawn
+/// (it has no membership to fall back to), so it stays, and with it every
+/// `begin_import` of the store is refused, until a person looks. Read only;
+/// `None` when there is no index.
+pub fn large_old_claims_read_only(state_dir: &std::path::Path) -> Result<Option<u64>> {
+    let path = state_dir.join("sources").join("retention.db");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let c = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(1))?;
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM source_delete_claim WHERE done=0 AND json_extract(claim_json,'$.root') IS NULL AND json_extract(claim_json,'$.leaf.size')>?1",
+        [BYTE_BUDGET as i64],
+        |r| r.get(0),
+    )?;
+    Ok(Some(n as u64))
+}
+/// A [`Index::drain`] error from before anything was unlinked: a large
+/// claim may then be withdrawn (its membership and file are both there).
+#[derive(Debug)]
+pub(super) struct Untouched;
+impl std::fmt::Display for Untouched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing was unlinked")
+    }
+}
+/// What [`Index::hash_outside`] reads at a time, `stop` asked before each.
+const HASH_CHUNK: usize = 1 << 20;
 /// What became of one membership of a root that is being released.
 pub(super) enum Released {
     /// Another root holds the object: only the membership was removed. The

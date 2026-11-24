@@ -19,7 +19,18 @@ struct Env {
     /// Step 4's calls, and whether the clone's import lock is busy.
     refs: RefCell<Vec<String>>,
     refs_busy: std::cell::Cell<bool>,
+    /// Step 4's removal fails; step 4 was called while the store's
+    /// exclusive lock was held.
+    refs_fail: std::cell::Cell<bool>,
+    refs_under_ex: std::cell::Cell<bool>,
+    /// What `stop` answers at its n-th call (from 1) in a pass, and does
+    /// meanwhile (the large tests use it to act during the hash).
+    on_stop: RefCell<Option<StopProbe>>,
+    stops: std::cell::Cell<usize>,
+    held: RefCell<Option<Guard>>,
 }
+
+type StopProbe = Box<dyn Fn(&Env, usize) -> bool>;
 
 impl Env {
     fn new() -> Self {
@@ -33,6 +44,11 @@ impl Env {
             n: 0,
             refs: RefCell::new(Vec::new()),
             refs_busy: std::cell::Cell::new(true),
+            refs_fail: std::cell::Cell::new(false),
+            refs_under_ex: std::cell::Cell::new(false),
+            on_stop: RefCell::new(None),
+            stops: std::cell::Cell::new(0),
+            held: RefCell::new(None),
         };
         env.sql(
             "UPDATE meta SET value='done' WHERE key IN ('legacy_registration','bytes_fill','clone_ref_fill')",
@@ -123,10 +139,26 @@ impl Env {
             max_age_ms: AGE,
             cap_bytes: cap,
             uses,
-            stop: &|| false,
-            refs: &|clone, source| {
-                self.refs.borrow_mut().push(format!("{clone}:{source}"));
-                Ok(!self.refs_busy.get())
+            stop: &|| {
+                let n = self.stops.get() + 1;
+                self.stops.set(n);
+                self.on_stop.borrow().as_ref().is_some_and(|f| f(self, n))
+            },
+            refs: &|clone, source, row| {
+                // (M2: no git under the store's exclusive lock)
+                self.refs_under_ex
+                    .set(self.refs_under_ex.get() || self.receiver.retention.guard(false).is_err());
+                if self.refs_busy.get() {
+                    return Ok(false);
+                }
+                if !(row.held)()? {
+                    if self.refs_fail.get() && clone.starts_with('f') {
+                        anyhow::bail!("git failed");
+                    }
+                    self.refs.borrow_mut().push(format!("{clone}:{source}"));
+                }
+                (row.done)()?;
+                Ok(true)
             },
         })
     }
@@ -707,6 +739,10 @@ fn an_unknown_size_is_looked_at_before_it_is_read() {
     assert_eq!(report.unlinked, 2, "{report:?}");
     assert!(!fa.exists() && !fb.exists());
     assert!(fc.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:c:1'"),
+        1
+    );
     // the next section takes it
     let (_, report) = env.receiver.retention.leftovers_with(1000).unwrap();
     assert_eq!(report.unlinked, 1, "{report:?}");
@@ -773,7 +809,7 @@ fn a_stopped_pass_runs_no_section() {
             cap_bytes: u64::MAX,
             uses: &|_, _| Ok(SourceUse::Ended(None)),
             stop: &|| true,
-            refs: &|_, _| Ok(true),
+            refs: &|_, _, _| Ok(true),
         })
         .unwrap();
     assert_eq!(report.sections, 0, "{report:?}");
@@ -959,20 +995,227 @@ fn step_4_removes_orphaned_refs_unless_received_again() {
          INSERT INTO clone_ref(clone,source,root) VALUES('c2','again','receive:again')"
     ));
     env.trust_clock();
-    // busy: the orphan's row stays; the re-received one goes uncalled
+    // busy: both rows stay (the check of `clone_ref` is made under the
+    // import lock), with a next try
     let report = env.pass();
     assert_eq!(report.detached, 1, "{report:?}");
     let key = format!("SELECT count(*) FROM meta WHERE key='ref_drop:c1:{old}'");
     assert_eq!(env.count(&key), 1);
+    let again = "SELECT count(*) FROM meta WHERE key='ref_drop:c2:again'";
+    assert_eq!(env.count(again), 1);
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 2);
+    // free (and its next try come): removed, never under the exclusive lock
+    env.refs_busy.set(false);
+    env.sql("UPDATE ref_retry SET next_ms=0");
+    let report = env.pass();
+    assert!(!env.refs_under_ex.get());
+    assert_eq!(report.refs, 2, "{report:?}");
+    assert_eq!(env.count(&key), 0);
+    assert_eq!(env.count(again), 0);
+    assert_eq!(*env.refs.borrow(), vec![format!("c1:{old}")]);
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 0);
+}
+
+/// Review round 1 (L2): rows whose removal failed wait for their next try,
+/// so the rows after them are reached in the same pass.
+#[test]
+fn failing_ref_rows_do_not_starve_the_rest() {
+    let env = Env::new();
+    // 32 rows whose removal fails (clones `f..`), then 8 that work
+    let rows: String = (0..40)
+        .map(|i| format!("('ref_drop:{}{i:02}:s','')", if i < 32 { "f" } else { "g" }))
+        .collect::<Vec<_>>()
+        .join(",");
+    env.sql(&format!("INSERT INTO meta(key,value) VALUES{rows}"));
+    env.refs_busy.set(false);
+    env.refs_fail.set(true);
+    let report = env.pass();
+    assert_eq!(report.refs, 8, "{report:?}");
     assert_eq!(
-        env.count("SELECT count(*) FROM meta WHERE key='ref_drop:c2:again'"),
+        env.count("SELECT count(*) FROM meta WHERE key>='ref_drop:g' AND key<'ref_drop;'"),
         0
     );
-    assert!(!env.refs.borrow().iter().any(|r| r == "c2:again"));
-    // free: removed
+    assert_eq!(env.count("SELECT count(*) FROM ref_retry"), 32);
+    // the failed ones are not tried again before their time
+    env.refs_fail.set(false);
+    assert_eq!(env.pass().refs, 0);
+}
+
+/// Review round 1 (M2): step 4 waits for the `clone_ref` fill, which writes
+/// rows without the import lock.
+#[test]
+fn step_4_waits_for_the_clone_ref_fill() {
+    let env = Env::new();
+    env.sql(
+        "INSERT INTO meta(key,value) VALUES('ref_drop:c1:s','');
+         UPDATE meta SET value='' WHERE key='clone_ref_fill'",
+    );
     env.refs_busy.set(false);
-    let report = env.pass();
-    assert_eq!(report.refs, 1, "{report:?}");
-    assert_eq!(env.count(&key), 0);
-    assert_eq!(env.refs.borrow().last().unwrap(), &format!("c1:{old}"));
+    assert_eq!(env.pass().refs, 0);
+    env.sql("UPDATE meta SET value='done' WHERE key='clone_ref_fill'");
+    assert_eq!(env.pass().refs, 1);
+}
+
+/// Review round 1 (L3): `doctor` counts the large undone claims of the
+/// older shape (no root), and no other claim.
+#[test]
+fn doctor_counts_large_old_claims() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = SourceStore::open(dir.path()).unwrap();
+    let c = store.retention.connect().unwrap();
+    c.execute_batch(
+        r#"INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES
+           ('b:1',1,'{"leaf":{"size":100000000}}',0),
+           ('b:2',1,'{"leaf":{"size":100000000},"root":"drop:x"}',0),
+           ('b:3',1,'{"leaf":{"size":10}}',0)"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::source::retention::large_old_claims_read_only(dir.path()).unwrap(),
+        Some(1)
+    );
+}
+
+/// A pass of budget 1,000 over one abandoned 600-byte blob (large), with
+/// `probe` as its `stop`: the calls are 1 at the section's start, 2 and 3
+/// before each read of the hash, 4 after the lock is taken again.
+fn large_pass(probe: StopProbe) -> (Env, std::path::PathBuf, ReceivedPassReport) {
+    let mut env = Env::new();
+    let a = env.source(&[("f", &"a".repeat(600))], YOUNG);
+    let fa = abandon_blob(&env, &a, "drop:a:1", true);
+    *env.on_stop.borrow_mut() = Some(probe);
+    let report = pass_budget(&env, 1000);
+    *env.on_stop.borrow_mut() = None;
+    *env.held.borrow_mut() = None;
+    (env, fa, report)
+}
+
+/// The claim was withdrawn: no claim, the publication live again, the file
+/// and its membership kept, the root waiting for its next try.
+fn assert_withdrawn(env: &Env, file: &std::path::Path) {
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM publication WHERE state='claimed'"),
+        0
+    );
+    assert!(file.exists());
+    assert_eq!(
+        env.count("SELECT count(*) FROM member WHERE root='drop:a:1'"),
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM drop_retry WHERE root='drop:a:1'"),
+        1
+    );
+}
+
+/// Review round 1 (M1): the gate closes while the large file is hashed:
+/// under the lock taken again the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_gate_closes_during_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            env.sql("UPDATE meta SET value='pending' WHERE key='legacy_registration'");
+        }
+        false
+    }));
+    assert!(report.gate.is_some(), "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): the lock cannot be taken again (a shared holder):
+/// the claim is withdrawn under the shared lock.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_retake_is_busy() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            *env.held.borrow_mut() = Some(env.receiver.retention.guard(false).unwrap());
+        }
+        false
+    }));
+    assert!(report.busy, "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): with the exclusive lock held elsewhere (no lock to
+/// be had), the claim stays for the next pass, which finishes it.
+#[test]
+fn a_large_claim_stays_only_while_no_lock_can_be_had() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 2 {
+            *env.held.borrow_mut() = Some(env.receiver.retention.guard(true).unwrap());
+        }
+        false
+    }));
+    assert!(report.busy, "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 1);
+    let report = pass_budget(&env, 1000);
+    assert_eq!(report.unlinked, 1, "{report:?}");
+    assert!(!fa.exists());
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+}
+
+/// Review round 1 (M1): the agent stops after the hash: the claim is
+/// withdrawn under the lock taken again.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_pass_stops_after_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|_, n| n >= 4));
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (L5): the agent stops during the hash: the hash ends
+/// there and the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_pass_stops_during_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|_, n| n >= 2));
+    assert_eq!(report.unlinked, 0, "{report:?}");
+    assert!(
+        env.stops.get() <= 3,
+        "the hash read on: {}",
+        env.stops.get()
+    );
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (M1): the file changes between the hash and the retake
+/// (the same content length, so only its identity shows it): nothing is
+/// unlinked, the file stays and the claim is withdrawn.
+#[test]
+fn a_large_claim_is_withdrawn_when_the_file_changes_after_the_hash() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 4 {
+            let c = env.receiver.retention.connect().unwrap();
+            let path: String = c
+                .query_row(
+                    "SELECT o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root='drop:a:1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let file = env.receiver.root().join(path);
+            let mut perm = std::fs::metadata(&file).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+            std::fs::set_permissions(&file, perm).unwrap();
+            std::fs::write(&file, "x".repeat(600)).unwrap();
+        }
+        false
+    }));
+    assert_eq!((report.unlinked, report.stuck), (0, false), "{report:?}");
+    assert_withdrawn(&env, &fa);
+}
+
+/// Review round 1 (L4): a large claim whose root is no longer abandoned
+/// (a crash left it, then the root changed) is not drained but withdrawn.
+#[test]
+fn a_large_claim_of_a_root_no_longer_abandoned_is_withdrawn() {
+    let (env, fa, report) = large_pass(Box::new(|env, n| {
+        if n == 4 {
+            env.sql("UPDATE root SET kind='receipt' WHERE id='drop:a:1'");
+        }
+        false
+    }));
+    assert_eq!((report.unlinked, report.stuck), (0, false), "{report:?}");
+    assert_eq!(env.count("SELECT count(*) FROM source_delete_claim"), 0);
+    assert!(fa.exists());
 }

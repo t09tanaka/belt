@@ -1857,14 +1857,146 @@ fn imported_refs_go_only_under_a_free_import_lock() {
         .to_string();
     let held = ws.import_lock("github:example/repo").unwrap();
     held.lock().unwrap();
-    assert!(!ws.drop_imported_refs(&clone, &source).unwrap());
+    let done = std::cell::Cell::new(0);
+    let drop_refs = |clone: &str| {
+        ws.drop_imported_refs(clone, &source, &|| Ok(false), &|| {
+            done.set(done.get() + 1);
+            Ok(())
+        })
+    };
+    assert!(!drop_refs(&clone).unwrap());
+    assert_eq!(done.get(), 0);
     assert_eq!(f.git(repo.dir(), &["rev-parse", &snapshot]), head);
     drop(held);
-    assert!(ws.drop_imported_refs(&clone, &source).unwrap());
+    // (a child forked meanwhile may hold a copy of the lock's descriptor
+    // until its exec: the lock is free within a bounded wait)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !drop_refs(&clone).unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the import lock stayed busy"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(done.get(), 1);
     assert!(f
         .git(repo.dir(), &["for-each-ref", "refs/local-ci/"])
         .is_empty());
     assert!(repo.dir().is_dir());
     // a name that is not a clone's is refused
-    assert!(ws.drop_imported_refs("../x", &source).is_err());
+    assert!(drop_refs("../x").is_err());
+}
+
+/// Review round 1 (M2): step 4's git runs with hooks off: a hook the clone
+/// has (`reference-transaction`, which `update-ref -d` runs) does not run;
+/// a source received again keeps its refs and only its row goes.
+#[test]
+fn imported_refs_go_without_the_clones_hooks() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    f.git(repo.dir(), &["fetch", "-q", f.dir.to_str().unwrap(), &head]);
+    let source = format!("src-{}", "b".repeat(32));
+    let snapshot = format!("refs/local-ci/snapshots/{source}");
+    f.git(repo.dir(), &["update-ref", &snapshot, &head]);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let hooks = repo.dir().join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let ran = repo.dir().join("hook-ran");
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+    let mut perm = std::fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&hook, perm).unwrap();
+    // (the hook does run for git as usual)
+    f.git(repo.dir(), &["update-ref", "refs/heads/probe", &head]);
+    assert!(ran.exists());
+    std::fs::remove_file(&ran).unwrap();
+    // received again: the refs stay, the row goes
+    let done = std::cell::Cell::new(0);
+    let run = |held: bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ok = ws
+                .drop_imported_refs(&clone, &source, &|| Ok(held), &|| {
+                    done.set(done.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            if ok {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the import lock stayed busy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    run(true);
+    assert_eq!(done.get(), 1);
+    assert_eq!(f.git(repo.dir(), &["rev-parse", &snapshot]), head);
+    run(false);
+    assert_eq!(done.get(), 2);
+    assert!(f
+        .git(repo.dir(), &["for-each-ref", "refs/local-ci/"])
+        .is_empty());
+    assert!(!ran.exists(), "a hook of the clone ran");
+}
+
+/// Review round 1 (L1): a clone directory without its own `.git` directory
+/// is an error (git never looks above it), and the row stays.
+#[test]
+fn imported_refs_need_the_clones_own_git_directory() {
+    let f = fixture();
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let head = f.commit("a", "a");
+    let repo = f.clone_of(&ws);
+    let clone = repo
+        .dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let source = format!("src-{}", "c".repeat(32));
+    // the clone's .git replaced by a file: refused, nothing done
+    let git = repo.dir().join(".git");
+    let kept = repo.dir().join("git-kept");
+    std::fs::rename(&git, &kept).unwrap();
+    std::fs::write(&git, "gitdir: elsewhere\n").unwrap();
+    let done = std::cell::Cell::new(0);
+    let r = ws.drop_imported_refs(&clone, &source, &|| Ok(false), &|| {
+        done.set(done.get() + 1);
+        Ok(())
+    });
+    assert!(r.is_err());
+    assert_eq!(done.get(), 0);
+    // a clone that cannot be looked at (not "absent") is an error too
+    std::fs::remove_file(&git).unwrap();
+    std::fs::rename(&kept, &git).unwrap();
+    let clones = repo.dir().parent().unwrap().to_path_buf();
+    let mode = |m: u32| {
+        let mut perm = std::fs::metadata(&clones).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, m);
+        std::fs::set_permissions(&clones, perm).unwrap();
+    };
+    mode(0o000);
+    let r = ws.drop_imported_refs(&clone, &source, &|| Ok(false), &|| {
+        done.set(done.get() + 1);
+        Ok(())
+    });
+    mode(0o700);
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(done.get(), 0);
+    let _ = head;
 }

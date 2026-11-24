@@ -54,10 +54,21 @@ pub struct ReceivedPassInputs<'a> {
     /// without detaching anything (the agent is stopping, or a version is
     /// on trial, spec 25.1 8).
     pub stop: &'a dyn Fn() -> bool,
-    /// Step 4 (spec (e)): remove the refs of `source` (CI id) on the clone
-    /// `clone` under its import lock taken without waiting; `Ok(false)` when
-    /// that lock is busy (the row waits for a later section).
-    pub refs: &'a dyn Fn(&str, &str) -> Result<bool>,
+    /// Step 4 (spec (e)), called with no source lock held: under the import
+    /// lock of the clone `clone` taken without waiting, unless `row.held()`
+    /// remove the refs of `source` (CI id), then call `row.done()`.
+    /// `Ok(false)` when that lock is busy (the row waits for its next try).
+    pub refs: &'a dyn Fn(&str, &str, &RefRow<'_>) -> Result<bool>,
+}
+
+/// One step 4 row, for the caller's `refs`, which calls both under the
+/// clone's import lock.
+pub struct RefRow<'a> {
+    /// Whether the source has a `clone_ref` row again (received again): its
+    /// refs then stay.
+    pub held: &'a dyn Fn() -> Result<bool>,
+    /// Removes the row (and its next try), in a short transaction.
+    pub done: &'a dyn Fn() -> Result<()>,
 }
 
 /// What one pass did.
@@ -104,6 +115,9 @@ const CANDIDATES: usize = 32;
 const DROP_CURSOR: &str = "drop_cursor";
 /// The source clock of the expiry (its own key: `clock` is the parent's).
 const CLOCK: &str = "received_clock";
+/// How long a pass waits for the exclusive lock again after a large hash
+/// (and then for the shared one, to withdraw the claim).
+const RETAKE: std::time::Duration = std::time::Duration::from_secs(2);
 /// The pause between sections, so a waiting reader takes the lock first.
 const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -146,10 +160,25 @@ const EMPTY_ROOTS: &str = "SELECT id FROM root WHERE kind='abandoned'
      AND (id LIKE 'drop:%' OR id LIKE 'receive:%' OR id LIKE 'import:%')
      AND NOT EXISTS(SELECT 1 FROM member WHERE root=root.id) LIMIT ?1";
 const EMPTY_LIMIT: i64 = 64;
+/// Step 4's rows whose next try is due (one more than an hour ahead is due:
+/// the clock went back).
+const REF_ROWS: &str = "SELECT m.key FROM meta m WHERE m.key>='ref_drop:' AND m.key<'ref_drop;'
+     AND NOT EXISTS(SELECT 1 FROM ref_retry t WHERE t.key=m.key AND t.next_ms>?1 AND t.next_ms<=?1+3600000)
+     ORDER BY m.key LIMIT ?2";
+const REF_HELD: &str = "SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2 LIMIT 1";
+/// How long a step 4 row whose import lock was busy waits.
+const REF_BUSY_MS: i64 = 60_000;
 /// The queries whose plans a test checks.
 #[cfg(test)]
-pub(in crate::source::retention) const PLANNED: [&str; 5] =
-    [STEP0_ROOTS, STEP0_MEMBERS, UNTIMED, TIMED, EMPTY_ROOTS];
+pub(in crate::source::retention) const PLANNED: [&str; 7] = [
+    STEP0_ROOTS,
+    STEP0_MEMBERS,
+    UNTIMED,
+    TIMED,
+    EMPTY_ROOTS,
+    REF_ROWS,
+    REF_HELD,
+];
 
 /// A member step 0 looks at: root, object, path, counted bytes.
 type Member = (String, String, String, Option<i64>);
@@ -240,20 +269,26 @@ impl SourceStore {
                         large = false;
                         step0 += 1;
                         drop(guard);
-                        let digest = self.retention.hash_outside(&claim);
-                        let _guard = match self.retention.guard(true) {
-                            Ok(guard) => guard,
-                            Err(e) if super::super::import_owner::would_block(&e) => {
-                                // (the claim stays; the next pass hashes again)
-                                report.busy = true;
-                                return Ok(report);
+                        let digest = self.retention.hash_outside(&claim, inputs.stop);
+                        // The lock is waited for, briefly; without it the
+                        // claim is withdrawn under the shared lock (which
+                        // no exclusive holder, so no drain, shares), and
+                        // only when neither comes does it stay for the
+                        // next pass ((M1): a claim fences the store's SDK).
+                        let Some(_guard) = self.retention.guard_exclusive_waiting(RETAKE)? else {
+                            if let Ok(_shared) = self.retention.guard_waiting(RETAKE) {
+                                self.retention.withdraw_large(&claim, inputs.wall)?;
                             }
-                            Err(e) => return Err(e),
+                            report.busy = true;
+                            return Ok(report);
                         };
-                        if (inputs.stop)() {
+                        let mut c = self.retention.connect()?;
+                        let gate = Gate::closed(&c)?;
+                        if (inputs.stop)() || gate.is_some() {
+                            report.gate = gate;
+                            self.retention.withdraw_large(&claim, inputs.wall)?;
                             return Ok(report);
                         }
-                        let mut c = self.retention.connect()?;
                         match self
                             .retention
                             .finish_large(&mut c, &claim, digest, inputs.wall)?
@@ -269,32 +304,37 @@ impl SourceStore {
                     }
                 }
             }
-            // Step 4's rows left by earlier detaches, after step 0.
-            self.retention.drop_refs(&c, inputs, &mut report)?;
-            if !detaching {
-                return Ok(report);
-            }
-            let now = match cutoff {
-                Some(now) => now,
-                None => {
-                    let now = self.retention.received_clock(&c, inputs)?;
-                    report.clock_held = now.is_none();
-                    cutoff = Some(now);
-                    now
+            let ran = detaching;
+            if detaching {
+                let now = match cutoff {
+                    Some(now) => now,
+                    None => {
+                        let now = self.retention.received_clock(&c, inputs)?;
+                        report.clock_held = now.is_none();
+                        cutoff = Some(now);
+                        now
+                    }
+                };
+                let detached = self.retention.detach_section(
+                    &mut c,
+                    &mut budget,
+                    inputs,
+                    now,
+                    &mut after,
+                    &mut report,
+                )?;
+                if detached.is_none() {
+                    detaching = false;
                 }
-            };
-            let detached = self.retention.detach_section(
-                &mut c,
-                &mut budget,
-                inputs,
-                now,
-                &mut after,
-                &mut report,
-            )?;
-            // Step 4: the refs this section's detaches orphaned.
-            self.retention.drop_refs(&c, inputs, &mut report)?;
-            if detached.is_none() {
-                detaching = false;
+            }
+            // Step 4: the rows (earlier detaches' and this section's) are
+            // read under the lock; their git runs after it is let go.
+            let rows = self.retention.ref_rows(&c, inputs.wall)?;
+            drop(c);
+            drop(guard);
+            self.retention.drop_refs(rows, inputs, &mut report)?;
+            if !ran {
+                return Ok(report);
             }
         }
         report.again = true;
@@ -354,48 +394,121 @@ impl Index {
             Err(_) => false,
         };
         if content {
-            return Ok(self.drain(c, claim, None).is_ok().then_some(true));
+            match self.drain(c, claim, None) {
+                Ok(()) => return Ok(Some(true)),
+                // (protected again, its root no longer abandoned, or the
+                // file changed: nothing was unlinked, so it is withdrawn)
+                Err(e) if e.downcast_ref::<super::Untouched>().is_some() => {}
+                Err(_) => return Ok(None),
+            }
         }
-        let Some(root) = &claim.root else {
+        if claim.root.is_none() {
+            // (an older claim cannot be withdrawn; `doctor` shows it)
             return Ok(None);
-        };
-        self.unclaim(c, claim)?;
-        retry_root(c, root, now)?;
+        }
+        self.withdraw_large(claim, now)?;
         Ok(Some(false))
     }
 
-    /// Step 4 (spec (e)): up to [`CANDIDATES`] `ref_drop:<clone>:<source>`
-    /// rows (at most one per ref a detach orphaned). A `(clone, source)`
-    /// that has a `clone_ref` row again (received again) keeps its refs and
-    /// loses only the row; otherwise the refs are removed and the row goes.
-    /// A busy import lock or a failure keeps the row (not a change).
+    /// The large claim `claim` is withdrawn, under a lock that keeps every
+    /// drain out (the exclusive one, or the shared one): its file and
+    /// membership stay, and its root waits for its next try. An older claim
+    /// (no root) stays.
+    fn withdraw_large(&self, claim: &Claim, now: u64) -> Result<()> {
+        let Some(root) = &claim.root else {
+            return Ok(());
+        };
+        let mut c = self.connect()?;
+        self.unclaim(&mut c, claim)?;
+        retry_root(&c, root, now)
+    }
+
+    /// Step 4 (spec (e)), under the exclusive lock: up to [`CANDIDATES`]
+    /// `ref_drop:<clone>:<source>` rows whose next try is due, once the
+    /// `clone_ref` fill (which writes rows without the import lock) is done
+    /// and no root waits for its retry; their next tries without a row go.
+    fn ref_rows(&self, c: &Connection, now: u64) -> Result<Vec<String>> {
+        c.execute(
+            "DELETE FROM ref_retry WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=ref_retry.key)",
+            [],
+        )?;
+        let filled: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='clone_ref_fill' AND value='done')
+             AND NOT EXISTS(SELECT 1 FROM clone_ref_retry)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !filled {
+            return Ok(Vec::new());
+        }
+        let mut s = c.prepare(REF_ROWS)?;
+        let rows = s.query_map(params![now as i64, CANDIDATES as i64], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Step 4 with the exclusive lock let go: each row under its clone's
+    /// import lock taken without waiting (the caller's `refs`), which also
+    /// covers the check of `clone_ref` (a source received again keeps its
+    /// refs) and the row's removal. A busy lock or a failure keeps the row
+    /// and gives it a next try ([`REF_BUSY_MS`], [`RETRY_MS`]), so the rows
+    /// after it are not starved.
     fn drop_refs(
         &self,
-        c: &Connection,
+        rows: Vec<String>,
         inputs: &ReceivedPassInputs,
         report: &mut ReceivedPassReport,
     ) -> Result<()> {
-        let rows: Vec<String> = {
-            let mut s = c.prepare(
-                "SELECT key FROM meta WHERE key>='ref_drop:' AND key<'ref_drop;' ORDER BY key LIMIT ?1",
-            )?;
-            let rows = s.query_map([CANDIDATES as i64], |r| r.get(0))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let c = self.connect()?;
         for key in rows {
+            if (inputs.stop)() {
+                break;
+            }
             let Some((clone, source)) = key["ref_drop:".len()..].split_once(':') else {
                 continue;
             };
-            let held: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM clone_ref WHERE clone=?1 AND source=?2)",
-                params![clone, source],
-                |r| r.get(0),
+            let held = || -> Result<bool> {
+                Ok(
+                    c.query_row(REF_HELD, params![clone, source], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .is_some(),
+                )
+            };
+            let done = || -> Result<()> {
+                c.execute_batch("BEGIN IMMEDIATE")?;
+                let removed = (|| -> Result<()> {
+                    c.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+                    c.execute("DELETE FROM ref_retry WHERE key=?1", [&key])?;
+                    Ok(())
+                })();
+                match removed {
+                    Ok(()) => c.execute_batch("COMMIT")?,
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            };
+            let row = RefRow {
+                held: &held,
+                done: &done,
+            };
+            let wait = match (inputs.refs)(clone, source, &row) {
+                Ok(true) => {
+                    report.refs += 1;
+                    continue;
+                }
+                Ok(false) => REF_BUSY_MS,
+                Err(_) => RETRY_MS,
+            };
+            c.execute(
+                "INSERT INTO ref_retry(key,next_ms) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM meta WHERE key=?1)
+                 ON CONFLICT(key) DO UPDATE SET next_ms=excluded.next_ms",
+                params![key, inputs.wall as i64 + wait],
             )?;
-            if !held && !matches!((inputs.refs)(clone, source), Ok(true)) {
-                continue;
-            }
-            c.execute("DELETE FROM meta WHERE key=?1", [&key])?;
-            report.refs += 1;
         }
         Ok(())
     }

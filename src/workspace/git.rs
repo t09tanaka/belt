@@ -122,6 +122,49 @@ pub(super) fn run_in_worktree(
     )
 }
 
+/// Git on the repository `git_dir` alone (`GIT_DIR` set, discovery not
+/// above `ceiling`), with hooks off (`core.hooksPath=/dev/null` through
+/// `GIT_CONFIG_*`, which a repository's own config cannot override) and
+/// killed at `limit`: its exit code. Output is not read.
+pub(super) fn run_bounded(
+    env: &Env,
+    git_dir: &Path,
+    ceiling: &Path,
+    args: &[&str],
+    limit: std::time::Duration,
+) -> Result<i32> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(git_dir)
+        .env_clear()
+        .envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_DIR", git_dir)
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().context("cannot run git")?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return status
+                .code()
+                .with_context(|| format!("git {} was killed", args.join(" ")));
+        }
+        if start.elapsed() >= limit {
+            // (our own child: never pid <= 1)
+            crate::platform::signal_pid(child.id(), libc::SIGKILL);
+            let _ = child.wait();
+            bail!("git {} took longer than {limit:?}", args.join(" "));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

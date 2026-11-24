@@ -2145,6 +2145,7 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes: 0,
         bytes_truncated: false,
         unreadable_tokens: 0,
+        large_old_claims: 0,
     });
     assert!(evaluate("mini-a", &facts)
         .iter()
@@ -2155,6 +2156,7 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes: 900,
         bytes_truncated: false,
         unreadable_tokens: 0,
+        large_old_claims: 0,
     });
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "abandoned_imports"), Level::Notice);
@@ -2171,10 +2173,30 @@ fn what_released_import_tokens_still_hold_is_counted() {
         bytes: 0,
         bytes_truncated: true,
         unreadable_tokens: 3,
+        large_old_claims: 0,
     });
     let checks = evaluate("mini-a", &facts);
     let text = detail(&checks, "abandoned_imports");
     assert!(text.contains("at least 0 byte") && text.contains("3 incoming source(s)"));
+    assert!(checks.iter().all(|c| c.id != "source_old_claims"));
+}
+
+/// Review round 1 (L3): a large undone claim of the older shape, which may
+/// block imports for good, is shown.
+#[test]
+fn a_large_old_claim_is_shown() {
+    let mut facts = healthy();
+    facts.abandoned_imports = Some(AbandonedImports {
+        roots: 0,
+        members: 0,
+        bytes: 0,
+        bytes_truncated: false,
+        unreadable_tokens: 0,
+        large_old_claims: 2,
+    });
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "source_old_claims"), Level::Notice);
+    assert!(detail(&checks, "source_old_claims").contains("2 deletion claim"));
 }
 
 #[test]
