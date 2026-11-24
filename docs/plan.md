@@ -1851,6 +1851,15 @@ WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含む�
 - warm-up の解放（PR #129）: resident 上の worker で `supervise` が `reap_warmups` を呼んでいなかった。
 - retry の後続 Job（PR #131）: 失敗のために `skipped` になった後続も開き直す。
 - `belt ci status`（PR #132）。
+- 一時workerの終了（PR #130）: SIGTERM・SIGINT・SIGHUPで、生きているattemptを止め（各supervisorがTERM・猶予・KILL）、stateを消して終了コード0。待つ上限は猶予に10秒を足した時間で、残れば stateを残して終了コード1。試験は `tests/it/ephemeral_stop.rs`（実workerと実attempt、各10回）。
+- `belt workers` の一覧の試験（PR #133）: 登録なし、接続中、切断、`forget` の後（登録は残り、identityだけ退役する）。
+- 純粋な判定の切り出し（PR #134）: `advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` の判定を、変異試験と coverage の対象の module（`src/ci/advance/pure.rs`、`src/service/ci_run/lines.rs`、`src/results/plan.rs`）へ移した。挙動は変わらない。
+- `ci` のtaskのtoolchain（PR #135）: workflowの `setup-*` の `*-version` 入力を、taskごとの束へ固定する（仕様22.1）。
+- 直接実行のsignal（PR #137・#142）: task-traffic-controller 0.10.5 で、近接した2つのsignalの両方と、待ちに入る直前のsignalを転送する。signalはbitmaskで1回だけ送り、回収済みのpidには送らない。0.10.6 の後は、起動時に無視されていたSIGINT・SIGQUIT・SIGTERM・SIGHUPを、beltもcommandも無視したままにする（`cmd &`・`nohup` と同じ）。integration試験のbinaryは、4つのsignalを既定へ戻してから始める（仕様第16章）。
+- native toolでの充足（PR #138）: registryが満たせない版を、profileのtool自身が同じ版を報告するときに満たす。範囲は、親が観測した版へ固定する（仕様22.1）。
+- 試験のフレーキーの修正（PR #139）: `warmup_stop` の idle release は、managerが動くまで問い合わせ続ける。`bootstrap` の再起動をまたぐsyncは、原因が分からないので、失敗時に診断を出すだけにした。
+- local-ci 0.18.4（PR #140）: コード変更なし。清掃は local-ci のCLIの経路だけで、belt は読み書きしない。
+- 入力の保持の終点（PR #143）: retire済みのattemptだけが残るrunも、入力を解放する（仕様第25章）。
 - 試験の追加（PR #125・#126・#128）とフレーキーの修正（PR #123・#127）。
 
 ### 入れないと決めたもの
@@ -1869,11 +1878,99 @@ scheduler は、run の入力が届いた remote worker だけを候補にする
 
 ### 実機試験（延期中）で確かめるもの
 
-次を、実機試験の一覧に足す。
+次は、下の「Mac miniの実機試験の一覧」に足した（M01〜M16）。
 - 端末で `belt exec` を動かしている間の Ctrl-C が、子に SIGINT をちょうど1回だけ届けること。
 - R03〜R08、R10、R12、R14、R66、R74、R93。
 
 version 0.1.0 への変更、`cargo publish`、tag、Release は、実機試験のあとに行う。
+
+## Mac miniの実機試験の一覧（`agent@macmini-1.local`）
+
+この一覧は、実機試験の台本である。A対応表（上の「A01〜A58 の対応」）とは別に持つ。載せたのは次の2種類で、省いたものは無い。(1) A対応表で「実機要」とした A01・A02・A24・A26・A34・A35・A37・A45・A46・A51・A53・A54 のすべて。(2) Dockerでは代わりにならない項目（sleep、boot、launchd、GUIのないsystem-userのLaunchDaemon、実SSHの鍵の配布、別マシン間の転送、別マシンの停止）と、「延期中」の一覧にある R03〜R08・R10・R12・R14・R66・R74・R93、端末のCtrl-C。
+
+呼び名: **親** は、この試験を始める手元のMac。**mini** は `agent@macmini-1.local`。「利用者の操作」は、管理者権限（`sudo`、GUI、電源、ケーブル）を要するもので、Claudeは行わない（`sudo` は使わず、`~/.ssh` は触らない）。
+
+### 前提（M00）
+
+- 利用者の操作: miniで「リモートログイン」を有効にする。親の公開鍵を `agent` の `~/.ssh/authorized_keys` に入れる。`agent` は管理者でない一般のアカウントにする（A35で使う）。
+- 親で、試験する版を作る: `cargo build --release -p belt-cli --bin belt` と `./target/release/belt --version`。
+- 確かめる: `ssh agent@macmini-1.local 'uname -sm; sw_vers -productVersion'`。期待: `Darwin arm64` と、親と同じ世代のmacOS。違うときは、`workers add` に `--binary <miniで動く build>` を付ける。
+- 親で、`belt init` と `belt doctor`。期待: `doctor` が合格する。
+- 試験の前後に、親とminiで `pgrep -fl belt` と `launchctl list | grep -i belt` を残す。終わったら、親から `belt workers stop mini --cancel-running` で止め、利用者が登録を外す。
+
+### A対応表の「実機要」
+
+**M01 — A01・A02: 実機の2台への配置。**
+- 手順（親）: `belt workers add mini --ssh agent@macmini-1.local --install`、`belt workers`、`belt doctor`。`belt submit -- sh -c 'hostname; sleep 60'` を、親のworkerの予算が埋まる数だけ続けて出し、`belt ls` を見る。A02は、先に親だけで未配置のbacklogを作ってから、そのbacklogがある間に `workers add` する。
+- 期待: 発注側がhostを選ばず、`belt show <task>` の担当workerに親とminiの両方が出て、`belt logs <id>` に両方のhost名が出る。後から足したminiが、既存の未配置のtaskを引き取る。`belt workers` は `connected` と、miniのidentityを示す。
+- 利用者の操作: M00のみ。
+
+**M02 — A24（R03）: 実際のrebootとboot ID。**
+- 手順: `belt submit -- sleep 600` を、miniに置かれるようにして出す（`belt show` で担当がminiと確かめる）。利用者がminiで `sudo reboot` する。起動後、LaunchAgentの場合は `agent` がログインし直す。親で `belt show <task>`、`belt doctor`、`belt retry <task>`。
+- 期待: miniのboot IDが変わったことを検知し、そのboot前のattemptだけが `interrupted` に確定する。子孫のcommandが残らず、停止の確認が済んでから確定する。`retry` した仕事が、新しいboot IDで一度だけ走る。親のrunと、他のworkerのattemptは続く。
+- 利用者の操作: `sudo reboot`、必要ならGUIでのログイン。
+
+**M03 — A26（R03）: Macのsleepと壁時計。**
+- 手順: (a) miniで仕事を走らせ、`pmset -g assertions` を見る。(b) 仕事が走る間に、利用者がminiを `pmset sleepnow` でsleepさせ、数分後に起こす。(c) 利用者がminiの時計を1日進め（システム設定の「日付と時刻」で自動設定を切る）、仕事が走る間に戻す。親で `belt show`、`belt doctor` を見る。
+- 期待: (a) 仕事の間だけ、`caffeinate` によるidle sleepの抑止（`PreventUserIdleSystemSleep`）が見え、終わると消える。(b)(c) leaseとtimeoutが逆行せず、起きた後に整合し、仕事は1回だけ完了するか、規則どおり未解決になる。
+- 利用者の操作: `pmset sleepnow` の後の起こす操作、時計の変更と復元。
+
+**M04 — A34（R04・R05）: 実launchd・実SSHでの導入・更新・rollback。**
+- 手順（親）: 導入は `belt workers add mini --ssh agent@macmini-1.local --install`（M01で済み）。`belt workers drain mini`、`belt workers resume mini`、`belt workers stop mini`、`belt workers start mini`。更新は、同じversionで別のdigestのbuild（`RUSTFLAGS='-C metadata=mini-b' cargo build --release` の成果物）を `belt workers upgrade mini --binary <path>` に渡す。失敗の注入は、親のPATHの先頭に置いた `ssh` の包み（疎通確認の呼び出しだけを失敗させる）で行う。方法は `scripts/s26/worker_upgrade.py` と同じである。
+- 期待: 導入・start・stop・drain・resumeが実launchdで通る。更新中は、動いているbinaryを上書きしない。疎通確認が失敗すると旧版へ戻り、再試行で更新できる。drainの確認と受理の競合（R05）は、`workers stop mini` を、仕事の受理と同時に何度か繰り返して、受理済みの仕事が失われないことを確かめる。
+- 利用者の操作: M00のみ（launchd（LaunchAgent）への登録は `agent` の権限で足りる）。
+
+**M05 — A35（R06・R07・R74）: system-userのLaunchDaemon（GUIなし）。**
+- 手順（親）: `~/.config/belt/config.toml` のminiの `[[workers]]` に `service_mode = "system-user"` を書く。`belt workers add mini --ssh agent@macmini-1.local --install` を繰り返し、報告された設定directoryと、期待されるsystem service fileを控える。
+- 利用者の操作（`sudo`。Claudeは行わない）: miniで、管理者が管理するbeltの写しから `sudo /usr/local/sbin/belt register-system-worker --account agent --config-dir <`workers add` が報告した設定directory>` を実行し、表示されたplistのpathを `sudo launchctl bootstrap system <printed-plist-path>` に渡す。その後、利用者がminiを再起動し、**ログインせずに**待つ。
+- 手順（親、再起動の後）: `belt workers add mini --ssh agent@macmini-1.local --install` を繰り返して確認と登録を終え、`belt doctor`、`belt exec -- sh -c 'id -un; echo $HOME'`。
+- 期待: login前に、非rootの `agent` でworkerが自動で復帰する。`doctor` が、実際のservice userとservice環境（login shellやGUI Keychainが無いこと）でprofileを検査して合格する（R07・R74）。CIはrootで動かない。`id -un` が `agent` を示す。
+- 利用者の操作: 上のとおり。
+
+**M06 — A37: 実際に使うプロジェクトのCI。**
+- 手順（親）: 利用者が選んだプロジェクトで、`belt ci plan`、`belt workers drain mini`、`belt ci --snapshot commit --ref HEAD`（親のみ）、`belt workers resume mini`、`belt ci --snapshot commit --ref HEAD`（親とmini）。各2回（cold／warm）。`belt show <run>` と `belt outputs <run> --dir ./belt-results`。
+- 期待: 同じsnapshotで、親のみと複数Macの結果（jobの成否、テスト数、成果物）が一致する。実行時間が準備・転送・資源待ち・計算・回収に分けて記録され、分散の実益（または、小さいjobは転送で遅いこと）が数字で分かる。目標の負荷が1台に集中したままなら、完成としない。
+- 利用者の操作: 対象プロジェクトの指定（公開の文書には書かない）。
+
+**M07 — A45: Linuxのworker。**
+- Mac miniでは確かめない。Linuxの実機は準備しない（承認済み）。Docker（実systemd・実sshd・lingering）での合格（上の「仕様1.5とS26の非実機受入」）を、そのまま維持する。実機の確認が要る範囲（実systemd `--user` の `show` の書式と `enable` の副作用とlinger（R08）、x86_64とarm64の実worker（R12））は、Linux実機が用意できるまで、公開する版の未検証範囲に書く。
+
+**M08 — A46（R10）: 一時workerと `workers forget`。**
+- 手順: miniで `belt worker --ephemeral --cluster <グループID> --name mini-e --key-file <鍵>`（グループIDと鍵の受け渡しは `docs/linux-and-ephemeral-workers.md` に従う）を `nohup` で起動する。親は、miniを指す `ssh` の別名で `belt workers add mini-e --ephemeral --ssh <別名>`。`belt submit -- sleep 300` を置き、親のSSHの転送だけを切り（利用者がminiのネットワークを切る）、`belt show`。その後 `belt workers forget mini-e`。さらに、miniで `kill -TERM <worker>` して終了の挙動を見る。
+- 期待: 起動ごとに新しいidentityを持ち、トンネル越しのSSHで置ける。切った間のattemptは `unknown` のまま保たれ、再投入されない。`forget` したときだけ `interrupted` に確定してidentityを退役させ、遅れて戻った旧identityは断られる。SIGTERMでは、liveなattemptを止め、stateを消して終了コード0で終わる（PR #130）。残りがあればstateを残して終了コード1。
+- 利用者の操作: miniのネットワークの切断と復旧。実Colabでの受入（R10）は、Mac miniでは代替にならないので、別に行う。
+
+**M09 — A51: 実機間で、どのメンバーからでも投入できる。**
+- 手順: 親で `belt init --name mac`。miniで（`ssh agent@macmini-1.local` の中から）`belt init --name mini`、その後、`belt group join <親のssh宛先>`（miniが親のグループへ入る。両方向を登録する）。両方で `belt group`。親とminiの両方から、ほぼ同時に `belt ci` を出す。
+- 期待: 両方のメンバーのrunが完了する。runの記録は投げたメンバーのDBだけにあり、他のメンバーの `belt ls` には出ない。既にbeltを持つhostへの `workers add` は2つ目のworkerを作らない。
+- 利用者の操作: M00のみ。
+
+**M10 — A53（R66）: 実SSHでの鍵の配布と、remote syncの受入。**
+- 手順（親）: `belt group rotate-key`、`belt group`。miniのresidentを止めた状態で `belt group rotate-key --skip mini`、起動し直して `belt group send-key mini`。`belt group rotate-key --remove mini`（表示される、外したマシンのSSH鍵を消す手順を読む）。R66: `belt workers sync mini --project <dir>`、`belt workers diff mini`。
+- 期待: 鍵が合わない接続は断られる。切り替えの途中のどこで止めても、再実行が続きを行う。`--skip` したメンバーは `send-key` で戻る。`--remove` は、一覧から消し、SSHのアクセスは消さないと表示する。`workers sync` がssh越しに導入し、`diff` が `same` になる。
+- 利用者の操作: `--remove` の後の、miniのSSH鍵の削除。
+
+**M11 — A54: 別マシンの停止。**
+- 手順: 親とminiが同じグループにいる状態（M09）で、miniから `belt submit -- sleep 300` を出す（親のworkerに置かれる）。親で `belt workers stop mini`（拒否される）、`belt workers stop mini --all-submitters`。親が投げたrunを、親の側で `belt show`。miniのresidentを起動し直す。
+- 期待: miniが停止している間、miniが投げたrunだけが進まず、そのattemptはleaseの範囲で続いてから止まる。親が投げたrunは完了する。miniを起動し直すと、同じattemptをadoptして、再spawnしない。`--all-submitters` が無い `stop` は、他のメンバーの仕事を持つマシンでは断られる。
+- 利用者の操作: M00のみ。
+
+### Dockerで代わりにならない、A対応表の外の項目
+
+**M12 — 別マシン間の転送（LAN）。** 手順: M06の `belt ci` の間に `belt top` を見る。大きいsource（数百MiB）のrunを出し、`belt show <run>` の転送の時間と、親とminiのdiskの使用量を控える。期待: 転送で、sourceの再送が再開でき（途中でminiのネットワークを切って戻す）、転送後の整合（digest）が一致する。親と子の性能の違いで、runtimeを同一視しない。利用者の操作: ネットワークの切断と復旧。
+
+**M13 — R14: 実managerでの導入。** 手順: miniに `nodenv`・`rustup`・`mise`・`fvm`・`corepack` のいくつかを入れ、`.nvmrc` などの版指定を持つプロジェクトで、`belt workers diff mini`、`belt workers sync mini --project <dir>`、`belt ci`。期待: `diff` が `auto_installable` と手順を示し、`sync` の後に `same` になる。再同期で追加の導入は0件。networkが無いときは、導入に失敗して理由を示し、成功扱いにしない。利用者の操作: manager自体の導入（Homebrewなど）。
+
+**M14 — R93: native installerとMSRV。** 手順: miniで `rustup toolchain install 1.89`、`cargo +1.89 check --all-targets`（リポジトリ）。製品が呼ぶnative installerがある場合は、その導入を実OSで通す。期待: MSRV 1.89で `check` が通る。installerが、承認なしにlicenseを受け入れず、`sudo` を使わない。利用者の操作: Xcodeなど、利用者が承認する導入。
+
+**M15 — 端末のCtrl-C（`belt exec` の直接実行）。** 手順: 端末で、residentが動いていない状態で `belt exec -- sh -c 'trap "echo got INT" INT; sleep 30'` を実行し、Ctrl-C を1回押す。期待: `got INT` が1回だけ出る（beltが端末のforeground groupにいるときは、SIGINTを転送しない。PR #137・#142、第16章）。`kill -INT <belt>` を別の端末から送ったときは、転送されて1回出る。終了コードは、commandの終わり方に従う（signalで終わったときは128にその番号を足した値）。利用者の操作: 端末でのCtrl-C。
+
+**M16 — launchdが所有するresidentの停止。** 手順: `launchctl kickstart -k gui/$(id -u)/<ラベル>`（ラベルは `launchctl list | grep -i belt` で得る）。走っている仕事があるときの、residentの再起動。期待: supervisorは別processで、residentの再起動の後も同じattemptを追い続ける（第15章）。commandは再実行されない（再spawnは0件）。再起動がcommandへどう伝わったか（続いたか、規則どおり止まったか）を記録する。利用者の操作: M00のみ。
+
+### 終わるとき
+
+- 全項目の結果（合格・不合格・見送り）と、残した証跡のpathを、この節の下に日付つきで書き足す。不合格や見送りは、理由と、公開する版の未検証範囲に書く文言を添える。
+- version 0.1.0 への変更、`cargo publish`、tag、Release は、この試験のあとに行う（上の「実機試験（延期中）で確かめるもの」）。
 
 ## 仕様1.7（第25章: ディスクに残すものと消す時点）の実装
 

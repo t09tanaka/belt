@@ -991,6 +991,7 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 - **identity**: 起動ごとに新しいworker identityを発行する。以前のidentityの再接続として扱わない。親は最後に見たidentityを記録する。同じ名前で別のidentityが接続を試みた場合、利用者が旧identityを `workers forget` するまで新しい接続を拒否する。以前の起動のattemptを新しい起動へ送らない。
 - **到達不能**: 一時workerへ配置したattemptは、接続が切れてもunknownのまま保持する。時間の経過や推測で別workerへ再投入しない（第11章・第12章）。
 - **`workers forget`**: 利用者が `belt workers forget <worker>` で消滅を宣言したときだけ、そのworkerのunknownのattemptをinterruptedに確定し、そのidentityを退役させる。退役したidentityはtombstoneを永続保持し（消す時点は未決。25.16）、遅れて戻った同じidentityは接続させない（親はsubmitもrenewも送らず、退役を通知する。workerはそのメンバーのattemptをすぐに止める。通知が届かなければ、worker側のattemptはleaseが切れて止まる。24.3）。確定したattemptの回収は断念として閉じる（消えたworkerからは回収できない）。確定後の再実行は、プロジェクトの明示retry policyまたは利用者の明示retryによる。forgetは、接続中のworkerや通常のworkerには使えない（拒否する）。forgetが退役させるのはidentityだけで、workerの登録は一覧に残る。登録を一覧から外すのは `group rotate-key --remove` である。
+- **終了のsignal（PR #130）**: 一時workerがSIGTERM・SIGINT・SIGHUPを受けたら、新しい配置を止め、生きているattemptをすべてcancelし（operatorのcancelと同じ経路。各supervisorが自分のcommandを、TERM・猶予・KILLで止める）、supervisorの終了を待ってからstateを消して終了コード0で終わる。待つ間もlinkは保ち、結果は通常の経路で報告する。待つ上限は `term_grace_seconds` に5秒と5秒を足した時間（上限1日）で、残りがあればstateを残し、残ったattemptを表示して終了コード1で終わる。待つ間の2回目のsignalは何も変えない。liveなattemptが無いときと、identityが退役済みのときの終わり方は変わらない（上限と根拠は第16章「signalの送り方と、停止の上限」）。
 
 親が送るバイナリは、workerのOSとarchが親と同じときだけ親自身のものとする。違うときは `--binary <path>` で指定されたbuildを送り、指定が無ければ必要なtarget triple（例: `x86_64-unknown-linux-gnu`）を示して何も送らずに断る。releaseの成果物を自動で取得することはしない。送ったバイナリは、導入・切替の前にworker上で `--version` を実行させ、親と同じversionであることを確かめる。違う場合は送ったcopyを消して断り、導入済みのversionには触れない。
 
@@ -1093,7 +1094,7 @@ residentが動いていないときの `belt exec`（直接実行、第4章）�
 
 - **台帳・scope・policy**: 単独CLIと同じ規則でstate scopeとconfigを決め、同じ台帳（ledger）・lock・履歴を使う。belt用の別の台帳や別のscopeを作らない。同じhostで単独CLIと同時に動かしても、admissionの合計は1つの予算に収まる（A05と同じ考え方）。
 - **待ちと表示**: 待ちの理由、進捗の表示、nestedなlease（`TASK_TRAFFIC_CONTROLLER_LEASE` の継承）の扱いは単独CLIの `exec` と同じとする。表示はstderrに出す。
-- **終了と中断**: commandのexit codeをそのまま返し、signalで終わった場合は128にsignal番号を足した値を返す。Ctrl-Cはcommandのprocess groupへ送り、終了を確かめてから台帳のentryを外す。ただしbeltが端末のforeground process groupにいるとき（`tcgetpgrp(tty) == getpgrp()`）は、SIGINTを子へ転送しない。端末がforeground groupの全員へSIGINTを直接届けるので、転送すると子が2回受けて強制終了と見なし、後始末を飛ばすためである。`kill` で送られたSIGINTは、この場合でも転送する。
+- **終了と中断**: commandのexit codeをそのまま返し、signalで終わった場合は128にsignal番号を足した値を返す。Ctrl-Cは、belt自身のhandlerがcommandのpid1つへ送る（直接実行のcommandはbeltが管理するprocess groupを持たない。下の「signalの送り方と、停止の上限」）。commandが終わるのを待ってから台帳のentryを外す。ただしbeltが端末のforeground process groupにいるとき（`tcgetpgrp(tty) == getpgrp()`）は、SIGINTを子へ転送しない。端末がforeground groupの全員へSIGINTを直接届けるので、転送すると子が2回受けて強制終了と見なし、後始末を飛ばすためである。`kill` で送られたSIGINTは、この場合でも転送する。
 - **直接実行で使えないoption**: `--snapshot`・`--ref`・`--in-place`・`--profile`・`--requires` はrunを要するので、residentが動いていないときは拒否する。拒否の文言はそのoption名を挙げ、residentを起動するか、optionを外すよう案内する。
 - **`--json`**: commandのstdoutをstderrへ流し、stdoutは最後のJSON文書のために空けておく。
 - **nested**: `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` のときはadmissionを取らず、親のleaseを引き継いで実行する。`admit` と `inherit` 以外の値は拒否する。
@@ -1102,6 +1103,39 @@ residentが動いていないときの `belt exec`（直接実行、第4章）�
 - **版の違い**: 単独CLIのtask-traffic-controllerと組み込みcoreの版が違っても、台帳の形式が互換なら共存する。組み込みcoreが読めない台帳の版（新しい単独CLIが書いたもの）は書き換えずに断り、`doctor` が理由を示す。下の「既存stateとの互換」の規則（未修正binaryは不適合）はここでも同じである。
 
 residentが動いているときの `exec` は、自分のlocal workerでも他のworkerでも、attemptのsupervisorが同じ台帳・scopeでadmissionを取る（「登録と終了の順序」）。直接実行・単独CLIは呼び出したshellの環境から、residentは保持したserviceの環境から（22.2）scopeを決める。両者のscopeが同じなら、直接実行と、residentの中のattemptと、単独CLIの3つが同じhostで同時に動いても、予算は1つである。scopeが違えば予算は別になるので、`doctor` がtraffic scopeの比較でその差を示す。
+
+## signalの送り方と、停止の上限
+
+beltがprocessへsignalを送る箇所は、すべて次の規則に従う（第12章の「signalを送る前の確認」は、その上に重ねる判定である）。
+
+**1. 送る関数は2つだけ。** `platform::signal_pid(pid, sig)` と `platform::signal_process_group(pgid, sig)` 以外から、`kill` と `killpg` を呼ばない。`libc::kill`・`libc::killpg` は `clippy.toml` の `disallowed-methods` で禁止し、許可を付けるのはこの2関数の本体だけである。他の箇所が直接呼ぶと `cargo clippy -D warnings` が落ちる。
+
+**2. pid・group番号が1以下のものには、決して送らない。**
+- `signal_pid` は、`pid` が `i32` に収まらないか1以下なら、何もせず `false` を返す。0は自分のgroup、1はinit、`i32::MAX` を超える値は負の `pid_t` になって `kill(-1)`（そのuserの全process）になるからである。送れたとき（zombieへの送信を含む）だけ `true` を返す。
+- `signal_process_group` は、`pgid` が1以下なら、syscallを呼ばずに `Empty` を返す。成功は `Delivered`、権限なし（EPERM）は `Denied`、それ以外（居ない場合を含む）は `Empty` である。signal 0は存在の確認だけに使う。
+- `process_group_of(pid)` は、`pid` が1より大きく、読めたgroupも1より大きいときだけ値を返す。
+- groupへ送るには `signal_process_group` を使う。`-pgid` を `signal_pid` へ渡さない。
+
+**3. 送る相手は、自分が起動したprocessか、identityを確かめたprocessに限る。** 次のどちらかを満たすものだけに送る。(a) 自分が起動して、まだ回収していない子（回収前はpidもgroup番号も再利用されない）。(b) 記録したidentity（pidと開始時刻）と一致することを、送る直前に読み直して確かめたprocess（第12章。resident が張ったSSH子の強制終了も、開始時刻の一致を確かめてから送る）。試験が送る相手も、その試験が起動した子だけである。
+
+**4. process groupの扱い。**
+- commandは専用のprocess group（managedは専用のsession）で起動し、停止はそのgroupへ送る。送る直前に、groupがそのcommandのものであることを毎回確かめ直す（第12章）。
+- 短命の補助process（`gh`・probe・`fast-worktree` など）と、境界つきのgit runnerは、`process_group(0)` で自分のgroupを持たせて起動する。groupへ送ってよいのは、起動の直後に `process_group_of(pid) == pid`（子自身がgroupのleader）と確かめたときだけである。そうでなければ、子のpid1つにだけ送る。leaderを回収する前なら、group番号は再利用されない。
+- 直接実行（`belt exec` でresidentが無いとき）のcommandは、beltが管理するgroupを持たない。belt自身のhandlerは、`signal_pid` でcommandのpid1つにだけ転送する（SIGTERMとSIGHUPは常に、SIGINTは端末のforeground groupにbeltが居ないときだけ。SIGQUITは転送しない）。同じsignalは、handlerと実行ライブラリの回収の片方だけが送る。
+
+**5. 停止の順序と上限。** 段階のあるものはSIGTERMで止めてから、猶予の後にSIGKILLを送る。上限は次のとおりである。
+
+| 停止するもの | 順序と上限 | 根拠 |
+| - | - | - |
+| attemptのcommand（supervisor） | groupへSIGTERM、`term_grace_ms`（既定10秒、`term_grace_seconds`）の後にSIGKILL、その後 `kill_wait_ms` の間groupが空になるのを確かめる（workerの既定は5秒）。確定できなければ、猶予なしでSIGKILLから最大3回やり直す。やり直しの回数は、30秒を `kill_wait_ms` で割った値（最大3回）で、合計は30秒の予算に収まる。各signalの直前にgroupの持ち主を読み直し、不明ならそれ以上送らない | `src/supervisor/stop.rs:150-163`（段階）、`:172-177`（やり直し）、`src/supervisor/spec.rs:21,26`、`src/worker/agent.rs:161-162` |
+| 一時workerの停止（SIGTERM・SIGINT・SIGHUP） | workerは新しい配置を止め、生きているattemptをすべてcancelする。上の supervisor が、それぞれのcommandを止める。待つのは `term_grace_ms` + 5秒 + 5秒の間で、1日で打ち切る。その間に何も残らなければ、stateを消して終了コード0。残れば、stateを残し、残ったattemptを表示して終了コード1。待つ間の2回目のsignalは何も変えない。beltが自分でcommandにSIGKILLを送ることはなく、送るのはsupervisorである | `src/service/worker.rs:362-381`、`src/service/worker/ephemeral/plan.rs:281-288` |
+| 境界つきのgit（refの削除など） | groupへSIGTERM、500ミリ秒の後に、groupへSIGKILL（leaderが先に終わっていても、残りのgroupに送る）、回収。SIGKILLまで要した場合は、自分のrefの `.lock` だけを消す | `src/workspace/git.rs:195,211-245` |
+| 時間切れの補助process（`gh`、fast-worktree、toolchainのprobe・環境報告） | 猶予なしで、自分のgroupへSIGKILLし、回収する。fast-worktreeは、読み手のthreadを2秒だけ待つ | `src/service/github_status.rs:100-115`、`src/workspace/fastwt.rs:38,143-145,175`、`src/toolchain/profile.rs:957-963`、`src/toolchain/envreport.rs:83-88` |
+| resident が張ったSSHの子 | 開始時刻の一致を確かめてから、pid1つにSIGKILL。その後、`IO_TIMEOUT` まで回収を待つ | `src/service/resident/remote.rs:160-168` |
+
+**6. 組み込んだlocal-ci 0.20.0の停止（beltの上限ではなく、ライブラリの挙動）。** CIのstepのcommand: 時間切れまたはcancelでstepのgroupへSIGTERM、10秒後にSIGKILL（200ミリ秒ごとに見る）。`CancelHandle::cancel` は、追跡したgroup（1より大きいものだけ）へSIGTERMを送る。local-ciが起動するgit: SIGTERM、2秒の猶予の後、groupの持ち主の破棄でSIGKILLして回収する。native stepは、登録済みで、leaderの同一性を確かめられたときだけ送る。task-traffic-controller 0.11.0のrunnerは、managed commandのleaderが終わった後に残るgroupとsessionへ、SIGTERM、2秒、SIGKILL、3秒の順で送る。`belt exec` の直接実行のcommandはmanagedではないので、これは適用されない。根拠は、local-ci の `src/exec.rs:1437-1441`、`src/context.rs:47`、`src/source/transfer.rs:174-178`、`src/cleanup.rs:49`、task-traffic-controllerの `src/runner.rs:122-146`。
+
+**7. 既知の制約。** `kill` と `killpg` は、pidを引数に取り、processそのものを指定できない。判定の読み取りからsignalまでの間にpidが再利用される、ごく短い競合は残る（第12章）。leaderを回収する前のgroup、または回収前の子のpidには、この競合は無い。
 
 ## 既存stateとの互換
 
@@ -1327,6 +1361,15 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
 `ci` のtaskも、通常のtaskと同じく、提出時に固定したtoolchain（`FrozenBundle`）を持つ。宣言した版を用意できるworkerが無ければ、そのtaskは配置されない。配置の判断に残る理由の行は、`toolchain <tool>=<version> unavailable` の形（例: `toolchain node=20.0.0 unavailable`）とする。
+
+**`ci` のtaskが固定するtoolchain（PR #135）。** `ci` は、taskごとに1つの束を固定する。プロジェクトの版指定ファイルに、そのtaskが走らせるjobの `setup-*` stepの `*-version` 入力（と `*-version-file` が指すファイル）を足したものである。親とworkerは同じ関数（`ci::toolchains`）で導出する。stepが要件を作るのは、beltが入力を読めるときだけである。
+- 版、範囲、`${{ matrix.<key> }}`（そのtask自身のmatrixの値。脚ごとに別の要件になる）、`${{ env.<NAME> }}`（stepとjobとworkflowの `env:` の順に見つかるリテラル）。`dtolnay/rust-toolchain@1.89` は、`toolchain:` 入力が無ければその版を宣言する。満たせない要件は、既存の拒否・blockedの経路に入る。
+- `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する。解決できなければ何も要求せず、noticeを出す。
+- 読めない入力（`pypy3.10` のような版の文字列、`go.mod`・`pyproject.toml` のような独自形式の版ファイル、captureに無い版ファイル、matrixに無いkey、動的なmatrix、`if:` の付いたsetup step）は、何も要求せずnoticeを出す。noticeは `belt ci` のstderrに `warning:` 行（task、job、stepの `file:line`）で出し、runには保存しない。
+- そのtaskが走らせるjobだけを数える。`if:` の無いsetup stepが要件を作るtoolは、プロジェクトの版ファイルをそのtaskの要件にしない。同じtoolを別の版に固定する `if:` の無いsetup stepが1つのtaskに2つあれば、提出時に `conflicting_versions` で拒否する。reusable workflowとcomposite actionの中は読まない。
+- setup stepが無いtaskの束は、従来と同じである。`exec` はworkflowを読まない。`workers sync --project` は従来どおりで、setup stepが指す独自形式の版ファイルだけを、`warning:` を出して読み飛ばす。
+
+**native toolによる充足（PR #138）。** 管理されたinstall（registry）が満たせない固定した版（registryが無い、非対応、在庫に無い）は、profileのPATHにあるtool自身が、profileのprobeでちょうどその版を報告するときに限り、そのtoolで満たす。何も導入せず、private pathも足さない。activationには、installの領収の代わりに、観測した版とprobeのidentityを記録し、その実行ファイルに結び付ける。後でそのtoolが別の版を報告したworkerは、そのrunの候補から外れる。registryが満たせるときの挙動は変わらない。親は、既存の経路（exactなpin、手元のregistry、workerの提案）で解決できなかった要件について、全制約が親の観測した版を許すとき、その版に固定する（根拠の領域tagは `parent_observed_version_v1`。wire・保存形式は変わらない）。channelとaliasは、観測から解決せず、従来どおり拒否する。native toolを満たせるworkerは候補になり、満たせるworkerが無ければ従来の行 `toolchain <tool>=<version> unavailable` を出す。`exec` と `ci` は同じ経路を使う。
 
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
 
