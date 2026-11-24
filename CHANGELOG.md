@@ -4,6 +4,8 @@
 
 - Add `source::GitOptions` and `source::import_objects_with`, `import_objects_for_with` and `remove_imported_refs_with`, for a caller that holds a lock of its own around these calls. `GitOptions::new().hermetic()` runs Git without the context's `GIT_*` variables (an inherited `GIT_DIR` no longer points Git at another repository), without system or global configuration (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`), without hooks (`core.hooksPath=/dev/null`), and with `GIT_CEILING_DIRECTORIES` at the clone's parent. `.deadline(at)` bounds each Git process. Under these functions each Git process runs in a process group of its own and is ended on the deadline or when the context's `cancel` handle is cancelled: SIGTERM to that group, SIGKILL after two seconds, then it is reaped, and the call fails. No other process or group is signalled. The existing functions are unchanged.
 - The fetch of an import (`import_objects`, `import_objects_for` and the new ones) passes `-c gc.auto=0 -c maintenance.auto=false`. An auto gc could detach and go on packing refs in the clone after the import returned, outside any lock the caller held.
+- The capture's own writes into the private repository, the fetch of HEAD's history and the unpack of staged blobs, pass `-c gc.auto=0 -c maintenance.auto=false` too.
+- A staged capture releases the `flock` on its scratch directory explicitly when it ends. Closing the descriptor alone left the directory locked while a child that any thread of the process had forked in the meantime was still between fork and exec, so the next capture in the same directory could be refused as "in use by another capture".
 
 ## [0.19.0] - 2026-11-23
 
