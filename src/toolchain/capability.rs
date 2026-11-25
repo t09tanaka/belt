@@ -930,6 +930,13 @@ mod tests {
         assert_eq!(unmet, vec![unmet_line(&req.requires[0])]);
         let same = setup_report(&[], vec![rust_at("1.92.0", &["llvm-tools"])]);
         assert!(missing_with_installable(&req, Some(&same), Some(&bundle)).is_empty());
+        // A tool beside it is checked as before, not as a component.
+        let both = setup_req(vec![
+            Requirement::Setup("cargo-x".into()),
+            Requirement::Component("llvm-tools".into()),
+        ]);
+        let with_tool = setup_report(&["cargo-x"], vec![rust_at("1.92.0", &["llvm-tools"])]);
+        assert!(missing_with_installable(&both, Some(&with_tool), Some(&bundle)).is_empty());
         // Unmet already by the plain check: said once.
         let none = setup_report(&[], vec![rust_at("1.92.0", &[])]);
         assert_eq!(

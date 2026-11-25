@@ -300,6 +300,40 @@ mod tests {
         assert!(text.contains("`bad/name` is not a component"), "{text}");
     }
 
+    /// Each leg reads its own matrix value; a value that is no string is an
+    /// expression; the other job and workflow add nothing.
+    #[test]
+    fn a_task_reads_the_steps_of_its_own_jobs_with_its_matrix_values() {
+        const WORKFLOW: &str = "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        tool: [cargo-hack, 7]\n    steps:\n      - uses: taiki-e/install-action@v2\n        with:\n          tool: ${{ matrix.tool }}\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: taiki-e/install-action@just\n";
+        let f = crate::ci::execute::tests::fixture(WORKFLOW);
+        let mut seen = Vec::new();
+        for task in f
+            .plan
+            .tasks
+            .iter()
+            .filter(|t| t.jobs.contains(&"lint".to_string()))
+        {
+            seen.push(of_task(&f.plan, task));
+        }
+        assert_eq!(seen.len(), 2, "{:?}", f.plan.tasks);
+        let hack = SetupTools {
+            requires: vec![Requirement::Setup("cargo-hack".into())],
+            notices: Vec::new(),
+        };
+        assert!(seen.contains(&hack), "{seen:?}");
+        let number = seen.iter().find(|s| *s != &hack).unwrap();
+        assert!(number.requires.is_empty());
+        assert!(number.notices[0].contains("job lint"), "{number:?}");
+        assert!(number.notices[0].contains("is an expression"), "{number:?}");
+        let other = f
+            .plan
+            .tasks
+            .iter()
+            .find(|t| t.jobs.contains(&"other".to_string()));
+        let other = of_task(&f.plan, other.unwrap());
+        assert_eq!(other.requires, vec![Requirement::Setup("just".into())]);
+    }
+
     #[test]
     fn a_tag_with_letters_after_v_is_a_tool_name_and_other_actions_require_nothing() {
         assert!(!names_no_tool("v2x"));
