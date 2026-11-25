@@ -7,6 +7,16 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-26
+
+### Breaking for library users
+
+- `lineage::step` takes a new `gaps: &mut u32` argument (the failed looks in a row so far; start it at 0).
+
+### Fixed
+
+- One look at the process table that could not be believed (the command not listed although it still runs) no longer marks the descendant record truncated for good. Such a look changes nothing; up to `lineage::GAP_LIMIT` (3) of them in a row followed by a good look are taken as a longer pause between looks, which is what they are: a process that leaves the tree between two looks is missed whatever the pause, and the next good look walks the tree again. Before, a single such look made `managed::finish` refuse with "the descendants of the command could not be recorded" and every later `resolve` and reaper pass end "could not be checked", so the entry was never released. A longer gap, or one still open at the last look, still marks the record truncated, and any gap still leaves the record not covering the command's whole life (the hidden-orphan window stays open).
+
 ## [0.11.0] - 2026-11-23
 
 ### Breaking for library users
