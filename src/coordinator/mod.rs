@@ -619,6 +619,9 @@ pub struct Coordinator {
     input_cursor: Mutex<Option<crate::storage::InputCursor>>,
     placement_fence: Arc<tokio::sync::Mutex<()>>,
     fenced: AtomicBool,
+    /// Set when the resident stops: a tick still running finishes the step
+    /// it is in, and starts no submit after it.
+    stopping: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
     unplaceable: Mutex<BTreeSet<TaskId>>,
@@ -689,6 +692,7 @@ impl Coordinator {
             input_cursor: Mutex::default(),
             placement_fence: Arc::default(),
             fenced: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             capacity_refused: Mutex::default(),
             input_missing: Mutex::default(),
@@ -775,6 +779,17 @@ impl Coordinator {
 
     pub fn epoch(&self) -> CoordinatorEpoch {
         self.store.epoch()
+    }
+
+    /// The resident stops: no submit starts after this, neither a new
+    /// placement nor a resend. What is not sent is sent by the next
+    /// coordinator, which follows the attempt again.
+    pub fn stop_submitting(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -1653,6 +1668,8 @@ impl Coordinator {
             // These ask the worker first, and apply what it says themselves.
             Step::Retire => return self.retire(link, &live, report, asked).await,
             Step::Cancel => return self.cancel(link, a, status, report, asked).await,
+            // Not sent while stopping: the next coordinator sends it.
+            Step::Submit if self.stopping() => return Ok(()),
             Step::Submit => return self.submit(link, &live, report, asked).await.map(|_| ()),
             _ => {}
         }
@@ -2285,7 +2302,7 @@ impl Coordinator {
         report: &mut TickReport,
         telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
-        if self.in_trial() {
+        if self.in_trial() || self.stopping() {
             return Ok(());
         }
         self.prune_missing().await?;
@@ -2339,6 +2356,9 @@ impl Coordinator {
         let page_len = queued.len();
         let mut processed = 0;
         for task in queued {
+            if self.stopping() {
+                break;
+            }
             self.join_newcomers(round, report, telemetry).await?;
             let evaluated: Vec<_> = round
                 .open
@@ -3044,7 +3064,9 @@ impl Coordinator {
             cancel_requested: placed.record.cancel_requested_at_ms.is_some(),
             retire_requested: placed.retire_reason.is_some(),
         };
-        if !policy::may_send(facts) {
+        // A placement committed as the resident stops is sent by the next
+        // coordinator, like any placement that was never sent.
+        if !policy::may_send(facts) || self.stopping() {
             return Ok(Sent::Withheld);
         }
         self.submit(link, &placed, report, asked).await
