@@ -1410,7 +1410,7 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 - 範囲と上限: 導入するのは、束がすでに固定した具体版だけで、版を選ぶこと（範囲・channelの解決）には使わない。導入したrootは管理されたinstallのrootと同じ `toolchains/<identity>/` であり、25.7 (b) の規則（参照の無いものを、14日使われないか合計20 GiBを超えたとき古い順に消す）で消える。消すのはbeltが導入したrootだけで、利用者のmise・rustupの版には触れない。
 - 優先: recipe、次にworkerに既にある版（native、検出済みのrustup toolchainとほかの管理ツールの版）、最後にこの導入の順とする。既にある版を導入し直さない。
 - 候補: 導入できるworker（miseまたはrustupがある）は、その版を持たなくても候補になる。配置は既に持つworkerを優先する。見積は、この導入を待つ導入として数える（最後に測ったprofileの報告がその版を持つときは数えない。報告がまだ無ければ数える）。
-- miseが無いworker: その版を持たなければ候補にならず、拒否の文に「this worker has no mise」と導入の方法（`brew install mise`、または公式のinstaller `curl https://mise.run | sh`）を書く。`workers diff` と `doctor` は `mise` の行を出し、無ければ `manual_required` として同じ導入の方法を示す（miseの有無を測っていない古いworkerの報告には行を出さない）。
+- miseが無いworker: その版を持たなければ候補にならず、拒否の文に「this worker has no mise」と導入の方法（`brew install mise`、または公式のinstaller `curl https://mise.run | sh`）を書く。`workers diff` と `doctor` は `mise` の行を出し、無ければ `absent` と同じ導入の方法を示す（失敗にはしない。持つ版は今までどおり使え、`sync` はmiseを導入できないため）（miseの有無を測っていない古いworkerの報告には行を出さない）。
 
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
 

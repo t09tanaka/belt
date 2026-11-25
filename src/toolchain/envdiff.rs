@@ -332,9 +332,11 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
     if let Some(mise) = have.helpers.get("mise") {
         items.push(match mise {
             Some(_) => item("mise", Class::Same, None, Some("present"), None),
+            // Shown with how to get it, never a failure: the worker still
+            // serves the versions it has, and sync cannot install mise.
             None => item(
                 "mise",
-                Class::ManualRequired,
+                Class::Same,
                 None,
                 Some("absent"),
                 Some(format!(
@@ -1068,12 +1070,12 @@ mod tests {
         worker.helpers.insert("mise".into(), None);
         let items = diff(&parent, &worker);
         let row = items.iter().find(|i| i.subject == "mise").unwrap();
-        assert_eq!(row.class, Class::ManualRequired);
+        assert_eq!(row.worker.as_deref(), Some("absent"));
         assert!(row
             .steps
             .as_deref()
             .is_some_and(|s| s.contains("brew install mise")));
-        assert!(!all_same(&items));
+        assert!(all_same(&items));
         worker.helpers.insert("mise".into(), Some("present".into()));
         let row = diff(&parent, &worker)
             .into_iter()
