@@ -471,6 +471,21 @@ pub fn begin<L: Launcher>(
     options: Options,
     clock: &dyn Fn() -> u64,
 ) -> anyhow::Result<Trial> {
+    begin_with(env, current_exe, launcher, options, clock, None)
+}
+
+/// [`begin`], and with `path` the resident also runs with that `PATH` (the
+/// login shell's, `belt upgrade --refresh-env`). The same build with a new
+/// `PATH` is a trial like any other: the guard and the health check apply,
+/// and a rollback restores the previous `PATH` with the kept input.
+pub fn begin_with<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    current_exe: &Path,
+    launcher: &mut L,
+    options: Options,
+    clock: &dyn Fn() -> u64,
+    path: Option<&str>,
+) -> anyhow::Result<Trial> {
     let initial = Paths::resolve_for(env, launcher.backend())?;
     // `init.lock` says nothing: a pass over old versions makes it on a host
     // where `init` never ran. The resident's journal does.
@@ -507,7 +522,18 @@ pub fn begin<L: Launcher>(
         None => lift_orphaned_hold(&paths)?,
     };
     let to = ws::sha256_file(current_exe)?;
-    if to == from.binary_hash {
+    let new_path = path.filter(|p| from.spec.env.get("PATH").map(String::as_str) != Some(*p));
+    if to == from.binary_hash && new_path.is_none() {
+        if path.is_some() {
+            match recovered {
+                Some(note) => anyhow::bail!(
+                    "this machine already runs version {to} with the login shell's PATH; {note}"
+                ),
+                None => anyhow::bail!(
+                    "this machine already runs version {to} with the login shell's PATH; nothing was changed"
+                ),
+            }
+        }
         match recovered {
             Some(note) => anyhow::bail!("this machine already runs version {to}; {note}"),
             None => anyhow::bail!("this machine already runs version {to}"),
@@ -661,6 +687,9 @@ pub fn begin<L: Launcher>(
             control::begin_trial(&paths.worker)?;
         }
         let mut j = retargeted(&paths, &from, &to);
+        if let Some(path) = new_path {
+            j.spec.env.insert("PATH".into(), path.to_string());
+        }
         j.files.retain(|p| p.path != from.spec.executable);
         j.files.push(Proof::read(&j.spec.executable)?);
         put_input(&paths, &j.spec)?;
@@ -746,7 +775,20 @@ pub fn upgrade<L: Launcher>(
     clock: &dyn Fn() -> u64,
     health: &mut dyn FnMut(&Spec, &mut L) -> anyhow::Result<()>,
 ) -> anyhow::Result<Upgraded> {
-    let trial = begin(env, current_exe, launcher, options, clock)?;
+    upgrade_with(env, current_exe, launcher, options, clock, health, None)
+}
+
+/// [`upgrade`] with the `PATH` of [`begin_with`].
+pub fn upgrade_with<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    current_exe: &Path,
+    launcher: &mut L,
+    options: Options,
+    clock: &dyn Fn() -> u64,
+    health: &mut dyn FnMut(&Spec, &mut L) -> anyhow::Result<()>,
+    path: Option<&str>,
+) -> anyhow::Result<Upgraded> {
+    let trial = begin_with(env, current_exe, launcher, options, clock, path)?;
     if let Err(error) = health(&trial.spec, launcher) {
         return Err(trial.abandon(
             launcher,
@@ -1098,7 +1140,7 @@ pub enum Ran {
     /// The named binary ran the upgrade and printed its own answer.
     Delegated(i32),
 }
-pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
+pub fn command(binary: Option<&Path>, refresh_env: bool, json: bool) -> Result<Ran, ApiError> {
     let current = std::env::current_exe()
         .map_err(|_| ApiError::new(ErrorCode::InvalidInput, "cannot locate executable"))?;
     let failure = |e: anyhow::Error| ApiError::new(ErrorCode::Conflict, format!("upgrade: {e:#}"));
@@ -1111,8 +1153,11 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
             if json {
                 command.arg("--json");
             }
+            command.arg("upgrade");
+            if refresh_env {
+                command.arg("--refresh-env");
+            }
             let status = command
-                .arg("upgrade")
                 .status()
                 .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("upgrade: {e}")))?;
             return Ok(Ran::Delegated(status.code().unwrap_or(1)));
@@ -1121,10 +1166,26 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
     let env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
+    // The login shell's PATH, read as `belt workers refresh-env` reads a
+    // worker's: bounded, with only HOME, USER and SHELL.
+    let path = if refresh_env {
+        let login = crate::service::doctor::env_gaps::login_path(
+            &env,
+            &mut crate::service::doctor::SystemRunner::default(),
+        )
+        .ok_or_else(|| {
+            failure(anyhow::anyhow!(
+                "the login shell's PATH could not be read; nothing was changed"
+            ))
+        })?;
+        Some(login)
+    } else {
+        None
+    };
     // Ours while this upgrade runs; an interrupt outside the wait still ends
     // the command at once.
     let interrupt = crate::service::workers::warmup::interrupt::Guard::new();
-    upgrade(
+    upgrade_with(
         &env,
         &current,
         &mut ws::HostLauncher::native(),
@@ -1136,6 +1197,7 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
         },
         &crate::platform::wall_ms,
         &mut checked,
+        path.as_deref(),
     )
     .map(Ran::Here)
     .map_err(failure)
