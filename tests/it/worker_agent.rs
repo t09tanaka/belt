@@ -2658,8 +2658,11 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
         }
     }));
     submit(&c, &a, &p).await;
-    // The first grant runs out during the preparation.
-    std::thread::sleep(Duration::from_millis(4_300));
+    // Half of the first grant passes during the preparation; the renewal
+    // comes in time (a later one is refused: spec 12). A start that read
+    // the new key with the first grant's time would cut the renewed lease
+    // to what is left of the first one, which the end below tells apart.
+    std::thread::sleep(Duration::from_millis(2_000));
     let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 4_000)).await.unwrap() else {
         panic!()
     };
@@ -2675,6 +2678,28 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
     assert_eq!(expired.len(), 1);
     let after = expired[0].at_ms - renewed_at;
     assert!((3_500..6_500).contains(&after), "{after} ms");
+}
+
+/// Spec 12: a supervisor counts the lease from the last grant however late
+/// it looks, so a renewal after that grant ran out is refused and cannot
+/// revive the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_after_the_last_grant_ran_out_is_refused() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 1_000;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(1_300));
+    let e = call(&c, renew_req(&a, 1, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(lines(&marker), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

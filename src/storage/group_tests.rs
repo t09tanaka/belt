@@ -295,7 +295,7 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     // Opening again changes nothing.
     drop((store, member));
     WorkerStore::open(dir.path(), &worker()).unwrap();
-    assert_eq!(version(dir.path()), "7");
+    assert_eq!(version(dir.path()), "8");
 }
 
 struct Two {
