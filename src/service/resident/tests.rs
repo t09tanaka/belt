@@ -2157,6 +2157,7 @@ fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     let ci = TaskSpec {
         ci: Some(crate::coordinator::CiSpec {
             history_keys: Vec::new(),
+            duration_key: None,
             dynamic_origin: false,
             core_outcome: None,
             matrix: None,

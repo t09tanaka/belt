@@ -175,6 +175,7 @@ pub fn task_specs(
                         &demand,
                         &crate::ci::timing::task_scope(plan, &task.id),
                     ),
+                    duration_key: Some(crate::ci::timing::task_scope(plan, &task.id)),
                     dynamic_origin: task.dynamic_matrix,
                     core_outcome: None,
                     matrix: matrix_admission(plan, task)?,

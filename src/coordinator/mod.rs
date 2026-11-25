@@ -239,6 +239,11 @@ pub struct CiSpec {
     /// Planned SDK step identities, in demand order. Old tasks have no samples.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_keys: Vec<Option<crate::ids::Digest>>,
+    /// The job of the plan in its project (`ci::timing::task_scope`): the
+    /// key earlier runs of the same job are found by, to place the longest
+    /// first (spec 配置の手順 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_key: Option<crate::ids::Digest>,
     /// A dynamic origin waits on derived variants and never executes itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dynamic_origin: bool,
@@ -1105,6 +1110,13 @@ impl Coordinator {
             specs.push((task, value));
         }
         self.db(move |s| {
+            let mut specs = specs;
+            let keys = specs
+                .iter()
+                .filter_map(|(_, spec)| policy::duration_key(spec).map(str::to_string))
+                .collect();
+            let since = wall_ms().saturating_sub(crate::storage::DURATION_MAX_AGE_MS);
+            policy::longest_first(&mut specs, &s.ci_job_durations(keys, since)?);
             s.enqueue_guarded(
                 &run_id,
                 Some(&source_id),

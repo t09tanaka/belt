@@ -29,7 +29,7 @@ mod collect;
 mod live_log;
 pub use live_log::{LiveLogTarget, LogProgress};
 mod ci;
-pub use ci::{CiAttempt, CiTaskRow};
+pub use ci::{CiAttempt, CiTaskRow, DURATION_MAX_AGE_MS};
 mod control;
 mod identity;
 pub use identity::Forgotten;

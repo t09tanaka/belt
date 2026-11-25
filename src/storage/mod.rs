@@ -46,7 +46,9 @@ pub use coordinator::{
     PlaceOutcome, Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation,
     RunStanding, Seen, WorkerLoad, PAGE_MAX,
 };
-pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
+pub use coordinator::{
+    CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload, DURATION_MAX_AGE_MS,
+};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use coordinator::{MarkPage, RowsPage, RowsState, ROWS_PER_TRANSACTION};
 pub use db::Db;
