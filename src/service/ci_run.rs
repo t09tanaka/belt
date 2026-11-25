@@ -747,10 +747,26 @@ fn job_report(
                 Err(_) => None,
             },
         };
+        // A task that left no result says why its attempt ended, when its
+        // worker told (the preparation failed).
+        let unrunnable = ci
+            .unrunnable
+            .clone()
+            .or_else(|| match (&result, &row.attempt) {
+                (None, Some(attempt)) => store
+                    .events_of(&attempt.attempt_id, crate::ci::FAILURE_REASON_EVENT)
+                    .ok()
+                    .and_then(|events| {
+                        events
+                            .last()
+                            .and_then(|e| e.payload.get("reason")?.as_str().map(str::to_string))
+                    }),
+                _ => None,
+            });
         lines.extend(lines::row_lines(
             &row.task_id,
             &ci.task.task_id,
-            ci.unrunnable.as_deref(),
+            unrunnable.as_deref(),
             // A task no worker could be placed for failed (spec 22.1).
             ci.core_outcome
                 .as_deref()

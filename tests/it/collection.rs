@@ -258,6 +258,7 @@ impl Worker {
             retired: false,
             log_truncated: false,
             log_dropped_bytes: 0,
+            failure_reason: None,
         }
     }
 

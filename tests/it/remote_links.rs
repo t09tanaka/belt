@@ -1485,7 +1485,7 @@ async fn init_send_key_reconnects_local_worker_without_restarting_resident() {
         })
         .await;
         previous = identity();
-        let Reply::WorkersListed { observations } = client
+        let Reply::WorkersListed { observations, .. } = client
             .request(Operation::ListWorkers {
                 names: vec![spec.worker_id.clone()],
             })

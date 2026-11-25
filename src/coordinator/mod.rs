@@ -387,6 +387,14 @@ impl TickReport {
     }
 }
 
+/// What a worker said about its host: the cores and memory of `workers` and
+/// `top`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct WorkerResources {
+    pub cpu_cores: Option<u32>,
+    pub memory_bytes: Option<u64>,
+}
+
 /// A worker that answered `inspect` in this tick.
 struct Reached {
     capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
@@ -562,6 +570,8 @@ pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
+    /// Cores and memory each worker last reported at `inspect`.
+    resources: Mutex<BTreeMap<WorkerId, WorkerResources>>,
     /// The submits on their way: no acknowledgement or release of them is
     /// sent until they are answered (spec 25.6 (c)).
     submits: Arc<release::InFlight>,
@@ -652,6 +662,7 @@ impl Coordinator {
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
+            resources: Mutex::default(),
             submits: Arc::default(),
             unreleased_due: Mutex::default(),
             unreleased_after: Mutex::default(),
@@ -1339,6 +1350,18 @@ impl Coordinator {
             return Ok((None, report));
         }
         self.mark_silent(&worker_id, false);
+        if let Some(c) = &inspected.capabilities {
+            self.resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    worker_id.clone(),
+                    WorkerResources {
+                        cpu_cores: c.cpu_cores,
+                        memory_bytes: c.memory_bytes,
+                    },
+                );
+        }
         let reached = Reached {
             capabilities: inspected.capabilities,
             worker_id,
@@ -1454,6 +1477,16 @@ impl Coordinator {
         let rec = self
             .db(move |s| s.record_seen(&a, true, Some(seen), Observation::Known, wall_ms()))
             .await?;
+        if let Some(why) = &status.failure_reason {
+            // The reason the worker gives stays here, where `ci` reads it.
+            let why = crate::worker::agent::bounded_reason(why);
+            self.note(
+                &rec.attempt_id,
+                crate::ci::FAILURE_REASON_EVENT,
+                json!({ "reason": why }),
+            )
+            .await?;
+        }
         if rec.state == AttemptState::Terminal {
             report.settled.push(rec.attempt_id);
         }

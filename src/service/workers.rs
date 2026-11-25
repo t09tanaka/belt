@@ -2179,11 +2179,35 @@ pub(super) fn observed_connections(
     spec: &Spec,
     names: Vec<WorkerId>,
 ) -> Result<Option<WorkerConnections>, ApiError> {
+    Ok(observed_listing(spec, names)?.map(|(connections, _)| connections))
+}
+
+/// The cores and memory each worker last reported to the coordinator.
+pub(super) type WorkerResourceMap = BTreeMap<WorkerId, crate::coordinator::WorkerResources>;
+
+pub(super) fn observed_listing(
+    spec: &Spec,
+    names: Vec<WorkerId>,
+) -> Result<Option<(WorkerConnections, WorkerResourceMap)>, ApiError> {
     match resident_request(spec, super::resident::Operation::ListWorkers { names }) {
-        Ok(super::resident::Reply::WorkersListed { observations }) => Ok(Some(observations)),
+        Ok(super::resident::Reply::WorkersListed {
+            observations,
+            resources,
+        }) => Ok(Some((observations, resources))),
         Ok(super::resident::Reply::ControlError { error }) => Err(error),
         _ => Ok(None),
     }
+}
+
+/// `8 cores, 16 GiB`; `-` for what the worker did not report.
+pub(super) fn describe_resources(r: Option<&crate::coordinator::WorkerResources>) -> String {
+    let cores = r
+        .and_then(|r| r.cpu_cores)
+        .map_or("-".to_string(), |c| format!("{c} cores"));
+    let memory = r
+        .and_then(|r| r.memory_bytes)
+        .map_or("-".to_string(), |b| format!("{} GiB", b / (1 << 30)));
+    format!("{cores}, {memory}")
 }
 
 /// List registrations even when no resident is running. Only a resident
@@ -2201,7 +2225,7 @@ pub fn list_command(json: bool) -> i32 {
             None
         } else {
             match super::context::runtime_spec(&env) {
-                Ok(spec) => observed_connections(&spec, ids)?,
+                Ok(spec) => observed_listing(&spec, ids)?,
                 Err(e) if e.code == ErrorCode::NotFound => None,
                 Err(e) => return Err(e),
             }
@@ -2210,7 +2234,8 @@ pub fn list_command(json: bool) -> i32 {
         let mut rows = Vec::new();
         for entry in entries {
             let key = WorkerId::parse(&entry.id).map_err(|e| invalid(e.to_string()))?;
-            let observed = observations.as_ref().and_then(|m| m.get(&key));
+            let observed = observations.as_ref().and_then(|(m, _)| m.get(&key));
+            let resources = observations.as_ref().and_then(|(_, r)| r.get(&key));
             let connection = match observed {
                 Some((true, _)) => "connected",
                 Some((false, _)) => "disconnected",
@@ -2223,16 +2248,19 @@ pub fn list_command(json: bool) -> i32 {
                 "persistent"
             };
             text.push(format!(
-                "{}  {}  {}  {}  {}",
+                "{}  {}  {}  {}  {}  {}",
                 entry.id,
                 entry.ssh,
                 kind,
                 connection,
-                identity.unwrap_or("-")
+                identity.unwrap_or("-"),
+                describe_resources(resources)
             ));
             rows.push(
                 serde_json::json!({"id":entry.id, "ssh":entry.ssh, "ephemeral":entry.ephemeral,
-                "connection":connection, "identity":identity}),
+                "connection":connection, "identity":identity,
+                "cpu_cores":resources.and_then(|r| r.cpu_cores),
+                "memory_bytes":resources.and_then(|r| r.memory_bytes)}),
             );
         }
         if text.is_empty() {

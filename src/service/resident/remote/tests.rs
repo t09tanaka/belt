@@ -657,7 +657,10 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
                 })
                 .await
                 .unwrap();
-            let Reply::WorkersListed { mut observations } = reply else {
+            let Reply::WorkersListed {
+                mut observations, ..
+            } = reply
+            else {
                 panic!("{reply:?}")
             };
             observations.remove(&id).unwrap()

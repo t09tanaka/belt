@@ -2092,6 +2092,25 @@ async fn a_secret_file_declared_as_an_artifact_starts_no_command_when_the_source
     let failed = f.store().events_of(&a, "agent_prepare_failed").unwrap();
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].payload["code"], "INVALID_INPUT");
+    // The status says why no command started.
+    let Response::GetAttempt(status) = call(
+        &c,
+        Request::GetAttempt(GetAttemptRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    let why = status.failure_reason.expect("a reason");
+    assert!(
+        why.starts_with("agent_prepare_failed: INVALID_INPUT "),
+        "{why}"
+    );
+    assert!(why.chars().count() <= belt::wire::FAILURE_REASON_MAX);
 
     // A source that never came: the declarations cannot be told from its
     // secret files, and nothing is started either.

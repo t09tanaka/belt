@@ -164,6 +164,8 @@ pub enum Reply {
     },
     WorkersListed {
         observations: BTreeMap<WorkerId, (bool, Option<String>)>,
+        #[serde(default)]
+        resources: BTreeMap<WorkerId, crate::coordinator::WorkerResources>,
     },
     WorkersReloaded {
         /// The workers this request started dialing.
@@ -1496,7 +1498,10 @@ async fn handle(
     }
     if let Operation::ListWorkers { names } = &request.operation {
         let reply = match coordinator.worker_observations(names.clone()).await {
-            Ok(observations) => Reply::WorkersListed { observations },
+            Ok(observations) => Reply::WorkersListed {
+                observations,
+                resources: coordinator.worker_resources(),
+            },
             Err(error) => Reply::ControlError {
                 error: crate::error::ApiError::new(
                     crate::error::ErrorCode::Internal,

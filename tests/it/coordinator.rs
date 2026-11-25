@@ -310,6 +310,12 @@ impl FakeWorker {
             retired: h.retired,
             log_truncated: false,
             log_dropped_bytes: 0,
+            // A failed attempt whose command never started says why.
+            failure_reason: (h.state == AttemptState::Terminal
+                && h.launches == 0
+                && h.termination
+                    .is_some_and(|t| t.outcome() == Outcome::Failed))
+            .then(|| "agent_prepare_failed: BLOCKED node: command not found".to_string()),
         }
     }
 
@@ -1685,6 +1691,28 @@ async fn a_stop_whose_ending_is_not_known_frees_nothing() {
 }
 
 #[tokio::test]
+async fn the_reason_a_worker_gives_for_an_unstarted_failed_attempt_is_kept_once() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 1).await;
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    a.finish(&first.attempt_id, Outcome::Failed);
+    c.tick().await.unwrap();
+    c.tick().await.unwrap();
+    let kept = c
+        .store()
+        .events_of(&first.attempt_id, belt::ci::FAILURE_REASON_EVENT)
+        .unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        kept[0].payload["reason"],
+        "agent_prepare_failed: BLOCKED node: command not found"
+    );
+}
+
+#[tokio::test]
 async fn a_cancel_while_a_retire_is_pending_settles_the_attempt_cancelled() {
     // The cancel before or after the retire request: the same end.
     for cancel_first in [false, true] {
@@ -2746,6 +2774,8 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
             rustup: Vec::new(),
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
         })
     });
     let c = f.open(&[&old, &capable]);

@@ -506,6 +506,8 @@ mod tests {
         let mut report = WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
             schema_version: 1,
             os: "linux".into(),
             arch: "aarch64".into(),
@@ -805,6 +807,8 @@ mod tests {
         WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
             schema_version: 1,
             os: "linux".into(),
             arch: "aarch64".into(),

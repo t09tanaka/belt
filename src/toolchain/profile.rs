@@ -586,6 +586,8 @@ impl Profile {
         let report = WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: host_cores(),
+            memory_bytes: host_memory_bytes(),
             schema_version: 1,
             os,
             arch,
@@ -1322,6 +1324,51 @@ fn patient(profile: Profile) -> Profile {
         probe_timeout: Duration::from_secs(2),
         ..profile
     }
+}
+
+/// Logical CPU cores of this host, when the platform says.
+pub(crate) fn host_cores() -> Option<u32> {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u32::try_from(n.get()).ok())
+}
+
+/// Physical memory of this host in bytes, read once: `sysctlbyname(hw.memsize)`
+/// on macOS, `MemTotal` of `/proc/meminfo` elsewhere. None when unreadable.
+pub(crate) fn host_memory_bytes() -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            let mut size: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            // SAFETY: `size` and `len` are valid for the 8 bytes the kernel
+            // writes for `hw.memsize`; the name is a NUL-terminated literal.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"hw.memsize".as_ptr(),
+                    (&raw mut size).cast(),
+                    &raw mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            (rc == 0 && size > 0).then_some(size)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let kib: u64 = text
+                .lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))?
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse()
+                .ok()?;
+            kib.checked_mul(1024)
+        }
+    })
 }
 
 #[cfg(test)]

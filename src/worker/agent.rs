@@ -413,6 +413,17 @@ fn now() -> u64 {
     platform::wall_ms()
 }
 
+/// `text` on one line, cut at [`crate::wire::FAILURE_REASON_MAX`] characters.
+pub(crate) fn bounded_reason(text: &str) -> String {
+    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max = crate::wire::FAILURE_REASON_MAX;
+    if one.chars().count() <= max {
+        return one;
+    }
+    let cut: String = one.chars().take(max - 3).collect();
+    format!("{cut}...")
+}
+
 fn failed() -> Termination {
     Termination::new(Outcome::Failed, None, None).expect("failed without an exit is valid")
 }
@@ -3456,6 +3467,25 @@ impl Agent {
         })
     }
 
+    /// Why a terminal attempt whose command never started ended: what the
+    /// preparation said, bounded.
+    fn failure_reason(&self, rec: &AcceptedAttempt) -> Option<String> {
+        if rec.state != AttemptState::Terminal || rec.receipts.at_ms(Receipt::Running).is_some() {
+            return None;
+        }
+        let events = self
+            .store
+            .events_of(&rec.attempt_id, "agent_prepare_failed")
+            .ok()?;
+        let payload = &events.last()?.payload;
+        let field = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
+        Some(bounded_reason(&format!(
+            "agent_prepare_failed: {} {}",
+            field("code"),
+            field("message")
+        )))
+    }
+
     fn status(&self, rec: &AcceptedAttempt) -> Result<AttemptStatus, ApiError> {
         let a = &rec.attempt_id;
         let out = self.store.log_position(a, "stdout").map_err(api)?;
@@ -3481,6 +3511,7 @@ impl Agent {
             retired: rec.retired,
             log_truncated: dropped > 0,
             log_dropped_bytes: dropped,
+            failure_reason: self.failure_reason(rec),
         })
     }
 
@@ -3899,6 +3930,7 @@ impl Agent {
             retired: false,
             log_truncated: false,
             log_dropped_bytes: 0,
+            failure_reason: None,
         })
     }
 

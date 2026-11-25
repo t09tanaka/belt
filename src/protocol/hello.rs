@@ -422,6 +422,8 @@ mod tests {
         id.capabilities = Some(WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
             schema_version: 1,
             os: "macos".into(),
             arch: "aarch64".into(),

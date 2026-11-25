@@ -1238,7 +1238,15 @@ pub struct AttemptStatus {
     pub log_truncated: bool,
     #[serde(default)]
     pub log_dropped_bytes: u64,
+    /// Why the attempt ended without its command starting (the worker's
+    /// `agent_prepare_failed`: code and message), at most
+    /// [`FAILURE_REASON_MAX`] characters. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
+
+/// The bound of [`AttemptStatus::failure_reason`], in characters.
+pub const FAILURE_REASON_MAX: usize = 400;
 
 impl AttemptStatus {
     /// `state` is `Terminal` if and only if `termination` is present.
@@ -2234,6 +2242,7 @@ mod tests {
             retired: false,
             log_truncated: true,
             log_dropped_bytes: 9,
+            failure_reason: None,
         }
     }
 
