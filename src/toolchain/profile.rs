@@ -541,10 +541,27 @@ impl Profile {
     /// and is measured again in the background. Without one, or after drift,
     /// it is measured now (at most the startup bound).
     pub(crate) fn measured_profile(&self) -> (WorkerCapabilities, Vec<String>) {
+        self.from_measurement(false)
+    }
+    /// What admission and toolchain activation check a task against: the
+    /// same measured profile, so a task's start probes no tool. It is
+    /// measured again now, with the startup bounds, only on a drift signal
+    /// (a tool file or the rustup toolchains changed) or once it is
+    /// [`RESOLUTION_REFRESH`] old. A real version change is therefore still
+    /// seen; a tool whose calls all ran out of time keeps the version
+    /// measured before.
+    pub(crate) fn accepted_profile(&self) -> (WorkerCapabilities, Vec<String>) {
+        self.from_measurement(true)
+    }
+    /// `measured_profile`, or with `stale_now` the `accepted_profile`.
+    fn from_measurement(&self, stale_now: bool) -> (WorkerCapabilities, Vec<String>) {
         let current = self.drift_identity();
         let cached = self.resolution.lock().ok().and_then(|slot| slot.clone());
         match cached {
-            Some(cached) if cached.files == current => {
+            Some(cached)
+                if cached.files == current
+                    && !(stale_now && cached.measured.elapsed() >= RESOLUTION_REFRESH) =>
+            {
                 if cached.measured.elapsed() >= RESOLUTION_REFRESH
                     && !self.refreshing.swap(true, Ordering::SeqCst)
                 {
@@ -561,16 +578,6 @@ impl Profile {
                 (measured.report, measured.held)
             }
         }
-    }
-    /// What admission and toolchain activation check a task against,
-    /// measured now with the startup bounds: a probe that runs late is
-    /// called again (at most 5s + 14 calls x 300ms), and a tool whose calls
-    /// all ran out of time keeps the version measured before. A failing,
-    /// absent or changed tool is reported as it is now. Also refreshes what
-    /// toolchain questions are answered from.
-    pub(crate) fn checked_report(&self) -> (WorkerCapabilities, Vec<String>) {
-        let (_, checked) = self.remeasure();
-        (checked.report, checked.held)
     }
     /// The published measurement, and what toolchain questions are
     /// answered from.
@@ -1839,6 +1846,49 @@ mod tests {
         let (report, _) = profile.measured_profile();
         assert!(
             matches!(&report.tools["node"], ToolObservation::Available { version, .. } if version == "v23.0.0")
+        );
+    }
+    /// A task's acceptance checks against the measured profile: no probe
+    /// while the tool files are unchanged and the profile is fresh; a
+    /// changed file, or a profile older than the bound, is measured again
+    /// before the answer, so a real version change is still seen.
+    #[test]
+    fn acceptance_probes_only_on_drift_or_once_the_profile_is_old() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let node =
+            |version: &str| format!("echo x >> '{}'; printf '{version}\\n'", calls.display());
+        fake(dir.path(), "node", &node("v22.0.0"), 0o700);
+        let profile = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        profile.startup_report();
+        let count = || fs::read_to_string(&calls).unwrap().lines().count();
+        let measured = count();
+        let version = |report: &WorkerCapabilities| match &report.tools["node"] {
+            ToolObservation::Available { version, .. } => version.clone(),
+            other => panic!("node is {other:?}"),
+        };
+        for _ in 0..3 {
+            assert_eq!(version(&profile.accepted_profile().0), "v22.0.0");
+        }
+        assert_eq!(count(), measured, "an acceptance probed node");
+        fake(dir.path(), "node", &node("v23.0.0"), 0o700);
+        assert_eq!(version(&profile.accepted_profile().0), "v23.0.0");
+        let after_drift = count();
+        assert!(after_drift > measured, "a changed node was not measured");
+        let old = Instant::now()
+            .checked_sub(RESOLUTION_REFRESH + Duration::from_secs(1))
+            .expect("the clock is past the bound");
+        profile
+            .resolution
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .measured = old;
+        profile.accepted_profile();
+        assert!(
+            count() > after_drift,
+            "an old profile was not measured again"
         );
     }
     #[test]
