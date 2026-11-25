@@ -231,6 +231,7 @@ fn recover_using(
             by_identity,
             "not held".into(),
             hidden,
+            None,
         );
     }
     let reason =
@@ -616,5 +617,59 @@ mod tests {
         let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert!(os.signals.borrow().is_empty());
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
+    }
+
+    #[test]
+    fn an_unresolved_event_names_the_failing_check_within_a_bound() {
+        let f = fx();
+        let short = "belt-x-0: the command's session still has members";
+        unresolved_report(
+            &f.store,
+            &f.spec.attempt_id,
+            &["n".into()],
+            "why".into(),
+            false,
+            "not held".into(),
+            Vec::new(),
+            Some(short),
+        )
+        .unwrap();
+        let long = "é".repeat(crate::supervisor::run::UNRESOLVED_DETAIL_MAX);
+        unresolved_report(
+            &f.store,
+            &f.spec.attempt_id,
+            &["n".into()],
+            "why".into(),
+            false,
+            "not held".into(),
+            Vec::new(),
+            Some(&long),
+        )
+        .unwrap();
+        unresolved_report(
+            &f.store,
+            &f.spec.attempt_id,
+            &["n".into()],
+            "why".into(),
+            false,
+            "not held".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let ev = f
+            .store
+            .events_of(&f.spec.attempt_id, "supervisor_unresolved")
+            .unwrap();
+        assert_eq!(ev.len(), 3);
+        assert_eq!(ev[0].payload["detail"], json!(short));
+        let cut = ev[1].payload["detail"].as_str().unwrap();
+        assert!(cut.ends_with('…') && cut.starts_with("éé"), "{cut}");
+        assert!(
+            cut.len() <= crate::supervisor::run::UNRESOLVED_DETAIL_MAX + '…'.len_utf8(),
+            "{}",
+            cut.len()
+        );
+        assert_eq!(ev[2].payload["detail"], serde_json::Value::Null);
     }
 }

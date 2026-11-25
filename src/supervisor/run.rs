@@ -203,8 +203,27 @@ pub(crate) fn hidden_suspects_json(ctx: &Context, id: &str) -> Vec<serde_json::V
         .collect()
 }
 
+/// The most of a failing check's text kept in a `supervisor_unresolved`
+/// event (bytes, cut on a character boundary).
+pub(crate) const UNRESOLVED_DETAIL_MAX: usize = 1024;
+
+/// `text` cut to [`UNRESOLVED_DETAIL_MAX`] bytes, with "…" when it was cut.
+pub(crate) fn bounded_detail(text: &str) -> String {
+    if text.len() <= UNRESOLVED_DETAIL_MAX {
+        return text.to_string();
+    }
+    let mut end = UNRESOLVED_DETAIL_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// The report for an attempt that cannot be settled, after recording why
-/// (and for which nodes) in the worker database.
+/// (and for which nodes) in the worker database. `detail`: the text of the
+/// check that failed (task-traffic-controller's `finish` error), when one
+/// did; it is kept bounded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unresolved_report(
     store: &WorkerStore,
     attempt: &crate::ids::AttemptId,
@@ -213,6 +232,7 @@ pub(crate) fn unresolved_report(
     identity_unknown: bool,
     sleep_inhibit: String,
     hidden_suspects: Vec<serde_json::Value>,
+    detail: Option<&str>,
 ) -> Result<Report> {
     if let Some(a) = store.get(attempt)? {
         store.append_event(
@@ -224,6 +244,7 @@ pub(crate) fn unresolved_report(
                 "nodes": nodes,
                 "identity_unknown": identity_unknown,
                 "hidden_suspects": hidden_suspects,
+                "detail": detail.map(bounded_detail),
             }),
             platform::wall_ms(),
         )?;
@@ -804,6 +825,9 @@ pub(super) struct Control<'a> {
     /// A file that gets a copy of the masked output of the node being run
     /// (the step log of a CI task); `None` for a command of `exec`.
     pub(super) tee: Option<std::fs::File>,
+    /// Why task-traffic-controller's `finish` last refused to settle a node
+    /// (for the `supervisor_unresolved` event).
+    finish_error: Option<String>,
 }
 
 /// Notify only after a new grant was accepted by the clock. Diagnostics are
@@ -1234,7 +1258,11 @@ impl Control<'_> {
             (_, Some(Exit::Signal(signal))) => TerminalKind::Signaled { signal },
             (_, None) => TerminalKind::SpawnFailed,
         };
-        let confirmed = managed::finish(&self.traffic.ctx, guard, kind).is_ok();
+        let finished = managed::finish(&self.traffic.ctx, guard, kind);
+        if let Err(e) = &finished {
+            self.finish_error = Some(e.to_string());
+        }
+        let confirmed = finished.is_ok();
         if confirmed && reason.is_none() && exit == Some(Exit::Code(0)) {
             if let Ok(ran) = &ran {
                 if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
@@ -1654,6 +1682,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
         tee: None,
+        finish_error: None,
     };
     let mut end = NodeEnd {
         reason: None,
@@ -1693,6 +1722,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
             end.identity_unknown,
             sleep_inhibit,
             Vec::new(),
+            ctl.finish_error.as_deref(),
         );
     }
     // The heartbeat that would have recorded a reader error may not have got
