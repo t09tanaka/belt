@@ -109,7 +109,7 @@ async fn submit_command(
         }
         context.config.source_mode.value = crate::config::model::SourceMode::Worktree;
     }
-    let requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+    let mut requirements = crate::toolchain::capability::ExecutionRequirements::parse(
         context.config.profile.value.clone(),
         &context.config.requires.value,
     )
@@ -136,8 +136,16 @@ async fn submit_command(
     let cwd = String::from_utf8(captured.manifest.cwd_relative.0.clone())
         .map_err(|e| invalid(e.to_string()))?;
     let freeze_state = context.state_dir().to_owned();
-    let resolution_guard = tokio::task::spawn_blocking(move || {
-        crate::source::SourceStore::open_foreground(&freeze_state).map(|(_source, guard)| guard)
+    let prepare_manifest = (!in_place).then(|| (context.clone(), run_id.clone()));
+    let (resolution_guard, prepare) = tokio::task::spawn_blocking(move || {
+        crate::source::SourceStore::open_foreground(&freeze_state).map(|(source, guard)| {
+            let prepare = prepare_manifest.map(|(context, run_id)| {
+                let manifest =
+                    super::input::source_manifest(&context, &run_id).map_err(|e| e.message)?;
+                crate::toolchain::snapshot::read_captured_prepare_tools(&source, &manifest)
+            });
+            (guard, prepare)
+        })
     })
     .await
     .map_err(|e| invalid(e.to_string()))?
@@ -148,6 +156,12 @@ async fn submit_command(
             invalid(error.to_string())
         }
     })?;
+    // An `--in-place` workspace is the caller's own and is not prepared.
+    if let Some(prepare) = prepare {
+        let prepare = prepare
+            .map_err(|e| invalid(format!("cannot read how the workspace is prepared: {e}")))?;
+        requirements = super::ci_run::run_requirements(requirements, &prepare)?;
+    }
     let toolchains = freeze_resolved(
         &context,
         &owner,
@@ -772,7 +786,8 @@ fn prepare(
     )
     .map_err(blocked)?;
     let generic = requirements.requires.iter().filter_map(|r| match r {
-        crate::toolchain::capability::Requirement::Tool(name) => Some(name.clone()),
+        crate::toolchain::capability::Requirement::Tool(name)
+        | crate::toolchain::capability::Requirement::Prepare(name) => Some(name.clone()),
         _ => None,
     });
     let required = profile
