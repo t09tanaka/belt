@@ -157,6 +157,7 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
     let log = fs::File::create(dir.join(LOG))?;
     let exe = crate::util::helper_exe()?;
     let mut c = Command::new(exe);
+    crate::util::apply_env(&mut c);
     c.arg("install")
         .arg("--root")
         .arg(root)

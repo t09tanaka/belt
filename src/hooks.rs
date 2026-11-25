@@ -417,6 +417,7 @@ pub fn run(cfg: &Config, stage: Stage, worktree: &Path, main_checkout: &Path) ->
             .stdin(Stdio::null())
             .env("FAST_WORKTREE_PATH", worktree)
             .env("FAST_WORKTREE_MAIN", main_checkout);
+        util::apply_env(&mut c);
         if let Some(p) = path_with(extra_path) {
             c.env("PATH", p);
         }
@@ -442,7 +443,7 @@ pub fn run(cfg: &Config, stage: Stage, worktree: &Path, main_checkout: &Path) ->
 /// `requires` found in `~/.cargo/bin` is also found by the hook's shell.
 fn path_with(dir: Option<PathBuf>) -> Option<std::ffi::OsString> {
     let dir = dir?;
-    let current = env::var_os("PATH").unwrap_or_default();
+    let current = util::env_var("PATH").unwrap_or_default();
     if env::split_paths(&current).any(|p| p == dir) {
         return None;
     }

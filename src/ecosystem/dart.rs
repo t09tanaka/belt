@@ -135,12 +135,12 @@ impl Preset for Dart {
 /// `key_commands` say more.
 fn target_key(ctx: &Ctx, t: &Target) -> Result<String, String> {
     let project = super::project_path(&ctx.root, &t.dir);
-    if t.key_is_lockfile_only() && t.key_commands.is_empty() {
+    if t.key_is_lockfile_only() && t.key_commands.is_empty() && util::key_identity().is_none() {
         let lockfile = fs::read(project.join(LOCKFILE)).map_err(|e| format!("{LOCKFILE}: {e}"))?;
         return Ok(key(&lockfile));
     }
     let files = super::key_digest(&ctx.root, &t.key)?;
-    let outputs = super::command_outputs(&project, &t.key_commands, &ctx.root, &ctx.main)?;
+    let outputs = super::key_outputs(&project, &t.key_commands, &ctx.root, &ctx.main)?;
     let mut h = Sha256::new();
     h.update(files);
     h.update(super::outputs_digest(&outputs));
@@ -295,6 +295,7 @@ fn install(project: &Path, dir: &str, mode: Mode, get: &Get, key: &str) -> Resul
 /// `<tool> pub get [--offline]`. Its output is shown only when it fails.
 fn pub_get(tool: &Path, project: &Path, offline: bool) -> Result<(), String> {
     let mut c = Command::new(tool);
+    util::apply_env(&mut c);
     c.args(["pub", "get"]);
     if offline {
         c.arg("--offline");

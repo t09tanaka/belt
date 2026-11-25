@@ -114,6 +114,7 @@ mod trash;
 mod util;
 
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -243,6 +244,7 @@ pub struct Repository {
     main: PathBuf,
     output: Output,
     helper: Option<PathBuf>,
+    tools: util::Tools,
 }
 
 /// Where a new worktree starts.
@@ -478,6 +480,7 @@ impl Repository {
             main,
             output: Output::Inherit,
             helper: util::find_tool("fast-worktree"),
+            tools: util::Tools::default(),
         })
     }
 
@@ -494,6 +497,34 @@ impl Repository {
     /// with `with_helper(None)` and call [`Self::fill_pool`] themselves.
     pub fn with_helper(mut self, exe: Option<PathBuf>) -> Self {
         self.helper = exe;
+        self
+    }
+
+    /// Variables (`PATH` among them) set, over the process environment, on
+    /// every command a call runs: the `key_commands` (such as `node -v`),
+    /// the installs, the hooks and the helper processes. Tools named by
+    /// `PATH`, such as `npm` and `flutter`, are looked up on this `PATH`.
+    /// For a caller that activates a toolchain per call. Replaces what an
+    /// earlier call of this method set.
+    pub fn with_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.tools.env = vars
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    /// An identity of the toolchain that [`Self::with_env`] activates (for
+    /// example `node=22.11.0`), made part of every cache key next to the
+    /// `key_commands` outputs, so that caches made with different toolchains
+    /// never mix. `None` (the default) leaves the keys as the CLI makes them;
+    /// the CLI reads the same from `FAST_WORKTREE_KEY_IDENTITY`.
+    pub fn with_tool_identity(mut self, identity: Option<String>) -> Self {
+        self.tools.identity = identity.filter(|i| !i.is_empty());
         self
     }
 
@@ -524,7 +555,7 @@ impl Repository {
                 }))
             }
         };
-        let value = util::with_context(sink, self.helper.clone(), f);
+        let value = util::with_tools(sink, self.helper.clone(), self.tools.clone(), f);
         let log = log.take();
         (value, log)
     }

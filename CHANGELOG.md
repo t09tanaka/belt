@@ -7,6 +7,21 @@ change bumps the minor version).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-25
+
+### Added
+
+- `Repository::with_env`: variables (`PATH` among them) that every command
+  of a library call runs with, over the process environment: the
+  `key_commands`, the installs, the hooks and the helper processes; `npm`,
+  `dart` and `flutter` and a hook's `requires` are looked up on that
+  `PATH`. For a caller that activates a toolchain per call.
+- `Repository::with_tool_identity`: an identity of the toolchain that is
+  part of every cache key, next to the `key_commands` outputs, so that
+  trees made with different toolchains never mix. The command reads the
+  same from `FAST_WORKTREE_KEY_IDENTITY`, and the library hands it to its
+  helper processes that way. Unset, the keys are as before.
+
 ## [0.7.0] - 2026-11-23
 
 ### Changed

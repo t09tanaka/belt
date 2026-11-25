@@ -357,6 +357,7 @@ fn try_spawn_fill(main: &Path, pool: &Path, after: Option<&Path>) -> io::Result<
         .open(&log_path)?;
     let exe = util::helper_exe()?;
     let mut c = Command::new(exe);
+    util::apply_env(&mut c);
     c.args(["pool", "fill"]);
     if let Some(a) = after {
         c.arg("--after").arg(a);
