@@ -52,7 +52,7 @@ async fn a_retry_of_a_job_is_refused_when_the_job_that_needs_it_ended_with_the_e
     let (root, spec, input) = control_fixture();
     let marks = ci_project(root.path(), &input, &jobs(":"));
     start_resident(&spec).await;
-    let out = ci_command(&spec, &input).output().await.unwrap();
+    let out = ci_out(&spec, &input).await;
     assert!(out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
@@ -137,12 +137,26 @@ struct Failed {
     store: CoordinatorStore,
 }
 
+/// `belt ci` in `input`, bounded like `bootstrap::ci_output`: a run that
+/// never ends fails here instead of keeping the test binary waiting.
+async fn ci_out(
+    spec: &belt::service::bootstrap::Spec,
+    input: &std::path::Path,
+) -> std::process::Output {
+    let mut command = ci_command(spec, input);
+    command.kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(240), command.output()).await {
+        Ok(output) => output.unwrap(),
+        Err(elapsed) => panic!("ci did not end: {elapsed}"),
+    }
+}
+
 /// The run of `failing_jobs` ended: `a` failed, `b` and `c` were skipped.
 async fn failed_run(passes_at: u32) -> Failed {
     let (root, spec, input) = control_fixture();
     let marks = ci_project(root.path(), &input, &failing_jobs(passes_at));
     start_resident(&spec).await;
-    let out = ci_command(&spec, &input).output().await.unwrap();
+    let out = ci_out(&spec, &input).await;
     assert!(!out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
@@ -233,7 +247,7 @@ async fn a_job_whose_steps_were_all_skipped_by_their_own_if_is_a_job_that_ran() 
     let (root, spec, input) = control_fixture();
     let marks = ci_project(root.path(), &input, STEPS_SKIPPED);
     start_resident(&spec).await;
-    let out = ci_command(&spec, &input).output().await.unwrap();
+    let out = ci_out(&spec, &input).await;
     assert!(out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
