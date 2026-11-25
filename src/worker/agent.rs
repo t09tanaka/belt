@@ -4174,10 +4174,10 @@ impl Agent {
         self.capabilities_with_diagnostic().ok().flatten()
     }
     /// The report admission and toolchain activation check a task against
-    /// ([`crate::toolchain::profile::Profile::checked_report`]): a probe that
-    /// runs late on a loaded host is called again within the startup bound,
-    /// and one that still gives no answer keeps the version measured before;
-    /// it is never taken for a mismatch. A real version change still is one.
+    /// ([`crate::toolchain::profile::Profile::accepted_profile`]): the
+    /// measured profile, measured again only on a drift signal or once it is
+    /// old. A probe that runs late keeps the version measured before; it is
+    /// never taken for a mismatch. A real version change still is one.
     fn measured_with_diagnostic(
         &self,
     ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
@@ -4213,10 +4213,10 @@ impl Agent {
         let spawned = std::thread::Builder::new()
             .name("profile-probe".into())
             .spawn(move || {
-                let _ = send.send(theirs.checked_report());
+                let _ = send.send(theirs.accepted_profile());
             });
         if spawned.is_err() {
-            return Ok(profile.checked_report());
+            return Ok(profile.accepted_profile());
         }
         loop {
             match receive.recv_timeout(STOP_LOOK) {
