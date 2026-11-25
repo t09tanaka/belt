@@ -632,7 +632,7 @@ async fn failed_child_and_interrupted_startup_do_not_keep_startup_lock() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     waiting.abort();
     assert!(waiting.await.err().unwrap().is_cancelled());
-    drop(lock);
+    lock.unlock().unwrap();
     let client = ensure(spec).await.unwrap();
     shutdown(&client).await;
 }
@@ -1707,7 +1707,7 @@ async fn an_interrupt_after_the_capture_began_always_sends_the_cancel() {
     lock.lock().unwrap();
     let holder = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(3));
-        drop(lock);
+        lock.unlock().unwrap();
     });
     let report =
         control::stop_submission(&context, &run, &mut signals, Duration::from_secs(30)).await;

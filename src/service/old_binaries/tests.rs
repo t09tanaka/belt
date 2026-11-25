@@ -400,7 +400,7 @@ fn a_pass_concurrent_with_a_placement_never_removes_the_placed_version() {
                 format!("{{\"binary_hash\":\"{digest}\"}}"),
             )
             .unwrap();
-            drop(held);
+            held.unlock().unwrap();
             assert!(dir.join("belt").exists(), "{digest}");
         }
     });
