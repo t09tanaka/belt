@@ -228,6 +228,7 @@ pub fn sh(cwd: &Path, cmd: &str, root: &Path, main: &Path) -> Command {
         .stdin(Stdio::null())
         .env("FAST_WORKTREE_PATH", root)
         .env("FAST_WORKTREE_MAIN", main);
+    crate::util::apply_env(&mut c);
     c
 }
 
@@ -287,6 +288,22 @@ pub fn command_outputs(
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         })
         .collect()
+}
+
+/// What a cache key takes from the toolchain: the [`command_outputs`] of
+/// the `key_commands`, then the toolchain identity the embedding program
+/// set, if any, so that caches made with different toolchains never mix.
+pub fn key_outputs(
+    cwd: &Path,
+    cmds: &[String],
+    root: &Path,
+    main: &Path,
+) -> std::result::Result<Vec<String>, String> {
+    let mut outputs = command_outputs(cwd, cmds, root, main)?;
+    if let Some(id) = crate::util::key_identity() {
+        outputs.push(id);
+    }
+    Ok(outputs)
 }
 
 /// The sha256 of the files `key` (relative to `root`), each with its path

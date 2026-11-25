@@ -145,8 +145,9 @@ pub fn install_projects(
                 .enumerate()
                 .filter(|(_, p)| p.has_preset() == phase)
                 .map(|(i, p)| {
-                    let ctx = &ctx;
-                    (i, s.spawn(move || p.preset.install(ctx, p, mode)))
+                    let (ctx, tools) = (&ctx, util::tools());
+                    let install = move || p.preset.install(ctx, p, mode);
+                    (i, s.spawn(move || util::in_tools(tools, install)))
                 })
                 .collect();
             for (i, h) in handles {

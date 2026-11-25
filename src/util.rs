@@ -2,7 +2,9 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -120,13 +122,39 @@ struct Context {
     exe: Option<PathBuf>,
 }
 
+/// The environment of the tools that one library call runs (key commands,
+/// installs, hooks, helper processes), set by the embedding program.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tools {
+    /// Variables set on every command, over the process environment
+    /// (`PATH` among them).
+    pub env: Vec<(OsString, OsString)>,
+    /// An identity of the toolchain, part of every cache key.
+    pub identity: Option<String>,
+}
+
+/// The variable that hands [`Tools::identity`] to a helper process; the
+/// CLI also reads it.
+pub const KEY_IDENTITY_VAR: &str = "FAST_WORKTREE_KEY_IDENTITY";
+
 thread_local! {
     static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    static TOOLS: RefCell<Tools> = RefCell::new(Tools::default());
 }
 
 /// Run `f` with the output of this thread sent to `sink`, and `exe` as the
 /// helper executable. Nests; the previous context is restored.
 pub fn with_context<T>(sink: Option<Sink>, exe: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+    with_tools(sink, exe, Tools::default(), f)
+}
+
+/// [`with_context`], with `tools` for the commands that `f` runs.
+pub fn with_tools<T>(
+    sink: Option<Sink>,
+    exe: Option<PathBuf>,
+    tools: Tools,
+    f: impl FnOnce() -> T,
+) -> T {
     let prev = CONTEXT.with(|c| c.borrow_mut().replace(Context { sink, exe }));
     struct Restore(Option<Context>);
     impl Drop for Restore {
@@ -136,6 +164,27 @@ pub fn with_context<T>(sink: Option<Sink>, exe: Option<PathBuf>, f: impl FnOnce(
         }
     }
     let _restore = Restore(prev);
+    in_tools(tools, f)
+}
+
+/// This thread's [`Tools`], to hand to a thread it starts ([`in_tools`]).
+pub fn tools() -> Tools {
+    TOOLS.with(|t| t.borrow().clone())
+}
+
+/// Run `f` with `tools` for the commands it runs; the previous ones are
+/// restored. For threads that a call starts.
+pub fn in_tools<T>(tools: Tools, f: impl FnOnce() -> T) -> T {
+    let prev = TOOLS.with(|t| t.replace(tools));
+    struct Restore(Option<Tools>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                TOOLS.with(|t| *t.borrow_mut() = prev);
+            }
+        }
+    }
+    let _restore = Restore(Some(prev));
     f()
 }
 
@@ -149,6 +198,43 @@ fn to_sink(stream: Stream, s: &str) -> bool {
         }
         _ => false,
     })
+}
+
+/// The variable `name` as the commands see it: the context's value, else
+/// the process's.
+pub fn env_var(name: &str) -> Option<OsString> {
+    let set = TOOLS.with(|t| {
+        t.borrow()
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    });
+    set.or_else(|| env::var_os(name))
+}
+
+/// Set the context's variables on `c`; for a helper process also the
+/// toolchain identity, so that its keys are the same.
+pub fn apply_env(c: &mut Command) -> &mut Command {
+    TOOLS.with(|t| {
+        let t = t.borrow();
+        for (k, v) in &t.env {
+            c.env(k, v);
+        }
+        if let Some(id) = &t.identity {
+            c.env(KEY_IDENTITY_VAR, id);
+        }
+    });
+    c
+}
+
+/// The toolchain identity that goes into every cache key: the context's,
+/// else a non-empty `FAST_WORKTREE_KEY_IDENTITY`; `None` for neither.
+pub fn key_identity() -> Option<String> {
+    TOOLS
+        .with(|t| t.borrow().identity.clone())
+        .or_else(|| env::var(KEY_IDENTITY_VAR).ok().filter(|v| !v.is_empty()))
 }
 
 /// The executable that runs `pool fill` and `install --changed` detached:
@@ -266,7 +352,7 @@ fn tilde_with(path: &Path, home: &Path) -> String {
 /// Find an executable on `PATH`, then in `~/.cargo/bin` (where `cargo
 /// install` puts tools even when that directory is not on `PATH`).
 pub fn find_tool(name: &str) -> Option<PathBuf> {
-    find_tool_in(name, env::var_os("PATH").as_deref(), &home())
+    find_tool_in(name, env_var("PATH").as_deref(), &home())
 }
 
 fn find_tool_in(name: &str, path: Option<&std::ffi::OsStr>, home: &Path) -> Option<PathBuf> {

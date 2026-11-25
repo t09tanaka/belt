@@ -110,7 +110,7 @@ pub fn key(root: &Path, main: &Path, t: &Target) -> Result<String, String> {
 }
 
 fn outputs(root: &Path, main: &Path, t: &Target) -> Result<Vec<String>, String> {
-    super::command_outputs(
+    super::key_outputs(
         &super::project_path(root, &t.dir),
         &t.key_commands,
         root,

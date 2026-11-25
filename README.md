@@ -1408,7 +1408,7 @@ on the same repository and state directories at the same time.
 ```toml
 [dependencies]
 # `default-features = false` leaves the command-line parser (clap) out.
-fast-worktree = { version = "0.7", default-features = false }
+fast-worktree = { version = "0.8", default-features = false }
 ```
 
 ```rust
@@ -1448,6 +1448,15 @@ let cfg = repo.config()?;
   `fast-worktree pool fill`; the library does so with the `fast-worktree`
   executable it finds on `PATH` or in `~/.cargo/bin` (or `with_helper`),
   and does not refill without one.
+- `Repository::with_env` gives the commands of every call (the
+  `key_commands` such as `node -v`, the installs, the hooks and the
+  background helper) variables over the process environment, `PATH` among
+  them, for a caller that activates a toolchain per call. The key commands
+  then report that toolchain, so it is in the cache keys already;
+  `Repository::with_tool_identity` adds an identity of its own to every
+  key (as `FAST_WORKTREE_KEY_IDENTITY` does for the command), so that
+  trees made with different toolchains are never cloned into each other.
+  Without either, keys are what they were.
 - Errors are one `Error` enum (`Refused`, `BranchNotMerged`, `Config`, `Git`,
   `Io`, `Failed`). Progress lines go where `Output` says: the terminal (as the
   command), nowhere, or the `log` of the result.

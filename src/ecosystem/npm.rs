@@ -202,7 +202,7 @@ pub fn fingerprint(outputs: &[String]) -> String {
 /// first part hashes them all.
 fn target_key(ctx: &Ctx, t: &Target, lockfile: &[u8]) -> Result<(String, String), String> {
     let project = super::project_path(&ctx.root, &t.dir);
-    let outputs = super::command_outputs(&project, &t.key_commands, &ctx.root, &ctx.main)?;
+    let outputs = super::key_outputs(&project, &t.key_commands, &ctx.root, &ctx.main)?;
     let fp = fingerprint(&outputs);
     let key = if t.key_is_lockfile_only() {
         cache_key(lockfile, &fp)
@@ -319,7 +319,7 @@ impl DonorProbe for FsProbe<'_> {
     }
     fn fingerprint(&self, project: &Path) -> Option<String> {
         let wt = self.worktree_of(project);
-        super::command_outputs(project, &self.t.key_commands, wt, self.main)
+        super::key_outputs(project, &self.t.key_commands, wt, self.main)
             .ok()
             .map(|o| fingerprint(&o))
     }
@@ -870,6 +870,7 @@ fn delta(
 fn npm_output(project: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     output_retrying_config_lock(|| {
         let mut c = Command::new("npm");
+        util::apply_env(&mut c);
         c.args(args)
             .args(NPM_FLAGS)
             .current_dir(project)
@@ -1026,7 +1027,7 @@ fn run_install_scripts(
 /// or the environment): then `npm ci` runs no script, and neither does
 /// fast-worktree in its place.
 fn ignore_scripts(project: &Path) -> bool {
-    Command::new("npm")
+    util::apply_env(&mut Command::new("npm"))
         .args(["config", "get", "ignore-scripts"])
         .current_dir(project)
         .stdin(Stdio::null())
@@ -1064,6 +1065,7 @@ fn run_scripts(
         take(waited);
         let out = output_retrying_config_lock(|| {
             let mut c = Command::new("npm");
+            util::apply_env(&mut c);
             c.arg("rebuild")
                 .args(&scripts.rebuild)
                 .current_dir(project)
@@ -1095,6 +1097,7 @@ fn run_scripts(
         // `postinstall`, which run on their own turn).
         let out = output_retrying_config_lock(|| {
             let mut c = Command::new("npm");
+            util::apply_env(&mut c);
             c.args(["run", script, "--ignore-scripts"])
                 .current_dir(project)
                 .stdin(Stdio::null())
