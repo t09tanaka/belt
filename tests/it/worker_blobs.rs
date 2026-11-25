@@ -412,8 +412,20 @@ impl Host for RealButCore {
     fn sweep_workspaces(&self, h: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
         self.0.sweep_workspaces(h)
     }
-    fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
-        self.0.prepare(a, p)
+    fn prepare(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+        t: Option<&belt::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
+        self.0.prepare(a, p, t)
+    }
+    fn check_toolchain_source(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+    ) -> Result<(), ApiError> {
+        self.0.check_toolchain_source(a, p)
     }
     fn hold_source(&self) -> Result<Option<belt::source::retention::Guard>, ApiError> {
         self.0.hold_source()

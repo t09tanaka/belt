@@ -871,7 +871,8 @@ impl Coordinator {
 
     /// Whether some attached worker reports every tool the workspace's
     /// preparation runs (the [`Requirement::Prepare`] of `requirements`,
-    /// spec 22.1). The refusal names what each asked worker lacks, as
+    /// spec 22.1) on its bare PATH. The submit leaves out the tools the
+    /// resolved toolchains of every task serve. The refusal names what each asked worker lacks, as
     /// placement would. Read-only: the same worker cap, deadline and fence
     /// checks as [`Self::resolve_toolchains`].
     ///

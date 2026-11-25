@@ -130,6 +130,8 @@ impl Machine {
             pins: self.pins.clone(),
             store: self.store.clone(),
             workspaces: Workspaces::new(self.state_dir.clone(), self.env.clone(), self.fw.clone()),
+            state_dir: self.state_dir.clone(),
+            env: self.env.clone(),
         };
         self.setups = Some(Setups::open(cfg, Arc::new(ws))?);
         Ok(self)
@@ -229,6 +231,17 @@ pub fn check_toolchain_source(
 /// shared lock, so its blob reads (which only try the lock) wait for a
 /// deleting pass's step too (spec 25.8 5b (a)) instead of failing as an
 /// invalid bundle.
+/// The workspaces whose preparation runs with `toolchain` activated
+/// (spec 22.1); Git keeps the worker's own environment `env`.
+fn prepared_with(
+    state_dir: &Path,
+    env: &BTreeMap<String, String>,
+    toolchain: &super::host::PrepareToolchain,
+) -> Workspaces {
+    let fw = CliFastWorktree::new(toolchain.environment(env));
+    Workspaces::new(state_dir.to_path_buf(), env.clone(), Arc::new(fw))
+}
+
 fn check_toolchain_waiting(
     store: &SourceStore,
     state_dir: &Path,
@@ -306,10 +319,21 @@ struct BuilderWs {
     pins: SourcePins,
     store: SourceStore,
     workspaces: Workspaces,
+    state_dir: PathBuf,
+    env: BTreeMap<String, String>,
 }
 
 impl BuilderWorkspaces for BuilderWs {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
+        self.create_with(attempt, payload, None)
+    }
+
+    fn create_with(
+        &self,
+        attempt: &AttemptId,
+        payload: &AttemptPayload,
+        toolchain: Option<&super::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
         let m = manifest_in(&self.store, payload, Wait::Yes, None)?;
         // (the builder's thread is not joined by the attempt's release: it
         // pins the source for as long as it makes the workspace)
@@ -318,8 +342,17 @@ impl BuilderWorkspaces for BuilderWs {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
         };
-        self.workspaces
-            .create(attempt, &self.store, &m, repo.as_ref())
+        match toolchain {
+            None => self
+                .workspaces
+                .create(attempt, &self.store, &m, repo.as_ref()),
+            Some(t) => prepared_with(&self.state_dir, &self.env, t).create(
+                attempt,
+                &self.store,
+                &m,
+                repo.as_ref(),
+            ),
+        }
     }
 
     fn remove(&self, ws: &Workspace) -> Result<(), ApiError> {
@@ -464,10 +497,24 @@ impl Host for Machine {
         }
     }
 
+    fn check_toolchain_source(
+        &self,
+        attempt: &AcceptedAttempt,
+        payload: &AttemptPayload,
+    ) -> Result<(), ApiError> {
+        if payload.toolchains.is_none() {
+            return Ok(());
+        }
+        let m = self.manifest(attempt)?;
+        let _pin = pin(&self.pins, &self.store, &m)?;
+        check_toolchain_waiting(&self.store, &self.state_dir, &m, payload)
+    }
+
     fn prepare(
         &self,
         attempt: &AcceptedAttempt,
         payload: &AttemptPayload,
+        toolchain: Option<&super::host::PrepareToolchain>,
     ) -> Result<Workspace, ApiError> {
         if let Some(why) = crate::workspace::embedded::incompatible_registry(&self.env) {
             return Err(ApiError::blocked(
@@ -492,8 +539,17 @@ impl Host for Machine {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
         };
-        self.workspaces
-            .create(&attempt.attempt_id, &self.store, &m, repo.as_ref())
+        match toolchain {
+            None => self
+                .workspaces
+                .create(&attempt.attempt_id, &self.store, &m, repo.as_ref()),
+            Some(t) => prepared_with(&self.state_dir, &self.env, t).create(
+                &attempt.attempt_id,
+                &self.store,
+                &m,
+                repo.as_ref(),
+            ),
+        }
     }
 
     fn setup_poll(
@@ -692,6 +748,35 @@ mod tests {
     use super::*;
     use crate::ids::{Digest, Generation, RunId, SourceId, TaskId};
     use std::time::{Duration, Instant};
+
+    /// Preparation runs on the activation's PATH, keeps the worker's other
+    /// variables, and carries the activated tools' identity: two toolchains
+    /// give fast-worktree two cache keys (spec 22.1).
+    #[test]
+    fn preparation_runs_with_the_activation_and_its_identity() {
+        let own: BTreeMap<String, String> = [
+            ("HOME", "/h"),
+            ("PATH", "/usr/bin"),
+            ("NPM_CONFIG_CACHE", "/c"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let toolchain = |node: &str, id: &str| crate::worker::host::PrepareToolchain {
+            env: [("PATH".to_string(), format!("/t/bin:{node}:/usr/bin"))].into(),
+            identity: id.into(),
+        };
+        let a = toolchain("/m/node20/bin", "sha256:a").environment(&own);
+        let b = toolchain("/m/node22/bin", "sha256:b").environment(&own);
+        assert_eq!(a["PATH"], "/t/bin:/m/node20/bin:/usr/bin");
+        assert_eq!(a["HOME"], "/h");
+        assert_eq!(a["NPM_CONFIG_CACHE"], "/c");
+        assert_eq!(a["FAST_WORKTREE_KEY_IDENTITY"], "sha256:a");
+        assert_ne!(
+            a["FAST_WORKTREE_KEY_IDENTITY"],
+            b["FAST_WORKTREE_KEY_IDENTITY"]
+        );
+    }
 
     fn payload() -> AttemptPayload {
         let d = Digest::of_bytes(b"x");

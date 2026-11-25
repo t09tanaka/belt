@@ -602,9 +602,9 @@ dependencies = [
 
 [[package]]
 name = "fast-worktree"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0eb672e46608aa503af947add945656c9f933a32b73e2c5296ee09b9db09d8b2"
+checksum = "bf8d21008ee622f034d69854fa1587c840ecc2036f0cd17c5a0432120c570dfa"
 dependencies = [
  "clap",
  "globset",
