@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-26
+
 ### Fixed
 
 - A gap in the descendant record (failed looks at the process table, see 0.12.0) is now closed only by a look that lists the command alive. Before, any non-empty look closed it, including the final look after the command was reaped, which cannot show the table is complete: a recorded process missed before the gap and again by that look was dropped and the record ended "complete". A gap still open when the command ends now marks the record truncated, as in 0.11.0.
