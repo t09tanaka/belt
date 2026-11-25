@@ -372,7 +372,7 @@ fn stop_failure(live: Option<u32>, error: anyhow::Error) -> anyhow::Error {
 
 /// Stop the service of the version the journal names. It is booted out only
 /// after no attempt is live; a state that cannot be told stops nothing.
-fn retire<L: Launcher>(
+pub(super) fn retire<L: Launcher>(
     paths: &Paths,
     journal: &Journal,
     receipt: &macos::Receipt,

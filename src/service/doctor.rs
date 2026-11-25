@@ -154,6 +154,14 @@ pub struct HostFacts {
     /// the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lock_problem: Option<String>,
+    /// The service's `PATH` against the login shell's. `None`: the host
+    /// predates the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_path: Option<env_gaps::PathFacts>,
+    /// The macOS linker against the SDK it links against. `None`: not macOS,
+    /// or the host predates the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_linker: Option<env_gaps::ToolchainFacts>,
 }
 
 /// Abandoned token roots, their memberships, and the bytes of the files
@@ -462,6 +470,8 @@ pub fn gather(
         linger: None,
         abandoned_imports: abandoned_imports(worker_state),
         source_lock_problem: crate::source::retention::mutation_lock_problem(worker_state),
+        service_path: None,
+        macos_linker: None,
     }
 }
 
@@ -759,6 +769,19 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             ),
         ));
     }
+    if let Some(path) = &facts.service_path {
+        let fix = if host == "parent" {
+            "this machine's service keeps the PATH `belt init` recorded, and belt has no command to recapture it yet".to_string()
+        } else {
+            format!(
+                "run `belt workers refresh-env {host}` to recapture the PATH from the login shell"
+            )
+        };
+        out.extend(env_gaps::path_checks(host, path, &fix));
+    }
+    if let Some(linker) = &facts.macos_linker {
+        out.extend(env_gaps::toolchain_checks(host, linker));
+    }
     out
 }
 
@@ -867,6 +890,10 @@ pub fn host_main() -> i32 {
         |(status, state, service_env, recorded)| {
             let mut runner = SystemRunner::default();
             let mut facts = gather(&state, &service_env, &recorded, &mut runner);
+            facts.service_path = Some(env_gaps::path_facts(&env, &service_env, &mut runner));
+            if cfg!(target_os = "macos") {
+                facts.macos_linker = Some(env_gaps::toolchain_facts(&service_env, &mut runner));
+            }
             if !status.system_user {
                 facts.linger = linger_fact(
                     backend,
@@ -1398,6 +1425,15 @@ pub fn run(
             runner,
         );
     }
+    if retained {
+        local.service_path = Some(env_gaps::path_facts(env, &spec.env, runner));
+    }
+    if cfg!(target_os = "macos") {
+        local.macos_linker = Some(env_gaps::toolchain_facts(
+            if retained { &spec.env } else { env },
+            runner,
+        ));
+    }
     checks.extend(evaluate("parent", &local));
     checks.extend(direct_checks(env, &local.worker_scope));
     checks.extend(capture_checks(spec));
@@ -1761,6 +1797,7 @@ pub fn command(json: bool) -> i32 {
     }
 }
 
+pub mod env_gaps;
 pub mod linger;
 pub use linger::Linger;
 

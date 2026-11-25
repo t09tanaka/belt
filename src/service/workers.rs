@@ -523,6 +523,8 @@ pub enum Lifecycle {
     },
     Drain,
     Resume,
+    /// Recapture the service's `PATH` from the login shell and restart.
+    RefreshEnv,
 }
 impl Lifecycle {
     fn action(self) -> &'static str {
@@ -531,6 +533,7 @@ impl Lifecycle {
             Lifecycle::Stop { .. } => "stop",
             Lifecycle::Drain => "drain",
             Lifecycle::Resume => "resume",
+            Lifecycle::RefreshEnv => "refresh-env",
         }
     }
 }
@@ -1328,6 +1331,9 @@ fn check_outcome(action: Lifecycle, status: &Status) -> Result<(), ApiError> {
         }
         Lifecycle::Drain if !status.draining => unmet("the worker is not draining"),
         Lifecycle::Resume if status.draining => unmet("the worker is still draining"),
+        Lifecycle::RefreshEnv if status.loaded != Some(true) => {
+            unmet("the service is not loaded again")
+        }
         _ => Ok(()),
     }
 }
@@ -1343,6 +1349,9 @@ pub fn describe(name: &str, action: Lifecycle, status: &Status) -> String {
         Lifecycle::Stop { .. } => format!("worker {name} stopped"),
         Lifecycle::Drain => format!("worker {name} draining"),
         Lifecycle::Resume => format!("worker {name} resumed"),
+        Lifecycle::RefreshEnv => {
+            format!("worker {name} restarted with the PATH of its login shell")
+        }
     }
 }
 
@@ -1399,7 +1408,7 @@ pub fn lifecycle(
         .ok()
         .map(|store| store.coordinator_id().clone());
     let timeout = match action {
-        Lifecycle::Stop { .. } => Duration::from_secs(wait + 120),
+        Lifecycle::Stop { .. } | Lifecycle::RefreshEnv => Duration::from_secs(wait + 120),
         _ => Duration::from_secs(120),
     };
     let out = remote
@@ -2367,6 +2376,11 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         WorkersSub::Drain { name } => {
             (name, Lifecycle::Drain, lifecycle_of(name, Lifecycle::Drain))
         }
+        WorkersSub::RefreshEnv { name } => (
+            name,
+            Lifecycle::RefreshEnv,
+            lifecycle_of(name, Lifecycle::RefreshEnv),
+        ),
         WorkersSub::Resume { name } => (
             name,
             Lifecycle::Resume,

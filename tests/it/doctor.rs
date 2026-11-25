@@ -311,6 +311,8 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
             linger: None,
             abandoned_imports: None,
             source_lock_problem: None,
+            service_path: None,
+            macos_linker: None,
         },
     }});
     // No machine that runs this test is this platform.
