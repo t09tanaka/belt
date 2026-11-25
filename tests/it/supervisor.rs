@@ -65,6 +65,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
     store
         .submit(
             NewAcceptance {
+                lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
                 task_id: TaskId::generate(),
@@ -198,6 +199,7 @@ impl Fx {
         self.store
             .submit(
                 NewAcceptance {
+                    lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                     attempt_id: attempt.clone(),
                     run_id: first.run_id,
                     task_id: first.task_id,
@@ -999,7 +1001,7 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
                 &attempt,
                 key(seq),
                 platform::wall_ms(),
-                platform::monotonic_ms(),
+                belt::storage::GrantStamp::now(),
             ) {
                 errors.push(format!("renewal {seq}: {e}"));
             }
@@ -1025,7 +1027,7 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
             f.attempt(),
             key(next),
             platform::wall_ms(),
-            platform::monotonic_ms(),
+            belt::storage::GrantStamp::now(),
         )
         .unwrap_err();
     assert!(matches!(err, StorageError::LeaseNotRenewable(_)), "{err:?}");
@@ -1057,7 +1059,7 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
                 &attempt,
                 key(seq),
                 platform::wall_ms(),
-                platform::monotonic_ms(),
+                belt::storage::GrantStamp::now(),
             ) {
                 Ok(_) => {
                     longest = longest.max(last.elapsed());
@@ -1097,7 +1099,7 @@ fn a_replayed_renewal_does_not_extend_the_lease() {
                 &attempt,
                 key(1),
                 platform::wall_ms(),
-                platform::monotonic_ms(),
+                belt::storage::GrantStamp::now(),
             ) {
                 extended += 1;
             }
@@ -1262,7 +1264,7 @@ fn a_seed_measured_before_a_renewal_does_not_shorten_that_renewal() {
             f.attempt(),
             key(1),
             platform::wall_ms(),
-            platform::monotonic_ms(),
+            belt::storage::GrantStamp::now(),
         )
         .unwrap();
     f.spec.lease_seed = Some(LeaseSeed {

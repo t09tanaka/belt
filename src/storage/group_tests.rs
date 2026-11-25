@@ -19,6 +19,7 @@ fn hash(c: char) -> PayloadHash {
 
 fn acceptance(a: &AttemptId, task: &TaskId, h: char, epoch: u64) -> NewAcceptance {
     NewAcceptance {
+        lease: Some(crate::storage::AcceptedLease::now(3_600_000, 1)),
         attempt_id: a.clone(),
         run_id: RunId::generate(),
         task_id: task.clone(),
@@ -346,7 +347,7 @@ fn a_member_reaches_only_its_own_attempts_and_the_worker_finds_any_by_id() {
                 lease_seq: 1,
             },
             6,
-            6,
+            GrantStamp::now(),
         )
         .err()
         .unwrap(),
@@ -444,7 +445,8 @@ fn the_coordinator_epoch_is_each_members_own() {
         lease_seq: s,
     };
     assert_eq!(
-        t.b.renew_lease(&x, key(2, 1), 4, 4).unwrap(),
+        t.b.renew_lease(&x, key(2, 1), 4, GrantStamp::now())
+            .unwrap(),
         LeaseOutcome::Extended
     );
     assert_eq!(t.b.lease(&x).unwrap().unwrap().0, key(2, 1));

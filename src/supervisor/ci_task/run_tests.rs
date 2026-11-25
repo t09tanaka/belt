@@ -53,6 +53,7 @@ impl Sup {
         self.store
             .submit(
                 NewAcceptance {
+                    lease: Some(crate::storage::AcceptedLease::now(3_600_000, 1)),
                     attempt_id: attempt.clone(),
                     run_id: RunId::generate(),
                     task_id: TaskId::generate(),
@@ -395,7 +396,7 @@ fn renew_until(s: &Sup, spec: &SuperviseSpec, stop: &AtomicBool) {
             &spec.attempt_id,
             key,
             10 + seq,
-            crate::platform::monotonic_ms(),
+            crate::storage::GrantStamp::now(),
         );
         seq += 1;
         std::thread::sleep(Duration::from_millis(100));

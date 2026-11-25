@@ -810,6 +810,8 @@ pub(super) struct Control<'a> {
     store: &'a WorkerStore,
     traffic: Traffic,
     lease: LeaseClock,
+    /// This boot: only a grant stamped in it is counted from its time.
+    boot: Option<String>,
     started_ms: u64,
     spool: &'a AttemptSpool,
     masker: Masker,
@@ -880,10 +882,11 @@ impl Control<'_> {
                 "attempt {attempt} vanished"
             )));
         };
-        let (key, granted, db_expired) = match self.store.lease_grant(attempt)? {
-            Some((k, g, e)) => (Some(k), g, e),
-            None => (None, None, false),
-        };
+        let (key, granted, db_expired) =
+            match self.store.lease_grant(attempt, self.boot.as_deref())? {
+                Some((k, g, e)) => (Some(k), g, e),
+                None => (None, None, false),
+            };
         // Read after the database: the grant just read is not later than
         // `now`, and a slow read is not counted against it.
         let now = platform::monotonic_ms();
@@ -1676,6 +1679,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
         store: &store,
         traffic: Traffic::open(spec)?,
         lease: LeaseClock::start_seeded(now, spec.lease_ms, spec.poll_ms, applied, spec.lease_seed),
+        boot: platform::boot_id(),
         started_ms: now,
         spool: &spool,
         masker: masker.clone(),

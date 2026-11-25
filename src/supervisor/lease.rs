@@ -161,13 +161,27 @@ impl LeaseClock {
     }
 }
 
-/// Whether the agent may grant a renewal at `now_ms` after the grant at
-/// `prev_granted_ms` (both monotonic, same boot): only while that grant has
-/// not run out as a supervisor counts it (`duration - poll_ms`). A renewal
-/// after that would revive a lease that a supervisor looking late counts
-/// from its last grant.
-pub fn renewal_in_time(prev_granted_ms: u64, now_ms: u64, duration_ms: u64, poll_ms: u64) -> bool {
-    now_ms < prev_granted_ms.saturating_add(duration_ms.saturating_sub(poll_ms))
+/// Whether a renewal may be granted at `now_ms` of boot `now_boot` after
+/// the grant before it, `prev` (its monotonic time and boot), under the
+/// persisted `window` terms `(lease_ms, poll_ms)` (spec 12): only while that
+/// grant has not run out as a supervisor counts it (`lease_ms - poll_ms`).
+/// A renewal after that would revive a lease that a supervisor looking late
+/// counts from its last grant. Whatever is needed to prove "in time" and is
+/// missing, of another boot or later than now refuses.
+pub fn renewal_in_time(
+    prev: Option<(u64, Option<&str>)>,
+    window: Option<(u64, u64)>,
+    now_ms: u64,
+    now_boot: Option<&str>,
+) -> bool {
+    let (Some((prev_ms, Some(prev_boot))), Some((lease_ms, poll_ms)), Some(boot)) =
+        (prev, window, now_boot)
+    else {
+        return false;
+    };
+    prev_boot == boot
+        && prev_ms <= now_ms
+        && now_ms < prev_ms.saturating_add(lease_ms.saturating_sub(poll_ms))
 }
 
 #[cfg(test)]
@@ -456,9 +470,34 @@ mod tests {
 
     #[test]
     fn a_renewal_is_granted_only_while_the_last_grant_runs() {
-        assert!(renewal_in_time(1_000, 2_999, 2_000, 0));
-        assert!(!renewal_in_time(1_000, 3_000, 2_000, 0));
-        assert!(!renewal_in_time(1_000, 2_900, 2_000, 100));
-        assert!(renewal_in_time(1_000, 2_899, 2_000, 100));
+        let b = Some("b");
+        let w = Some((2_000, 0));
+        assert!(renewal_in_time(Some((1_000, b)), w, 2_999, b));
+        assert!(!renewal_in_time(Some((1_000, b)), w, 3_000, b));
+        let w = Some((2_000, 100));
+        assert!(!renewal_in_time(Some((1_000, b)), w, 2_900, b));
+        assert!(renewal_in_time(Some((1_000, b)), w, 2_899, b));
+    }
+
+    #[test]
+    fn a_renewal_without_proof_of_the_last_grant_is_refused() {
+        let (b, w) = (Some("b"), Some((2_000, 100)));
+        // No base, no stamp of the base's boot, another boot, no boot now.
+        assert!(!renewal_in_time(None, w, 1_000, b));
+        assert!(!renewal_in_time(Some((1_000, None)), w, 1_000, b));
+        assert!(!renewal_in_time(Some((1_000, Some("a"))), w, 1_000, b));
+        assert!(!renewal_in_time(Some((1_000, b)), w, 1_000, None));
+        // A base later than now (another boot that read the same id) and no
+        // window.
+        assert!(!renewal_in_time(Some((1_001, b)), w, 1_000, b));
+        assert!(!renewal_in_time(Some((1_000, b)), None, 1_000, b));
+        // A window no longer than a poll grants nothing.
+        assert!(!renewal_in_time(
+            Some((1_000, b)),
+            Some((100, 100)),
+            1_000,
+            b
+        ));
+        assert!(renewal_in_time(Some((1_000, b)), w, 1_000, b));
     }
 }

@@ -1208,6 +1208,7 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
         .for_member(&CoordinatorId::generate())
         .submit(
             belt::storage::NewAcceptance {
+                lease: None,
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
                 task_id: TaskId::generate(),
@@ -2702,6 +2703,119 @@ async fn a_renewal_after_the_last_grant_ran_out_is_refused() {
     assert_eq!(lines(&marker), 0);
 }
 
+fn renew_at(a: &AttemptId, epoch: u64, seq: u64) -> Request {
+    let Request::RenewLease(mut r) = renew_req(a, seq, 1_000) else {
+        unreachable!()
+    };
+    r.coordinator_epoch = CoordinatorEpoch(epoch);
+    Request::RenewLease(r)
+}
+
+/// An attempt held in preparation with a lease of `lease_ms`, accepted by an
+/// agent polling every `poll_ms`.
+async fn held(f: &Fx, lease_ms: u64, poll_ms: u64) -> (Arc<Agent>, Client, AttemptId) {
+    let mut cfg = f.cfg("boot-a");
+    cfg.poll_ms = poll_ms;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, _, _) = stay(f);
+    let mut p = payload(&script);
+    p.lease_ms = lease_ms;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    (agent, c, a)
+}
+
+/// Spec 12: after the agent restarts it keeps nothing in memory; the base
+/// for the first renewal is the acceptance stamp in the database. A renewal
+/// later than a window after it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_a_first_renewal_past_the_acceptance_window_is_refused() {
+    let f = fx();
+    let (agent, _c, a) = held(&f, 1_000, 400).await;
+    let accepted = Instant::now();
+    agent.shutdown();
+    let mut cfg = f.cfg("boot-a");
+    cfg.poll_ms = 400;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    // The window is 1_000 - 400 = 600 ms.
+    std::thread::sleep(Duration::from_millis(800).saturating_sub(accepted.elapsed()));
+    let e = call(&c, renew_req(&a, 1, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// Spec 12: a lease row without a grant stamp (an older binary wrote it)
+/// proves nothing; the next renewal is refused, however soon it comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_after_an_unstamped_grant_is_refused() {
+    let f = fx();
+    let (agent, c, a) = held(&f, 30_000, 25).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 30_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    agent.shutdown();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    assert_eq!(
+        db.execute("UPDATE lease SET renewed_mono_ms = NULL", [])
+            .unwrap(),
+        1
+    );
+    drop(db);
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let e = call(&c, renew_req(&a, 2, 30_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// Spec 12: the window is the one persisted at acceptance, not the poll of
+/// the agent that happens to run now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_renewal_window_is_the_one_persisted_at_acceptance() {
+    let f = fx();
+    let (agent, c, a) = held(&f, 1_000, 400).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 1_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    let granted = Instant::now();
+    agent.shutdown();
+    // The new agent polls every 25 ms: by its own poll the window would be
+    // 975 ms; the persisted one is 600 ms.
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    std::thread::sleep(Duration::from_millis(700).saturating_sub(granted.elapsed()));
+    let e = call(&c, renew_req(&a, 2, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// A refused late renewal still leaves the newer coordinator epoch it
+/// carried, and a replay of an applied renewal stays a no-op, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_renewal_keeps_its_epoch_and_a_late_replay_stays_a_replay() {
+    let f = fx();
+    let (_agent, c, a) = held(&f, 1_000, 25).await;
+    let Response::RenewLease(r) = call(&c, renew_at(&a, 1, 1)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    std::thread::sleep(Duration::from_millis(1_300));
+    let Response::RenewLease(r) = call(&c, renew_at(&a, 1, 1)).await.unwrap() else {
+        panic!()
+    };
+    assert!(!r.extended);
+    let e = call(&c, renew_at(&a, 5, 1)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    let e = call(&c, renew_at(&a, 4, 9)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::StaleEpoch, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_that_cannot_be_read_starts_nothing_until_it_can_be() {
     let f = fx();
@@ -3219,6 +3333,7 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
         store
             .submit(
                 belt::storage::NewAcceptance {
+                    lease: None,
                     attempt_id: a.clone(),
                     run_id: p.run_id.clone(),
                     task_id: p.task_id.clone(),

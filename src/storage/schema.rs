@@ -534,10 +534,17 @@ UPDATE worker_attempt SET source_id = json_extract(spec_json, '$.source_id') WHE
 CREATE INDEX worker_attempt_source ON worker_attempt(source_id) WHERE state <> 'terminal';
 ";
 
-// Spec 12. When the agent granted the applied key, on the worker's monotonic
-// clock: the supervisor counts the lease from it, not from when it looked.
-// NULL for a row an older binary wrote.
-const WORKER_V7: &str = "ALTER TABLE lease ADD COLUMN renewed_mono_ms INTEGER;";
+// Spec 12. When each lease grant was made (the acceptance, then every applied
+// renewal): the worker's monotonic clock and the boot it belongs to, and the
+// window terms persisted at acceptance. A renewal is applied only in time
+// after the grant before it; the supervisor counts the lease from the last
+// grant. NULL for a row an older binary wrote: such a grant proves nothing.
+const WORKER_V7: &str = "ALTER TABLE lease ADD COLUMN renewed_mono_ms INTEGER;
+ALTER TABLE lease ADD COLUMN renewed_boot TEXT;
+ALTER TABLE worker_attempt ADD COLUMN accepted_mono_ms INTEGER;
+ALTER TABLE worker_attempt ADD COLUMN accepted_boot TEXT;
+ALTER TABLE worker_attempt ADD COLUMN lease_ms INTEGER;
+ALTER TABLE worker_attempt ADD COLUMN lease_poll_ms INTEGER;";
 
 /// What must hold before step `to` of a `kind` database runs, checked in the
 /// step's own transaction. Worker step 4 drops every attempt row, so it is

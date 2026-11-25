@@ -521,6 +521,7 @@ fn accept(w: &Wk) -> AttemptId {
         .store
         .submit(
             NewAcceptance {
+                lease: None,
                 attempt_id: a.clone(),
                 run_id: run,
                 task_id: task,
