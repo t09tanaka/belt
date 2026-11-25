@@ -62,6 +62,10 @@ pub enum Operation {
         bundle: crate::toolchain::contract::FrozenBundle,
         requirements: crate::toolchain::capability::ExecutionRequirements,
     },
+    /// Whether some worker can run the workspace's preparation (spec 22.1).
+    CheckPreparation {
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    },
     /// One look at a warm-up on one worker (`workers sync`); the first look
     /// starts it. Asked again with the same `sync_id` until nothing is pending.
     EnvSync {
@@ -144,6 +148,7 @@ pub enum Reply {
     ResolvedToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
     },
+    PreparationChecked,
     EnvSync {
         results: Vec<crate::wire::ToolSyncResult>,
     },
@@ -259,7 +264,7 @@ fn submit_count_is_valid(tasks: &[(TaskId, TaskSpec)]) -> bool {
 impl Operation {
     fn requires_toolchains(&self) -> bool {
         match self {
-            Self::ResolveToolchains { .. } => true,
+            Self::ResolveToolchains { .. } | Self::CheckPreparation { .. } => true,
             Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
                 tasks.iter().any(|(_, spec)| spec.toolchains.is_some())
             }
@@ -1601,6 +1606,18 @@ async fn handle(
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::CheckPreparation { requirements } = request.operation {
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.check_preparation(requirements) => match result {
+                Ok(()) if !*stop.borrow() && !coordinator.is_fenced() => Reply::PreparationChecked,
+                Ok(()) => Reply::Stopping,
+                Err(error) => Reply::ControlError { error },
+            }
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     if let Operation::ResolveToolchains {
         bundle,
         requirements,
@@ -2225,7 +2242,8 @@ async fn handle(
             | Operation::EstimateTask { .. }
             | Operation::EnvReport { .. }
             | Operation::EnvSync { .. }
-            | Operation::ResolveToolchains { .. } => {
+            | Operation::ResolveToolchains { .. }
+            | Operation::CheckPreparation { .. } => {
                 unreachable!("read handled before admission")
             }
             Operation::Shutdown => {

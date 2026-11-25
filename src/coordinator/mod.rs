@@ -869,6 +869,92 @@ impl Coordinator {
         ))
     }
 
+    /// Whether some attached worker reports every tool the workspace's
+    /// preparation runs (the [`Requirement::Prepare`] of `requirements`,
+    /// spec 22.1). The refusal names what each asked worker lacks, as
+    /// placement would. Read-only: the same worker cap, deadline and fence
+    /// checks as [`Self::resolve_toolchains`].
+    ///
+    /// [`Requirement::Prepare`]: crate::toolchain::capability::Requirement::Prepare
+    pub async fn check_preparation(
+        &self,
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    ) -> std::result::Result<(), crate::error::ApiError> {
+        use crate::toolchain::capability::{missing, ExecutionRequirements, Requirement};
+        let prepare = ExecutionRequirements {
+            profile: None,
+            requires: requirements
+                .requires
+                .iter()
+                .filter(|r| matches!(r, Requirement::Prepare(_)))
+                .cloned()
+                .collect(),
+        };
+        if prepare.is_empty() {
+            return Ok(());
+        }
+        let mut workers: Vec<_> = self
+            .workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, link)| (id.clone(), link.clone()))
+            .collect();
+        workers.sort_by(|a, b| a.0.cmp(&b.0));
+        let budget = std::time::Duration::from_millis(self.cfg.worker_budget_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut lacking = Vec::new();
+        for (worker_id, link) in workers.into_iter().take(32) {
+            if self.is_fenced() {
+                break;
+            }
+            let request = Request::Inspect(InspectRequest {
+                preparation_observations: None,
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+            });
+            let response = tokio::time::timeout(
+                budget.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                link.read_only_call(request),
+            )
+            .await;
+            let capabilities = match response {
+                Ok(Ok(Response::Inspect(r))) if r.worker_id == worker_id => r.capabilities,
+                _ => continue,
+            };
+            let unmet = crate::toolchain::envdiff::with_steps(
+                missing(&prepare, capabilities.as_ref()),
+                &prepare.requires,
+                capabilities.as_ref(),
+            );
+            if unmet.is_empty() {
+                return Ok(());
+            }
+            if lacking.len() < 4 {
+                lacking.push(format!("{worker_id}: {}", unmet.join(", ")));
+            }
+        }
+        let tools: Vec<String> = prepare
+            .requires
+            .iter()
+            .filter_map(|r| match r {
+                Requirement::Prepare(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut why = format!(
+            "workspace preparation runs {}: no worker reports them",
+            tools.join(", ")
+        );
+        if !lacking.is_empty() {
+            why = format!("{why} ({})", lacking.join("; "));
+        }
+        Err(crate::error::ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            why,
+        ))
+    }
+
     pub fn set_parent_local(&self, worker: WorkerId) {
         *self.parent_local.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
     }

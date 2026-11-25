@@ -1882,6 +1882,7 @@ WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含む�
 - native toolでの充足（PR #138）: registryが満たせない版を、profileのtool自身が同じ版を報告するときに満たす。範囲は、親が観測した版へ固定する（仕様22.1）。
 - 導入済みrustup toolchainの検出: 設定なしで、利用者のrustupにあるそのhost向けtoolchainを読むだけで見つけ（最大16個、bounded probe）、recipeが無いときRustの版を満たす（仕様22.1）。
 - 導入済みのほかのtoolの版の検出: 設定なしで、mise・nodenv・nvm・Homebrewにあるnode（miseはpython・go・rubyも）の版を読むだけで見つけ（最大32個、bounded probe）、recipeが無いときその版を満たす（仕様22.1）。不足版のmiseでの導入は別のPRで行う。
+- 準備のtoolの続き（Task G）: どのworkerも準備のtoolを報告しないrunは、提出時に理由つきで断る（rc 76）。`belt estimate` も準備のtoolを要件に足す。版管理ツールの実行ファイル（実際のmiseは約50 MB）は、probeの共有の上限の外に別の上限（256 MiB）で読む。報告の無いworkerの見積は導入を数える。準備をtoolchainを有効にして走らせる変更は、fast-worktreeのenvとcache keyの理由で行わない（仕様22.1・22.5）。
 - 不足した版の導入: 設定なしで、profileのPATHにある利用者の `mise`（node・python・go・ruby）と `rustup`（rust）を、既存のMise・Rustupのadapterの計画で使い、束が固定した具体版だけを `<state>/toolchains/` へ導入する（仕様22.1）。優先はrecipe、既にある版、導入の順。導入できるworkerは候補になり、見積は導入を数えるので既に持つworkerが優先される。miseの無いworkerは拒否の文、`workers diff`、`doctor` で導入の方法を示す。rootの上限と削除は25.7 (b) のまま。
 - 試験のフレーキーの修正（PR #139）: `warmup_stop` の idle release は、managerが動くまで問い合わせ続ける。`bootstrap` の再起動をまたぐsyncは、原因が分からないので、失敗時に診断を出すだけにした。
 - local-ci 0.18.4（PR #140）: コード変更なし。清掃は local-ci のCLIの経路だけで、belt は読み書きしない。

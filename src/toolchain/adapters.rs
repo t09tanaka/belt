@@ -22,6 +22,10 @@ type Result<T> = std::result::Result<T, &'static str>;
 const MAX_RECEIPT: u64 = 32 * 1024 * 1024;
 const MAX_FILES: usize = 131072;
 const MAX_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
+/// The largest version manager executable a read-only probe hashes (spec
+/// 22.1). The shared probe budget (16 MiB a file, 64 MiB in all) does not
+/// count it.
+pub(crate) const MAX_PROBE_MANAGER_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdapterKind {
     Nodenv,
@@ -57,6 +61,10 @@ pub struct FileIdentity {
 pub(crate) struct IdentityReadBudget {
     per_file: u64,
     remaining: std::cell::Cell<u64>,
+    /// The separate pool of the version manager's executable.
+    manager_remaining: std::cell::Cell<u64>,
+    /// The manager identities this probe already read.
+    managers: std::cell::RefCell<Vec<FileIdentity>>,
     reads: std::cell::Cell<u64>,
     snapshot: std::cell::RefCell<probe::Snapshot>,
     limited: bool,
@@ -72,6 +80,9 @@ impl IdentityReadBudget {
         Self {
             per_file,
             remaining: std::cell::Cell::new(total),
+            // One full read, plus the growth sentinel.
+            manager_remaining: std::cell::Cell::new(MAX_PROBE_MANAGER_BYTES + 1),
+            managers: std::cell::RefCell::new(Vec::new()),
             reads: std::cell::Cell::new(0),
             snapshot: std::cell::RefCell::new(probe::Snapshot::default()),
             limited: true,
@@ -88,6 +99,15 @@ impl IdentityReadBudget {
     fn capture(&self, path: &Path) -> Result<FileIdentity> {
         if self.limited {
             probe::capture(path, self)
+        } else {
+            FileIdentity::capture(path)
+        }
+    }
+    /// [`Self::capture`] of the version manager's executable (a real mise
+    /// is about 50 MB): its own cap, outside the shared byte budget.
+    fn capture_manager(&self, path: &Path) -> Result<FileIdentity> {
+        if self.limited {
+            probe::capture_manager(path, self)
         } else {
             FileIdentity::capture(path)
         }
@@ -374,7 +394,7 @@ pub(crate) fn plan_with_limit(
     {
         return Err("invalid_host_tools");
     }
-    if budget.capture(&host.manager.path)? != host.manager {
+    if budget.capture_manager(&host.manager.path)? != host.manager {
         return Err("tool_identity_drift");
     }
     if !host.manager.executable {
