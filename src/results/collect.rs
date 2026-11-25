@@ -275,21 +275,50 @@ fn fault_of(e: LinkError) -> Fault {
     }
 }
 
-/// What the result says about each declared artifact.
-fn verdict_of(declared: &[(String, bool)], result: &GetResultResponse) -> Verdict {
-    let standings: Vec<(bool, Standing)> = declared
+/// What the result says about each declared artifact, and why it is not
+/// complete when it is not.
+fn verdict_of(
+    declared: &[(String, bool)],
+    result: &GetResultResponse,
+) -> (Verdict, Option<String>) {
+    let each: Vec<(&str, bool, Option<&str>, Standing)> = declared
         .iter()
         .map(|(name, required)| {
             let stored = result.artifacts.iter().any(|a| &a.name == name);
-            let not_stored = result
-                .artifacts_not_stored
-                .iter()
-                .find(|n| &n.name == name)
-                .map(|n| n.reason);
-            (*required, plan::standing(stored, not_stored))
+            let not_stored = result.artifacts_not_stored.iter().find(|n| &n.name == name);
+            (
+                name.as_str(),
+                *required,
+                not_stored.map(|n| n.path.as_str()),
+                plan::standing(stored, not_stored.map(|n| n.reason)),
+            )
         })
         .collect();
-    plan::judge_artifacts(&standings)
+    let standings: Vec<(bool, Standing)> = each.iter().map(|(_, r, _, s)| (*r, *s)).collect();
+    (
+        plan::judge_artifacts(&standings),
+        plan::missing_reason(&each),
+    )
+}
+
+/// Keep why a collection closed as `required_missing`, where `ci` reads it.
+fn note_missing(
+    s: &crate::storage::CoordinatorStore,
+    attempt: &AttemptId,
+    verdict: Verdict,
+    reason: Option<&str>,
+    at_ms: u64,
+) -> crate::storage::Result<()> {
+    if let (Verdict::RequiredMissing, Some(reason)) = (verdict, reason) {
+        s.append_event(
+            None,
+            Some(attempt),
+            crate::ci::COLLECTION_MISSING_EVENT,
+            &json!({ "reason": reason }),
+            at_ms,
+        )?;
+    }
+    Ok(())
 }
 
 /// The stored artifacts of a result that the parent declared, in the order
@@ -648,18 +677,22 @@ impl Collector {
         let result = bare_result(&termination);
         let digest = payload_hash(&result)
             .map_err(|e| StorageError::Invalid(format!("result digest: {e}")))?;
-        let standings: Vec<(bool, Standing)> = declared
+        let each: Vec<(&str, bool, Option<&str>, Standing)> = declared
             .artifacts
             .iter()
-            .map(|(_, required)| (*required, Standing::Unreported))
+            .map(|(name, required)| (name.as_str(), *required, None, Standing::Unreported))
             .collect();
+        let standings: Vec<(bool, Standing)> = each.iter().map(|(_, r, _, s)| (*r, *s)).collect();
         let verdict = plan::judge_artifacts(&standings);
+        let reason = plan::missing_reason(&each);
         let (a, names) = (rec.attempt_id.clone(), declared.artifacts.clone());
         self.db(move |s| {
             let at = wall_ms();
             s.begin_collection(&a, &digest, &result, &names, &[], at)?;
             s.set_collection_logs(&a, &digest, &json!({}), at)?;
-            s.close_collection(&a, Some(&digest), verdict, false, at)?;
+            if s.close_collection(&a, Some(&digest), verdict, false, at)? {
+                note_missing(s, &a, verdict, reason.as_deref(), at)?;
+            }
             Ok(())
         })
         .await?;
@@ -1461,8 +1494,8 @@ impl Collector {
         rec: &AttemptRecord,
         declared: &Declared,
         result: &GetResultResponse,
-    ) -> Result<Verdict> {
-        let verdict = verdict_of(&declared.names(result), result);
+    ) -> Result<(Verdict, Option<String>)> {
+        let (verdict, reason) = verdict_of(&declared.names(result), result);
         let name = crate::supervisor::ci_task::RESULT_ARTIFACT;
         let ci = declared.payload.ci_task.as_ref();
         let record = result.artifacts.iter().find(|r| r.name == name);
@@ -1471,7 +1504,7 @@ impl Collector {
             record,
             plan::needs_ci_read(ci.is_some(), record.is_some(), verdict),
         ) else {
-            return Ok(verdict);
+            return Ok((verdict, reason));
         };
         let (attempt, digest, task) = (
             rec.attempt_id.clone(),
@@ -1486,7 +1519,10 @@ impl Collector {
                     .map(|result| result.task))
             })
             .await?;
-        Ok(plan::judge_ci_result(read.as_deref(), &task))
+        let verdict = plan::judge_ci_result(read.as_deref(), &task);
+        let reason = (verdict == Verdict::RequiredMissing)
+            .then(|| plan::unreadable_ci_reason(read.as_deref(), &task));
+        Ok((verdict, reason))
     }
 
     /// Everything of the recorded result is verified and durable here: tell
@@ -1514,10 +1550,16 @@ impl Collector {
         });
         match link.call(request).await {
             Ok(Response::AckCollected(r)) if r.attempt_id == a && r.released => {
-                let verdict = self.judged(rec, declared, result).await?;
+                let (verdict, reason) = self.judged(rec, declared, result).await?;
                 let digest = digest.clone();
-                self.db(move |s| s.close_collection(&a, Some(&digest), verdict, true, wall_ms()))
-                    .await?;
+                self.db(move |s| {
+                    let at = wall_ms();
+                    if s.close_collection(&a, Some(&digest), verdict, true, at)? {
+                        note_missing(s, &a, verdict, reason.as_deref(), at)?;
+                    }
+                    Ok(())
+                })
+                .await?;
                 Ok(Flow::Closed(verdict))
             }
             Ok(_) => Ok(bad("an acknowledgement that released nothing")),
@@ -1537,10 +1579,14 @@ impl Collector {
                 // the worker deleted what it released). Everything is here,
                 // verified: the collection is closed, as not acknowledged.
                 AckRefusal::Gone => {
-                    let verdict = self.judged(rec, declared, result).await?;
+                    let (verdict, reason) = self.judged(rec, declared, result).await?;
                     let digest = digest.clone();
                     self.db(move |s| {
-                        s.close_collection(&a, Some(&digest), verdict, false, wall_ms())
+                        let at = wall_ms();
+                        if s.close_collection(&a, Some(&digest), verdict, false, at)? {
+                            note_missing(s, &a, verdict, reason.as_deref(), at)?;
+                        }
+                        Ok(())
                     })
                     .await?;
                     Ok(Flow::Closed(verdict))
