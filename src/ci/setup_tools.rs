@@ -217,7 +217,19 @@ mod tests {
             ),
             step("taiki-e/install-action@cargo-llvm-cov", &[]),
             step("actions/checkout@v4", &[]),
+            // Said twice, required and told once; a run step adds nothing.
+            step("taiki-e/install-action@cargo-llvm-cov", &[]),
+            StepSpec {
+                uses: None,
+                run: Some("cargo llvm-cov".into()),
+                ..step("", &[])
+            },
         ]);
+        let twice = read(&[
+            step("taiki-e/install-action@v2", &[]),
+            step("taiki-e/install-action@v2", &[]),
+        ]);
+        assert_eq!(twice.notices.len(), 1, "{:?}", twice.notices);
         assert_eq!(
             got.requires,
             vec![
