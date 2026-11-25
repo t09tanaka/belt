@@ -836,11 +836,12 @@ fn observe_lease(
     clock: &mut LeaseClock,
     now: u64,
     key: Option<crate::wire::LeaseKey>,
+    granted: Option<u64>,
     db_expired: bool,
     note: impl FnOnce(crate::wire::LeaseKey) -> bool,
 ) -> LeaseStatus {
     let before = clock.applied_key();
-    let status = clock.observe(now, key, db_expired);
+    let status = clock.observe_granted(now, key, granted, db_expired);
     if matches!(status, LeaseStatus::Valid { .. }) && clock.applied_key() != before {
         if let Some(applied) = clock.applied_key() {
             let _ = note(applied);
@@ -874,17 +875,19 @@ impl Control<'_> {
         stage: timeouts::Stage,
     ) -> Result<Option<StopReason>> {
         let attempt = &self.spec.attempt_id;
-        let now = platform::monotonic_ms();
         let Some(rec) = self.store.get(attempt)? else {
             return Err(SupervisorError::State(format!(
                 "attempt {attempt} vanished"
             )));
         };
-        let (key, db_expired) = match self.store.lease(attempt)? {
-            Some((k, e)) => (Some(k), e),
-            None => (None, false),
+        let (key, granted, db_expired) = match self.store.lease_grant(attempt)? {
+            Some((k, g, e)) => (Some(k), g, e),
+            None => (None, None, false),
         };
-        let status = observe_lease(&mut self.lease, now, key, db_expired, |applied| {
+        // Read after the database: the grant just read is not later than
+        // `now`, and a slow read is not counted against it.
+        let now = platform::monotonic_ms();
+        let status = observe_lease(&mut self.lease, now, key, granted, db_expired, |applied| {
             // Like the identity diagnostic, this is not an authoritative
             // receipt or a condition for keeping the command alive.
             self.store
@@ -1884,7 +1887,7 @@ mod tests {
         };
         let mut clock = LeaseClock::start(0, 100, 0, None);
         let mut noted = Vec::new();
-        let status = observe_lease(&mut clock, 10, Some(key), false, |applied| {
+        let status = observe_lease(&mut clock, 10, Some(key), None, false, |applied| {
             noted.push(applied);
             // A failed best-effort write has no result to feed back into
             // the clock or the caller's stop decision.
@@ -1893,7 +1896,7 @@ mod tests {
         assert_eq!(status, LeaseStatus::Valid { remaining_ms: 100 });
         assert_eq!(noted, vec![key]);
         assert_eq!(
-            observe_lease(&mut clock, 20, Some(key), false, |_| panic!("replay")),
+            observe_lease(&mut clock, 20, Some(key), None, false, |_| panic!("replay")),
             LeaseStatus::Valid { remaining_ms: 90 }
         );
         let newer = LeaseKey {
@@ -1901,12 +1904,14 @@ mod tests {
             ..key
         };
         assert_eq!(
-            observe_lease(&mut clock, 110, Some(newer), false, |_| panic!("late")),
+            observe_lease(&mut clock, 110, Some(newer), None, false, |_| panic!(
+                "late"
+            )),
             LeaseStatus::Expired
         );
         let mut clock = LeaseClock::start(0, 100, 0, None);
         assert_eq!(
-            observe_lease(&mut clock, 10, Some(key), true, |_| panic!(
+            observe_lease(&mut clock, 10, Some(key), None, true, |_| panic!(
                 "expired in database"
             )),
             LeaseStatus::Expired

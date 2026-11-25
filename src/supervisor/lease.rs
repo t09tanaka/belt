@@ -3,13 +3,20 @@
 //! The lease is counted by the supervisor on the monotonic clock that
 //! includes suspend; it never compares wall-clock times and never trusts a
 //! timestamp from another host. The agent applies renewals to the worker
-//! database; the supervisor observes the highest applied key and, whenever it
-//! grows, restarts its own countdown from the moment it noticed.
+//! database and records, with each key, when it granted it on the same
+//! monotonic clock of the same boot. The supervisor observes the highest
+//! applied key and counts the lease from that grant: a supervisor that looks
+//! late (a stall longer than the lease) never expires a lease that was
+//! renewed in time. The agent refuses a renewal that arrives after the grant
+//! before it ran out, so a late renewal never revives a lease, however late
+//! the supervisor looks. A key without a recorded grant (a row an older
+//! binary wrote) is counted from when it was noticed, judged after the
+//! deadline as before.
 //!
-//! The supervisor only looks every `poll_ms`, so a renewal (or the grant at
-//! the start) can have happened up to one poll before it is noticed. The
-//! countdown is shortened by that delay (`duration - poll_ms`): the lease
-//! never outlives what the coordinator granted.
+//! The supervisor only looks every `poll_ms`, so a grant (at the start) can
+//! have happened up to one poll before it is noticed. Every grant is
+//! shortened by that delay (`duration - poll_ms`): the lease never outlives
+//! what the coordinator granted.
 //!
 //! All functions take the current monotonic time as an argument, so the
 //! decisions are pure.
@@ -89,28 +96,55 @@ impl LeaseClock {
         clock
     }
 
-    /// Look at the database again at `now_ms`. `seen` is the highest key
-    /// applied there and `db_expired` whether the row is marked expired.
-    ///
-    /// The deadline is judged first, so a renewal that is only noticed after
-    /// the deadline cannot bring the lease back. A key that is not strictly
-    /// greater than the applied one (a replay, an older renewal) changes
-    /// nothing: renewal is idempotent.
+    /// [`LeaseClock::observe_granted`] for a key without a recorded grant.
     pub fn observe(
         &mut self,
         now_ms: u64,
         seen: Option<LeaseKey>,
         db_expired: bool,
     ) -> LeaseStatus {
-        if self.expired || db_expired || now_ms >= self.deadline_ms {
+        self.observe_granted(now_ms, seen, None, db_expired)
+    }
+
+    /// Look at the database again at `now_ms` (read after the database).
+    /// `seen` is the highest key applied there, `granted_ms` when the agent
+    /// granted it (monotonic, same boot) and `db_expired` whether the row is
+    /// marked expired.
+    ///
+    /// A greater key with a grant time is counted first, from that time and
+    /// never from later than `now_ms` (a time from another boot is no lease
+    /// without end); then the deadline is judged. So a supervisor that looks
+    /// late keeps a lease that was renewed in time, and a lease whose
+    /// renewals stopped runs out a window after the last grant. A greater
+    /// key without a grant time is only counted while the lease is still
+    /// valid, from when it was noticed: a renewal noticed after the deadline
+    /// cannot bring the lease back. A key that is not strictly greater than
+    /// the applied one (a replay, an older renewal) changes nothing: renewal
+    /// is idempotent. An expiry is final.
+    pub fn observe_granted(
+        &mut self,
+        now_ms: u64,
+        seen: Option<LeaseKey>,
+        granted_ms: Option<u64>,
+        db_expired: bool,
+    ) -> LeaseStatus {
+        if self.expired || db_expired {
             self.expired = true;
             return LeaseStatus::Expired;
         }
-        if let Some(key) = seen {
-            if key.extends(self.applied) {
-                self.applied = Some(key);
-                self.deadline_ms = now_ms.saturating_add(self.window_ms);
-            }
+        let fresh = seen.filter(|k| k.extends(self.applied));
+        if let (Some(key), Some(granted)) = (fresh, granted_ms) {
+            self.applied = Some(key);
+            let from = granted.min(now_ms).saturating_add(self.window_ms);
+            self.deadline_ms = self.deadline_ms.max(from);
+        }
+        if now_ms >= self.deadline_ms {
+            self.expired = true;
+            return LeaseStatus::Expired;
+        }
+        if let (Some(key), None) = (fresh, granted_ms) {
+            self.applied = Some(key);
+            self.deadline_ms = now_ms.saturating_add(self.window_ms);
         }
         LeaseStatus::Valid {
             remaining_ms: self.deadline_ms - now_ms,
@@ -125,6 +159,15 @@ impl LeaseClock {
     pub fn is_expired(&self) -> bool {
         self.expired
     }
+}
+
+/// Whether the agent may grant a renewal at `now_ms` after the grant at
+/// `prev_granted_ms` (both monotonic, same boot): only while that grant has
+/// not run out as a supervisor counts it (`duration - poll_ms`). A renewal
+/// after that would revive a lease that a supervisor looking late counts
+/// from its last grant.
+pub fn renewal_in_time(prev_granted_ms: u64, now_ms: u64, duration_ms: u64, poll_ms: u64) -> bool {
+    now_ms < prev_granted_ms.saturating_add(duration_ms.saturating_sub(poll_ms))
 }
 
 #[cfg(test)]
@@ -329,5 +372,93 @@ mod tests {
         let mut c = LeaseClock::start(u64::MAX - 5, u64::MAX, 0, None);
         assert_eq!(c.observe(u64::MAX - 5, Some(key(1, 1)), false), valid(5));
         assert_eq!(c.observe(u64::MAX, None, false), LeaseStatus::Expired);
+    }
+
+    #[test]
+    fn a_late_look_keeps_a_lease_renewed_in_time() {
+        // Lease 2 s; the supervisor looks last at 0 and next at 5_000, a
+        // stall of more than two periods. Renewals kept coming; the last
+        // one was granted at 4_900.
+        let mut c = LeaseClock::start(0, 2_000, 0, Some(key(1, 1)));
+        assert_eq!(
+            c.observe_granted(5_000, Some(key(1, 30)), Some(4_900), false),
+            valid(1_900)
+        );
+        assert_eq!(c.applied_key(), Some(key(1, 30)));
+        // With nothing newer it runs out a window after that grant.
+        assert_eq!(
+            c.observe_granted(6_899, Some(key(1, 30)), Some(4_900), false),
+            valid(1)
+        );
+        assert_eq!(
+            c.observe_granted(6_900, Some(key(1, 30)), Some(4_900), false),
+            LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn renewals_that_stopped_still_expire_from_the_last_grant() {
+        // No renewal at all.
+        let mut c = LeaseClock::start(0, 2_000, 0, None);
+        assert_eq!(
+            c.observe_granted(5_000, None, None, false),
+            LeaseStatus::Expired
+        );
+        // The last renewal was granted at 1_000: a look at 5_000 sees it
+        // for the first time, and it ran out at 3_000.
+        let mut c = LeaseClock::start(0, 2_000, 0, None);
+        assert_eq!(
+            c.observe_granted(5_000, Some(key(1, 1)), Some(1_000), false),
+            LeaseStatus::Expired
+        );
+        assert!(c.is_expired());
+        // Exactly a window after the grant is expired; the noticing delay is
+        // taken off a recorded grant too.
+        let mut c = LeaseClock::start(0, 2_000, 100, None);
+        assert_eq!(
+            c.observe_granted(2_900, Some(key(1, 1)), Some(1_000), false),
+            LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_grant_time_from_the_future_counts_from_now() {
+        // A time beyond `now` (another boot) is no lease without end.
+        let mut c = LeaseClock::start(0, 2_000, 0, None);
+        assert_eq!(
+            c.observe_granted(1_000, Some(key(1, 1)), Some(u64::MAX), false),
+            valid(2_000)
+        );
+    }
+
+    #[test]
+    fn an_older_grant_time_never_shortens_the_lease() {
+        let mut c = LeaseClock::start(1_000, 2_000, 0, None);
+        assert_eq!(
+            c.observe_granted(1_500, Some(key(1, 1)), Some(500), false),
+            valid(1_500)
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_late_renewal_still_cannot_revive() {
+        let mut c = LeaseClock::start(0, 2_000, 0, None);
+        assert_eq!(
+            c.observe_granted(2_500, Some(key(1, 1)), None, false),
+            LeaseStatus::Expired
+        );
+        // And an expiry is final, whatever grant is recorded later.
+        assert_eq!(
+            c.observe_granted(2_600, Some(key(1, 2)), Some(2_600), false),
+            LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_renewal_is_granted_only_while_the_last_grant_runs() {
+        assert!(renewal_in_time(1_000, 2_999, 2_000, 0));
+        assert!(!renewal_in_time(1_000, 3_000, 2_000, 0));
+        assert!(!renewal_in_time(1_000, 2_900, 2_000, 100));
+        assert!(renewal_in_time(1_000, 2_899, 2_000, 100));
     }
 }

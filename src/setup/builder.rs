@@ -1564,7 +1564,7 @@ impl Setups {
                     coordinator_epoch: CoordinatorEpoch(1),
                     lease_seq: lease.seq,
                 };
-                let _ = store.renew_lease(attempt, key, wall);
+                let _ = store.renew_lease(attempt, key, wall, now);
                 lease.last = now;
             }
         } else if !lease.cancelled {

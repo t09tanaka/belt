@@ -774,7 +774,9 @@ lease seedは、agentがsupervisorを起動する直前に測った「受理ま�
 - seedの残りは、leaseの1期間（`lease_ms`）を上限にする。別のbootの時計の値や誤った値が渡っても、1期間より長いleaseにはならない。pollの遅れ（`poll_ms`）は、通常のgrantと同じく差し引く。
 - supervisorの起動時にDBで適用済みのlease keyがseedのkeyと違えば、seedを測った後にrenewが届いている。このときseedは無効とし、そのrenewを起動時点から1期間として数える（短く数えて、有効なleaseを切らない）。
 - seedはsupervisorを起動するたびに書き直す。seedの無いspecでは、supervisorは起動時点から1期間を数える。
-- 起動後のrenewは従来どおり、supervisorが気付いた時点から1期間として数える。
+- 起動後のrenewは、agentがそのrenewを適用した時刻（workerの単調時計の値。lease keyと同じ行に `renewed_mono_ms` として記録する）から1期間（`poll_ms` を差し引く）として数える。supervisorは、DBから最新のkeyとその時刻を読んだ後で現在時刻を読み、まず最新のrenewを数え、その後で期限を判定する。supervisorが1期間より長く見に来なかっただけでは、期限内にrenewされたleaseを失効させない。renewが本当に止まったattemptは、最後に適用されたrenewから1期間で失効する。
+- 記録された時刻が現在より後（別のbootの値など）なら現在時刻として数え、1期間より長いleaseにはしない。時刻の無い行（前の版が書いた行）のkeyは、従来どおり期限を判定してから、気付いた時点から1期間として数える。
+- agentは、直前のgrant（受理または最後に適用したrenew。agentが再起動した後は行に記録された時刻）から1期間（`poll_ms` を差し引く）を過ぎて届いたrenewを `LEASE_NOT_RENEWABLE` で断る。supervisorは最新のrenewだけを見て数えるので、切れた後のrenewを適用すると、supervisorが遅れて見たときにleaseを復活させてしまうためである。
 
 renewはsequenceとrequest IDで冪等にし、同じrenewの再送で期限を再延長しない。失効・cancel・retireが確定したattemptは、遅延renewで実行許可を復活させない。共有setup builderには独立leaseを設け、少なくとも1つの有効なconsumer参照がある間だけ更新する。全参照の失効時はbuilder自身のsupervisorが停止する。
 

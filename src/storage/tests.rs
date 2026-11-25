@@ -1355,7 +1355,7 @@ fn a_retired_attempt_refuses_submit_launch_and_lease() {
     ));
     let e = w
         .store
-        .renew_lease(&a.attempt_id, key(1, 1), 33)
+        .renew_lease(&a.attempt_id, key(1, 1), 33, 33)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LeaseNotRenewable(_)));
@@ -1456,7 +1456,7 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    let renew = |k| w.store.renew_lease(id, k, 50);
+    let renew = |k| w.store.renew_lease(id, k, 50, 70);
     assert_eq!(renew(key(1, 1)).unwrap(), LeaseOutcome::Extended);
     assert_eq!(renew(key(1, 1)).unwrap(), LeaseOutcome::Stale);
     assert_eq!(renew(key(1, 3)).unwrap(), LeaseOutcome::Extended);
@@ -1464,11 +1464,21 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     // A new coordinator epoch restarts the sequence and still wins.
     assert_eq!(renew(key(2, 1)).unwrap(), LeaseOutcome::Extended);
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), false)));
+    // The grant time on the monotonic clock travels with the key.
+    assert_eq!(
+        w.store.lease_grant(id).unwrap(),
+        Some((key(2, 1), Some(70), false))
+    );
     // The old coordinator is now rejected outright.
     let e = renew(key(1, 99)).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     assert_eq!(e.code(), ErrorCode::StaleEpoch);
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), false)));
+    // The grant time on the monotonic clock travels with the key.
+    assert_eq!(
+        w.store.lease_grant(id).unwrap(),
+        Some((key(2, 1), Some(70), false))
+    );
     // An expiry is remembered and a late renewal does not undo it.
     assert!(w.store.events_of(id, "lease_expired").unwrap().is_empty());
     assert!(w.store.expire_lease(id, 60).unwrap());
@@ -1482,7 +1492,7 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     assert!(renew(key(2, 5)).is_err());
     assert!(w
         .store
-        .renew_lease(&AttemptId::generate(), key(2, 1), 1)
+        .renew_lease(&AttemptId::generate(), key(2, 1), 1, 1)
         .is_err());
 }
 
@@ -1492,19 +1502,19 @@ fn a_lease_is_not_renewed_while_cancelling_or_after_the_end() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    w.store.renew_lease(id, key(1, 1), 1).unwrap();
+    w.store.renew_lease(id, key(1, 1), 1, 1).unwrap();
     drive(&w, id, &[AttemptState::Cancelling]);
-    assert!(w.store.renew_lease(id, key(1, 2), 2).is_err());
+    assert!(w.store.renew_lease(id, key(1, 2), 2, 2).is_err());
     drive(&w, id, &[AttemptState::Finalizing]);
-    assert!(w.store.renew_lease(id, key(1, 3), 3).is_err());
+    assert!(w.store.renew_lease(id, key(1, 3), 3, 3).is_err());
     w.store.finalize(id, done(Outcome::Cancelled), 4).unwrap();
-    assert!(w.store.renew_lease(id, key(1, 4), 5).is_err());
+    assert!(w.store.renew_lease(id, key(1, 4), 5, 5).is_err());
     // A never-started cancel request alone also blocks renewal.
     let b = accepted(&w);
     w.store
         .cancel(&b.attempt_id, CoordinatorEpoch(1), 6)
         .unwrap();
-    assert!(w.store.renew_lease(&b.attempt_id, key(1, 1), 7).is_err());
+    assert!(w.store.renew_lease(&b.attempt_id, key(1, 1), 7, 7).is_err());
 }
 
 #[test]
@@ -1972,7 +1982,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
     }
 }
 
@@ -2193,7 +2203,7 @@ fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     // renew_lease on a retired attempt fails at epoch 9 and still raises it.
     w.store.retire(&a, CoordinatorEpoch(7), 6).unwrap();
-    let e = w.store.renew_lease(&a, key(9, 1), 7).err().unwrap();
+    let e = w.store.renew_lease(&a, key(9, 1), 7, 7).err().unwrap();
     assert!(matches!(e, StorageError::LeaseNotRenewable(_)));
     let e = w.store.retire(&a, CoordinatorEpoch(8), 8).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
@@ -2216,7 +2226,7 @@ fn an_expired_lease_refuses_a_new_launch_claim_but_not_a_replay() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    w.store.renew_lease(id, key(1, 1), 25).unwrap();
+    w.store.renew_lease(id, key(1, 1), 25, 25).unwrap();
     assert_eq!(
         w.store.claim_launch(id, &node("build"), 30).unwrap(),
         LaunchClaim::Granted

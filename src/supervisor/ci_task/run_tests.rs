@@ -391,7 +391,12 @@ fn renew_until(s: &Sup, spec: &SuperviseSpec, stop: &AtomicBool) {
             lease_seq: seq,
         };
         // (Refused once the attempt is over: nothing to renew then.)
-        let _ = store.renew_lease(&spec.attempt_id, key, 10 + seq);
+        let _ = store.renew_lease(
+            &spec.attempt_id,
+            key,
+            10 + seq,
+            crate::platform::monotonic_ms(),
+        );
         seq += 1;
         std::thread::sleep(Duration::from_millis(100));
     }

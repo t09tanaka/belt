@@ -27,7 +27,7 @@ use crate::storage::{
     AcceptedAttempt, CancelOutcome, GcReport, LeaseOutcome, NewAcceptance, ProcessLock,
     StorageError, SubmitOutcome, WorkerStore,
 };
-use crate::supervisor::lease::LeaseSeed;
+use crate::supervisor::lease::{renewal_in_time, LeaseSeed};
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::outcome::drain_pending_deletes;
 use crate::supervisor::process::spawn_detached;
@@ -3647,27 +3647,42 @@ impl Agent {
         // The new key and the time of its grant change as one step for a
         // start that measures the lease (`lease_step`).
         let renewing = lock(&self.lease_step);
+        let lease_ms = serde_json::from_value::<AttemptPayload>(rec.spec)
+            .map(|p| p.lease_ms)
+            .unwrap_or(0);
+        let mono = platform::monotonic_ms();
+        // The supervisor counts the lease from the last grant, however late
+        // it looks; a grant after that one ran out would revive it. The last
+        // grant is this process's (acceptance or renewal), else the one
+        // recorded with the key.
+        let last = match lock(&self.clocks).get(r.attempt_id.as_str()) {
+            Some(c) => Some(c.granted_ms),
+            None => store
+                .lease_grant(&r.attempt_id)
+                .map_err(api)?
+                .and_then(|(_, granted, _)| granted),
+        };
+        if last.is_some_and(|g| !renewal_in_time(g, mono, lease_ms, self.cfg.poll_ms)) {
+            return Err(api(StorageError::LeaseNotRenewable(r.attempt_id.clone())));
+        }
         let outcome = store
-            .renew_lease(&r.attempt_id, r.key(), now())
+            .renew_lease(&r.attempt_id, r.key(), now(), mono)
             .map_err(api)?;
         let extended = outcome == LeaseOutcome::Extended;
         if extended {
             self.at(ProbePoint::LeaseRenewed, &r.attempt_id);
             if let Some(c) = lock(&self.clocks).get_mut(r.attempt_id.as_str()) {
-                c.granted_ms = platform::monotonic_ms();
+                c.granted_ms = mono;
             }
         }
         drop(renewing);
-        let lease_ms = serde_json::from_value::<AttemptPayload>(rec.spec)
-            .map(|p| p.lease_ms)
-            .unwrap_or(0);
         Ok(RenewLeaseResponse {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
             lease_seq: r.lease_seq,
             extended,
             // The supervisor counts the lease on its own monotonic clock; a
-            // renewal that extended starts a full period there.
+            // renewal that extended starts a full period from its grant.
             lease_remaining_ms: if extended { lease_ms } else { 0 },
             state: rec.state,
         })

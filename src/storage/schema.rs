@@ -534,6 +534,11 @@ UPDATE worker_attempt SET source_id = json_extract(spec_json, '$.source_id') WHE
 CREATE INDEX worker_attempt_source ON worker_attempt(source_id) WHERE state <> 'terminal';
 ";
 
+// Spec 12. When the agent granted the applied key, on the worker's monotonic
+// clock: the supervisor counts the lease from it, not from when it looked.
+// NULL for a row an older binary wrote.
+const WORKER_V7: &str = "ALTER TABLE lease ADD COLUMN renewed_mono_ms INTEGER;";
+
 /// What must hold before step `to` of a `kind` database runs, checked in the
 /// step's own transaction. Worker step 4 drops every attempt row, so it is
 /// refused while one is live, and while one has ended with a result nobody
@@ -795,7 +800,7 @@ CREATE INDEX ci_test_timing_written ON ci_test_timing(written_at_ms);"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
-        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_TOOLCHAIN_ROOTS.to_string(), WORKER_V5.to_string(), WORKER_V6.to_string()],
+        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(), WORKER_V4.to_string(), WORKER_TOOLCHAIN_ROOTS.to_string(), WORKER_V5.to_string(), WORKER_V6.to_string(), WORKER_V7.to_string()],
     }
 }
 

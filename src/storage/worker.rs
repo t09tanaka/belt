@@ -1464,12 +1464,14 @@ impl WorkerStore {
     /// Apply a renewal. Only a strictly greater `(coordinator_epoch,
     /// lease_seq)` extends; a replay is `Stale`. A renewal of an expired,
     /// cancelling, finalizing, terminal or retired attempt is an error and
-    /// never restores the right to run.
+    /// never restores the right to run. `mono_ms` is when it was granted on
+    /// this worker's monotonic clock: the supervisor counts the lease from it.
     pub fn renew_lease(
         &self,
         attempt_id: &AttemptId,
         key: LeaseKey,
         at_ms: u64,
+        mono_ms: u64,
     ) -> Result<LeaseOutcome> {
         let a = attempt_id.clone();
         under_epoch(
@@ -1509,11 +1511,11 @@ impl WorkerStore {
                     LeaseDecision::Stale => Ok(LeaseOutcome::Stale),
                     LeaseDecision::Extend => {
                         tx.execute(
-                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, coordinator_id)
-                         VALUES (?1,?2,?3,?4,?5)
+                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, coordinator_id, renewed_mono_ms)
+                         VALUES (?1,?2,?3,?4,?5,?6)
                          ON CONFLICT (coordinator_id, attempt_id) DO UPDATE SET coordinator_epoch = ?2,
-                            lease_seq = ?3, renewed_at_ms = ?4",
-                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?, o],
+                            lease_seq = ?3, renewed_at_ms = ?4, renewed_mono_ms = ?6",
+                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?, o, to_i64(mono_ms)?],
                     )?;
                         Ok(LeaseOutcome::Extended)
                     }
@@ -1558,6 +1560,44 @@ impl WorkerStore {
                 at_ms,
             )?;
             Ok(true)
+        })
+    }
+
+    /// The highest applied key, when it was granted (monotonic; `None` for
+    /// a row an older binary wrote) and whether the lease expired, read
+    /// together.
+    pub fn lease_grant(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<(LeaseKey, Option<u64>, bool)>> {
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
+            c.query_row(
+                "SELECT coordinator_epoch, lease_seq, renewed_mono_ms, expired_at_ms FROM lease
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [&o, &a],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(e, s, m, x)| {
+                Ok((
+                    LeaseKey {
+                        coordinator_epoch: CoordinatorEpoch(to_u64(e)?),
+                        lease_seq: to_u64(s)?,
+                    },
+                    m.map(to_u64).transpose()?,
+                    x.is_some(),
+                ))
+            })
+            .transpose()
         })
     }
 
