@@ -1394,6 +1394,7 @@ impl Agent {
         &self,
         rec: &AcceptedAttempt,
         payload: &AttemptPayload,
+        toolchain: Option<super::host::PrepareToolchain>,
     ) -> Result<Option<Workspace>, ApiError> {
         let a = &rec.attempt_id;
         let permit = loop {
@@ -1412,8 +1413,10 @@ impl Agent {
             .name("prepare".into())
             .spawn(move || {
                 let _permit = permit;
-                let made = catch_unwind(AssertUnwindSafe(|| host.prepare(&rec2, &payload2)))
-                    .unwrap_or_else(|_| Err(internal("workspace", "the preparation panicked")));
+                let made = catch_unwind(AssertUnwindSafe(|| {
+                    host.prepare(&rec2, &payload2, toolchain.as_ref())
+                }))
+                .unwrap_or_else(|_| Err(internal("workspace", "the preparation panicked")));
                 let mut slot = lock(&theirs);
                 if matches!(*slot, Slot::Abandoned) {
                     drop(slot);
@@ -1464,13 +1467,32 @@ impl Agent {
         }
         let dir = self.attempt_dir(attempt);
         private_dir(&dir).map_err(|e| internal("attempt directory", e))?;
+        // The toolchains first: the workspace's preparation runs with them
+        // activated (spec 22.1), as setup-node runs before npm ci. Nothing
+        // is installed for a bundle the source does not read back to.
+        self.host.check_toolchain_source(rec, &payload)?;
+        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
+            return Ok(());
+        };
+        let binding = binding.as_ref();
         // An agent that died after making the workspace left its record.
         let ws = match self.workspace_of(attempt) {
             Some(ws) if ws.root.is_dir() => ws,
-            _ => match self.host_prepare(rec, &payload)? {
-                Some(ws) => ws,
-                None => return Ok(()),
-            },
+            _ => {
+                let bin = self
+                    .cfg
+                    .capability_profile
+                    .as_ref()
+                    .and_then(|p| p.embedded_bin());
+                let toolchain = binding
+                    .map(|b| super::host::PrepareToolchain::of(bin, b))
+                    .transpose()
+                    .map_err(invalid)?;
+                match self.host_prepare(rec, &payload, toolchain)? {
+                    Some(ws) => ws,
+                    None => return Ok(()),
+                }
+            }
         };
         let ws_json = serde_json::to_vec(&ws).map_err(|e| internal("workspace record", e))?;
         write_atomic(&self.workspace_path(attempt), &ws_json)
@@ -1478,10 +1500,6 @@ impl Agent {
 
         // The prepared setup steps are copied in (or waited for); the
         // commands that are such a step are left out.
-        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
-            return Ok(());
-        };
-        let binding = binding.as_ref();
         let Some(skip) = self.setup_wait(rec, &payload, &ws, binding)? else {
             return Ok(());
         };

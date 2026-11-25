@@ -34,9 +34,10 @@ pub enum Requirement {
     Arch(String),
     Tool(String),
     Feature(String),
-    /// A tool the workspace's preparation runs on the worker's own
-    /// environment, before any toolchain is activated (spec 22.1): only a
-    /// native observation meets it, never a frozen toolchain selection.
+    /// A tool the workspace's preparation runs (spec 22.1). Preparation runs
+    /// with the task's activated toolchains, so a native observation or a
+    /// frozen toolchain selection of its toolchain (installed or installable)
+    /// meets it.
     Prepare(String),
 }
 fn os(v: &str) -> Option<&str> {
@@ -292,16 +293,29 @@ pub fn missing_with_installable(
 ) -> Vec<String> {
     let mut native = req.clone();
     if let Some(bundle) = bundle {
-        native.requires.retain(|r| match r {
-            Requirement::Tool(name) => !bundle
+        let selected = |tool: &str| {
+            bundle
                 .frozen
                 .selections
                 .iter()
-                .any(|s| s.tool.as_str() == crate::toolchain::contract::canonical_tool(name)),
+                .any(|s| s.tool.as_str() == tool)
+        };
+        native.requires.retain(|r| match r {
+            Requirement::Tool(name) => !selected(crate::toolchain::contract::canonical_tool(name)),
+            Requirement::Prepare(name) => !selected(prepare_toolchain(name)),
             _ => true,
         });
     }
     missing(&native, report)
+}
+
+/// The toolchain whose activation serves a tool preparation runs: npm ships
+/// with node.
+pub fn prepare_toolchain(name: &str) -> &str {
+    match name {
+        "npm" => "node",
+        other => crate::toolchain::contract::canonical_tool(other),
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +456,20 @@ mod tests {
         let selected = FrozenBundle::seal_exact(frozen).unwrap();
         selected.validate(&selected.frozen.source_manifest).unwrap();
         assert!(missing_with_installable(&required, Some(&report), Some(&selected)).is_empty());
+        // Preparation runs with the activated toolchain (spec 22.1): the
+        // selected node serves node and npm for it too.
+        let node_npm = ["node".to_string(), "npm".to_string()];
+        let prepares = ExecutionRequirements::default()
+            .with_prepare(&node_npm)
+            .unwrap();
+        assert!(missing_with_installable(&prepares, Some(&report), Some(&selected)).is_empty());
+        assert_eq!(
+            missing_with_installable(&prepares, Some(&report), None),
+            [
+                "Prepare(\"node\") unavailable",
+                "Prepare(\"npm\") unavailable"
+            ],
+        );
         assert_eq!(
             missing_with_installable(&required, Some(&report), None),
             vec!["Tool(\"node\") unavailable"],

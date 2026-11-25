@@ -73,6 +73,8 @@ struct DirHost {
     pass_hook: Mutex<Option<PassHook>>,
     /// The reports `received_pass` gives, first to last (then a default one).
     pass_reports: Mutex<std::collections::VecDeque<belt::source::retention::ReceivedPassReport>>,
+    /// The toolchain each `prepare` was given, in order.
+    prepared_with: Mutex<Vec<Option<belt::worker::host::PrepareToolchain>>>,
 }
 
 type PassHook = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
@@ -141,8 +143,14 @@ impl Host for DirHost {
         self.log("workspaces");
         Ok(())
     }
-    fn prepare(&self, a: &AcceptedAttempt, _: &AttemptPayload) -> Result<Workspace, ApiError> {
+    fn prepare(
+        &self,
+        a: &AcceptedAttempt,
+        _: &AttemptPayload,
+        toolchain: Option<&belt::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
         self.log(format!("prepare {}", a.attempt_id));
+        self.prepared_with.lock().unwrap().push(toolchain.cloned());
         let now = self.preparing_now.fetch_add(1, Ordering::SeqCst) + 1;
         self.preparing_max.fetch_max(now, Ordering::SeqCst);
         while self.block_prepare.load(Ordering::SeqCst) {
@@ -331,6 +339,7 @@ pub(crate) fn fx_named(worker: &str) -> Fx {
         tool_poll_hold: AtomicBool::new(false),
         pass_hook: Mutex::default(),
         pass_reports: Mutex::default(),
+        prepared_with: Mutex::default(),
     });
     Fx {
         dir,
@@ -3259,8 +3268,20 @@ impl Host for RealButCore {
     fn sweep_workspaces(&self, h: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
         self.0.sweep_workspaces(h)
     }
-    fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
-        self.0.prepare(a, p)
+    fn prepare(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+        t: Option<&belt::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
+        self.0.prepare(a, p, t)
+    }
+    fn check_toolchain_source(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+    ) -> Result<(), ApiError> {
+        self.0.check_toolchain_source(a, p)
     }
     fn setup_poll(
         &self,
@@ -6862,4 +6883,87 @@ fn a_forecast_counts_a_mise_install_only_where_the_version_is_missing() {
         );
         assert!(!f.dir.path().join("mise-ran").exists());
     }
+}
+
+/// The workspace's preparation runs with the task's activated toolchain
+/// (spec 22.1): a worker whose node 22.1.0 is only in its version manager,
+/// not on its bare PATH, prepares with that node first on the PATH, and the
+/// identity of the activated node goes with it. Two tasks with the same
+/// node share it; nothing is prepared before the toolchain is ready.
+#[test]
+fn the_workspace_is_prepared_with_the_activated_toolchain() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let node = |version: &str| {
+        let p = payload("exit 0");
+        let scope = Scope::project("");
+        let mut p = p;
+        p.commands[0].env.clear();
+        p.toolchains = Some(Box::new(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    p.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse(version).unwrap(),
+                        scope,
+                        location: Location {
+                            path: ".node-version".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ));
+        p
+    };
+    let f = fx();
+    let agent = mise_agent(&f, &["22.1.0"], false);
+    let base = std::fs::canonicalize(f.dir.path()).unwrap();
+    let managed = base.join("nodenv/versions/22.1.0/bin");
+    for _ in 0..2 {
+        let p = node("22.1.0");
+        agent
+            .handle(mise_session(), submit_req(&AttemptId::generate(), &p))
+            .unwrap();
+    }
+    wait_for("both preparations", || {
+        f.host.prepared_with.lock().unwrap().len() == 2
+    });
+    let seen = f.host.prepared_with.lock().unwrap().clone();
+    let first = seen[0]
+        .clone()
+        .expect("prepared with the activated toolchain");
+    let path = &first.env["PATH"];
+    assert!(std::env::split_paths(path).any(|d| d == managed), "{path}");
+    assert!(!first.identity.is_empty());
+    assert_eq!(
+        seen[1].as_ref(),
+        Some(&first),
+        "the same node, the same key"
+    );
+    // A toolchain that is not ready yet: the workspace is not prepared.
+    let g = fx();
+    *g.host.tool_poll.lock().unwrap() = Some(Some("no recipe".into()));
+    let agent = mise_agent(&g, &[], true);
+    let c = AttemptId::generate();
+    agent
+        .handle(mise_session(), submit_req(&c, &node("22.1.0")))
+        .unwrap();
+    wait_for("the toolchain to be asked for", || {
+        g.host.calls().iter().any(|c| c.starts_with("tool_poll"))
+    });
+    g.wait_terminal(&c);
+    assert!(
+        !g.host.calls().iter().any(|c| c.starts_with("prepare")),
+        "{:?}",
+        g.host.calls()
+    );
 }

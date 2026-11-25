@@ -14,6 +14,46 @@ use crate::storage::AcceptedAttempt;
 use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
+/// The environment a workspace's preparation (`fast-worktree add`) runs
+/// with when the task has toolchains (spec 22.1): the activation's
+/// variables, its `PATH` with the tool-bin directory first, and the
+/// activated tools' identity, which goes into every preparation cache key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareToolchain {
+    pub env: std::collections::BTreeMap<String, String>,
+    pub identity: String,
+}
+
+impl PrepareToolchain {
+    /// Under `binding`: the activation with the tool-bin directory `bin`
+    /// first on its `PATH`, and the identity of the activated tools (the
+    /// activation's installation digest: each tool with its identity).
+    pub fn of(
+        bin: Option<&std::path::Path>,
+        binding: &crate::toolchain::contract::ExecutionBinding,
+    ) -> Result<Self, String> {
+        Ok(PrepareToolchain {
+            env: crate::workspace::embedded::activated(bin, binding, &Default::default())?,
+            identity: binding.activation.installation.as_str().to_string(),
+        })
+    }
+
+    /// What `fast-worktree add` runs with: the worker's own variables
+    /// `own`, overlaid by the activation's (its `PATH` among them), and the
+    /// identity, which fast-worktree 0.8 adds to every preparation cache
+    /// key: a `node_modules` prepared with one node is never reused for
+    /// another.
+    pub fn environment(
+        &self,
+        own: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut env = own.clone();
+        env.extend(self.env.clone());
+        env.insert("FAST_WORKTREE_KEY_IDENTITY".into(), self.identity.clone());
+        env
+    }
+}
+
 /// For each source, across every member: whether a non-terminal attempt
 /// names it, and the newest `terminal_at_ms` of those that did.
 pub type SourceAttempts<'a> =
@@ -132,12 +172,25 @@ pub trait Host: Send + Sync {
     /// Remove workspaces and scratch directories no live attempt owns. Runs
     /// before any [`Host::prepare`].
     fn sweep_workspaces(&self, has_record: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError>;
+    /// Check, before any toolchain is installed for it, that the attempt's
+    /// frozen toolchains are what its captured source reads back to. The
+    /// default has no source store.
+    fn check_toolchain_source(
+        &self,
+        _attempt: &AcceptedAttempt,
+        _payload: &AttemptPayload,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
     /// Make the attempt's workspace. Safe to call again for the same attempt
-    /// (an agent that died half-way).
+    /// (an agent that died half-way). `toolchain` is the task's activated
+    /// toolchains, which the workspace's preparation runs with (spec 22.1);
+    /// `None` for a task without any.
     fn prepare(
         &self,
         attempt: &AcceptedAttempt,
         payload: &AttemptPayload,
+        toolchain: Option<&PrepareToolchain>,
     ) -> Result<Workspace, ApiError>;
     /// Where the setup of the attempt stands (spec chapter 8): its steps
     /// are prepared once per worker by a builder and copied into the

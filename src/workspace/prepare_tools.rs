@@ -2,17 +2,17 @@
 //! add` prepares the projects of the captured source's `.fast-worktree.toml`
 //! (its `[[clone]]` entries, or without any the tracked lockfiles of its
 //! presets less its `[[ignore]]`) and runs its `[[post_add]]` hooks, on the
-//! worker's own environment and before the task's toolchains are activated.
-//! A worker that lacks one of these tools cannot prepare the workspace, so
-//! each is a presence requirement of the task. No I/O.
+//! task's activated toolchains (the worker's own environment without any).
+//! A worker that neither has nor can activate one of these tools cannot
+//! prepare the workspace, so each is a requirement of the task. No I/O.
 //!
-//! This mirrors `fast-worktree` `=0.7.0` (see `Cargo.toml`), whose target
+//! This mirrors `fast-worktree` `=0.8.0` (see `Cargo.toml`), whose target
 //! rules are private: when the pin moves, check the preset table below.
 
 use crate::toolchain::capability::TOOLS;
 use std::collections::BTreeSet;
 
-/// The presets of `fast-worktree` 0.7.0: its name, the lockfile that marks a
+/// The presets of `fast-worktree` 0.8.0: its name, the lockfile that marks a
 /// project, and the tools its default key commands and install run.
 const PRESETS: &[(&str, &str, &[&str])] = &[
     ("npm", "package-lock.json", &["node", "npm"]),
