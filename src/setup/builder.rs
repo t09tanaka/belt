@@ -1585,6 +1585,13 @@ impl Setups {
     ) -> BuildEnd {
         let crashed =
             |what: &str, e: &dyn std::fmt::Display| BuildEnd::Crashed(format!("{what}: {e}"));
+        // A builder's supervisor counts its lease from its own start, with
+        // no seed: the first window runs from just before it, not from the
+        // acceptance (the work between them can outlast a window). Earlier
+        // than the supervisor's start, so never longer than it counts.
+        if let Err(e) = store.restamp_unrenewed_grant(attempt, GrantStamp::now()) {
+            return crashed("the lease", &e);
+        }
         let mut child = match spawn_detached(&self.cfg.supervisor_exe, &dir.join("spec.json")) {
             Ok(c) => c,
             Err(e) => return crashed("supervisor", &e),

@@ -778,6 +778,7 @@ lease seedは、agentがsupervisorを起動する直前に測った「受理ま�
 - supervisorが時刻から数えるのは、自分と同じbootの記録だけである。時刻が現在より後なら現在時刻として数える。時刻の無い行（前の版が書いた行）や別のbootの行のkeyは、従来どおり期限を判定してから、気付いた時点から1期間として数える（遅れて気付いたrenewでは復活しない）。
 - 受理のとき、受理の時刻（単調時計とbootのID、受理のcommitより前に測る）と、leaseの条件（`lease_ms` と `poll_ms`）をattemptの行に記録する。renewの期限の判定とsupervisorのspecは、どちらもこの記録した条件を使う。agentの設定が後で変わっても、両者の1期間（`lease_ms - poll_ms`）は同じである。
 - 延長になるrenewは、直前のgrant（最後に適用したrenew、無ければ受理）から1期間を過ぎる前に届いたときだけ適用する。判定は、DBに記録した直前のgrantの時刻とbootだけを使い、新しいgrantの書き込みと同じtransactionで行う。メモリ上の値は使わないので、agentの再起動の前後で変わらない。共有setup builderのrenewも同じ判定を通る。
+- 共有setup builderのsupervisorはseedを持たず、自分の起動時点から数える。builderは受理からsupervisorの起動までに長い作業をするので、まだrenewが1つも適用されていなければ、supervisorを起動する直前に受理の時刻を測り直す。起動より前の時刻なので、supervisorが数えるより長いleaseにはならない。renewが適用された後は測り直さない。
 - 証明に要るものが1つでも無ければ断る（`LEASE_NOT_RENEWABLE`）。直前のgrantの時刻やbootの記録が無い（前の版が受理・renewした行）、bootが現在と違う、またはbootのIDが取れない、時刻が現在より後、条件の記録が無い、のいずれも断る。前の版が受理したattemptは、更新後の最初のrenewでleaseを失う（安全側に倒す）。
 - これで、時刻の記録された行のkeyはどれも、受理から一度も切れずにつながったgrantの最後である。supervisorは最新の行しか見ないが、記録のある行はこの判定を通った書き込みでしか作られないので、最新のgrantから数えても、切れた後のrenewでleaseが復活することはない。
 - 断ったrenewも、運んできたcoordinator epochは記録する。延長にならないrenew（同じkeyの再送など）は判定より先に従来どおり扱い、期限の後に届いた再送も `extended=false` で返す。

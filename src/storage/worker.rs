@@ -1694,6 +1694,25 @@ impl WorkerStore {
         })
     }
 
+    /// Move the acceptance's grant stamp to `stamp` while no renewal was
+    /// applied. Only for a supervisor that counts from its own start without
+    /// a seed (a setup builder's), called before it starts: the first window
+    /// then runs from no later than where that supervisor counts it.
+    pub fn restamp_unrenewed_grant(&self, attempt_id: &AttemptId, stamp: GrantStamp) -> Result<()> {
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db.write(move |tx| {
+            let o = owner_in(tx, &o, Some(&a))?;
+            tx.execute(
+                "UPDATE worker_attempt SET accepted_mono_ms = ?3, accepted_boot = ?4
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2 AND lease_ms IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM lease
+                                   WHERE coordinator_id = ?1 AND attempt_id = ?2)",
+                params![o, a, to_i64(stamp.mono_ms)?, stamp.boot],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The lease terms persisted at acceptance: `(lease_ms, poll_ms)`.
     pub fn lease_terms(&self, attempt_id: &AttemptId) -> Result<Option<(u64, u64)>> {
         let (o, a) = (self.scope.clone(), attempt_id.to_string());

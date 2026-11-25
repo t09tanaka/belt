@@ -1567,6 +1567,34 @@ fn a_renewal_is_applied_only_within_the_window_of_the_grant_before_it() {
     assert_eq!(renew(3, 2_800).unwrap(), LeaseOutcome::Extended);
 }
 
+/// A builder's grant moves to its supervisor's start only while nothing
+/// was renewed: after a renewal the chain stays as it was.
+#[test]
+fn an_unrenewed_grant_is_restamped_and_a_renewed_one_is_not() {
+    let w = wx();
+    let id = accepted_at_1000(&w, true);
+    w.store
+        .restamp_unrenewed_grant(&id, at(Some("b"), 5_000))
+        .unwrap();
+    assert!(w
+        .store
+        .renew_lease(&id, key(1, 1), 50, at(Some("b"), 1_899))
+        .is_err());
+    assert_eq!(
+        w.store
+            .renew_lease(&id, key(1, 1), 50, at(Some("b"), 5_899))
+            .unwrap(),
+        LeaseOutcome::Extended
+    );
+    w.store
+        .restamp_unrenewed_grant(&id, at(Some("b"), 9_000))
+        .unwrap();
+    assert!(w
+        .store
+        .renew_lease(&id, key(1, 2), 50, at(Some("b"), 9_001))
+        .is_err());
+}
+
 /// A refused late renewal still leaves the newer epoch it carried.
 #[test]
 fn a_late_renewal_is_refused_and_still_remembers_its_epoch() {
