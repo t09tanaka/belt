@@ -412,13 +412,19 @@ async fn collection_shutdown_fixture(
     crate::service::bootstrap::ensure(spec.clone())
         .await
         .expect("spec reaches the live owner");
-    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    // The stop can never be confirmed here, so the wait ends through an
+    // interrupt sent once the acknowledgement has been read. A wall-clock
+    // budget would race the cancel request's round trip on a loaded host.
+    let (sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let target = crate::service::completion::Target::Run(run.clone());
-    let pending = crate::service::control::cancel_and_stop(
+    let pending = crate::service::control::cancel_and_stop_observed(
         &spec,
         target,
         &mut signals,
-        Duration::from_millis(500),
+        Duration::from_secs(30),
+        &mut || {
+            let _ = sender.send(());
+        },
     )
     .await;
     assert_eq!(pending.cli_exit_code, 77);
