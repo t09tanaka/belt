@@ -4201,10 +4201,13 @@ impl Agent {
     fn checked_report_unless_stopping(
         &self,
         profile: &Arc<crate::toolchain::profile::Profile>,
-    ) -> Result<(crate::toolchain::capability::WorkerCapabilities, Vec<String>), &'static str> {
-        if self.stopping() {
-            return Err(AGENT_STOPPING);
-        }
+    ) -> Result<
+        (
+            crate::toolchain::capability::WorkerCapabilities,
+            Vec<String>,
+        ),
+        &'static str,
+    > {
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         let theirs = profile.clone();
         let spawned = std::thread::Builder::new()

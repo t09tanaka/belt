@@ -4479,7 +4479,10 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
         .unwrap();
     // The probe's own deadline is 2 s, the measurement's 5 s.
     let took = at.elapsed();
-    assert!(took < Duration::from_millis(1_000), "the stop took {took:?}");
+    assert!(
+        took < Duration::from_millis(1_000),
+        "the stop took {took:?}"
+    );
     assert_ne!(f.rec(&a).state, AttemptState::Terminal);
     assert_eq!(events(&f, &a, "agent_prepare_failed"), 0);
 }
