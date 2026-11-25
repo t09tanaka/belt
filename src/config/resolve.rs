@@ -24,7 +24,31 @@ pub const DEFAULT_TERM_GRACE_SECONDS: u64 = 10;
 pub const DEFAULT_WARMUP_IDLE_SECONDS: u64 = 60;
 pub const DEFAULT_FORECAST_TTL_MS: u64 = 2000;
 pub const DEFAULT_PREFETCH_PER_WORKER: u32 = 1;
-pub const DEFAULT_MAX_ACTIVE_TASK: u32 = 2;
+/// The smallest built-in active window, for a host that reports nothing.
+pub const MIN_DEFAULT_MAX_ACTIVE_TASK: u32 = 2;
+/// Memory one active task is assumed to need when the window is derived.
+pub const DEFAULT_TASK_MEMORY_BYTES: u64 = 4 << 30;
+
+/// The built-in `max_active_task` of a worker with these cores and memory:
+/// one task per two logical cores, at most one per 4 GiB of memory, and never
+/// below 2. A CI step (a cargo build or test) already uses several cores, so
+/// half the cores keeps the host busy while TTC admission still decides CPU
+/// and memory per step. 12 cores give 6, 8 cores give 4.
+pub fn default_max_active_task(cores: Option<u32>, memory_bytes: Option<u64>) -> u32 {
+    let by_cores = cores.map_or(MIN_DEFAULT_MAX_ACTIVE_TASK, |c| c / 2);
+    let by_memory = memory_bytes.map_or(u32::MAX, |m| {
+        u32::try_from(m / DEFAULT_TASK_MEMORY_BYTES).unwrap_or(u32::MAX)
+    });
+    by_cores.min(by_memory).max(MIN_DEFAULT_MAX_ACTIVE_TASK)
+}
+
+/// The built-in `max_active_task` of this host.
+pub fn host_default_max_active_task() -> u32 {
+    default_max_active_task(
+        crate::toolchain::profile::host_cores(),
+        crate::toolchain::profile::host_memory_bytes(),
+    )
+}
 pub const DEFAULT_LOG_SPOOL_LIMIT_BYTES: u64 = 1_073_741_824;
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const DEFAULT_PRIORITY: i64 = 0;
@@ -807,7 +831,7 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
             None,
             None,
             coord.max_active_task,
-            DEFAULT_MAX_ACTIVE_TASK,
+            host_default_max_active_task(),
         ),
         log_spool_limit_bytes: pick(
             &layers,
@@ -970,6 +994,28 @@ mod tests {
         assert_eq!(MAX_PRIORITY, 100);
         assert_eq!(MAX_PRIORITY_STEP_SECONDS, 3600);
     }
+
+    #[test]
+    fn the_default_task_window_follows_cores_and_memory() {
+        let twelve = default_max_active_task(Some(12), None);
+        let eight = default_max_active_task(Some(8), None);
+        assert_eq!((twelve, eight), (6, 4));
+        assert!(twelve > eight);
+        assert_eq!(default_max_active_task(Some(12), Some(96 << 30)), 6);
+        assert_eq!(default_max_active_task(Some(12), Some(8 << 30)), 2);
+        assert_eq!(default_max_active_task(Some(32), Some(16 << 30)), 4);
+        assert_eq!(default_max_active_task(Some(2), None), 2);
+        assert_eq!(default_max_active_task(None, None), 2);
+        assert_eq!(default_max_active_task(Some(4), Some(1 << 30)), 2);
+        assert_eq!(
+            host_default_max_active_task(),
+            default_max_active_task(
+                crate::toolchain::profile::host_cores(),
+                crate::toolchain::profile::host_memory_bytes(),
+            )
+        );
+        assert!(host_default_max_active_task() >= MIN_DEFAULT_MAX_ACTIVE_TASK);
+    }
     #[test]
     fn generic_output_admission_checks_paths_and_folded_names() {
         let mut project = ProjectConfig {
@@ -1083,6 +1129,11 @@ pub struct RuntimeSettings {
     pub warmup_idle_ms: u64,
     pub retention_ms: u64,
     pub log_limit_bytes: u64,
+    /// This machine's own window, which its worker answers in `inspect`.
+    /// `coordinator.limits` differs only when `max_active_task` is the
+    /// built-in value: a parent does not cap another worker with a default
+    /// derived from its own cores, and takes the worker's answer instead.
+    pub own_limits: crate::coordinator::policy::Limits,
 }
 
 impl ResolvedConfig {
@@ -1116,9 +1167,17 @@ impl ResolvedConfig {
             problems: vec![message],
         })?;
         Ok(RuntimeSettings {
+            own_limits: crate::coordinator::policy::Limits {
+                max_active_task: self.max_active_task.value,
+                prefetch_per_worker: self.prefetch_per_worker.value,
+            },
             coordinator: crate::coordinator::CoordinatorConfig {
                 limits: crate::coordinator::policy::Limits {
-                    max_active_task: self.max_active_task.value,
+                    max_active_task: if self.max_active_task.origin == Origin::Default {
+                        u32::MAX
+                    } else {
+                        self.max_active_task.value
+                    },
                     prefetch_per_worker: self.prefetch_per_worker.value,
                 },
                 lease_ms,
