@@ -349,19 +349,46 @@ pub fn look_failed(table: &[Row], root: ProcRef, root_gone: bool) -> bool {
     table.is_empty() || (!root_gone && !contains_root(table, root))
 }
 
+/// Failed looks in a row that are taken as a longer pause between two good
+/// looks rather than as a loss.
+///
+/// Why this is safe: the tracker only ever sees processes at its looks. A
+/// process that is forked and leaves the tree (its parent exits) between two
+/// looks is not recorded, whether the looks are one interval apart or a few.
+/// A failed look changes nothing in the record and drops nothing from it
+/// (see [`step`]), and the next good look walks the whole tree again from
+/// the command and from every recorded process. So a gap of up to
+/// `GAP_LIMIT` failed looks followed by a good one loses no more than the
+/// same pause between good looks would. A longer gap, or a gap that is
+/// still open at the last look, is not closed by anything: the record is
+/// then truncated, and stays so. Any failed look also leaves the record not
+/// `covered` (the tracker's caller keeps that), so the window for hidden
+/// orphans never closes on its strength.
+pub const GAP_LIMIT: u32 = 3;
+
 /// One look at the table: prune, find what is new and record it. A look that
-/// failed is a tracker failure: the record becomes truncated (a change, to be
-/// persisted at once) and is otherwise left as it is, so no recorded entry is
-/// dropped on the strength of a bad read.
+/// failed is left out: the record is not changed (no recorded entry is
+/// dropped on the strength of a bad read) and `gaps` counts it. Once more
+/// than [`GAP_LIMIT`] looks in a row failed the record becomes truncated (a
+/// change, to be persisted at once), and that is sticky. A good look ends
+/// the gap.
 pub fn step(
     table: &[Row],
     root: ProcRef,
     root_gone: bool,
     tracked: &mut Tracked,
     missed: &mut Vec<ProcRef>,
+    gaps: &mut u32,
     cap: usize,
 ) -> Step {
     if look_failed(table, root, root_gone) {
+        *gaps = gaps.saturating_add(1);
+        if *gaps <= GAP_LIMIT {
+            return Step {
+                changed: false,
+                failed: true,
+            };
+        }
         let changed = !tracked.truncated;
         tracked.truncated = true;
         return Step {
@@ -369,6 +396,7 @@ pub fn step(
             failed: true,
         };
     }
+    *gaps = 0;
     let pruned = prune(table, &tracked.descendants, missed);
     tracked.descendants = pruned.kept;
     *missed = pruned.missed;
@@ -772,7 +800,7 @@ mod tests {
         missed: &mut Vec<ProcRef>,
         cap: usize,
     ) -> bool {
-        let s = step(table, root, false, t, missed, cap);
+        let s = step(table, root, false, t, missed, &mut 0, cap);
         assert!(!s.failed, "{table:?}");
         s.changed
     }
@@ -827,12 +855,39 @@ mod tests {
             t.truncated,
         );
         assert_eq!(held.probe, Probe::Unknown);
-        assert!(!step(&gone, root, false, &mut t, &mut missed, 2).changed);
+        assert!(!step(&gone, root, false, &mut t, &mut missed, &mut 0, 2).changed);
         assert!(t.truncated, "sticky");
     }
 
     #[test]
-    fn a_look_that_cannot_be_believed_truncates_and_drops_nothing() {
+    fn one_failed_look_followed_by_good_ones_does_not_hold_the_entry_for_ever() {
+        // The command is running; one look misses it (a table read that
+        // could not be believed), then every look is good again and the
+        // command and its child end.
+        let root = p(5, 50);
+        let full = [row(5, 1, 50), row(6, 5, 60)];
+        let other = [row(9, 1, 90)];
+        let mut t = Tracked::default();
+        let mut missed = Vec::new();
+        let mut gaps = 0;
+        assert!(!step(&full, root, false, &mut t, &mut missed, &mut gaps, 10).failed);
+        assert!(step(&other, root, false, &mut t, &mut missed, &mut gaps, 10).failed);
+        for _ in 0..3 {
+            assert!(!step(&full, root, false, &mut t, &mut missed, &mut gaps, 10).failed);
+        }
+        let ended = [row(9, 1, 90)];
+        for _ in 0..3 {
+            assert!(!step(&ended, root, true, &mut t, &mut missed, &mut gaps, 10).failed);
+        }
+        assert!(t.descendants.is_empty(), "{t:?}");
+        // Nothing runs and nothing was lost: a clear scan is believed.
+        assert!(!t.truncated, "{t:?}");
+        let scan = with_recorded(Scan::new(Probe::Gone, vec![]), vec![], t.truncated);
+        assert_eq!(scan.probe, Probe::Gone);
+    }
+
+    #[test]
+    fn a_look_that_cannot_be_believed_drops_nothing_and_a_long_gap_truncates() {
         let root = p(5, 50);
         let child = p(6, 60);
         let full = [row(5, 1, 50), row(6, 5, 60)];
@@ -848,7 +903,15 @@ mod tests {
                 truncated: false,
             };
             let mut m2 = vec![child];
-            let s = step(&none, root, gone, &mut t2, &mut m2, 10);
+            let s = step(
+                &none,
+                root,
+                gone,
+                &mut t2,
+                &mut m2,
+                &mut GAP_LIMIT.clone(),
+                10,
+            );
             assert_eq!(
                 s,
                 Step {
@@ -861,9 +924,22 @@ mod tests {
             assert_eq!(m2, vec![child]);
             assert!(t2.truncated);
         }
-        // A table without the command although it still runs.
+        // A table without the command although it still runs: a gap, which
+        // changes nothing until it is longer than `GAP_LIMIT` looks.
         let other = [row(9, 1, 90)];
-        let s = step(&other, root, false, &mut t, &mut missed, 10);
+        let mut gaps = 0;
+        for n in 1..=GAP_LIMIT {
+            let s = step(&other, root, false, &mut t, &mut missed, &mut gaps, 10);
+            assert_eq!(
+                s,
+                Step {
+                    changed: false,
+                    failed: true
+                }
+            );
+            assert_eq!((gaps, t.truncated), (n, false));
+        }
+        let s = step(&other, root, false, &mut t, &mut missed, &mut gaps, 10);
         assert_eq!(
             s,
             Step {
@@ -871,9 +947,11 @@ mod tests {
                 failed: true
             }
         );
+        assert!(t.truncated);
         assert_eq!(t.descendants, before);
-        // Already truncated: failing again changes nothing.
-        let s = step(&other, root, false, &mut t, &mut missed, 10);
+        // Already truncated: failing again changes nothing, and a good look
+        // after a gap that long does not take it back.
+        let s = step(&other, root, false, &mut t, &mut missed, &mut gaps, 10);
         assert_eq!(
             s,
             Step {
@@ -881,6 +959,8 @@ mod tests {
                 failed: true
             }
         );
+        assert!(!step(&full, root, false, &mut t, &mut missed, &mut gaps, 10).failed);
+        assert!(t.truncated && gaps == 0, "sticky");
         // A command that has ended or is gone is not a failure...
         assert!(!look_failed(&other, root, true));
         // ...nor is one that is listed.
