@@ -526,7 +526,7 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 
 例：`local_worker_priority = -1`、他のworkerが0なら、手元は60秒遅いものとして比べられ、他のworkerが60秒以上遅れない限りそちらへ配置される。手元を実質使わないなら大きな差（例：-50）を付ける。配置理由の表示には、priorityによる補正量（worker別の秒数）を含める。
 
-workerはactive task数と未開始prefetch数の両方を制限する。既定は `max_active_task = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive taskもactive枠を使う。親は、あるworkerに置いたtask（開始済み・未開始・未ACK・unknown・retire確認待ちを含む）の合計が `max_active_task + prefetch_per_worker` に達したら、そのworkerへ新しく配置しない。上限は親の設定とworkerが `inspect` で答えた値の、項目ごとに小さい方を使う。件数は配置を記録するtransactionの中で数え直す。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
+workerはactive task数と未開始prefetch数の両方を制限する。`prefetch_per_worker` の既定は1、`max_active_task` の既定はそのマシンの論理コア数の半分と物理メモリ4 GiBあたり1の小さい方で、2を下回らない（12コアなら6、8コアなら4。コア数が分からなければ2）。どちらも設定で調整でき、明示した値が既定より優先する。理由：CIのstep（cargoのbuild・testなど）は1つで複数コアを使うので、コアの半分を並べればマシンを埋められ、stepごとのCPU・メモリの受け入れはworker上のtask-traffic-controllerが決める。固定の2では12コアのマシンも3件しか持てず、実測（13件のCI、12コアのMac 1台）で31分のうち約12〜14分を失った。prefetchを1に保つのは、窓を広げても動かせない分を1つのworkerが抱え込み、他のworkerの仕事を奪わないためである。既定値（設定していない `max_active_task`）は自分のworkerの窓にだけ使い、親として他のworkerへ配るときの上限にはしない（相手の窓はそのworkerが `inspect` で答える）。resource待ちのactive taskもactive枠を使う。親は、あるworkerに置いたtask（開始済み・未開始・未ACK・unknown・retire確認待ちを含む）の合計が `max_active_task + prefetch_per_worker` に達したら、そのworkerへ新しく配置しない。上限は親の設定（明示したもの）とworkerが `inspect` で答えた値の、項目ごとに小さい方を使う。件数は配置を記録するtransactionの中で数え直す。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
 
 この受付窓は、そのworkerへ仕事を投げるすべてのメンバーに共通の1つの予算で、値は受ける側のマシン自身の設定が決める（`inspect` で答える）。投げた側が数えられるのは自分が置いたtaskだけなので、上限を守る責任はworkerにあり、workerは窓を超える新規submitを断る。断られた側は、retireを確認してから別のworkerへ置き直す（24.4）。投げた側の件数の確認は、断られるsubmitを減らすために残す。
 

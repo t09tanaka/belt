@@ -232,8 +232,8 @@ impl ResolvedConfig {
         agent.group_key_path = inputs.cluster_key_path.clone();
         agent.traffic_state_dir = traffic.state_dir;
         agent.traffic_config = Some(traffic.config_file);
-        agent.max_active_task = settings.coordinator.limits.max_active_task;
-        agent.prefetch_per_worker = settings.coordinator.limits.prefetch_per_worker;
+        agent.max_active_task = settings.own_limits.max_active_task;
+        agent.prefetch_per_worker = settings.own_limits.prefetch_per_worker;
         agent.forecast_ttl_ms = settings.scheduler.rules.forecast_ttl_ms;
         agent.term_grace_ms = settings.term_grace_ms;
         agent.warmup_idle_ms = settings.warmup_idle_ms;
