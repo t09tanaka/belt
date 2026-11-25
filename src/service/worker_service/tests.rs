@@ -1816,6 +1816,27 @@ fn refresh_env_restarts_the_service_with_the_new_path_everywhere() {
 }
 
 #[test]
+fn refresh_env_ends_only_the_drain_it_made() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let new = with(&h.env, "PATH", "/opt/homebrew/bin:/usr/bin:/bin");
+    let status = refresh_env(&new, h.fake.clone(), Duration::ZERO, Duration::from_secs(2)).unwrap();
+    assert!(!status.draining && !status.drained_by_upgrade);
+}
+
+#[test]
+fn refresh_env_keeps_the_operators_drain() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    assert!(drain(&h.env, h.fake.clone()).unwrap().draining);
+    let new = with(&h.env, "PATH", "/opt/homebrew/bin:/usr/bin:/bin");
+    let status = refresh_env(&new, h.fake.clone(), Duration::ZERO, Duration::from_secs(2)).unwrap();
+    assert!(status.draining && !status.drained_by_upgrade);
+}
+
+#[test]
 fn refresh_env_without_an_install_is_refused() {
     let h = Host::new();
     assert!(refresh_env(

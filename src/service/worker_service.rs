@@ -1502,6 +1502,16 @@ pub fn refresh_env<L: Launcher>(
         return status_with(&paths, &journal, &plan_now, &receipt, &mut launcher, ready);
     }
     let files = services(&paths, &journal)?;
+    // The stop below drains the worker. A drain that was already there is
+    // the operator's (or an upgrade's) and stays; only the drain this stop
+    // makes is ended after the restart. It is recorded as owned first, so a
+    // failure in between leaves the drain the upgrade rules end: the next
+    // `upgrade` commit or the operator's `resume`.
+    let owns_drain = !journal.drained_by_upgrade && !Control::effective(&paths.state).drain;
+    if owns_drain {
+        journal.drained_by_upgrade = true;
+        save_journal(&paths, &journal)?;
+    }
     let (mut files, mut launcher) =
         upgrade::retire(&paths, &journal, &receipt, files, launcher, wait)?;
     // The old service file goes, then the journal records both the new PATH
@@ -1532,6 +1542,12 @@ pub fn refresh_env<L: Launcher>(
     let receipt = journal.receipt.clone().context("service receipt missing")?;
     clear_cancel(&paths.state)?;
     ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
+    if owns_drain {
+        // The marker first, as in the upgrade's commit.
+        marker(&paths, Duration::ZERO).request(&identity(&journal), WorkerRequest::Resume)?;
+        journal.drained_by_upgrade = false;
+        save_journal(&paths, &journal)?;
+    }
     let ready = wait_ready(&paths.state, ready_timeout);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
