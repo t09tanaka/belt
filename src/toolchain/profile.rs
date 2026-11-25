@@ -1338,7 +1338,8 @@ pub(crate) fn host_cores() -> Option<u32> {
 pub(crate) fn host_memory_bytes() -> Option<u64> {
     static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MEMORY.get_or_init(|| {
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             let mut size: u64 = 0;
             let mut len = std::mem::size_of::<u64>();
             // SAFETY: `size` and `len` are valid for the 8 bytes the kernel
@@ -1353,7 +1354,9 @@ pub(crate) fn host_memory_bytes() -> Option<u64> {
                 )
             };
             (rc == 0 && size > 0).then_some(size)
-        } else {
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             let text = std::fs::read_to_string("/proc/meminfo").ok()?;
             let kib: u64 = text
                 .lines()
