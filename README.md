@@ -462,9 +462,15 @@ How descendants are found, and what this cannot see:
   two looks is not recorded however far apart they are, and the next good
   look walks the whole tree again from the command and every recorded
   process, so such a gap loses nothing a pause of the same length would not.
-  A longer gap, or one still open at the last look, marks the record
-  truncated for good. After any gap the record does not count as covering
-  the command's whole life, so the window for hidden orphans stays open.
+  Only a look that lists the command alive ends a gap, and a recorded
+  process it does not list is dropped only if a later good look misses it
+  too. A longer gap, or one still open at the last look (including when the
+  command ended during the gap), marks the record truncated for good. After
+  a gap that was closed the record does not count as covering the
+  command's whole life: if the entry is later left to the reaper or
+  `resolve`, the window for hidden orphans stays open. A normal end of the
+  run is not affected: the entry is released once the process group, the
+  session and the marked and recorded processes are gone, as without a gap.
 - **A launch intent and hidden processes.** A launch intent (the supervisor
   died around the spawn) is released by the reaper once the lease is gone,
   60 seconds have passed, no marked or recorded process runs, *and* no

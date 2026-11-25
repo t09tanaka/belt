@@ -170,9 +170,34 @@ struct Writes {
     pending: bool,
 }
 
+/// Where the looks come from: the process table, or a script in tests.
+trait Looks {
+    /// One read of the table.
+    fn read(&mut self) -> Vec<lineage::Row>;
+    /// Asked only when the table does not list the command.
+    fn root_gone(&self, pid: u32) -> bool;
+}
+
+impl Looks for TableReader {
+    fn read(&mut self) -> Vec<lineage::Row> {
+        TableReader::read(self)
+    }
+    fn root_gone(&self, pid: u32) -> bool {
+        process::root_gone(pid)
+    }
+}
+
 fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Finished {
     sysinfo::set_open_files_limit(0);
-    let mut reader = TableReader::new();
+    track_with(TableReader::new(), root, record, stop)
+}
+
+fn track_with(
+    mut reader: impl Looks,
+    root: ProcRef,
+    record: &Record,
+    stop: &mpsc::Receiver<bool>,
+) -> Finished {
     let mut tracked = Tracked::default();
     let mut missed = Vec::new();
     let mut gaps = 0;
@@ -211,11 +236,12 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Fi
                     Instant::now(),
                 );
                 // A gap still open at the last look is never closed by a
-                // good one: what it hid is unknown.
-                if step.failed {
+                // good one: what it hid is unknown. Persisted here, since a
+                // caller that drops the tracker writes nothing itself.
+                if step.failed && !tracked.truncated {
                     tracked.truncated = true;
+                    writes.pending = !record(&tracked, false);
                 }
-                gapped |= step.failed;
                 let covered = !gapped && !tracked.truncated && !writes.pending;
                 return Finished { tracked, covered };
             }
@@ -232,7 +258,7 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Fi
 /// asked about its pid.
 #[allow(clippy::too_many_arguments)]
 fn tick(
-    reader: &mut TableReader,
+    reader: &mut impl Looks,
     root: ProcRef,
     reaped: bool,
     tracked: &mut Tracked,
@@ -244,7 +270,7 @@ fn tick(
 ) -> lineage::Step {
     let table = reader.read();
     let gone = lineage::root_is_gone(reaped, lineage::contains_root(&table, root), || {
-        process::root_gone(root.pid)
+        reader.root_gone(root.pid)
     });
     let step = lineage::step(&table, root, gone, tracked, missed, gaps, MAX_DESCENDANTS);
     let plan = lineage::plan(
@@ -485,5 +511,107 @@ mod tests {
         assert!(f.tracked.truncated && !f.covered, "{f:?}");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// Looks read from a script. The stop (`reaped`) is sent while the
+    /// second to last table is read, so the last one is the final look.
+    struct Script {
+        tables: std::collections::VecDeque<Vec<lineage::Row>>,
+        gone: bool,
+        reaped: bool,
+        stop: mpsc::Sender<bool>,
+    }
+
+    impl Looks for Script {
+        fn read(&mut self) -> Vec<lineage::Row> {
+            let t = self.tables.pop_front().unwrap_or_default();
+            if self.tables.len() == 1 {
+                let _ = self.stop.send(self.reaped);
+            }
+            t
+        }
+        fn root_gone(&self, _pid: u32) -> bool {
+            self.gone
+        }
+    }
+
+    fn r(pid: u32, parent: u32) -> lineage::Row {
+        lineage::Row {
+            proc: ProcRef {
+                pid,
+                start_time: Some(u64::from(pid) * 10),
+            },
+            parent: Some(parent),
+        }
+    }
+
+    /// Runs the loop over `tables` (the command is 5); returns what it
+    /// finished with and every write handed to the recorder.
+    fn scripted(
+        tables: Vec<Vec<lineage::Row>>,
+        gone: bool,
+        reaped: bool,
+    ) -> (Finished, Vec<(Tracked, bool)>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let record: Record = Arc::new(move |t, stamp| {
+            s.lock().unwrap().push((t.clone(), stamp));
+            true
+        });
+        let (tx, rx) = mpsc::channel::<bool>();
+        let script = Script {
+            tables: tables.into(),
+            gone,
+            reaped,
+            stop: tx,
+        };
+        let root = ProcRef {
+            pid: 5,
+            start_time: Some(50),
+        };
+        let f = track_with(script, root, &record, &rx);
+        let w = seen.lock().unwrap().clone();
+        (f, w)
+    }
+
+    #[test]
+    fn a_closed_gap_still_leaves_the_record_not_covering_the_whole_life() {
+        let looks = vec![vec![r(5, 1)], vec![r(9, 1)], vec![r(5, 1)], vec![r(5, 1)]];
+        let (f, _) = scripted(looks, false, false);
+        assert!(!f.tracked.truncated && !f.covered, "{f:?}");
+        // Control: the same run without the gap is covered.
+        let (f, _) = scripted(
+            vec![vec![r(5, 1)], vec![r(5, 1)], vec![r(5, 1)]],
+            false,
+            false,
+        );
+        assert!(f.covered, "{f:?}");
+    }
+
+    #[test]
+    fn a_gap_open_at_the_last_look_is_persisted_as_truncated() {
+        // The final look fails (the command still runs but is not listed):
+        // the sidecar must say truncated, whoever joins the thread.
+        let looks = vec![vec![r(5, 1), r(6, 5)], vec![r(9, 1)], vec![r(9, 1)]];
+        let (f, w) = scripted(looks, false, false);
+        assert!(f.tracked.truncated && !f.covered, "{f:?}");
+        let last = w.last().expect("a write");
+        assert!(last.0.truncated && !last.1, "{w:?}");
+    }
+
+    #[test]
+    fn a_reaped_last_look_does_not_close_a_gap() {
+        // D (6) recorded, missed once, then a gap, then the command is
+        // reaped and the final look misses D as well: unknown, not empty.
+        let looks = vec![
+            vec![r(5, 1), r(6, 5)],
+            vec![r(5, 1)],
+            vec![r(9, 1)],
+            vec![r(9, 1)],
+        ];
+        let (f, w) = scripted(looks, false, true);
+        assert!(f.tracked.truncated && !f.covered, "{f:?}");
+        assert_eq!(f.tracked.descendants.len(), 1, "{f:?}");
+        assert!(w.last().unwrap().0.truncated, "{w:?}");
     }
 }
