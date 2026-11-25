@@ -915,6 +915,8 @@ mod tests {
         });
         let worker = |tools: &[&str]| crate::toolchain::capability::WorkerCapabilities {
             disk_free_bytes: None,
+            cpu_cores: None,
+            memory_bytes: None,
             resource_budget: None,
             schema_version: 1,
             os: "macos".into(),
