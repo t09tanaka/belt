@@ -230,6 +230,15 @@ pub fn task_specs(
         .collect()
 }
 
+/// The requirements of every task of a run: the configured ones, with the
+/// tools the workspace's preparation runs (spec 22.1).
+pub(crate) fn run_requirements(
+    configured: crate::toolchain::capability::ExecutionRequirements,
+    prepare: &crate::workspace::prepare_tools::PrepareTools,
+) -> Result<crate::toolchain::capability::ExecutionRequirements, ApiError> {
+    configured.with_prepare(&prepare.tools).map_err(invalid)
+}
+
 /// Every task of the run carries its own frozen toolchain selection:
 /// `toolchains` is in the order of the plan's tasks, as `specs` is.
 pub(crate) fn with_toolchains(
@@ -270,7 +279,7 @@ async fn submit_run(
     revision: Option<String>,
     run_id: RunId,
 ) -> Result<Receipt, ApiError> {
-    let requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+    let mut requirements = crate::toolchain::capability::ExecutionRequirements::parse(
         context.config.profile.value.clone(),
         &context.config.requires.value,
     )
@@ -309,14 +318,19 @@ async fn submit_run(
                     invalid(error.to_string())
                 }
             })?;
+        let prepare = crate::toolchain::snapshot::read_captured_prepare_tools(&store, &manifest)
+            .map_err(|e| invalid(format!("cannot read how the workspace is prepared: {e}")))?;
         let (plan, policies) = super::planning::freeze_with_policies(&store, &manifest)?;
         let (plan_digest, _) = crate::ci::advance::keep_plan(context.state_dir(), &plan)
             .map_err(|e| invalid(format!("cannot keep the frozen plan: {e}")))?;
-        Ok((captured, plan, plan_digest, policies, guard))
+        Ok((captured, plan, plan_digest, policies, guard, prepare))
     })
     .await
     .map_err(|e| invalid(e.to_string()))?;
-    let (captured, plan, plan_digest, policies, guard) = frozen?;
+    let (captured, plan, plan_digest, policies, guard, prepare) = frozen?;
+    // Every task's workspace is prepared alike: the tools it runs are
+    // required of the worker of every task (spec 22.1).
+    requirements = run_requirements(requirements, &prepare)?;
     let source_id = captured.manifest.source_id.clone();
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
@@ -853,6 +867,91 @@ fn expected_of(tasks: Vec<String>, split: &[SplitGroup]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ci::execute::tests::{fixture, task_of};
+
+    /// A Rust-only job of a source whose tracked npm example the workspace
+    /// preparation installs runs `node -v` before any toolchain is active:
+    /// a worker without node is no candidate, even when the task's frozen
+    /// toolchain would select node (spec 22.1, run4 of the acceptance).
+    #[test]
+    fn a_worker_without_node_is_no_candidate_when_preparation_runs_node() {
+        use crate::toolchain::capability::{missing_with_installable, ToolObservation};
+        use crate::toolchain::versions::*;
+        let f = fixture(WORKFLOW);
+        let paths = ["Cargo.lock", "examples/sharding/node/package-lock.json"];
+        let prepare = crate::workspace::prepare_tools::prepare_tools(paths, None).unwrap();
+        let requirements = Default::default();
+        let requirements = run_requirements(requirements, &prepare).unwrap();
+        let digest = Digest::of_bytes(b"plan bytes");
+        let specs = task_specs(&f.plan, &digest, &digest, &requirements, None).unwrap();
+        let scope = Scope::project("");
+        let mut node = crate::toolchain::contract::FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                Digest::of_bytes(b"source"),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &Default::default(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // The bundle provides node for the job's steps.
+        node.frozen.selections.push(ResolvedSelection {
+            tool: ToolId::parse("node").unwrap(),
+            concrete: "20.0.0".parse().unwrap(),
+            requirement_digest: Digest::of_bytes(b"requirement"),
+            authority: Digest::of_bytes(b"authority"),
+        });
+        let worker = |tools: &[&str]| crate::toolchain::capability::WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            profile: "default".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: tools
+                .iter()
+                .map(|t| {
+                    let seen = ToolObservation::Available {
+                        version: "1.0.0".into(),
+                        identity: Digest::of_bytes(t.as_bytes()),
+                    };
+                    (t.to_string(), seen)
+                })
+                .collect(),
+            features: [crate::toolchain::capability::FEATURE.into()].into(),
+            rustup: Vec::new(),
+        };
+        let (mini, studio) = (
+            worker(&["cargo", "rustc"]),
+            worker(&["cargo", "node", "npm"]),
+        );
+        for (_, spec) in &specs {
+            for bundle in [None, Some(&node)] {
+                let unmet = missing_with_installable(&spec.requirements, Some(&mini), bundle);
+                let node = unmet.iter().any(|u| u.contains("\"node\""));
+                assert!(node, "mini cannot run `node -v`: {unmet:?}");
+                assert!(
+                    missing_with_installable(&spec.requirements, Some(&studio), bundle).is_empty()
+                );
+            }
+        }
+    }
 
     const WORKFLOW: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n      - run: echo two\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n";
 

@@ -34,6 +34,10 @@ pub enum Requirement {
     Arch(String),
     Tool(String),
     Feature(String),
+    /// A tool the workspace's preparation runs on the worker's own
+    /// environment, before any toolchain is activated (spec 22.1): only a
+    /// native observation meets it, never a frozen toolchain selection.
+    Prepare(String),
 }
 fn os(v: &str) -> Option<&str> {
     match v {
@@ -68,7 +72,7 @@ impl Requirement {
         match self {
             Self::Os(v) => os(v) == Some(v.as_str()),
             Self::Arch(v) => arch(v) == Some(v.as_str()),
-            Self::Tool(v) => TOOLS.contains(&v.as_str()),
+            Self::Tool(v) | Self::Prepare(v) => TOOLS.contains(&v.as_str()),
             Self::Feature(v) => FEATURES.contains(&v.as_str()),
         }
     }
@@ -95,6 +99,18 @@ impl ExecutionRequirements {
     }
     pub fn is_empty(&self) -> bool {
         self.profile.is_none() && self.requires.is_empty()
+    }
+    /// These requirements with a [`Requirement::Prepare`] for each of
+    /// `tools`: the tools the workspace's preparation runs (spec 22.1).
+    pub fn with_prepare<'a>(
+        mut self,
+        tools: impl IntoIterator<Item = &'a String>,
+    ) -> Result<Self, String> {
+        let mut all: BTreeSet<Requirement> = self.requires.into_iter().collect();
+        all.extend(tools.into_iter().map(|t| Requirement::Prepare(t.clone())));
+        self.requires = all.into_iter().collect();
+        self.validate()?;
+        Ok(self)
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.profile.as_ref().is_some_and(|v| !valid_name(v)) {
@@ -221,7 +237,7 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
         let available = match v {
             Requirement::Os(v) => v == &r.os,
             Requirement::Arch(v) => v == &r.arch,
-            Requirement::Tool(v) => {
+            Requirement::Tool(v) | Requirement::Prepare(v) => {
                 matches!(r.tools.get(v), Some(ToolObservation::Available { .. }))
             }
             Requirement::Feature(v) => r.features.contains(v),
@@ -275,6 +291,36 @@ mod tests {
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
         }
+    }
+    /// The tools preparation runs are added once each, beside what was
+    /// configured, and only a worker that reports them meets them.
+    #[test]
+    fn prepare_tools_are_added_as_native_requirements() {
+        let base = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+        let tools = ["node".to_string(), "npm".to_string(), "npm".to_string()];
+        let req = base.with_prepare(&tools).unwrap();
+        assert_eq!(
+            req.requires,
+            [
+                Requirement::Tool("node".into()),
+                Requirement::Prepare("node".into()),
+                Requirement::Prepare("npm".into()),
+            ]
+        );
+        assert_eq!(
+            missing(&req, Some(&report())),
+            [
+                "Tool(\"node\") unavailable",
+                "Prepare(\"node\") unavailable",
+                "Prepare(\"npm\") unavailable",
+            ]
+        );
+        let many: Vec<String> = (0..33).map(|_| "node".to_string()).collect();
+        assert!(ExecutionRequirements::default().with_prepare(&many).is_ok());
+        let unknown = ["magic".to_string()];
+        assert!(ExecutionRequirements::default()
+            .with_prepare(&unknown)
+            .is_err());
     }
     /// A report's detected rustup toolchains are bounded and well formed
     /// (spec 22.1); each rule refuses alone.
