@@ -383,6 +383,36 @@ mod tests {
         assert!(!with(vec![good, one("", "1.89.0", "/r/bin")]).validate());
     }
     #[test]
+    fn detected_installs_are_validated() {
+        let one = |tool: &str, source: &str, version: &str, bin: &str| DetectedInstall {
+            tool: tool.into(),
+            version: version.into(),
+            source: source.into(),
+            bin: bin.into(),
+            identity: Digest::of_bytes(b"node"),
+        };
+        let with = |installs: Vec<DetectedInstall>| WorkerCapabilities {
+            installs,
+            ..report()
+        };
+        let good = one("node", "nodenv", "20.11.1", "/n/bin");
+        assert!(with(vec![good.clone()]).validate());
+        assert!(with(vec![good.clone(); MAX_DETECTED_INSTALLS]).validate());
+        assert!(!with(vec![good.clone(); MAX_DETECTED_INSTALLS + 1]).validate());
+        for (source, _) in DETECTED_SOURCES.iter().zip(0..) {
+            assert!(with(vec![one("node", source, "20.11.1", "/n/bin")]).validate());
+        }
+        for (tool, _, _) in DETECTED_TOOLS {
+            assert!(with(vec![one(tool, "mise", "1.2.3", "/n/bin")]).validate());
+        }
+        assert!(!with(vec![one("rustc", "mise", "20.11.1", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "asdf", "20.11.1", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "nodenv", "not a version", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "nodenv", "20.11.1", "n/bin")]).validate());
+        // A bad entry after a good one still refuses the report.
+        assert!(!with(vec![good, one("node", "asdf", "20.11.1", "/n/bin")]).validate());
+    }
+    #[test]
     fn eligible_selected_tool_is_distinct_from_its_native_unavailable_observation() {
         use crate::toolchain::{contract::FrozenBundle, versions::*};
         let report = report();

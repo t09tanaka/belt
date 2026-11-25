@@ -66,11 +66,36 @@ fn versions(dir: &Path, strip: &str) -> Vec<(node_semver::Version, PathBuf)> {
     found
 }
 
+/// The parents of the profile PATH directories named `bin` that hold an
+/// executable `brew`, in PATH order, each once.
+fn brew_prefixes(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found: Vec<PathBuf> = Vec::new();
+    let Some(path) = env.get("PATH") else {
+        return found;
+    };
+    for dir in std::env::split_paths(path).take(MAX_ENTRIES) {
+        let brew = dir.join("brew");
+        let usable =
+            fs::metadata(&brew).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        if !dir.is_absolute() || !dir.ends_with("bin") || !usable {
+            continue;
+        }
+        if let Some(prefix) = dir.parent() {
+            if !found.iter().any(|p| p == prefix) {
+                found.push(prefix.to_path_buf());
+            }
+        }
+    }
+    found
+}
+
 /// Every installed version the managers of `env` have, highest first, at
 /// most [`MAX_DETECTED_INSTALLS`]: mise (`<data>/installs/<tool>/<v>`),
 /// nodenv (`$NODENV_ROOT` or `~/.nodenv`, `versions/<v>`), nvm (`$NVM_DIR`
 /// or `~/.nvm`, `versions/node/v<v>`) and Homebrew
-/// (`$HOMEBREW_PREFIX/Cellar/node[@N]/<v>`, else the standard prefixes).
+/// (`$HOMEBREW_PREFIX/Cellar/node[@N]/<v>`, else the prefix of each `brew`
+/// on the profile PATH).
 pub(crate) fn candidates(env: &BTreeMap<String, String>) -> Vec<Candidate> {
     let home = env.get("HOME").map(PathBuf::from);
     let mut found: Vec<(node_semver::Version, Candidate)> = Vec::new();
@@ -112,7 +137,9 @@ pub(crate) fn candidates(env: &BTreeMap<String, String>) -> Vec<Candidate> {
     }
     let prefixes: Vec<PathBuf> = match env.get("HOMEBREW_PREFIX") {
         Some(prefix) => absolute(prefix.into()).into_iter().collect(),
-        None => vec!["/opt/homebrew".into(), "/usr/local".into()],
+        // Without it, the prefix of a `brew` on the profile PATH: a machine
+        // whose profile does not use Homebrew is not read.
+        None => brew_prefixes(env),
     };
     for prefix in prefixes {
         let cellar = prefix.join("Cellar");
@@ -218,6 +245,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn homebrew_without_its_prefix_variable_is_found_through_brew_on_path() {
+        let t = tempfile::tempdir().unwrap();
+        let brew = t.path().join("brew");
+        dir(&brew.join("Cellar/node/22.1.0"));
+        dir(&brew.join("bin"));
+        let other = t.path().join("other");
+        dir(&other.join("Cellar/node/20.1.0"));
+        dir(&other.join("bin"));
+        let exe = brew.join("bin/brew");
+        fs::write(&exe, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            other.join("bin").display(),
+            brew.join("bin").display()
+        );
+        let env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                t.path().join("home").display().to_string(),
+            ),
+            ("PATH".to_string(), path),
+        ]);
+        let found: Vec<_> = candidates(&env).into_iter().map(|c| c.bin).collect();
+        assert_eq!(found, [brew.join("Cellar/node/22.1.0/bin")]);
+        // No brew on PATH: Homebrew is not read.
+        let env = BTreeMap::from([("PATH".to_string(), other.join("bin").display().to_string())]);
+        assert!(candidates(&env).is_empty());
+    }
     #[test]
     fn candidates_are_capped_highest_first() {
         let t = tempfile::tempdir().unwrap();

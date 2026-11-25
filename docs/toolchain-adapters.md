@@ -182,7 +182,8 @@ managers already have (spec 22.1). The profile lists, read-only, mise installs
 (`$MISE_DATA_DIR`, else `$XDG_DATA_HOME/mise`, else `~/.local/share/mise`,
 `installs/<tool>/<version>`), nodenv (`$NODENV_ROOT` or `~/.nodenv`), nvm
 (`$NVM_DIR` or `~/.nvm`, `versions/node/v<version>`) and Homebrew
-(`$HOMEBREW_PREFIX`, else `/opt/homebrew` and `/usr/local`, `Cellar/node[@N]`).
+(`$HOMEBREW_PREFIX`, else the prefix of each `brew` on the profile PATH,
+`Cellar/node[@N]`).
 It skips links and non-directories, probes at most 32 candidates (highest
 version first) with each tool's own bounded version probe under one 8 s bound,
 and never runs a manager, installs or writes. The detected versions (`installs`)
