@@ -247,7 +247,7 @@ fn a50_direct_exec_and_the_standalone_task_traffic_controller_share_one_budget()
             Box::new(move || assert!(child.wait().unwrap().success()))
         } else {
             let thread = hold_with_library(&fx, &held, &release);
-            Box::new(move || thread.join().unwrap())
+            Box::new(move || crate::common::join_within(thread, "the library holder"))
         };
         // Released whatever happens, so nothing is left waiting.
         struct Release(PathBuf);
@@ -683,7 +683,7 @@ fn a_signal_while_waiting_for_admission_ends_belt_without_starting_the_command()
         assert!(!cwd.join("ran").exists());
         wait_for("belt's entry to go", || entries(&fx).len() == 1);
         std::fs::write(&release, "").unwrap();
-        holder.join().unwrap();
+        crate::common::join_within(holder, "the holder");
         assert!(entries(&fx).is_empty());
     }
 }

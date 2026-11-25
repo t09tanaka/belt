@@ -210,8 +210,8 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
                 })
         }));
     }
-    let a = threads.remove(0).join().unwrap();
-    let b = threads.remove(0).join().unwrap();
+    let a = crate::common::join_within(threads.remove(0), "a racing thread");
+    let b = crate::common::join_within(threads.remove(0), "a racing thread");
     assert_eq!(a.epoch, b.epoch);
     assert_eq!(a.worker_id, b.worker_id);
     assert_eq!(a.cluster_id, b.cluster_id);

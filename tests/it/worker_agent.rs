@@ -2907,7 +2907,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
         })
         .collect();
     for r in racers {
-        r.join().unwrap();
+        crate::common::join_within(r, "a racer");
     }
     assert!(!f.host.overlap.load(Ordering::SeqCst));
     assert!(!f.host.ws_dir(&a).exists());
@@ -2932,7 +2932,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
     let started = Instant::now();
     agent.tick();
     assert!(started.elapsed() < Duration::from_millis(300));
-    slow.join().unwrap();
+    crate::common::join_within(slow, "the slow tick");
     f.host.fail_cleanup.store(false, Ordering::SeqCst);
     f.host.slow_cleanup_ms.store(0, Ordering::SeqCst);
 }
