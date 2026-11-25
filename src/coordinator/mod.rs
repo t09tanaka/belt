@@ -907,7 +907,12 @@ impl Coordinator {
             requires: requirements
                 .requires
                 .iter()
-                .filter(|r| matches!(r, Requirement::Prepare(_)))
+                .filter(|r| {
+                    matches!(
+                        r,
+                        Requirement::Prepare(_) | Requirement::Setup(_) | Requirement::Component(_)
+                    )
+                })
                 .cloned()
                 .collect(),
         };
@@ -955,18 +960,38 @@ impl Coordinator {
                 lacking.push(format!("{worker_id}: {}", unmet.join(", ")));
             }
         }
-        let tools: Vec<String> = prepare
-            .requires
-            .iter()
-            .filter_map(|r| match r {
-                Requirement::Prepare(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut why = format!(
-            "workspace preparation runs {}: no worker reports them",
-            tools.join(", ")
-        );
+        let named = |kind: fn(&Requirement) -> Option<&String>| -> Vec<String> {
+            prepare.requires.iter().filter_map(kind).cloned().collect()
+        };
+        let tools = named(|r| match r {
+            Requirement::Prepare(name) => Some(name),
+            _ => None,
+        });
+        let setup = named(|r| match r {
+            Requirement::Setup(name) => Some(name),
+            _ => None,
+        });
+        let components = named(|r| match r {
+            Requirement::Component(name) => Some(name),
+            _ => None,
+        });
+        let mut parts = Vec::new();
+        if !tools.is_empty() {
+            parts.push(format!("workspace preparation runs {}", tools.join(", ")));
+        }
+        if !setup.is_empty() {
+            parts.push(format!(
+                "the job's setup steps install {}",
+                setup.join(", ")
+            ));
+        }
+        if !components.is_empty() {
+            parts.push(format!(
+                "the job's setup steps add the rust components {}",
+                components.join(", ")
+            ));
+        }
+        let mut why = format!("{}: no worker reports them", parts.join("; "));
         if !lacking.is_empty() {
             why = format!("{why} ({})", lacking.join("; "));
         }

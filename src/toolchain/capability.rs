@@ -11,7 +11,54 @@ pub const FEATURES: &[&str] = &[
     "blob_resume",
     "log_resume",
     crate::forecast::COMMAND_FEATURE,
+    SETUP_TOOLS_FEATURE,
 ];
+/// The feature of a report that carries [`WorkerCapabilities::path_tools`]
+/// and the components of each detected rustup toolchain (spec 22.1): only
+/// such a report can meet a [`Requirement::Setup`] or a
+/// [`Requirement::Component`].
+pub const SETUP_TOOLS_FEATURE: &str = "setup_tools_v1";
+/// Most names a worker reports in [`WorkerCapabilities::path_tools`].
+pub const MAX_PATH_TOOLS: usize = 128;
+/// Executables a setup step installs that are not named `cargo-*` (spec
+/// 22.1): a worker reports these, and every `cargo-*`, from its PATH.
+pub const PATH_TOOL_NAMES: &[&str] = &[
+    "just",
+    "typos",
+    "mdbook",
+    "wasm-pack",
+    "wasm-bindgen",
+    "cross",
+    "sccache",
+    "protoc",
+    "shellcheck",
+    "shfmt",
+    "actionlint",
+    "hyperfine",
+    "taplo",
+    "dprint",
+    "zola",
+];
+/// Whether `name` is one a worker reports from its PATH.
+pub fn path_tool_name(name: &str) -> bool {
+    valid_name(name)
+        && (PATH_TOOL_NAMES.contains(&name)
+            || name
+                .strip_prefix("cargo-")
+                .is_some_and(|rest| !rest.is_empty()))
+}
+/// A rust component name without its host and `-preview` suffix:
+/// `llvm-tools-preview-aarch64-apple-darwin` and `llvm-tools` are both
+/// `llvm-tools`.
+pub fn component_name(raw: &str, host: Option<&str>) -> String {
+    let mut name = raw.trim();
+    if let Some(host) = host {
+        if let Some(short) = name.strip_suffix(host).and_then(|n| n.strip_suffix('-')) {
+            name = short;
+        }
+    }
+    name.strip_suffix("-preview").unwrap_or(name).to_string()
+}
 pub const TOOLS: &[&str] = &[
     "node",
     "npm",
@@ -39,6 +86,14 @@ pub enum Requirement {
     /// frozen toolchain selection of its toolchain (installed or installable)
     /// meets it.
     Prepare(String),
+    /// An executable a setup step of the job installs on GitHub Actions
+    /// (`taiki-e/install-action`, spec 22.1): met by a worker whose profile
+    /// PATH has it.
+    Setup(String),
+    /// A rust component a setup step adds (`components:` of
+    /// `dtolnay/rust-toolchain`), without the `-preview` suffix: met by a
+    /// worker whose rustup toolchain has it.
+    Component(String),
 }
 fn os(v: &str) -> Option<&str> {
     match v {
@@ -75,6 +130,8 @@ impl Requirement {
             Self::Arch(v) => arch(v) == Some(v.as_str()),
             Self::Tool(v) | Self::Prepare(v) => TOOLS.contains(&v.as_str()),
             Self::Feature(v) => FEATURES.contains(&v.as_str()),
+            Self::Setup(v) => path_tool_name(v),
+            Self::Component(v) => valid_name(v) && component_name(v, None) == *v,
         }
     }
 }
@@ -175,6 +232,11 @@ pub struct WorkerCapabilities {
     /// (mise, nodenv, nvm, Homebrew), found read-only (spec 22.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub installs: Vec<DetectedInstall>,
+    /// The `cargo-*` and [`PATH_TOOL_NAMES`] executables on the profile
+    /// PATH, sorted (spec 22.1). A live observation like the disk: not part
+    /// of the profile fingerprint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_tools: Vec<String>,
 }
 /// Most installed tool versions a worker probes, over every manager
 /// (spec 22.1).
@@ -210,6 +272,10 @@ pub struct DetectedRustup {
     pub bin: std::path::PathBuf,
     pub rustc: Digest,
     pub cargo: Digest,
+    /// The components the toolchain has (`lib/rustlib/components`), as
+    /// [`component_name`] writes them, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
 }
 impl WorkerCapabilities {
     pub fn validate(&self) -> bool {
@@ -238,6 +304,12 @@ impl WorkerCapabilities {
                         .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                     && r.bin.is_absolute()
             })
+            && self.path_tools.len() <= MAX_PATH_TOOLS
+            && self.path_tools.iter().all(|t| path_tool_name(t))
+            && self
+                .rustup
+                .iter()
+                .all(|r| r.components.len() <= 64 && r.components.iter().all(|c| valid_name(c)))
             && self.installs.len() <= MAX_DETECTED_INSTALLS
             && self.installs.iter().all(|i| {
                 DETECTED_TOOLS.iter().any(|(t, _, _)| *t == i.tool)
@@ -249,7 +321,15 @@ impl WorkerCapabilities {
 }
 /// The line `missing` writes for an unmet requirement.
 pub fn unmet_line(requirement: &Requirement) -> String {
-    format!("{requirement:?} unavailable")
+    match requirement {
+        Requirement::Setup(name) => format!(
+            "{name} unavailable: a setup step of the job installs it; belt does not install it yet, so put it on the worker's PATH (for example `cargo install --locked {name}`)"
+        ),
+        Requirement::Component(name) => format!(
+            "rust component {name} unavailable: a setup step of the job adds it; run `rustup component add {name}` on the worker"
+        ),
+        _ => format!("{requirement:?} unavailable"),
+    }
 }
 /// Missing reports and unknown probes never satisfy a constrained task.
 pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>) -> Vec<String> {
@@ -276,6 +356,13 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
                 matches!(r.tools.get(v), Some(ToolObservation::Available { .. }))
             }
             Requirement::Feature(v) => r.features.contains(v),
+            Requirement::Setup(v) => {
+                r.features.contains(SETUP_TOOLS_FEATURE) && r.path_tools.contains(v)
+            }
+            Requirement::Component(v) => {
+                r.features.contains(SETUP_TOOLS_FEATURE)
+                    && r.rustup.iter().any(|t| t.components.contains(v))
+            }
         };
         if !available {
             missing.push(unmet_line(v));
@@ -306,7 +393,33 @@ pub fn missing_with_installable(
             _ => true,
         });
     }
-    missing(&native, report)
+    let mut unmet = missing(&native, report);
+    // A component is one of the toolchain the job runs: with a frozen rust
+    // version, only the detected toolchain of that version meets it (a
+    // toolchain belt installs has the minimal profile).
+    let rust = bundle.and_then(|b| {
+        b.frozen
+            .selections
+            .iter()
+            .find(|s| s.tool.as_str() == "rust")
+    });
+    if let (Some(rust), Some(report)) = (rust, report) {
+        let version = rust.concrete.to_string();
+        for r in &native.requires {
+            let Requirement::Component(name) = r else {
+                continue;
+            };
+            let line = unmet_line(r);
+            let served = report
+                .rustup
+                .iter()
+                .any(|t| t.version == version && t.components.contains(name));
+            if !served && !unmet.contains(&line) {
+                unmet.push(line);
+            }
+        }
+    }
+    unmet
 }
 
 /// The toolchain whose activation serves a tool preparation runs: npm ships
@@ -339,6 +452,7 @@ mod tests {
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
         }
     }
     /// The tools preparation runs are added once each, beside what was
@@ -381,6 +495,7 @@ mod tests {
             bin: bin.into(),
             rustc: Digest::of_bytes(b"rustc"),
             cargo: Digest::of_bytes(b"cargo"),
+            components: Vec::new(),
         };
         let with = |rustup: Vec<DetectedRustup>| WorkerCapabilities { rustup, ..report() };
         let good = one("1.89.0-aarch64-apple-darwin", "1.89.0", "/r/bin");
@@ -722,5 +837,163 @@ mod tests {
             serde_json::from_str("{}").unwrap()
         );
         assert!(serde_json::from_str::<ExecutionRequirements>("{\"labels\":[]}").is_err());
+    }
+    fn rust_at(version: &str, components: &[&str]) -> DetectedRustup {
+        DetectedRustup {
+            name: format!("{version}-aarch64-apple-darwin"),
+            version: version.into(),
+            bin: format!("/r/{version}/bin").into(),
+            rustc: Digest::of_bytes(b"rustc"),
+            cargo: Digest::of_bytes(b"cargo"),
+            components: components.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+    fn setup_report(path_tools: &[&str], rustup: Vec<DetectedRustup>) -> WorkerCapabilities {
+        let mut r = report();
+        r.features.insert(SETUP_TOOLS_FEATURE.into());
+        r.path_tools = path_tools.iter().map(|t| t.to_string()).collect();
+        r.rustup = rustup;
+        r
+    }
+    fn setup_req(requires: Vec<Requirement>) -> ExecutionRequirements {
+        ExecutionRequirements {
+            profile: None,
+            requires,
+        }
+    }
+
+    /// run5: the coverage job needs cargo-llvm-cov and llvm-tools. A worker
+    /// without them is no candidate and is told how to get each; one with
+    /// them is; a report without the feature never meets them.
+    #[test]
+    fn setup_tools_and_components_are_met_only_by_a_worker_that_has_them() {
+        let req = setup_req(vec![
+            Requirement::Setup("cargo-llvm-cov".into()),
+            Requirement::Component("llvm-tools".into()),
+        ]);
+        let mini = setup_report(
+            &["cargo-schemata"],
+            vec![rust_at("1.100.0", &["cargo", "rustc"])],
+        );
+        let unmet = missing(&req, Some(&mini));
+        assert_eq!(unmet.len(), 2, "{unmet:?}");
+        assert!(
+            unmet[0].contains("cargo install --locked cargo-llvm-cov"),
+            "{unmet:?}"
+        );
+        assert!(
+            unmet[1].contains("rustup component add llvm-tools"),
+            "{unmet:?}"
+        );
+        let studio = setup_report(
+            &["cargo-llvm-cov"],
+            vec![rust_at("1.100.0", &["cargo", "llvm-tools"])],
+        );
+        assert!(missing(&req, Some(&studio)).is_empty());
+        let mut old = studio.clone();
+        old.features.remove(SETUP_TOOLS_FEATURE);
+        assert_eq!(missing(&req, Some(&old)).len(), 2);
+    }
+
+    /// With a frozen rust version, only that toolchain's components count.
+    #[test]
+    fn a_component_of_another_toolchain_does_not_meet_a_frozen_rust_version() {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("1.92.0").unwrap(),
+                scope,
+                location: Location {
+                    path: "rust-toolchain".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let bundle = FrozenBundle::seal_exact(frozen).unwrap();
+        let req = setup_req(vec![Requirement::Component("llvm-tools".into())]);
+        let other = setup_report(
+            &[],
+            vec![rust_at("1.100.0", &["llvm-tools"]), rust_at("1.92.0", &[])],
+        );
+        assert!(missing_with_installable(&req, Some(&other), None).is_empty());
+        let unmet = missing_with_installable(&req, Some(&other), Some(&bundle));
+        assert_eq!(unmet, vec![unmet_line(&req.requires[0])]);
+        let same = setup_report(&[], vec![rust_at("1.92.0", &["llvm-tools"])]);
+        assert!(missing_with_installable(&req, Some(&same), Some(&bundle)).is_empty());
+        // A tool beside it is checked as before, not as a component.
+        let both = setup_req(vec![
+            Requirement::Setup("cargo-x".into()),
+            Requirement::Component("llvm-tools".into()),
+        ]);
+        let with_tool = setup_report(&["cargo-x"], vec![rust_at("1.92.0", &["llvm-tools"])]);
+        assert!(missing_with_installable(&both, Some(&with_tool), Some(&bundle)).is_empty());
+        // Unmet already by the plain check: said once.
+        let none = setup_report(&[], vec![rust_at("1.92.0", &[])]);
+        assert_eq!(
+            missing_with_installable(&req, Some(&none), Some(&bundle)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn setup_names_components_and_reports_are_bounded() {
+        assert!(path_tool_name("cargo-llvm-cov"));
+        assert!(path_tool_name("just"));
+        assert!(!path_tool_name("cargo-"));
+        assert!(!path_tool_name("node"));
+        assert!(!path_tool_name("cargo-a/b"));
+        assert!(!path_tool_name(&format!("cargo-{}", "x".repeat(64))));
+        assert_eq!(
+            component_name(
+                "llvm-tools-preview-aarch64-apple-darwin",
+                Some("aarch64-apple-darwin")
+            ),
+            "llvm-tools"
+        );
+        assert_eq!(
+            component_name(" rustc-x86_64-apple-darwin", Some("x86_64-apple-darwin")),
+            "rustc"
+        );
+        assert_eq!(
+            component_name("rust-src", Some("aarch64-apple-darwin")),
+            "rust-src"
+        );
+        assert_eq!(component_name("clippy-preview", None), "clippy");
+        assert!(Requirement::Setup("cargo-nextest".into()).validate());
+        assert!(!Requirement::Setup("git".into()).validate());
+        assert!(Requirement::Component("llvm-tools".into()).validate());
+        assert!(!Requirement::Component("llvm-tools-preview".into()).validate());
+        assert!(!Requirement::Component("a b".into()).validate());
+        let good = setup_report(&["cargo-a"], vec![rust_at("1.92.0", &["rustc"])]);
+        assert!(good.validate());
+        let names: Vec<String> = (0..=MAX_PATH_TOOLS).map(|i| format!("cargo-{i}")).collect();
+        let at_cap = WorkerCapabilities {
+            path_tools: names[..MAX_PATH_TOOLS].to_vec(),
+            ..good.clone()
+        };
+        assert!(at_cap.validate());
+        assert!(!WorkerCapabilities {
+            path_tools: names,
+            ..good.clone()
+        }
+        .validate());
+        assert!(!setup_report(&["node"], vec![]).validate());
+        let many: Vec<String> = (0..65).map(|i| format!("c{i}")).collect();
+        let mut wide = rust_at("1.92.0", &[]);
+        wide.components = many[..64].to_vec();
+        assert!(setup_report(&[], vec![wide.clone()]).validate());
+        wide.components = many;
+        assert!(!setup_report(&[], vec![wide]).validate());
+        assert!(!setup_report(&[], vec![rust_at("1.92.0", &["a/b"])]).validate());
     }
 }

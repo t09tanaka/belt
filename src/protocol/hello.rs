@@ -436,6 +436,7 @@ mod tests {
             features: [FEATURE.into(), "private-feature".into()].into(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
         });
         let mut n = Negotiated {
             version: 1,

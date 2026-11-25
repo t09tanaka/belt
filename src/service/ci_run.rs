@@ -169,6 +169,16 @@ pub fn task_specs(
         .map(|task| {
             let demand = local_ci::plan_task_demand(plan, &task.id)
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
+            // What the setup steps of the task's jobs install is required of
+            // its worker (spec 22.1).
+            let mut requirements = requirements.clone();
+            let setup = crate::ci::setup_tools::of_task(plan, task);
+            requirements.requires.extend(setup.requires);
+            requirements.requires.sort();
+            requirements.requires.dedup();
+            requirements
+                .validate()
+                .map_err(|e| invalid(format!("task `{}`: {e}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
                     history_keys: crate::ci::timing::keys(
@@ -212,7 +222,7 @@ pub fn task_specs(
                     rerun: false,
                 }),
                 toolchains: None,
-                requirements: requirements.clone(),
+                requirements,
                 in_place: false,
                 local: false,
                 setup: None,
@@ -238,6 +248,68 @@ pub(crate) fn run_requirements(
     prepare: &crate::workspace::prepare_tools::PrepareTools,
 ) -> Result<crate::toolchain::capability::ExecutionRequirements, ApiError> {
     configured.with_prepare(&prepare.tools).map_err(invalid)
+}
+
+/// The notices of the setup tools of every task of `plan`, each once.
+pub(crate) fn setup_notices(plan: &local_ci::FrozenPlan) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for task in &plan.tasks {
+        for notice in crate::ci::setup_tools::of_task(plan, task).notices {
+            if !all.contains(&notice) {
+                all.push(notice);
+            }
+        }
+    }
+    all
+}
+
+/// The setup tool requirements of `requirements`: what a setup step of the
+/// task's jobs installs or adds.
+pub(crate) fn setup_requirements(
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+) -> crate::toolchain::capability::ExecutionRequirements {
+    use crate::toolchain::capability::Requirement;
+    crate::toolchain::capability::ExecutionRequirements {
+        profile: None,
+        requires: requirements
+            .requires
+            .iter()
+            .filter(|r| matches!(r, Requirement::Setup(_) | Requirement::Component(_)))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Asks the owner, once for each set of setup tools, whether some worker
+/// has them; a task no worker serves is marked unplaceable with the reason.
+async fn check_setup_tools(
+    owner: &super::resident::Client,
+    specs: &mut [(String, TaskSpec)],
+) -> Result<(), ApiError> {
+    let mut answers: Vec<(
+        crate::toolchain::capability::ExecutionRequirements,
+        Option<String>,
+    )> = Vec::new();
+    for (_, spec) in specs.iter_mut() {
+        let setup = setup_requirements(&spec.requirements);
+        if setup.is_empty() {
+            continue;
+        }
+        let refused = match answers.iter().find(|(asked, _)| *asked == setup) {
+            Some((_, refused)) => refused.clone(),
+            None => {
+                let refused = super::submit::ask_preparation(owner, &setup).await?;
+                answers.push((setup, refused.clone()));
+                refused
+            }
+        };
+        if let (Some(why), Some(ci)) = (refused, spec.ci.as_mut()) {
+            if ci.unplaceable.is_none() {
+                ci.unplaceable = Some(why);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every task of the run carries its own frozen toolchain selection:
@@ -358,6 +430,10 @@ async fn submit_run(
     )
     .await?;
     with_toolchains(&mut specs, toolchains);
+    // A task whose setup steps install what no worker has is never placed,
+    // with the reason (spec 22.1); the other tasks of the run still run.
+    check_setup_tools(&owner, &mut specs).await?;
+    let notices: Vec<String> = notices.into_iter().chain(setup_notices(&plan)).collect();
     let capacity = context.config.workers.len() + usize::from(context.config.local_worker.value);
     let capacity = capacity.saturating_mul(context.config.max_active_task.value as usize);
     if capacity > 1 {
@@ -882,6 +958,70 @@ mod tests {
     use super::*;
     use crate::ci::execute::tests::{fixture, task_of};
 
+    /// run5: the coverage job's setup steps are its requirements (spec 22.1).
+    #[test]
+    fn the_coverage_job_requires_its_setup_tools_and_the_other_job_does_not() {
+        use crate::toolchain::capability::*;
+        const COVERAGE: &str = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n  coverage:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n        with:\n          components: llvm-tools-preview\n      - uses: taiki-e/install-action@cargo-llvm-cov\n      - run: echo cover\n      - uses: taiki-e/install-action@v2\n        with:\n          tool: ${{ env.MORE }}\n";
+        let f = fixture(COVERAGE);
+        let digest = Digest::of_bytes(b"plan bytes");
+        let specs = task_specs(&f.plan, &digest, &digest, &Default::default(), None).unwrap();
+        let of = |job: &str| {
+            let (_, spec) = specs.iter().find(|(id, _)| id.contains(job)).unwrap();
+            spec.requirements.clone()
+        };
+        let coverage = of("coverage");
+        assert_eq!(
+            coverage.requires,
+            vec![
+                Requirement::Setup("cargo-llvm-cov".into()),
+                Requirement::Component("llvm-tools".into()),
+            ]
+        );
+        assert!(of("test").requires.is_empty());
+        assert_eq!(setup_requirements(&coverage), coverage);
+        let notices = setup_notices(&f.plan);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("${{ env.MORE }}"), "{notices:?}");
+        // A worker without the tool (mini, run5) is no candidate.
+        let worker = |tools: &[&str], components: &[&str]| WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
+            schema_version: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            profile: "default".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: Default::default(),
+            features: [FEATURE.into(), SETUP_TOOLS_FEATURE.into()].into(),
+            rustup: vec![DetectedRustup {
+                name: "stable-aarch64-apple-darwin".into(),
+                version: "1.100.0".into(),
+                bin: "/r/bin".into(),
+                rustc: Digest::of_bytes(b"r"),
+                cargo: Digest::of_bytes(b"c"),
+                components: components.iter().map(|c| c.to_string()).collect(),
+            }],
+            installs: Vec::new(),
+            path_tools: tools.iter().map(|t| t.to_string()).collect(),
+        };
+        let mini = worker(&["cargo-schemata"], &["llvm-tools"]);
+        let unmet = missing_with_installable(&coverage, Some(&mini), None);
+        assert_eq!(unmet.len(), 1, "{unmet:?}");
+        assert!(
+            unmet[0].starts_with("cargo-llvm-cov unavailable"),
+            "{unmet:?}"
+        );
+        let studio = worker(&["cargo-llvm-cov"], &["llvm-tools"]);
+        assert!(missing_with_installable(&coverage, Some(&studio), None).is_empty());
+        assert!(missing_with_installable(&of("test"), Some(&mini), None).is_empty());
+    }
+
     /// A Rust-only job of a source whose tracked npm example the workspace
     /// preparation installs runs `node -v`: without a node selection a
     /// worker without node is no candidate (run4 of the acceptance), and
@@ -953,6 +1093,7 @@ mod tests {
             features: [crate::toolchain::capability::FEATURE.into()].into(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
         };
         let (mini, studio) = (
             worker(&["cargo", "rustc"]),

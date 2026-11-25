@@ -214,6 +214,23 @@ refused with the install hint (`MISE_INSTALL_HINT`), and the environment report
 carries a `mise` helper row (`present` or absent) that `workers diff` and
 `doctor` show.
 
+### Tools and components that setup steps install (spec 22.1)
+
+`taiki-e/install-action` (`with: tool:` or the `@<tool>` reference) and the
+`components:` input of `dtolnay/rust-toolchain` are requirements of the task
+whose job has the step (`Requirement::Setup`, `Requirement::Component`), read by
+`src/ci/setup_tools.rs`. A worker meets a tool when an executable of that name
+is in a directory of its profile PATH (`path_tools`: `cargo-*` and
+`PATH_TOOL_NAMES`, listing and metadata only, not part of the fingerprint), and
+a component when a detected rustup toolchain lists it in
+`lib/rustlib/components` (read-only; with a frozen rust version, the toolchain
+of that version). Only reports with `setup_tools_v1` meet them. A task no
+worker serves is unplaceable at submit with the reason. Names a worker cannot
+report, expressions, and pinned versions are notices. belt does not install
+these yet: a private `cargo install --locked --root` under a
+`toolchains/<identity>/` root with the receipt, lock and 25.7 (b) rules is the
+next step. It never writes `~/.cargo/bin` or the user's rustup.
+
 Inventory is operator authorization to prepare a concrete version, not evidence that
 it is installed or available from a remote server. Local resolution chooses the highest
 matching authorized version and binds evidence to the recipe's inventory authority digest;
