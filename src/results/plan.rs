@@ -295,6 +295,55 @@ pub fn judge_artifacts(declared: &[(bool, Standing)]) -> Verdict {
     }
 }
 
+/// The bound of [`missing_reason`], in characters.
+pub const MISSING_REASON_MAX: usize = 400;
+
+/// Why a collection is `required_missing`, for the job line: each required
+/// artifact (name, declared path when the worker gave one, standing) that is
+/// not stored, in order, at most [`MISSING_REASON_MAX`] characters. `None`
+/// when every required one is stored.
+pub fn missing_reason(declared: &[(&str, bool, Option<&str>, Standing)]) -> Option<String> {
+    let parts: Vec<String> = declared
+        .iter()
+        .filter(|(_, required, _, _)| *required)
+        .filter_map(|(name, _, path, standing)| {
+            let why = match standing {
+                Standing::Stored => return None,
+                Standing::Missing => "the commands left nothing at its path",
+                Standing::Refused => "the worker did not keep what was there",
+                Standing::Unreported => "the result does not report it",
+            };
+            let at = path.map(|p| format!(" ({p})")).unwrap_or_default();
+            Some(format!("required output {name}{at} is missing: {why}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| bounded(&parts.join("; ")))
+}
+
+/// Why a CI task's result that is here is not a success: it cannot be read
+/// as the result of `expected` (`read`: the task it names, if readable).
+pub fn unreadable_ci_reason(read: Option<&str>, expected: &str) -> String {
+    bounded(&match read {
+        Some(other) => format!(
+            "required output {} names task {other}, not {expected}",
+            crate::supervisor::ci_task::RESULT_ARTIFACT
+        ),
+        None => format!(
+            "required output {} cannot be read as the result of task {expected}",
+            crate::supervisor::ci_task::RESULT_ARTIFACT
+        ),
+    })
+}
+
+fn bounded(text: &str) -> String {
+    if text.chars().count() <= MISSING_REASON_MAX {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MISSING_REASON_MAX - 1).collect();
+    out.push('…');
+    out
+}
+
 // ------------------------------------------------------------- the chunks
 
 /// One `blob_get` answer against what was asked.
@@ -992,5 +1041,34 @@ mod tests {
         ] {
             assert_eq!(run_verdict(2, &[T::Succeeded, bad]), RunVerdict::Failed);
         }
+    }
+
+    #[test]
+    fn the_missing_reason_names_each_required_output_not_stored_and_is_bounded() {
+        use Standing::*;
+        assert_eq!(
+            missing_reason(&[("a", true, None, Stored), ("b", false, None, Missing)]),
+            None
+        );
+        let why = missing_reason(&[
+            ("a", true, Some("out/a"), Missing),
+            ("b", false, None, Missing),
+            ("c", true, None, Refused),
+            ("d", true, None, Unreported),
+            ("e", true, None, Stored),
+        ])
+        .unwrap();
+        assert_eq!(
+            why,
+            "required output a (out/a) is missing: the commands left nothing at its path; \
+             required output c is missing: the worker did not keep what was there; \
+             required output d is missing: the result does not report it"
+        );
+        let long = "x".repeat(MISSING_REASON_MAX * 2);
+        let why = missing_reason(&[(long.as_str(), true, None, Missing)]).unwrap();
+        assert_eq!(why.chars().count(), MISSING_REASON_MAX);
+        assert!(why.ends_with('…'));
+        assert!(unreadable_ci_reason(Some("u"), "t").contains("names task u, not t"));
+        assert!(unreadable_ci_reason(None, "t").contains("cannot be read as the result of task t"));
     }
 }

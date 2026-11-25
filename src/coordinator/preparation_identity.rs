@@ -323,6 +323,7 @@ mod tests {
                             .into(),
                             rustup: Vec::new(),
                             installs: Vec::new(),
+                            path_tools: Vec::new(),
                         }),
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: r.worker_id.clone(),

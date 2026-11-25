@@ -1004,7 +1004,16 @@ impl Resident {
             loop {
                 tokio::select! { _ = tick_stop.changed() => return Ok::<(), anyhow::Error>(()), _ = timer.tick() => {} }
                 if !tick_root.present() { let _ = stop_tick.send(true); return Ok(()); }
-                if let Err(e) = coordinator.tick().await { let _ = stop_tick.send(true); return Err(e.into()); }
+                // A stop during the tick lets it finish its step, and no
+                // submit starts after it.
+                let tick = coordinator.tick();
+                tokio::pin!(tick);
+                let (ticked, stopped) = tokio::select! {
+                    ticked = &mut tick => (ticked, false),
+                    _ = tick_stop.changed() => { coordinator.stop_submitting(); (tick.await, true) }
+                };
+                if let Err(e) = ticked { let _ = stop_tick.send(true); return Err(e.into()); }
+                if stopped { return Ok(()); }
             }
         });
         let coordinator = self.coordinator.clone();

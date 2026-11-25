@@ -611,7 +611,7 @@ printf 'git version 2.50.0\n'
         .insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
     let started = Resident::start(&config(), input).await;
     releaser.await.unwrap();
-    let (progressed, _ready, _release) = observer.join().unwrap();
+    let (progressed, _ready, _release) = crate::common::join_within(observer, "the observer");
     let resident = started.unwrap();
     let calls = std::fs::read_to_string(bin.join("calls")).unwrap();
     let client = resident.client();

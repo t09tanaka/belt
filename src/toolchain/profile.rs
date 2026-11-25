@@ -541,10 +541,27 @@ impl Profile {
     /// and is measured again in the background. Without one, or after drift,
     /// it is measured now (at most the startup bound).
     pub(crate) fn measured_profile(&self) -> (WorkerCapabilities, Vec<String>) {
+        self.answer_measured(false)
+    }
+    /// What admission and toolchain activation check a task against: the
+    /// same measured profile, so a task's start probes no tool. It is
+    /// measured again now, with the startup bounds, only on a drift signal
+    /// (a tool file or the rustup toolchains changed) or once it is
+    /// [`RESOLUTION_REFRESH`] old. A real version change is therefore still
+    /// seen; a tool whose calls all ran out of time keeps the version
+    /// measured before.
+    pub(crate) fn accepted_profile(&self) -> (WorkerCapabilities, Vec<String>) {
+        self.answer_measured(true)
+    }
+    /// `measured_profile`, or with `stale_now` the `accepted_profile`.
+    fn answer_measured(&self, stale_now: bool) -> (WorkerCapabilities, Vec<String>) {
         let current = self.drift_identity();
         let cached = self.resolution.lock().ok().and_then(|slot| slot.clone());
         match cached {
-            Some(cached) if cached.files == current => {
+            Some(cached)
+                if cached.files == current
+                    && !(stale_now && cached.measured.elapsed() >= RESOLUTION_REFRESH) =>
+            {
                 if cached.measured.elapsed() >= RESOLUTION_REFRESH
                     && !self.refreshing.swap(true, Ordering::SeqCst)
                 {
@@ -561,16 +578,6 @@ impl Profile {
                 (measured.report, measured.held)
             }
         }
-    }
-    /// What admission and toolchain activation check a task against,
-    /// measured now with the startup bounds: a probe that runs late is
-    /// called again (at most 5s + 14 calls x 300ms), and a tool whose calls
-    /// all ran out of time keeps the version measured before. A failing,
-    /// absent or changed tool is reported as it is now. Also refreshes what
-    /// toolchain questions are answered from.
-    pub(crate) fn checked_report(&self) -> (WorkerCapabilities, Vec<String>) {
-        let (_, checked) = self.remeasure();
-        (checked.report, checked.held)
     }
     /// The published measurement, and what toolchain questions are
     /// answered from.
@@ -742,6 +749,7 @@ impl Profile {
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
             rustup,
             installs,
+            path_tools: path_tools(&self.definition.path),
         };
         // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
         #[allow(deprecated)]
@@ -1362,7 +1370,63 @@ fn probe_rustup(
         bin: bin.to_path_buf(),
         rustc,
         cargo,
+        components: rustup_components(bin, rustup_host().as_deref()),
     })
+}
+/// The components of the toolchain whose `bin` is `bin`, read from the
+/// `lib/rustlib/components` file rustup keeps beside it (at most 64 KiB and
+/// 64 names; spec 22.1). Read-only: an unreadable file is no component.
+pub(crate) fn rustup_components(bin: &Path, host: Option<&str>) -> Vec<String> {
+    use std::io::Read;
+    let Some(dir) = bin.parent() else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    let read = fs::File::open(dir.join("lib/rustlib/components"))
+        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text));
+    if read.is_err() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = text
+        .lines()
+        .map(|line| super::capability::component_name(line, host))
+        .filter(|name| super::capability::valid_name(name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(64);
+    names
+}
+/// The `cargo-*` and [`super::capability::PATH_TOOL_NAMES`] executables in
+/// the directories of `path`, sorted, at most
+/// [`super::capability::MAX_PATH_TOOLS`] (spec 22.1). Only directory
+/// listings and metadata: nothing runs.
+pub(crate) fn path_tools(path: &[PathBuf]) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found = std::collections::BTreeSet::new();
+    for dir in path.iter().take(64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten().take(4096) {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !super::capability::path_tool_name(&name) || found.contains(&name) {
+                continue;
+            }
+            // A link is followed: `~/.cargo/bin` entries may be links.
+            let executable = fs::metadata(entry.path())
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+            if executable {
+                found.insert(name);
+            }
+        }
+    }
+    found
+        .into_iter()
+        .take(super::capability::MAX_PATH_TOOLS)
+        .collect()
 }
 fn measured_version(tool: &str, output: &str) -> Option<String> {
     let text = output.trim();
@@ -1839,6 +1903,49 @@ mod tests {
         let (report, _) = profile.measured_profile();
         assert!(
             matches!(&report.tools["node"], ToolObservation::Available { version, .. } if version == "v23.0.0")
+        );
+    }
+    /// A task's acceptance checks against the measured profile: no probe
+    /// while the tool files are unchanged and the profile is fresh; a
+    /// changed file, or a profile older than the bound, is measured again
+    /// before the answer, so a real version change is still seen.
+    #[test]
+    fn acceptance_probes_only_on_drift_or_once_the_profile_is_old() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let node =
+            |version: &str| format!("echo x >> '{}'; printf '{version}\\n'", calls.display());
+        fake(dir.path(), "node", &node("v22.0.0"), 0o700);
+        let profile = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        profile.startup_report();
+        let count = || fs::read_to_string(&calls).unwrap().lines().count();
+        let measured = count();
+        let version = |report: &WorkerCapabilities| match &report.tools["node"] {
+            ToolObservation::Available { version, .. } => version.clone(),
+            other => panic!("node is {other:?}"),
+        };
+        for _ in 0..3 {
+            assert_eq!(version(&profile.accepted_profile().0), "v22.0.0");
+        }
+        assert_eq!(count(), measured, "an acceptance probed node");
+        fake(dir.path(), "node", &node("v23.0.0"), 0o700);
+        assert_eq!(version(&profile.accepted_profile().0), "v23.0.0");
+        let after_drift = count();
+        assert!(after_drift > measured, "a changed node was not measured");
+        let old = Instant::now()
+            .checked_sub(RESOLUTION_REFRESH + Duration::from_secs(1))
+            .expect("the clock is past the bound");
+        profile
+            .resolution
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .measured = old;
+        profile.accepted_profile();
+        assert!(
+            count() > after_drift,
+            "an old profile was not measured again"
         );
     }
     #[test]
@@ -2852,5 +2959,58 @@ mod rustup_tests {
         let changed = profile.report();
         assert_eq!(changed.installs[0].version, "20.11.2");
         assert_ne!(changed.profile_fingerprint, initial.profile_fingerprint);
+    }
+
+    /// A fake worker PATH: only executable `cargo-*` and listed names are
+    /// reported, a link is followed, the first directory wins, nothing runs.
+    #[test]
+    fn path_tools_are_the_executable_setup_names_on_the_profile_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let tool = |at: &Path, name: &str, mode: u32| {
+            // A script that would leave a mark if anything ran it.
+            let mark = dir.path().join("ran");
+            fs::write(
+                at.join(name),
+                format!("#!/bin/sh\ntouch {}\n", mark.display()),
+            )
+            .unwrap();
+            fs::set_permissions(at.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        tool(&a, "cargo-llvm-cov", 0o755);
+        tool(&a, "cargo-plain", 0o644);
+        tool(&a, "node", 0o755);
+        tool(&b, "just", 0o755);
+        fs::create_dir_all(b.join("cargo-dir")).unwrap();
+        symlink(a.join("cargo-llvm-cov"), b.join("cargo-linked")).unwrap();
+        let missing = dir.path().join("missing");
+        let got = path_tools(&[a, missing, b]);
+        assert_eq!(got, vec!["cargo-linked", "cargo-llvm-cov", "just"]);
+        assert!(!dir.path().join("ran").exists());
+    }
+
+    #[test]
+    fn rustup_components_are_read_from_the_toolchain_without_host_or_preview() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let bin = dir.path().join("1.92.0-aarch64-apple-darwin/bin");
+        fs::create_dir_all(&bin).unwrap();
+        assert!(rustup_components(&bin, Some("aarch64-apple-darwin")).is_empty());
+        let lib = bin.parent().unwrap().join("lib/rustlib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("components"),
+            "rustc-aarch64-apple-darwin\nllvm-tools-preview-aarch64-apple-darwin\ncargo-aarch64-apple-darwin\nbad name\nrustc-aarch64-apple-darwin\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rustup_components(&bin, Some("aarch64-apple-darwin")),
+            vec!["cargo", "llvm-tools", "rustc"]
+        );
+        let many: String = (0..100).map(|i| format!("c{i:03}\n")).collect();
+        fs::write(lib.join("components"), many).unwrap();
+        assert_eq!(rustup_components(&bin, None).len(), 64);
     }
 }

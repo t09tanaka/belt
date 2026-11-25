@@ -385,6 +385,10 @@ impl Drop for Driving {
 /// (spec 25.8 5b (d)), and the pause between the passes of a round.
 const RECEIVED_PASS_EVERY: Duration = Duration::from_secs(60);
 const RECEIVED_PASS_PAUSE: Duration = Duration::from_millis(100);
+/// How often a wait for the capability measurement looks at `stopping`.
+const STOP_LOOK: Duration = Duration::from_millis(10);
+/// The measurement was not waited for: the agent stops.
+const AGENT_STOPPING: &str = "the agent is stopping";
 
 struct Ticking<'a>(&'a AtomicBool);
 
@@ -1112,7 +1116,15 @@ impl Agent {
                     if rec.state == AttemptState::Ready && self.spec_path(attempt).is_file() {
                         self.launch(&rec)
                     } else {
-                        if let Err(e) = self.prepare(&rec) {
+                        // An error met while the agent stops (a probe it
+                        // left) is not the attempt's: the next agent resumes it.
+                        if let Err(e) = self.prepare(&rec).or_else(|e| {
+                            if self.stopping() {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        }) {
                             note(
                                 &self.store,
                                 &rec,
@@ -1204,6 +1216,11 @@ impl Agent {
             .and_then(|_| self.check_profile_identity(rec))
             .and_then(|_| self.check_execution_binding(rec))
         {
+            // The agent stops: the check may have been left unfinished, and
+            // the next agent looks again.
+            if self.stopping() {
+                return Ok(None);
+            }
             self.note_once(a, "agent_environment_changed", json!({ "code": error.code, "blocked_reason": error.blocked_reason, "message": error.message }));
             settle(
                 &self.cfg,
@@ -4157,17 +4174,17 @@ impl Agent {
         self.capabilities_with_diagnostic().ok().flatten()
     }
     /// The report admission and toolchain activation check a task against
-    /// ([`crate::toolchain::profile::Profile::checked_report`]): a probe that
-    /// runs late on a loaded host is called again within the startup bound,
-    /// and one that still gives no answer keeps the version measured before;
-    /// it is never taken for a mismatch. A real version change still is one.
+    /// ([`crate::toolchain::profile::Profile::accepted_profile`]): the
+    /// measured profile, measured again only on a drift signal or once it is
+    /// old. A probe that runs late keeps the version measured before; it is
+    /// never taken for a mismatch. A real version change still is one.
     fn measured_with_diagnostic(
         &self,
     ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
         let Some(profile) = &self.cfg.capability_profile else {
             return Ok(None);
         };
-        let (report, held) = profile.checked_report();
+        let (report, held) = self.checked_report_unless_stopping(profile)?;
         if !held.is_empty() {
             self.note_global("agent_toolchain_probe_held", "", json!({ "tools": held }));
         }
@@ -4175,6 +4192,43 @@ impl Agent {
             Ok(Some(report))
         } else {
             Err(profile.identity_failure_message(&report))
+        }
+    }
+    /// The profile's measurement, on a thread of its own: it can take
+    /// seconds (each tool probe has its own deadline), and a stopping agent
+    /// does not wait for it. A measurement left behind only updates the
+    /// profile's own record and ends at its deadlines.
+    fn checked_report_unless_stopping(
+        &self,
+        profile: &Arc<crate::toolchain::profile::Profile>,
+    ) -> Result<
+        (
+            crate::toolchain::capability::WorkerCapabilities,
+            Vec<String>,
+        ),
+        &'static str,
+    > {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let theirs = profile.clone();
+        let spawned = std::thread::Builder::new()
+            .name("profile-probe".into())
+            .spawn(move || {
+                let _ = send.send(theirs.accepted_profile());
+            });
+        if spawned.is_err() {
+            return Ok(profile.accepted_profile());
+        }
+        loop {
+            match receive.recv_timeout(STOP_LOOK) {
+                Ok(checked) => return Ok(checked),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopping() => {
+                    return Err(AGENT_STOPPING)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the capability measurement panicked")
+                }
+            }
         }
     }
     fn measured(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {

@@ -275,6 +275,28 @@ pub async fn wait_owner_released(state: &Path) {
     );
 }
 
+/// How long a test waits for a thread it started before it fails. A test
+/// thread that never ends (a loop whose exit never comes) once kept a whole
+/// `--test it` run waiting for 8.5 hours in `JoinHandle::join`.
+pub const JOIN_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Join `handle`, but fail with `what` if it has not ended within
+/// [`JOIN_BOUND`]. A panic in the thread is passed on as it was.
+pub fn join_within<T>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+    let deadline = std::time::Instant::now() + JOIN_BOUND;
+    while !handle.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} did not end within {JOIN_BOUND:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    match handle.join() {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
+
 /// The pid written in a file, if it holds one.
 pub fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()

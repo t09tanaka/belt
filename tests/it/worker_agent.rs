@@ -2522,26 +2522,34 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    // Never renewed: the supervisor starts 2 s into a 4 s lease and would
-    // count 4 s of its own (ending 6 s after the acceptance). It is given
-    // what is left and ends the lease when the grant ends.
+    // Never renewed: the supervisor starts after the acceptance, and is
+    // given what is left of the grant, not a full lease of its own. The
+    // seed it gets is checked, so how long the start takes on a loaded
+    // host does not matter.
     f.host.block_prepare.store(true, Ordering::SeqCst);
     let (script, marker, _) = stay(&f);
-    let mut p = payload(&script);
-    p.lease_ms = 4_000;
+    let p = payload(&script);
     let a = AttemptId::generate();
+    let before = belt::platform::monotonic_ms();
     submit(&c, &a, &p).await;
-    std::thread::sleep(Duration::from_millis(2_000));
+    let after = belt::platform::monotonic_ms();
+    wait_for("preparation to begin", || {
+        f.host.count(&format!("prepare {a}")) == 1
+    });
+    // A distinct tick: a lease counted from the start ends after the grant.
+    wait_for("a tick after acceptance", || {
+        belt::platform::monotonic_ms() > after
+    });
     f.host.block_prepare.store(false, Ordering::SeqCst);
-    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    assert_eq!(lines(&marker), 1, "the command did start");
-    // The supervisor saw it on its own clock, when the grant ended: the
-    // time of the expiry itself, however long the stop took after it.
-    let expired = f.store().events_of(&a, "lease_expired").unwrap();
-    assert_eq!(expired.len(), 1);
-    let after = expired[0].at_ms - f.rec(&a).accepted_at_ms;
-    assert!((3_500..5_500).contains(&after), "{after} ms");
+    wait_for("the command to start", || lines(&marker) == 1);
+    let end = seed_of(&f, &a)["ends_mono_ms"].as_u64().unwrap();
+    assert!(
+        (before + p.lease_ms..=after + p.lease_ms).contains(&end),
+        "seed {end}, acceptance bracket {before}..={after}"
+    );
     assert_eq!(events(&f, &a, "agent_lease_expired"), 0);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2899,7 +2907,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
         })
         .collect();
     for r in racers {
-        r.join().unwrap();
+        crate::common::join_within(r, "a racer");
     }
     assert!(!f.host.overlap.load(Ordering::SeqCst));
     assert!(!f.host.ws_dir(&a).exists());
@@ -2924,7 +2932,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
     let started = Instant::now();
     agent.tick();
     assert!(started.elapsed() < Duration::from_millis(300));
-    slow.join().unwrap();
+    crate::common::join_within(slow, "the slow tick");
     f.host.fail_cleanup.store(false, Ordering::SeqCst);
     f.host.slow_cleanup_ms.store(0, Ordering::SeqCst);
 }
@@ -4416,6 +4424,90 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
     assert!(f.store().get(&b).unwrap().is_none());
 }
 
+/// The capability measurement of a preparation can take seconds (each tool
+/// probe has its own deadline). A stopping agent does not wait for it, and
+/// what it left unfinished does not end the attempt: the next agent looks
+/// again.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() {
+    use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    let f = fx();
+    let bin = f.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (hang, probing) = (f.path("hang"), f.path("probing"));
+    let rustup = f.path("rustup");
+    std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+    let node = bin.join("node");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nif [ -f {hang:?} ]; then : > {probing:?}; exec /bin/sleep 30; fi\necho v22.0.0\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), rustup.to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements =
+        ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    // Accepted and checked with the tool answering; the workspace is held
+    // until the tool hangs and the rustup toolchains change (a drift
+    // signal), so the next measurement (the supervisor spec's) probes and
+    // is the one the stop meets.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    submit(&client, &a, &p).await;
+    let end = Instant::now() + T;
+    while f.host.preparing_now.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < end, "the workspace was never prepared");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::write(&hang, b"").unwrap();
+    drift(&rustup);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    while !probing.exists() && f.rec(&a).state != AttemptState::Terminal {
+        assert!(Instant::now() < end, "the preparation never measured");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(probing.exists(), "the attempt ended before it was measured");
+    let at = Instant::now();
+    tokio::task::spawn_blocking(move || agent.shutdown())
+        .await
+        .unwrap();
+    // The probe's own deadline is 2 s, the measurement's 5 s.
+    let took = at.elapsed();
+    assert!(
+        took < Duration::from_millis(1_000),
+        "the stop took {took:?}"
+    );
+    assert_ne!(f.rec(&a).state, AttemptState::Terminal);
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 0);
+}
+
+/// Change the rustup toolchains directory (a drift signal) without
+/// changing what is in it.
+fn drift(rustup: &std::path::Path) {
+    let entry = rustup.join("toolchains").join("drift");
+    std::fs::create_dir(&entry).unwrap();
+    std::fs::remove_dir(&entry).unwrap();
+}
+
 #[tokio::test]
 async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
     use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
@@ -4424,6 +4516,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let bin = f.path("bin");
         std::fs::create_dir(&bin).unwrap();
         let marker = f.path("probe-fails");
+        // HOME, which a profile from profiles.toml keeps too, places the
+        // rustup toolchains.
+        let home = f.path("home");
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
         let node = bin.join("node");
         std::fs::write(
             &node,
@@ -4439,7 +4536,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         }
         let profile = Profile::load(
             &f.state(),
-            &[("PATH".into(), bin.to_str().unwrap().into())].into(),
+            &[
+                ("PATH".into(), bin.to_str().unwrap().into()),
+                ("HOME".into(), home.to_str().unwrap().into()),
+            ]
+            .into(),
         )
         .unwrap();
         let mut cfg = f.cfg("boot-1");
@@ -4449,6 +4550,9 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let agent = f.start_with(cfg);
         let client = f.connect(&agent).await;
         std::fs::write(&marker, "fail").unwrap();
+        // Acceptance answers from the measured profile; a drift signal
+        // makes it measure again and see the failing tool.
+        drift(&rustup);
         let mut p = payload("exit 0");
         p.commands[0].env.clear();
         let a = AttemptId::generate();

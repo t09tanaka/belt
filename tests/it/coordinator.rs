@@ -817,6 +817,44 @@ async fn dispatch_fills_the_free_active_slots_and_the_prefetch_and_no_more() {
     assert!(queued(&c).is_empty());
 }
 
+/// A resident that stops lets a running tick finish its step, but no
+/// submit starts after the stop: the tasks stay queued for the next one.
+#[tokio::test]
+async fn a_stopping_coordinator_starts_no_submit() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 1));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 2).await;
+    c.stop_submitting();
+    let report = c.tick().await.unwrap();
+    assert!(report.placed.is_empty(), "{:?}", report.placed);
+    assert!(a.holds().is_empty());
+    assert_eq!(queued(&c).len(), tasks.len());
+}
+
+/// Nor is an attempt sent again while stopping: the next coordinator
+/// sends it.
+#[tokio::test]
+async fn a_stopping_coordinator_sends_no_attempt_again() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 1).await;
+    a.set(|s| s.lose.push((Op::Submit, Lost::Request)));
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    assert!(a.holds().is_empty(), "the submit never arrived");
+    drop(c);
+    let c = f.open(&[&a]);
+    c.stop_submitting();
+    c.tick().await.unwrap();
+    assert!(a.holds().is_empty(), "sent again while stopping");
+    drop(c);
+    let c = f.open(&[&a]);
+    c.tick().await.unwrap();
+    assert_eq!(a.holds(), vec![first.attempt_id]);
+}
+
 #[tokio::test]
 async fn the_coordinators_own_limits_hold_when_the_worker_allows_more() {
     let f = fx();
@@ -2773,6 +2811,7 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
             disk_free_bytes: None,
             resource_budget: None,
             cpu_cores: None,
