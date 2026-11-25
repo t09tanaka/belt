@@ -59,3 +59,4 @@ src/service/doctor/linger.rs
 src/ci/status.rs
 src/ci/advance/pure.rs
 src/service/ci_run/lines.rs
+src/ci/setup_tools.rs

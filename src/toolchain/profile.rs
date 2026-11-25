@@ -749,6 +749,7 @@ impl Profile {
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
             rustup,
             installs,
+            path_tools: path_tools(&self.definition.path),
         };
         // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
         #[allow(deprecated)]
@@ -1369,7 +1370,63 @@ fn probe_rustup(
         bin: bin.to_path_buf(),
         rustc,
         cargo,
+        components: rustup_components(bin, rustup_host().as_deref()),
     })
+}
+/// The components of the toolchain whose `bin` is `bin`, read from the
+/// `lib/rustlib/components` file rustup keeps beside it (at most 64 KiB and
+/// 64 names; spec 22.1). Read-only: an unreadable file is no component.
+pub(crate) fn rustup_components(bin: &Path, host: Option<&str>) -> Vec<String> {
+    use std::io::Read;
+    let Some(dir) = bin.parent() else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    let read = fs::File::open(dir.join("lib/rustlib/components"))
+        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text));
+    if read.is_err() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = text
+        .lines()
+        .map(|line| super::capability::component_name(line, host))
+        .filter(|name| super::capability::valid_name(name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(64);
+    names
+}
+/// The `cargo-*` and [`super::capability::PATH_TOOL_NAMES`] executables in
+/// the directories of `path`, sorted, at most
+/// [`super::capability::MAX_PATH_TOOLS`] (spec 22.1). Only directory
+/// listings and metadata: nothing runs.
+pub(crate) fn path_tools(path: &[PathBuf]) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found = std::collections::BTreeSet::new();
+    for dir in path.iter().take(64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten().take(4096) {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !super::capability::path_tool_name(&name) || found.contains(&name) {
+                continue;
+            }
+            // A link is followed: `~/.cargo/bin` entries may be links.
+            let executable = fs::metadata(entry.path())
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+            if executable {
+                found.insert(name);
+            }
+        }
+    }
+    found
+        .into_iter()
+        .take(super::capability::MAX_PATH_TOOLS)
+        .collect()
 }
 fn measured_version(tool: &str, output: &str) -> Option<String> {
     let text = output.trim();
@@ -2902,5 +2959,58 @@ mod rustup_tests {
         let changed = profile.report();
         assert_eq!(changed.installs[0].version, "20.11.2");
         assert_ne!(changed.profile_fingerprint, initial.profile_fingerprint);
+    }
+
+    /// A fake worker PATH: only executable `cargo-*` and listed names are
+    /// reported, a link is followed, the first directory wins, nothing runs.
+    #[test]
+    fn path_tools_are_the_executable_setup_names_on_the_profile_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let tool = |at: &Path, name: &str, mode: u32| {
+            // A script that would leave a mark if anything ran it.
+            let mark = dir.path().join("ran");
+            fs::write(
+                at.join(name),
+                format!("#!/bin/sh\ntouch {}\n", mark.display()),
+            )
+            .unwrap();
+            fs::set_permissions(at.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        tool(&a, "cargo-llvm-cov", 0o755);
+        tool(&a, "cargo-plain", 0o644);
+        tool(&a, "node", 0o755);
+        tool(&b, "just", 0o755);
+        fs::create_dir_all(b.join("cargo-dir")).unwrap();
+        symlink(a.join("cargo-llvm-cov"), b.join("cargo-linked")).unwrap();
+        let missing = dir.path().join("missing");
+        let got = path_tools(&[a, missing, b]);
+        assert_eq!(got, vec!["cargo-linked", "cargo-llvm-cov", "just"]);
+        assert!(!dir.path().join("ran").exists());
+    }
+
+    #[test]
+    fn rustup_components_are_read_from_the_toolchain_without_host_or_preview() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let bin = dir.path().join("1.92.0-aarch64-apple-darwin/bin");
+        fs::create_dir_all(&bin).unwrap();
+        assert!(rustup_components(&bin, Some("aarch64-apple-darwin")).is_empty());
+        let lib = bin.parent().unwrap().join("lib/rustlib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("components"),
+            "rustc-aarch64-apple-darwin\nllvm-tools-preview-aarch64-apple-darwin\ncargo-aarch64-apple-darwin\nbad name\nrustc-aarch64-apple-darwin\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rustup_components(&bin, Some("aarch64-apple-darwin")),
+            vec!["cargo", "llvm-tools", "rustc"]
+        );
+        let many: String = (0..100).map(|i| format!("c{i:03}\n")).collect();
+        fs::write(lib.join("components"), many).unwrap();
+        assert_eq!(rustup_components(&bin, None).len(), 64);
     }
 }
