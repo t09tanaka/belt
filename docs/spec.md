@@ -1387,6 +1387,12 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 - activationは、そのtoolchainの `bin` をPATHの先頭（管理されたinstallの後、profileのPATHの前）に置き、`RUSTUP_TOOLCHAIN` にtoolchain名を設定する。何も導入しない。identityはinstallの領収の代わりになる。
 - `workers diff` と `doctor` は検出したtoolchainを `rustup` の行に示す（失敗にはしない）。検出した版は `rustc`／`cargo` の行で導入済みの版として数える。
 
+**導入済みのほかのtoolの版による充足。** 同じ理由と同じ規則で、利用者の版管理ツールが既に持つnode・python・go・rubyの版も、その具体版を満たすものとして数える。証拠: あるMacではnode 20.xがnodenvにだけ入っていたが、どのworkerにもnode 20が無いとされた。
+- 読む場所: miseのinstalls（`$MISE_DATA_DIR`、無ければ `$XDG_DATA_HOME/mise`、無ければ `~/.local/share/mise` の `installs/<tool>/<版>`）、nodenv（`$NODENV_ROOT`、無ければ `~/.nodenv` の `versions/<版>`）、nvm（`$NVM_DIR`、無ければ `~/.nvm` の `versions/node/v<版>`）、Homebrew（`$HOMEBREW_PREFIX`、無ければ `/opt/homebrew` と `/usr/local` の `Cellar/node` と `Cellar/node@N` の `<版>`）。nodenv・nvm・Homebrewはnodeだけ。directoryとして列挙するだけで、`mise` などの管理ツールは実行せず、導入・設定の変更・書き込みはしない。symlink（`20`、`lts` などの別名）、directoryでないもの、版でない名前は飛ばす。各directoryで読む項目は最大1024とする。
+- 候補は版の高い順に最大32個とし、各候補の実行ファイル（`node -v`、`python3 --version`、`go version`、`ruby -v`）を既存の有界probeで呼び、全体で8秒を上限とする。版はその出力から取り、directory名は使わない。
+- 検出した版（tool・版・管理ツール・`bin`・実行ファイルのidentity）はworker profileの報告（`installs`）に入り、fingerprintに含まれる（無ければfingerprintは従来と同じ）。最初の報告の集合を基準とし、以後はその集合だけを見直す。消えた・変わった版はprofile drift、後から入れた版はresidentの再起動まで使わない。
+- 優先はrustupと同じで、recipeが満たせないときだけ範囲を満たす検出済みの最高版で解決する（根拠の領域tagは `worker_detected_install_v1`）。activationはその版の `bin` をPATHの先頭に置く。`doctor` と `workers diff` はその版を導入済みとして数える。
+
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
 
 公開 command submit は検証済み capture から版指定・必要 baseline を固定し、完全な resolution evidence とともに `FrozenBundle` として保持する。worker-local registry・既存 setup admission/singleflight・attempt ごとの activation 経路は [private adapter API](toolchain-adapters.md) に記録する。実 manager による受入確認と installed-version 一覧・diff/sync は別の検証範囲とする。

@@ -171,6 +171,22 @@ reason does worker resolution pick the highest detected version in range
 (`worker_detected_rustup_v1` evidence). Activation puts that toolchain's `bin`
 first on PATH (after managed installs) and sets `RUSTUP_TOOLCHAIN` to its name.
 
+### Installed versions of other tools (no configuration)
+
+The same rules cover node, python, go and ruby versions the user's own version
+managers already have (spec 22.1). The profile lists, read-only, mise installs
+(`$MISE_DATA_DIR`, else `$XDG_DATA_HOME/mise`, else `~/.local/share/mise`,
+`installs/<tool>/<version>`), nodenv (`$NODENV_ROOT` or `~/.nodenv`), nvm
+(`$NVM_DIR` or `~/.nvm`, `versions/node/v<version>`) and Homebrew
+(`$HOMEBREW_PREFIX`, else `/opt/homebrew` and `/usr/local`, `Cellar/node[@N]`).
+It skips links and non-directories, probes at most 32 candidates (highest
+version first) with each tool's own bounded version probe under one 8 s bound,
+and never runs a manager, installs or writes. The detected versions (`installs`)
+are part of the profile report and fingerprint with the same baseline and drift
+rules. Worker resolution uses them only where no recipe serves
+(`worker_detected_install_v1` evidence); activation puts the version's `bin`
+first on PATH.
+
 Inventory is operator authorization to prepare a concrete version, not evidence that
 it is installed or available from a remote server. Local resolution chooses the highest
 matching authorized version and binds evidence to the recipe's inventory authority digest;
