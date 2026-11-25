@@ -425,7 +425,7 @@ pub(crate) fn plan_with_limit(
             || !host
                 .rust_host
                 .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
     {
         return Err("explicit_rust_host_required");
     }

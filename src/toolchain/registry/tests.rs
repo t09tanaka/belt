@@ -319,6 +319,16 @@ fn invalid_host_paths_limits_and_recipe_pairs_are_rejected() {
     assert!(f.load().is_err());
 }
 
+/// A Rust host triple with an underscore, such as the one belt derives on
+/// x86_64 Linux, is a valid recipe host.
+#[test]
+fn an_x86_64_rust_host_with_an_underscore_is_accepted() {
+    let mut f = Fixture::new(AdapterKind::Rustup, "rust");
+    f.config.recipes[0].rust_host = "x86_64-unknown-linux-gnu".into();
+    f.write();
+    f.load().unwrap();
+}
+
 #[test]
 fn negative_outcomes_and_frozen_authority_are_distinct() {
     let f = Fixture::new(AdapterKind::Nodenv, "node");

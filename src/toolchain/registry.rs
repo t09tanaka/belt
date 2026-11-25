@@ -667,7 +667,7 @@ fn validate_recipe(r: &Recipe) -> Result<(), String> {
                 || !r
                     .rust_host
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')))
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')))
     {
         return Err("invalid_toolchain_recipe".into());
     }
