@@ -256,6 +256,25 @@ pub fn stop_daemon(state: &Path) {
     let _ = worker.join();
 }
 
+/// Wait until the resident that owns `state` has let go of its owner lock:
+/// its socket is removed first, and its database is closed (its WAL
+/// checkpointed) before the lock goes. The wait blocks on the lock itself,
+/// so it ends when the resident does, however busy the machine is.
+pub async fn wait_owner_released(state: &Path) {
+    let lock = std::fs::File::open(state.join("coordinator.lock")).unwrap();
+    let lock = tokio::task::spawn_blocking(move || {
+        lock.lock_shared().unwrap();
+        lock
+    })
+    .await
+    .unwrap();
+    lock.unlock().unwrap();
+    assert!(
+        !state.join("parent/request.sock").exists(),
+        "the owner lock went before the socket"
+    );
+}
+
 /// The pid written in a file, if it holds one.
 pub fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()

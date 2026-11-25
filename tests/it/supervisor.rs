@@ -979,7 +979,24 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     f.spec.nodes = vec![n];
     f.spec.lease_ms = 700;
     f.spec.term_grace_ms = 300;
+    // The lease is renewed until the command has started and then let lapse:
+    // the lease is counted from the start of the run, and the way to a
+    // running command (admission, the shell) can take longer than one lease
+    // on a busy machine, which would end the attempt before any command.
+    let second = f.open_second();
+    let attempt = f.attempt().clone();
+    let started = bg.clone();
+    let renewer = std::thread::spawn(move || {
+        let mut seq = 1;
+        while read_pid(&started).is_none() {
+            let _ = second.renew_lease(&attempt, key(seq), platform::wall_ms());
+            seq += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        seq
+    });
     let t = settled(&run(&f.spec).unwrap());
+    let next = renewer.join().unwrap();
     assert_eq!(t.outcome(), Outcome::Interrupted);
     assert!(t.exit().is_some(), "the command did run and was stopped");
     assert!(!alive(read_pid(&bg).unwrap()));
@@ -987,7 +1004,7 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     assert!(expired);
     let err = f
         .store
-        .renew_lease(f.attempt(), key(1), platform::wall_ms())
+        .renew_lease(f.attempt(), key(next), platform::wall_ms())
         .unwrap_err();
     assert!(matches!(err, StorageError::LeaseNotRenewable(_)), "{err:?}");
 }

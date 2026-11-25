@@ -140,7 +140,10 @@ mod tests {
         };
         let file = HeldLock::try_lock(open()).unwrap().into_file();
         assert!(open().try_lock().is_err());
-        drop(file);
+        // The next owner releases it explicitly, as `ProcessLock` does: a
+        // plain close would leave it held while a child that another test
+        // thread forks meanwhile still has the description, until its exec.
+        file.unlock().unwrap();
         open().try_lock().unwrap();
     }
 }
