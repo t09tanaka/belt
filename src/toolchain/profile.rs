@@ -636,6 +636,13 @@ impl Profile {
     }
 
     /// Consume only: never probes, renews the stamp, or changes admission reports.
+    /// The last completed report, if it was measured for `expected`. Nothing
+    /// is probed; there is none before the first report completes.
+    pub(crate) fn last_report(&self, expected: &Digest) -> Option<WorkerCapabilities> {
+        let slot = self.completed_report.lock().ok()?;
+        let snapshot = slot.as_ref()?;
+        (&snapshot.report.profile_fingerprint == expected).then(|| snapshot.report.clone())
+    }
     pub(crate) fn preparation_snapshot(
         &self,
         expected: &Digest,

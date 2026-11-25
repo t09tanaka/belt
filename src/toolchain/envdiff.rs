@@ -327,8 +327,27 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
             Some("upgrade belt to read the shared portool registry".into()),
         ));
     }
+    // The worker's own mise (spec 22.1). A report from before it was
+    // measured has no row; nothing is compared then.
+    if let Some(mise) = have.helpers.get("mise") {
+        items.push(match mise {
+            Some(_) => item("mise", Class::Same, None, Some("present"), None),
+            // Shown with how to get it, never a failure: the worker still
+            // serves the versions it has, and sync cannot install mise.
+            None => item(
+                "mise",
+                Class::Same,
+                None,
+                Some("absent"),
+                Some(format!(
+                    "{}; until then this worker serves only the node, python, go and ruby versions it already has{RERUN}",
+                    crate::toolchain::registry::MISE_INSTALL_HINT
+                )),
+            ),
+        });
+    }
     for (name, version) in &want.helpers {
-        if name == "portool_registry" {
+        if name == "portool_registry" || name == "mise" {
             continue;
         }
         let Some(version) = version else { continue };
@@ -1040,5 +1059,28 @@ mod tests {
             row.worker.as_deref(),
             Some("1.89.0 (1.89.0-aarch64-apple-darwin)")
         );
+    }
+    /// A worker without mise is told how to get it (spec 22.1); one with it
+    /// is the same; an older report that did not measure it has no row.
+    #[test]
+    fn a_worker_without_mise_is_told_how_to_install_it() {
+        let parent = report();
+        let mut worker = report();
+        assert!(diff(&parent, &worker).iter().all(|i| i.subject != "mise"));
+        worker.helpers.insert("mise".into(), None);
+        let items = diff(&parent, &worker);
+        let row = items.iter().find(|i| i.subject == "mise").unwrap();
+        assert_eq!(row.worker.as_deref(), Some("absent"));
+        assert!(row
+            .steps
+            .as_deref()
+            .is_some_and(|s| s.contains("brew install mise")));
+        assert!(all_same(&items));
+        worker.helpers.insert("mise".into(), Some("present".into()));
+        let row = diff(&parent, &worker)
+            .into_iter()
+            .find(|i| i.subject == "mise")
+            .unwrap();
+        assert_eq!(row.class, Class::Same);
     }
 }

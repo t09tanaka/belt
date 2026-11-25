@@ -81,6 +81,30 @@ pub struct Registry {
     base_profile: Digest,
     configuration: Option<Digest>,
     recipes: BTreeMap<ToolId, Registered>,
+    /// Installers found with no configuration (spec 22.1): the user's own
+    /// `mise` for node, python, go and ruby, and `rustup` for rust, on the
+    /// profile PATH, each only for a tool no recipe names. They serve an
+    /// exact version already selected, and only when no native tool does.
+    installers: BTreeMap<ToolId, Registered>,
+}
+/// The tools the user's own mise installs for belt.
+pub const MISE_TOOLS: &[&str] = &["node", "python", "go", "ruby"];
+/// What a person runs to give a worker mise (spec 22.1).
+pub const MISE_INSTALL_HINT: &str =
+    "install mise: `brew install mise`, or `curl https://mise.run | sh` (https://mise.jdx.dev)";
+/// The executable named `name` in the first directory of `dirs` that has
+/// one, resolved through links. A target with another file name is not
+/// taken: rustup and its proxies choose what they do by that name.
+pub fn find_installer(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| {
+        let candidate = dir.join(name);
+        let meta = std::fs::metadata(&candidate).ok()?;
+        if !meta.is_file() || meta.mode() & 0o111 == 0 {
+            return None;
+        }
+        let real = std::fs::canonicalize(&candidate).ok()?;
+        (real.file_name()? == name && clean_absolute(&real)).then_some(real)
+    })
 }
 impl Registry {
     /// `actual_fingerprint` must come from the checked worker's existing profile
@@ -99,8 +123,10 @@ impl Registry {
             base_profile: actual_fingerprint,
             configuration: None,
             recipes: BTreeMap::new(),
+            installers: BTreeMap::new(),
         };
         let Some(bytes) = read_configuration(&state.join("toolchains.toml"))? else {
+            registry.discover_installers(profile);
             return Ok(registry);
         };
         let config: Configuration =
@@ -155,7 +181,104 @@ impl Registry {
                 },
             );
         }
+        registry.discover_installers(profile);
         Ok(registry)
+    }
+    /// Read-only: finds `mise` and `rustup` on the profile PATH and captures
+    /// their identity. Nothing runs. One that cannot be taken is no installer.
+    fn discover_installers(&mut self, profile: &Profile) {
+        let search_path: Vec<PathBuf> = profile
+            .path_dirs()
+            .iter()
+            .filter(|p| canonical(p).is_ok() && p.is_dir())
+            .take(32)
+            .cloned()
+            .collect();
+        if search_path.is_empty() {
+            return;
+        }
+        let mut wanted: Vec<(AdapterKind, &str, &str, String)> = MISE_TOOLS
+            .iter()
+            .map(|tool| (AdapterKind::Mise, *tool, "mise", String::new()))
+            .collect();
+        if let Some(host) = super::profile::rustup_host() {
+            wanted.push((AdapterKind::Rustup, "rust", "rustup", host));
+        }
+        for (kind, tool, name, rust_host) in wanted {
+            let tool = ToolId::parse(tool).expect("known tool");
+            if self.recipes.contains_key(&tool) {
+                continue;
+            }
+            let Some(manager) = find_installer(profile.path_dirs(), name)
+                .and_then(|p| identity(&p).ok())
+                .filter(|m| m.executable)
+            else {
+                continue;
+            };
+            let recipe = Recipe {
+                tool: tool.clone(),
+                kind,
+                manager: manager.path.clone(),
+                dependencies: Vec::new(),
+                search_path: search_path.clone(),
+                rust_host,
+                inventory: Vec::new(),
+                resolved_inputs: BTreeMap::new(),
+            };
+            let catalog = Digest::of_bytes(
+                &serde_json::to_vec(&("belt_installer_v1", &recipe, &manager.digest))
+                    .expect("recipe serializes"),
+            );
+            let host = HostTools {
+                manager,
+                dependencies: Vec::new(),
+                search_path: search_path.clone(),
+                rust_host: recipe.rust_host.clone(),
+            };
+            self.installers.insert(
+                tool,
+                Registered {
+                    recipe,
+                    host,
+                    catalog,
+                },
+            );
+        }
+    }
+    /// Whether this worker can install versions of `tool` it lacks: a recipe
+    /// names it, or the user's own mise or rustup is on the profile PATH.
+    pub fn can_install(&self, tool: &str) -> bool {
+        ToolId::parse(tool)
+            .is_ok_and(|t| self.recipes.contains_key(&t) || self.installers.contains_key(&t))
+    }
+    /// The installer found for `tool` with no configuration, if any.
+    pub fn installer(&self, tool: &str) -> Option<&Path> {
+        let tool = ToolId::parse(tool).ok()?;
+        self.installers
+            .get(&tool)
+            .map(|e| e.host.manager.path.as_path())
+    }
+    /// The install of an exact version already selected (`evidence`), by the
+    /// user's own mise or rustup, into belt's private root. Callers ask only
+    /// after the registry and the native tool both refused, so a version the
+    /// worker has is never installed again. Read-only.
+    pub fn install_request(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: &ResolutionEvidence,
+    ) -> Result<PreparationRequest, Unavailable> {
+        self.request_from(true, frozen, tool, Some(evidence), None)
+            .map(|v| v.0)
+    }
+    pub(crate) fn probe_install_plan_request(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: &ResolutionEvidence,
+        budget: &adapters::IdentityReadBudget,
+    ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
+        self.probe_from(true, frozen, tool, evidence, budget)
     }
     pub fn configuration_digest(&self) -> Option<&Digest> {
         self.configuration.as_ref()
@@ -192,9 +315,24 @@ impl Registry {
         evidence: &ResolutionEvidence,
         budget: &adapters::IdentityReadBudget,
     ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
+        self.probe_from(false, frozen, tool, evidence, budget)
+    }
+    fn probe_from(
+        &self,
+        installer: bool,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: &ResolutionEvidence,
+        budget: &adapters::IdentityReadBudget,
+    ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
         use crate::setup::preparation_probe::bounded_path;
         bounded_path(&self.root).map_err(|_| Unavailable::Invalid("probe_root"))?;
-        let entry = self.recipes.get(tool).ok_or(Unavailable::Unsupported)?;
+        let entries = if installer {
+            &self.installers
+        } else {
+            &self.recipes
+        };
+        let entry = entries.get(tool).ok_or(Unavailable::Unsupported)?;
         if entry.host.dependencies.len() > 8 || entry.host.search_path.len() > 32 {
             return Err(Unavailable::Invalid("probe_budget"));
         }
@@ -204,11 +342,21 @@ impl Registry {
         {
             bounded_path(path).map_err(|_| Unavailable::Invalid("probe_path"))?;
         }
-        self.request_with_limit(frozen, tool, Some(evidence), Some(budget))
+        self.request_from(installer, frozen, tool, Some(evidence), Some(budget))
     }
 
     fn request_with_limit(
         &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: Option<&ResolutionEvidence>,
+        max_bytes: Option<&adapters::IdentityReadBudget>,
+    ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
+        self.request_from(false, frozen, tool, evidence, max_bytes)
+    }
+    fn request_from(
+        &self,
+        installer: bool,
         frozen: &FrozenToolchains,
         tool: &ToolId,
         evidence: Option<&ResolutionEvidence>,
@@ -225,14 +373,17 @@ impl Registry {
         if let Some(reason) = adapters::manual_requirement(tool.as_str()) {
             return Err(Unavailable::ManualRequired(reason));
         }
-        let entry = self
-            .recipes
-            .get(tool)
-            .ok_or(if self.configuration.is_none() {
-                Unavailable::Unconfigured
-            } else {
-                Unavailable::Unsupported
-            })?;
+        let entry = if installer {
+            self.installers.get(tool).ok_or(Unavailable::Unsupported)?
+        } else {
+            self.recipes
+                .get(tool)
+                .ok_or(if self.configuration.is_none() {
+                    Unavailable::Unconfigured
+                } else {
+                    Unavailable::Unsupported
+                })?
+        };
         let selected = frozen.selections.iter().find(|s| &s.tool == tool);
         let (resolved, evidence) = if let Some(evidence) = evidence {
             if evidence.tool != *tool || selected.is_none() {
@@ -243,11 +394,17 @@ impl Registry {
             if adapters::resolve(&prior, evidence).map_err(Unavailable::Invalid)? != *frozen {
                 return Err(Unavailable::Invalid("parent_resolution_mismatch"));
             }
-            if !entry.recipe.inventory.contains(&evidence.concrete) {
+            // An installer has no inventory: it serves the exact version the
+            // contract already selected, whatever selected it.
+            if !installer && !entry.recipe.inventory.contains(&evidence.concrete) {
                 return Err(Unavailable::NotInInventory);
             }
             (frozen.clone(), evidence.clone())
         } else {
+            // An installer never chooses a version.
+            if installer {
+                return Err(Unavailable::ResolveRequired);
+            }
             if selected.is_some() {
                 return Err(Unavailable::ResolveRequired);
             }
@@ -406,7 +563,13 @@ impl Registry {
     }
     /// Detect only the indexed exact artifact using its validated adapter receipt.
     pub fn detect(&self, request: &PreparationRequest) -> Result<Availability, Unavailable> {
-        let expected = self.request(&request.frozen, &request.tool, Some(&request.evidence))?;
+        let expected = match self.request(&request.frozen, &request.tool, Some(&request.evidence)) {
+            Ok(expected) => expected,
+            Err(refused) if refused.allows_native() => {
+                self.install_request(&request.frozen, &request.tool, &request.evidence)?
+            }
+            Err(refused) => return Err(refused),
+        };
         if expected.digest() != request.digest() {
             return Err(Unavailable::Invalid("registry_request_binding"));
         }
@@ -504,7 +667,7 @@ fn validate_recipe(r: &Recipe) -> Result<(), String> {
                 || !r
                     .rust_host
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')))
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')))
     {
         return Err("invalid_toolchain_recipe".into());
     }

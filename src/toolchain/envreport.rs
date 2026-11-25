@@ -298,6 +298,14 @@ fn measure(
             )),
         );
     }
+    // Whether the user's own mise is on the profile PATH: it installs the
+    // node, python, go and ruby versions this worker lacks (spec 22.1).
+    // Found by name only; mise is not run.
+    helpers.insert(
+        "mise".into(),
+        crate::toolchain::registry::find_installer(profile.path_dirs(), "mise")
+            .map(|_| "present".to_string()),
+    );
     let docker = docker_state(profile.path_dirs(), profile, env, docker_timeout);
     EnvReport {
         schema_version: SCHEMA,
@@ -496,7 +504,12 @@ mod tests {
         assert_eq!(report.tools["node"].version.as_deref(), Some("20.1.0"));
         assert_eq!(report.tools["cargo"].observed, Observed::Unavailable);
         assert_eq!(report.tools["node"].managed, None);
-        assert_eq!(report.helpers.keys().collect::<Vec<_>>(), ["belt"]);
+        assert_eq!(report.helpers.keys().collect::<Vec<_>>(), ["belt", "mise"]);
+        // No mise on the profile PATH; with one there, it is present (never run).
+        assert_eq!(report.helpers["mise"], None);
+        shim(&bin, "mise", "exit 91");
+        let with = collect_with(&state, &BTreeMap::new(), SHORT * 10).unwrap();
+        assert_eq!(with.helpers["mise"].as_deref(), Some("present"));
         let build = report.helpers["belt"].as_deref().unwrap();
         for name in crate::workspace::embedded::NAMES {
             assert!(build.contains(&format!(

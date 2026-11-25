@@ -31,6 +31,19 @@ struct Fixture {
     shell: FileIdentity,
 }
 fn fixture(kind: AdapterKind, tool: &str) -> Fixture {
+    fixture_for_host(kind, tool, "aarch64-apple-darwin")
+}
+/// A Rust host triple with an underscore, such as the one belt derives on
+/// x86_64 Linux, plans a Rustup install.
+#[test]
+fn an_x86_64_rust_host_with_an_underscore_plans_a_rustup_install() {
+    let f = fixture_for_host(AdapterKind::Rustup, "rust", "x86_64-unknown-linux-gnu");
+    assert!(f.plan.commands[0]
+        .argv
+        .iter()
+        .any(|a| a == "1.2.3-x86_64-unknown-linux-gnu"));
+}
+fn fixture_for_host(kind: AdapterKind, tool: &str, rust_host: &str) -> Fixture {
     let temp = crate::test_tmp::tempdir().unwrap();
     let state = fs::canonicalize(temp.path()).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -76,7 +89,7 @@ fn fixture(kind: AdapterKind, tool: &str) -> Fixture {
             .map(|p| FileIdentity::capture(&hostdir.join(p)).unwrap())
             .collect(),
         search_path: vec![hostdir.clone()],
-        rust_host: "aarch64-apple-darwin".into(),
+        rust_host: rust_host.into(),
     };
     let plan = plan(kind, &frozen, &tool, &evidence, &state, &host).unwrap();
     let shell = FileIdentity::capture(&hostdir.join("shell")).unwrap();

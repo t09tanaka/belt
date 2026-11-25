@@ -192,6 +192,28 @@ rules. Worker resolution uses them only where no recipe serves
 (`worker_detected_install_v1` evidence); activation puts the version's `bin`
 first on PATH.
 
+### Installing a missing exact version (no configuration)
+
+Without a recipe for the tool, the registry takes the user's own `mise` (node,
+python, go, ruby) and `rustup` (rust) from the profile PATH as installers
+(`Registry::install_request`; spec 22.1). Only a file of exactly that name,
+also after links are resolved, is taken; it is never run at discovery, only its
+byte identity captured. It reuses the Mise and Rustup rows above unchanged:
+`install-into` with every mise directory and HOME under the private root, or
+`toolchain install` with a private RUSTUP_HOME/CARGO_HOME. The install-lock,
+receipt, admission and setup singleflight rules are those of any recipe; the
+roots are ordinary `toolchains/<identity>/` roots, bounded and removed by spec
+25.7 (b), and are the only installs ever removed. An installer serves only a
+selection the frozen contract already holds, whatever evidence selected it; it
+never resolves a range, channel or alias. Callers ask it last: recipe, then the
+native or detected tool, then the installer, so a version the worker has is
+never installed again. The preparation probe and the forecast follow the same
+order; the forecast counts an installer request as a pending install unless the
+last completed profile report already has the version. A worker without mise is
+refused with the install hint (`MISE_INSTALL_HINT`), and the environment report
+carries a `mise` helper row (`present` or absent) that `workers diff` and
+`doctor` show.
+
 Inventory is operator authorization to prepare a concrete version, not evidence that
 it is installed or available from a remote server. Local resolution chooses the highest
 matching authorized version and binds evidence to the recipe's inventory authority digest;

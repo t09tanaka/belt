@@ -126,7 +126,13 @@ impl Setups {
                                     continue;
                                 }
                                 None if registry.is_none() => return Err(Unknown::MissingContext),
-                                None => return Err(Unknown::IoUnavailable),
+                                // The user's mise or rustup installs it, as the real run would.
+                                None => match registry.filter(|_| refused.allows_native()).map(|r| {
+                                    r.probe_install_plan_request(&bundle.frozen, &evidence.tool, evidence, &byte_budget)
+                                }) {
+                                    Some(Ok(planned)) => planned,
+                                    _ => return Err(Unknown::IoUnavailable),
+                                },
                             }
                         }
                     };
