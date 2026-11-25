@@ -170,9 +170,34 @@ struct Writes {
     pending: bool,
 }
 
+/// Where the looks come from: the process table, or a script in tests.
+trait Looks {
+    /// One read of the table.
+    fn read(&mut self) -> Vec<lineage::Row>;
+    /// Asked only when the table does not list the command.
+    fn root_gone(&self, pid: u32) -> bool;
+}
+
+impl Looks for TableReader {
+    fn read(&mut self) -> Vec<lineage::Row> {
+        TableReader::read(self)
+    }
+    fn root_gone(&self, pid: u32) -> bool {
+        process::root_gone(pid)
+    }
+}
+
 fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Finished {
     sysinfo::set_open_files_limit(0);
-    let mut reader = TableReader::new();
+    track_with(TableReader::new(), root, record, stop)
+}
+
+fn track_with(
+    mut reader: impl Looks,
+    root: ProcRef,
+    record: &Record,
+    stop: &mpsc::Receiver<bool>,
+) -> Finished {
     let mut tracked = Tracked::default();
     let mut missed = Vec::new();
     let mut gaps = 0;
@@ -232,7 +257,7 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Fi
 /// asked about its pid.
 #[allow(clippy::too_many_arguments)]
 fn tick(
-    reader: &mut TableReader,
+    reader: &mut impl Looks,
     root: ProcRef,
     reaped: bool,
     tracked: &mut Tracked,
@@ -244,7 +269,7 @@ fn tick(
 ) -> lineage::Step {
     let table = reader.read();
     let gone = lineage::root_is_gone(reaped, lineage::contains_root(&table, root), || {
-        process::root_gone(root.pid)
+        reader.root_gone(root.pid)
     });
     let step = lineage::step(&table, root, gone, tracked, missed, gaps, MAX_DESCENDANTS);
     let plan = lineage::plan(
