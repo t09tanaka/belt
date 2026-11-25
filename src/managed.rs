@@ -1625,8 +1625,8 @@ pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Resul
 /// Append `rec` to the history under the history lock, so it cannot land
 /// between a trim's read and its replacement of the file. One flock per
 /// record. A lock that stays busy for a second is not waited for: the
-/// record is then appended without it (a trim carries over what was
-/// appended while it wrote, so only the instant of its rename is exposed).
+/// record is then appended without it, which loses nothing either, since
+/// [`history::append`] locks the file itself against a trim's replacement.
 pub fn append_record(ctx: &Context, rec: &Record) -> Result<()> {
     let _lock = lock::acquire(
         &ctx.paths.history_lock(),

@@ -1411,7 +1411,20 @@ fn unlocked_appends_during_trims_leave_whole_lines_and_no_record_twice() {
                 for i in 0..EACH {
                     let mut r = record("live", now);
                     r.measurement_id = Some(format!("w{w}-{i}"));
-                    history::append(&path, &r).unwrap();
+                    // As a released version appends: one write, no lock of
+                    // any kind (`history::append` now locks the file).
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    let mut line = serde_json::to_string(&r).unwrap();
+                    line.push('\n');
+                    std::io::Write::write_all(
+                        &mut std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .unwrap(),
+                        line.as_bytes(),
+                    )
+                    .unwrap();
                 }
             })
         })
