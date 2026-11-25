@@ -26,7 +26,6 @@ use crate::{
     toolchain::envdiff::{self, Class, EnvReport, Item},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -317,8 +316,7 @@ pub fn worker_scope_paths(recorded: &BTreeMap<String, String>) -> (PathBuf, Path
 
 /// The digest task-traffic-controller itself gives an effective configuration.
 fn policy_digest(config: &Config) -> Option<String> {
-    let bytes = serde_json::to_vec(config).ok()?;
-    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
+    crate::config::traffic::policy_digest(config)
 }
 
 fn scope(state_dir: &Path, config_file: &Path) -> Scope {
@@ -1044,9 +1042,18 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
     items
         .iter()
         .map(|item| {
+            // A tool a machine lacks or has in another version breaks no
+            // task: placement sends a task that needs it to a member that
+            // has it. Only what breaks every task or the group fails.
+            let tool_row = crate::toolchain::capability::TOOLS.contains(&item.subject.as_str())
+                || item.subject == "docker"
+                || item.subject == "mise";
             let level = match item.class {
                 Class::Same => Level::Ok,
                 Class::AutoInstallable | Class::NotMeasured => Level::Notice,
+                Class::Differs | Class::Missing | Class::ManualRequired if tool_row => {
+                    Level::Notice
+                }
                 Class::Differs | Class::Missing | Class::ManualRequired => Level::Fail,
             };
             let class = serde_json::to_value(item.class)
@@ -1067,6 +1074,8 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
                     " (an exec installs it; `belt workers sync {host}` installs it now)"
                 )),
                 Class::NotMeasured => detail.push_str(" (not measured yet)"),
+                Class::Differs | Class::Missing | Class::ManualRequired if tool_row => detail
+                    .push_str(" (a notice: tasks that need it are placed on a member that has it)"),
                 _ => {}
             }
             // Values come from the worker's report.
