@@ -7,6 +7,17 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- A gap in the descendant record (failed looks at the process table, see 0.12.0) is now closed only by a look that lists the command alive. Before, any non-empty look closed it, including the final look after the command was reaped, which cannot show the table is complete: a recorded process missed before the gap and again by that look was dropped and the record ended "complete". A gap still open when the command ends now marks the record truncated, as in 0.11.0.
+- A recorded process that the look closing a gap does not list is no longer dropped on that look; a later good look has to miss it again.
+- When the tracker is dropped without `finish` (the wait for the command failed), a gap still open at its last look is now written to the sidecar as truncated; before, only the in-memory record said so.
+- The README and the `GAP_LIMIT` doc said a closed gap keeps the hidden-orphan window open. It does only when the entry is left to the reaper or `resolve`; a normal `managed::finish` releases on the process group, session and marked and recorded processes being gone, as without a gap. Now said so.
+
+### Not changed, on purpose
+
+- `managed::finish` does not keep the entry when a run had a closed gap and a recorded process was dropped after it. With the fixes above such a drop rests on the same evidence as without a gap (two good looks that list the command alive and miss the process). Keeping the entry would hand it to the reaper with the hidden-orphan window open from the command's start, where a hidden orphan that started after the command and leads its own session (the OS starts such processes for the user all the time) keeps it until the window closes, which it then never does: in practice the hold that 0.12.0 removed, for no evidence the release did not already have.
+
 ## [0.12.0] - 2026-11-26
 
 ### Breaking for library users

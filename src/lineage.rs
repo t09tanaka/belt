@@ -359,11 +359,23 @@ pub fn look_failed(table: &[Row], root: ProcRef, root_gone: bool) -> bool {
 /// (see [`step`]), and the next good look walks the whole tree again from
 /// the command and from every recorded process. So a gap of up to
 /// `GAP_LIMIT` failed looks followed by a good one loses no more than the
-/// same pause between good looks would. A longer gap, or a gap that is
-/// still open at the last look, is not closed by anything: the record is
-/// then truncated, and stays so. Any failed look also leaves the record not
-/// `covered` (the tracker's caller keeps that), so the window for hidden
-/// orphans never closes on its strength.
+/// same pause between good looks would.
+///
+/// Only a look that lists the command alive closes a gap; while a gap is
+/// open, a look that does not (the command ended, or was reaped before the
+/// final look) counts as one more failed look. What the closing look does
+/// not list is only marked missed, not dropped: a later good look has to
+/// miss it again, as without a gap. A longer gap, or a gap that is still
+/// open at the last look, is not closed by anything: the record is then
+/// truncated, and stays so.
+///
+/// What a closed gap still costs: the tracker reports the record as not
+/// `covered`, so the runner does not set `tracked_to_exit` and the
+/// hidden-orphan window stays open. That only matters when the entry is
+/// left to the reaper or `resolve` (the supervisor died, or `finish`
+/// refused). A normal `managed::finish` does not look at it: it releases
+/// once the process group, the session and the marked and recorded
+/// processes are gone, as after a run without a gap.
 pub const GAP_LIMIT: u32 = 3;
 
 /// One look at the table: prune, find what is new and record it. A look that
@@ -381,7 +393,11 @@ pub fn step(
     gaps: &mut u32,
     cap: usize,
 ) -> Step {
-    if look_failed(table, root, root_gone) {
+    // Only a look that lists the command alive can close a gap: "the table
+    // is not empty" is no evidence that it lists everything, and a look
+    // after the command ended (reaped) has nothing to check it against.
+    let closing = *gaps > 0;
+    if look_failed(table, root, root_gone) || (closing && !contains_root(table, root)) {
         *gaps = gaps.saturating_add(1);
         if *gaps <= GAP_LIMIT {
             return Step {
@@ -397,7 +413,11 @@ pub fn step(
         };
     }
     *gaps = 0;
-    let pruned = prune(table, &tracked.descendants, missed);
+    // What the closing look misses is only missed once: the table may have
+    // dropped it during the gap as well, so a later good look must confirm
+    // it before it is dropped.
+    let missed_before: &[ProcRef] = if closing { &[] } else { missed };
+    let pruned = prune(table, &tracked.descendants, missed_before);
     tracked.descendants = pruned.kept;
     *missed = pruned.missed;
     let found = descendants_of(table, root, &tracked.descendants);
@@ -1867,5 +1887,185 @@ mod tests {
             parent: None,
         };
         assert!(!inside_run(&[orphan], 30, None, None, Some(p(5, 5)), &[]));
+    }
+
+    #[test]
+    fn a_gap_keeps_what_was_missed_and_its_closing_look_finds_what_was_born_in_it() {
+        let root = p(5, 50);
+        let d = p(6, 60);
+        let mut t = Tracked::default();
+        let (mut missed, mut gaps) = (Vec::new(), 0);
+        step(
+            &[row(5, 1, 50), row(6, 5, 60)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        // D is not listed once: missed, still recorded.
+        step(
+            &[row(5, 1, 50)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert_eq!((t.descendants.clone(), missed.clone()), (vec![d], vec![d]));
+        // A failed look keeps both as they were.
+        assert!(
+            step(
+                &[row(9, 1, 90)],
+                root,
+                false,
+                &mut t,
+                &mut missed,
+                &mut gaps,
+                10
+            )
+            .failed
+        );
+        assert_eq!((t.descendants.clone(), missed.clone()), (vec![d], vec![d]));
+        // A child born during the gap is found by the look that closes it.
+        let full = [row(5, 1, 50), row(6, 5, 60), row(7, 5, 70)];
+        let s = step(&full, root, false, &mut t, &mut missed, &mut gaps, 10);
+        assert!(s.changed && !s.failed && gaps == 0, "{s:?}");
+        assert_eq!(
+            (t.descendants.clone(), missed.clone()),
+            (vec![d, p(7, 70)], vec![])
+        );
+    }
+
+    #[test]
+    fn the_look_that_closes_a_gap_prunes_nothing() {
+        // D was missed by the look before the gap and is missed again by
+        // the look that closes it: not two good looks in a row, and the
+        // table may have dropped D during the gap as well.
+        let root = p(5, 50);
+        let d = p(6, 60);
+        let mut t = Tracked::default();
+        let (mut missed, mut gaps) = (Vec::new(), 0);
+        step(
+            &[row(5, 1, 50), row(6, 5, 60)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        step(
+            &[row(5, 1, 50)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert!(
+            step(
+                &[row(9, 1, 90)],
+                root,
+                false,
+                &mut t,
+                &mut missed,
+                &mut gaps,
+                10
+            )
+            .failed
+        );
+        let s = step(
+            &[row(5, 1, 50)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert!(!s.failed && gaps == 0);
+        assert_eq!((t.descendants.clone(), missed.clone()), (vec![d], vec![d]));
+        // The next good look confirms it is gone.
+        step(
+            &[row(5, 1, 50)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert!(t.descendants.is_empty() && !t.truncated, "{t:?}");
+    }
+
+    #[test]
+    fn a_look_without_the_command_does_not_close_a_gap() {
+        // D missed, then a gap, then the final look after the command was
+        // reaped, which misses D too. Only the command listed alive shows
+        // the table can be believed, so the reaped look does not close the
+        // gap and D is not dropped.
+        let root = p(5, 50);
+        let d = p(6, 60);
+        let mut t = Tracked::default();
+        let (mut missed, mut gaps) = (Vec::new(), 0);
+        step(
+            &[row(5, 1, 50), row(6, 5, 60)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        step(
+            &[row(5, 1, 50)],
+            root,
+            false,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert!(
+            step(
+                &[row(9, 1, 90)],
+                root,
+                false,
+                &mut t,
+                &mut missed,
+                &mut gaps,
+                10
+            )
+            .failed
+        );
+        let s = step(
+            &[row(9, 1, 90)],
+            root,
+            true,
+            &mut t,
+            &mut missed,
+            &mut gaps,
+            10,
+        );
+        assert!(s.failed && gaps == 2, "{s:?}");
+        assert_eq!(t.descendants, vec![d]);
+        // Without a gap, the same look is believed.
+        let mut gaps = 0;
+        assert!(
+            !step(
+                &[row(9, 1, 90)],
+                root,
+                true,
+                &mut t,
+                &mut missed,
+                &mut gaps,
+                10
+            )
+            .failed
+        );
     }
 }
