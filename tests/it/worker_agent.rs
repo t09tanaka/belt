@@ -6401,14 +6401,16 @@ fn a_trial_stops_a_running_received_pass() {
 }
 
 /// A worker with no toolchain registry whose user's rustup (a fake one under
-/// the test directory) has `versions`, served over a connection.
+/// the test directory) has `versions`, served over a connection. An entry
+/// `<channel>=<version>` is the toolchain `<channel>-<host>` reporting
+/// `<version>`.
 async fn rustup_worker(f: &Fx, versions: &[&str]) -> Client {
-    use belt::toolchain::profile::Profile;
     let host = belt::toolchain::profile::rustup_host().unwrap();
     let home = f.dir.path().join("rustup");
     std::fs::create_dir_all(home.join("toolchains")).unwrap();
-    for version in versions {
-        let bin = home.join(format!("toolchains/{version}-{host}/bin"));
+    for entry in versions {
+        let (name, version) = entry.split_once('=').unwrap_or((entry, entry));
+        let bin = home.join(format!("toolchains/{name}-{host}/bin"));
         std::fs::create_dir_all(&bin).unwrap();
         for tool in ["rustc", "cargo"] {
             let path = bin.join(tool);
@@ -6420,6 +6422,11 @@ async fn rustup_worker(f: &Fx, versions: &[&str]) -> Client {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
+    serve_rustup_worker(f, &home).await
+}
+
+async fn serve_rustup_worker(f: &Fx, home: &std::path::Path) -> Client {
+    use belt::toolchain::profile::Profile;
     let profile = Profile::load(
         &f.state(),
         &[
@@ -6536,4 +6543,71 @@ async fn every_worker_with_the_installed_rustup_toolchain_is_a_candidate() {
         call(&none, again(bundle.clone())).await.is_err(),
         "a worker without 1.89 was a candidate"
     );
+}
+
+/// `stable` (`dtolnay/rust-toolchain@stable`, `toolchain: stable`) means the
+/// worker's installed `stable-<host>` toolchain, as on GitHub it means the
+/// latest stable release: never the user's `rustup default` nor the `rustc`
+/// on PATH (spec 22.1). Here the default and PATH say 1.92.0, the stable
+/// toolchain says 1.100.0, and the task activates 1.100.0. The fake rustup
+/// home is under the test directory; rustup itself never runs.
+#[tokio::test]
+async fn a_stable_task_activates_the_stable_toolchain_not_the_rustup_default() {
+    use belt::toolchain::contract::{native_tool, FrozenBundle};
+    let f = fx();
+    let host = belt::toolchain::profile::rustup_host().unwrap();
+    let home = f.dir.path().join("rustup");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.toml"),
+        format!("default_toolchain = \"1.92.0-{host}\"\n"),
+    )
+    .unwrap();
+    // The PATH's rustc and cargo are the default's.
+    let write = |dir: std::path::PathBuf, version: &str| {
+        std::fs::create_dir_all(&dir).unwrap();
+        for tool in ["rustc", "cargo"] {
+            let path = dir.join(tool);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho '{tool} {version} (fake)'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    };
+    write(home.join(format!("toolchains/1.92.0-{host}/bin")), "1.92.0");
+    write(
+        home.join(format!("toolchains/stable-{host}/bin")),
+        "1.100.0",
+    );
+    write(f.dir.path().to_path_buf(), "1.92.0");
+    let client = serve_rustup_worker(&f, &home).await;
+    let p = payload("exit 0");
+    let Response::ResolveToolchains(resolved) =
+        call(&client, ask_rust(&p, "stable")).await.unwrap()
+    else {
+        panic!()
+    };
+    let bundle: FrozenBundle = resolved.bundle;
+    bundle.validate(&p.manifest_digest).unwrap();
+    assert_eq!(bundle.evidence[0].concrete.to_string(), "1.100.0");
+    // Activation: the stable toolchain's bin, by name, not the default.
+    let profile = belt::toolchain::profile::Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), f.dir.path().to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), home.to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let report = profile.startup_report();
+    let rust = belt::toolchain::versions::ToolId::parse("rust").unwrap();
+    let native = native_tool(&bundle.frozen, &rust, &report).unwrap();
+    assert_eq!(native.version.to_string(), "1.100.0");
+    let (bin, name) = native.rustup.unwrap();
+    assert_eq!(name, format!("stable-{host}"));
+    assert_eq!(bin, home.join(format!("toolchains/stable-{host}/bin")));
 }

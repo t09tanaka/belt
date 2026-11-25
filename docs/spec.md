@@ -1372,7 +1372,7 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 **`ci` のtaskが固定するtoolchain（PR #135）。** `ci` は、taskごとに1つの束を固定する。プロジェクトの版指定ファイルに、そのtaskが走らせるjobの `setup-*` stepの `*-version` 入力（と `*-version-file` が指すファイル）を足したものである。親とworkerは同じ関数（`ci::toolchains`）で導出する。stepが要件を作るのは、beltが入力を読めるときだけである。
 - 版、範囲、`${{ matrix.<key> }}`（そのtask自身のmatrixの値。脚ごとに別の要件になる）、`${{ env.<NAME> }}`（stepとjobとworkflowの `env:` の順に見つかるリテラル）。`dtolnay/rust-toolchain@1.89` は、`toolchain:` 入力が無ければその版を宣言する。満たせない要件は、既存の拒否・blockedの経路に入る。
-- `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する。解決できなければ何も要求せず、noticeを出す。
+- `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する（Rustの `stable` は、workerの `stable-<host>` toolchainから解決する。下の「導入済みのrustup toolchainによる充足」）。解決できなければ何も要求せず、noticeを出す。
 - 読めない入力（`pypy3.10` のような版の文字列、`go.mod`・`pyproject.toml` のような独自形式の版ファイル、captureに無い版ファイル、matrixに無いkey、動的なmatrix、`if:` の付いたsetup step）は、何も要求せずnoticeを出す。noticeは `belt ci` のstderrに `warning:` 行（task、job、stepの `file:line`）で出し、runには保存しない。
 - そのtaskが走らせるjobだけを数える。`if:` の無いsetup stepが要件を作るtoolは、プロジェクトの版ファイルをそのtaskの要件にしない。同じtoolを別の版に固定する `if:` の無いsetup stepが1つのtaskに2つあれば、提出時に `conflicting_versions` で拒否する。reusable workflowとcomposite actionの中は読まない。
 - setup stepが無いtaskの束は、従来と同じである。`exec` はworkflowを読まない。`workers sync --project` は従来どおりで、setup stepが指す独自形式の版ファイルだけを、`warning:` を出して読み飛ばす。
@@ -1381,10 +1381,12 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 **導入済みのrustup toolchainによる充足。** 設定なしで、workerの利用者のrustupに、そのworker自身のhost向けに既に入っているtoolchainを、そのRustの具体版を満たすものとして数える。理由: 利用者は機械ごとの設定なしに普段の環境で `belt ci` を使いたい。MSRVのjob（例 `toolchain: "1.89"`）は、既定のRustが違う機械でも、その版のtoolchainが入っていれば動かせる。
 - 見つけ方は読むだけとする。`$RUSTUP_HOME/toolchains/`（未設定ならprofileの `HOME` の `.rustup`）をdirectoryとして列挙する。`rustup` は実行せず、導入・更新・network・`~/.rustup` への書き込みはしない。名前がhostで終わらないもの、symlink、directoryでないもの、UTF-8でない名前は飛ばす。読む項目は最大1024とする。
-- 候補は、名前が版で始まるものを版の降順、その後にchannel（`stable` など）を名前順に並べ、最大16個をprobeする。各候補の `bin/rustc -V` と `bin/cargo -V` を既存のbounded probe（固定argv、環境の消去、deadline）で呼び、両方が同じ版を答えたときだけ、その版のtoolchainとする。名前だけでは決めない。nightly・betaは版がprereleaseになるので、releaseの固定には一致しない。1回の検出のprobeは合わせて最大8秒（1回の呼び出しは起動時2秒、それ以外300ms）とし、使い切れば残りは検出しない。
+- 候補は、`stable-<host>` を先頭に、次に名前が版で始まるものを版の降順、その後に他のchannelを名前順に並べ、最大16個をprobeする（`stable` は下の解決に使うので、上限と時間で落とさない）。各候補の `bin/rustc -V` と `bin/cargo -V` を既存のbounded probe（固定argv、環境の消去、deadline）で呼び、両方が同じ版を答えたときだけ、その版のtoolchainとする。名前だけでは決めない。nightly・betaは版がprereleaseになるので、releaseの固定には一致しない。1回の検出のprobeは合わせて最大8秒（1回の呼び出しは起動時2秒、それ以外300ms）とし、使い切れば残りは検出しない。
 - 検出したtoolchainの名前・版・`rustc` と `cargo` のbyte identityはworker profileの報告（`rustup`）に入り、fingerprintに含まれる（無ければfingerprintは従来と同じ）。最初の報告で見つけた集合を基準とし、以後はその集合だけを見直す。ファイルが変わらなければprobeし直さない。消えた・変わったtoolchainはprofile drift（既存の規則）となる。後から入れたtoolchainは、residentの再起動まで使わない。
 - 優先: `toolchains.toml` のrecipeが満たせるならそれを使う。registryが無い、またはregistryが満たせない（native toolを許す拒否）ときだけ、範囲を満たす検出済みtoolchainの最高版で解決する（根拠の領域tagは `worker_detected_rustup_v1`。wire・保存形式は変わらない）。
 - activationは、そのtoolchainの `bin` をPATHの先頭（管理されたinstallの後、profileのPATHの前）に置き、`RUSTUP_TOOLCHAIN` にtoolchain名を設定する。何も導入しない。identityはinstallの領収の代わりになる。
+- **`stable` はstable channelであり、機械の既定ではない。** Rustの要件のchannel `stable`（`rust-toolchain` の `stable`、`dtolnay/rust-toolchain@stable`、`toolchain: stable`）は、workerに検出済みの `stable-<host>` toolchainが報告する版へ解決する（`resolved_inputs` に `stable` とその版を記録する）。利用者の `rustup default` やPATHの `rustc` が答える版には解決しない。理由: GitHub Actionsの `stable` は最新のstable releaseを意味し、機械の既定版で走らせると結果がGitHubと食い違う（既定が1.92、`stable` が1.100の機械で、coverageのjobが1.92で走った）。beltは `rustup` を実行せず、既定も変えない。`stable-<host>` が無いworkerは `stable` を解決しない。`beta`・`nightly` などの他のchannelは検出から解決しない。
+  - 版の揃え方: 解決した版は提出時にそのtaskの束へ具体版として固定される（他の要件と同じ）。そのため、そのrunのtaskは全workerで同じstableの版で走り、その版のtoolchainを持たないworker（`stable` が別の版のworkerを含む）は候補から外れる。GitHubの1回のrunが1つのstable版で走るのと同じ意味であり、`[toolchain] match` のbaselineで近い版を許す規則は使わない（channelの要件は束の固定で決まり、baselineではない）。実際に走った版は束の選択として記録される。
 - `workers diff` と `doctor` は検出したtoolchainを `rustup` の行に示す（失敗にはしない）。検出した版は `rustc`／`cargo` の行で導入済みの版として数える。
 
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。

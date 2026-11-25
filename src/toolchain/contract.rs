@@ -209,28 +209,49 @@ fn detected_rustup(
 /// The highest version of the user's rustup toolchains in `report` that
 /// every constraint of `requirement` accepts, as resolution evidence
 /// (domain `worker_detected_rustup_v1`). Only `rust` is detected.
+///
+/// The channel `stable` means the worker's installed `stable-<host>`
+/// toolchain, as GitHub's `stable` means the latest stable release: never
+/// the user's `rustup default` nor the `rustc` on PATH (spec 22.1). No other
+/// channel or alias resolves here.
 pub fn detected_rustup_evidence(
     frozen: &FrozenToolchains,
     requirement: &super::versions::EffectiveRequirement,
     report: &super::capability::WorkerCapabilities,
 ) -> Option<ResolutionEvidence> {
-    use super::versions::{Match, VersionObservation};
+    use super::versions::{Constraint, Match, VersionObservation};
     if requirement.tool.as_str() != "rust" {
         return None;
+    }
+    let mut channel = None;
+    let mut ranges = Vec::new();
+    for constraint in &requirement.constraints {
+        match constraint {
+            Constraint::Resolve(name) if name == "stable" => channel = Some(name.clone()),
+            Constraint::Range(_) | Constraint::Pub(_) => ranges.push(constraint),
+            _ => return None,
+        }
     }
     let best = report
         .rustup
         .iter()
+        .filter(|r| channel.is_none() || r.name.starts_with("stable-"))
         .filter_map(|r| node_semver::Version::parse(&r.version).ok())
+        .filter(|v| channel.is_none() || !v.is_prerelease())
         .filter(|v| {
             let seen = VersionObservation::Known(v.clone());
-            requirement
-                .constraints
-                .iter()
-                .all(|c| c.matches(&seen) == Match::Match)
+            ranges.iter().all(|c| c.matches(&seen) == Match::Match)
         })
         .max()?;
-    let evidence = proof(frozen, requirement, best, "worker_detected_rustup_v1");
+    let mut evidence = proof(
+        frozen,
+        requirement,
+        best.clone(),
+        "worker_detected_rustup_v1",
+    );
+    if let Some(channel) = channel {
+        evidence.resolved_inputs.insert(channel, best);
+    }
     adapters::resolve(frozen, &evidence).ok()?;
     Some(evidence)
 }
@@ -951,5 +972,44 @@ mod tests {
         assert!(
             detected_rustup_evidence(&node.frozen, &node.frozen.requirements[0], &report).is_none()
         );
+    }
+    /// `stable` is the worker's installed `stable-<host>` toolchain, as
+    /// GitHub's `stable` is the latest stable release: not the profile's own
+    /// rust (the user's `rustup default`, 1.92.0 here), and not the highest
+    /// toolchain installed under another name.
+    #[test]
+    fn the_stable_channel_resolves_to_the_installed_stable_toolchain_not_the_default() {
+        let rust = ToolId::parse("rust").unwrap();
+        let open = bundle_for("rust", "stable");
+        let requirement = open.frozen.requirements[0].clone();
+        let report = rustup_report(&[
+            ("1.92.0-host", "1.92.0"),
+            ("1.101.0-host", "1.101.0"),
+            ("stable-host", "1.100.0"),
+            ("nightly-host", "1.102.0-nightly"),
+        ]);
+        let evidence = detected_rustup_evidence(&open.frozen, &requirement, &report).unwrap();
+        assert_eq!(evidence.concrete.to_string(), "1.100.0");
+        let mut sealed = open.clone();
+        sealed.frozen = adapters::resolve(&open.frozen, &evidence).unwrap();
+        sealed.evidence.push(evidence);
+        sealed.validate(&sealed.frozen.source_manifest).unwrap();
+        let native = native_tool(&sealed.frozen, &rust, &report).unwrap();
+        assert_eq!(
+            native.rustup,
+            Some((
+                "/rustup/toolchains/stable-host/bin".into(),
+                "stable-host".into()
+            ))
+        );
+        // No stable toolchain installed: `stable` does not resolve here.
+        let none = rustup_report(&[("1.92.0-host", "1.92.0"), ("1.101.0-host", "1.101.0")]);
+        assert!(detected_rustup_evidence(&open.frozen, &requirement, &none).is_none());
+        // Other channels are not resolved from detection.
+        for channel in ["beta", "nightly"] {
+            let open = bundle_for("rust", channel);
+            let requirement = open.frozen.requirements[0].clone();
+            assert!(detected_rustup_evidence(&open.frozen, &requirement, &report).is_none());
+        }
     }
 }
