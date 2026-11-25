@@ -777,6 +777,19 @@ fn job_report(
                             .and_then(|e| e.payload.get("reason")?.as_str().map(str::to_string))
                     }),
                 _ => None,
+            })
+            // A task whose collection closed as `required_missing` says
+            // which required output is missing, and why.
+            .or_else(|| {
+                let attempt = row.attempt.as_ref()?;
+                store
+                    .events_of(&attempt.attempt_id, crate::ci::COLLECTION_MISSING_EVENT)
+                    .ok()?
+                    .last()?
+                    .payload
+                    .get("reason")?
+                    .as_str()
+                    .map(str::to_string)
             });
         lines.extend(lines::row_lines(
             &row.task_id,
