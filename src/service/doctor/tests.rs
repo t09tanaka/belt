@@ -386,6 +386,8 @@ fn healthy() -> HostFacts {
         linger: None,
         abandoned_imports: None,
         source_lock_problem: None,
+        service_path: None,
+        macos_linker: None,
     }
 }
 fn level(checks: &[Check], id: &str) -> Level {

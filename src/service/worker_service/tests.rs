@@ -1756,3 +1756,73 @@ fn install_sweeps_the_directories_it_writes_before_it_writes() {
         }
     }
 }
+
+/// Answers every command with a login shell's `PATH` line, or nothing.
+struct LoginShell(Option<String>);
+impl crate::service::doctor::Runner for LoginShell {
+    fn run(&mut self, _: &Path, _: &[&str], _: &BTreeMap<String, String>) -> Option<(i32, String)> {
+        let path = self.0.clone()?;
+        Some((0, format!("motd\n__BELT_LOGIN_PATH__={path}\n")))
+    }
+}
+
+#[test]
+fn install_and_refresh_env_record_the_login_shells_path_not_the_ssh_one() {
+    let ssh = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+    let process = BTreeMap::from([("SHELL".to_string(), "/bin/zsh".to_string())]);
+    let mut login = LoginShell(Some("/opt/homebrew/bin:/usr/bin:/bin".into()));
+    for action in [Action::Install, Action::RefreshEnv] {
+        let env = login_captured(action, ssh.clone(), &process, &mut login).unwrap();
+        assert_eq!(env["PATH"], "/opt/homebrew/bin:/usr/bin:/bin");
+    }
+    // Other actions keep the helper's own environment.
+    let env = login_captured(Action::Stop, ssh.clone(), &process, &mut login).unwrap();
+    assert_eq!(env["PATH"], "/usr/bin:/bin");
+    // An unreadable login shell: install keeps the ssh PATH, refresh-env
+    // changes nothing.
+    let mut silent = LoginShell(None);
+    let env = login_captured(Action::Install, ssh.clone(), &process, &mut silent).unwrap();
+    assert_eq!(env["PATH"], "/usr/bin:/bin");
+    assert!(login_captured(Action::RefreshEnv, ssh, &process, &mut silent).is_err());
+}
+
+#[test]
+fn refresh_env_restarts_the_service_with_the_new_path_everywhere() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let old = read_journal(&h.paths()).unwrap().unwrap().receipt.unwrap();
+    assert!(!fs::read_to_string(old.path())
+        .unwrap()
+        .contains("/opt/homebrew/bin"));
+    let new = with(&h.env, "PATH", "/opt/homebrew/bin:/usr/bin:/bin");
+    let status = refresh_env(&new, h.fake.clone(), Duration::ZERO, Duration::from_secs(2)).unwrap();
+    assert_eq!(status.loaded, Some(true));
+    assert!(status.ready);
+    assert_eq!(h.launchctl_calls(), ["bootstrap", "bootout", "bootstrap"]);
+    let paths = h.paths();
+    let journal = read_journal(&paths).unwrap().unwrap();
+    assert_eq!(journal.env["PATH"], "/opt/homebrew/bin:/usr/bin:/bin");
+    let receipt = journal.receipt.unwrap();
+    assert!(fs::read_to_string(receipt.path())
+        .unwrap()
+        .contains("/opt/homebrew/bin:/usr/bin:/bin"));
+    let spec: crate::service::worker::WorkerSpec =
+        serde_json::from_slice(&fs::read(&paths.input).unwrap()).unwrap();
+    assert_eq!(spec.env["PATH"], "/opt/homebrew/bin:/usr/bin:/bin");
+    // The same PATH again changes nothing and touches no service.
+    refresh_env(&new, h.fake.clone(), Duration::ZERO, Duration::from_secs(2)).unwrap();
+    assert_eq!(h.launchctl_calls(), ["bootstrap", "bootout", "bootstrap"]);
+}
+
+#[test]
+fn refresh_env_without_an_install_is_refused() {
+    let h = Host::new();
+    assert!(refresh_env(
+        &h.env,
+        h.fake.clone(),
+        Duration::ZERO,
+        Duration::from_secs(2)
+    )
+    .is_err());
+}

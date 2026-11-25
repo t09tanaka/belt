@@ -338,6 +338,9 @@ pub enum WorkersSub {
     Drain { name: String },
     /// Resume placement.
     Resume { name: String },
+    /// Recapture a worker's service PATH from its user's login shell, then
+    /// restart it once its accepted work has finished.
+    RefreshEnv { name: String },
     /// Stop a worker.
     Stop {
         name: String,

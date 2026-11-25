@@ -143,6 +143,7 @@ belt workers drain mini-a
 belt workers resume mini-a
 belt workers stop mini-a
 belt workers upgrade mini-a
+belt workers refresh-env mini-a
 belt workers diff mini-a
 belt workers sync mini-a
 belt workers forget colab-1
@@ -964,6 +965,14 @@ SSHで到達できる、起動中のMacへworkerを導入・起動できる。Re
 launchd配下のagentはforegroundで動作する。attempt supervisorをagentの一時的なSSH process groupへ従属させず、agent再起動が所有commandへどのように伝わるかを検証する。supervisor自体の自動再起動によってuser commandを再実行してはならない。
 
 system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用できるとは限らない。doctorが実際のservice user・service環境でprofileを検査し、必要能力を持つworkerだけを選ぶ。専用Macのreboot後の自動agent復帰はこのmodeで受入検証する。
+
+### serviceの環境とlogin shellの差
+
+serviceの `PATH` は、`workers add --install` がSSHの非login sessionではなく、その利用者のlogin shellから取る（login shellを `-l -c` で非対話に起動し、環境は `HOME`・`USER`・`SHELL` だけ、時間を区切る。読めなければSSHの `PATH` のまま入れ、doctorがそう言う）。
+
+- doctorは各workerのserviceの `PATH` を、同じ利用者のlogin shellの `PATH` と比べる。login shellにありserviceに無いdirectoryごとに警告し、その中の目立つtool（`brew`・`node`・`mise` など）を挙げ、直すcommand `belt workers refresh-env <name>` を示す。login shellが読めないときは比べていないと言う。親（coordinator）のserviceは `init` が記録した `PATH` のままで、取り直すcommandはまだ無い。
+- `belt workers refresh-env <name>` はworkerのhostでlogin shellの `PATH` を取り直し、違えば、受けた仕事の終わりを待って（`stop` と同じ。`--cancel-running` は無い）serviceを止め、service file・入力・journalを新しい `PATH` で書き直して起動する。同じなら何もしない。login shellが読めない、版の切替が途中、system-user modeのときは何も変えずに断る。
+- macOSでは、選ばれた開発directory（`xcode-select -p`）の同梱SDKのうち最新のものが、`xcrun --show-sdk-path` のSDK（リンク先）より古い、またはCommand Line Toolsが選ばれていてその版（`pkgutil --pkg-info=com.apple.pkg.CLTools_Executables`）のmajorがSDKより古いとき、doctorは「linkerがそのSDKの `.tbd` を読めず、C・Objective-Cのlinkがすべて失敗する」と警告し、Xcodeの更新か `sudo xcode-select --switch /Library/Developer/CommandLineTools`、CLTの更新（`softwareupdate --list` と `softwareupdate --install`）を示す。何もbuildしない。読めなければ比べていないと言う。
 
 ## Linuxの常駐
 
