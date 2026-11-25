@@ -305,16 +305,16 @@ pub const MISSING_REASON_MAX: usize = 400;
 pub fn missing_reason(declared: &[(&str, bool, Option<&str>, Standing)]) -> Option<String> {
     let parts: Vec<String> = declared
         .iter()
-        .filter(|(_, required, _, s)| *required && *s != Standing::Stored)
-        .map(|(name, _, path, standing)| {
-            let at = path.map(|p| format!(" ({p})")).unwrap_or_default();
+        .filter(|(_, required, _, _)| *required)
+        .filter_map(|(name, _, path, standing)| {
             let why = match standing {
+                Standing::Stored => return None,
                 Standing::Missing => "the commands left nothing at its path",
                 Standing::Refused => "the worker did not keep what was there",
                 Standing::Unreported => "the result does not report it",
-                Standing::Stored => unreachable!("filtered out"),
             };
-            format!("required output {name}{at} is missing: {why}")
+            let at = path.map(|p| format!(" ({p})")).unwrap_or_default();
+            Some(format!("required output {name}{at} is missing: {why}"))
         })
         .collect();
     (!parts.is_empty()).then(|| bounded(&parts.join("; ")))
