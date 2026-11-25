@@ -106,7 +106,7 @@ fn term_stops_a_cooperative_group_without_kill() {
     let started = std::time::Instant::now();
     let reaper = std::thread::spawn(move || child.wait().unwrap());
     assert_eq!(stop(&t, times(10_000)), StopResult::Confirmed);
-    let status = reaper.join().unwrap();
+    let status = crate::common::join_within(reaper, "the reaper");
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
     assert!(started.elapsed() < Duration::from_secs(8));
@@ -119,7 +119,7 @@ fn kill_follows_the_grace_for_a_group_that_ignores_term() {
     let started = std::time::Instant::now();
     let reaper = std::thread::spawn(move || child.wait().unwrap());
     assert_eq!(stop(&t, times(400)), StopResult::Confirmed);
-    let status = reaper.join().unwrap();
+    let status = crate::common::join_within(reaper, "the reaper");
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     // TERM was ignored, so the stop took at least the grace.

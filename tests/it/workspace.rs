@@ -2172,7 +2172,7 @@ fn a_publication_racing_step_4_never_keeps_a_row_without_its_refs() {
         )
         .unwrap();
     assert!(ok);
-    publisher.borrow_mut().take().unwrap().join().unwrap();
+    crate::common::join_within(publisher.borrow_mut().take().unwrap(), "the publisher");
     let refs_there = !f.git(repo.dir(), &["for-each-ref", &snapshot]).is_empty();
     let row = clone_ref.load(Ordering::SeqCst);
     assert!(
