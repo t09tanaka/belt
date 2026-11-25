@@ -4,13 +4,15 @@
 //!
 //! The core binds a workspace only while it is the captured source, byte for
 //! byte ([`PinnedExecution::verify_workspace`]): before any secret file is
-//! placed and before any setup result is copied in. A workspace that is not
-//! that is refused here, never run unverified.
+//! placed and before any setup result is copied in. The only exception is
+//! what preparation wrote ([`TaskPaths::prepared`], spec 22.5): those paths
+//! are left out of the comparison, and every other byte must still match. A
+//! workspace that is not that is refused here, never run unverified.
 
 use crate::source::SourceStore;
 use local_ci::exec::{Opts, Workspace};
-use local_ci::source::SourceManifest;
-use local_ci::source_execute::{PinnedExecution, RefusePinnedForks};
+use local_ci::source::{RelPath, SourceManifest};
+use local_ci::source_execute::{PinnedExecution, RefusePinnedForks, WorkspaceOverlay};
 use local_ci::{
     CancelHandle, ExecContext, FrozenPlan, PinnedPlanOptions, StepExecutor, TaskInputs, TaskResult,
 };
@@ -37,8 +39,14 @@ pub enum ExecuteError {
 /// may hold what must not be printed.
 #[derive(Clone)]
 pub struct TaskPaths {
-    /// The attempt's workspace: the captured source, nothing added.
+    /// The attempt's workspace: the captured source, plus only what
+    /// preparation wrote at `prepared`.
     pub root: PathBuf,
+    /// Relative paths `fast-worktree add` wrote before the source was laid
+    /// (dependencies, hook output), recorded when the workspace was made.
+    /// Left out of the byte check against the captured source; nothing else
+    /// is.
+    pub prepared: Vec<String>,
     /// Logs of the steps and the run's own files.
     pub run_dir: PathBuf,
     /// Scripts and shims of the attempt.
@@ -141,20 +149,24 @@ pub(crate) fn execute_selected(
         let run = || -> Result<TaskResult, ExecuteError> {
             let input = PinnedExecution::new(plan, manifest, objects)
                 .map_err(|e| ExecuteError::Binding(format!("{e:#}")))?;
-            let ws = input
-                .verify_workspace(
-                    &ctx,
-                    Workspace {
-                        root: paths.root.clone(),
-                        // No second checkout is ever made from it: forks
-                        // are refused.
-                        repo_root: paths.root.clone(),
-                        run_dir: paths.run_dir.clone(),
-                        tools: paths.tools.clone(),
-                        lock_file: paths.lock_file.clone(),
-                    },
-                )
-                .map_err(|e| ExecuteError::Workspace(format!("{e:#}")))?;
+            let workspace = Workspace {
+                root: paths.root.clone(),
+                // No second checkout is ever made from it: forks are refused.
+                repo_root: paths.root.clone(),
+                run_dir: paths.run_dir.clone(),
+                tools: paths.tools.clone(),
+                lock_file: paths.lock_file.clone(),
+            };
+            let ws = if paths.prepared.is_empty() {
+                input.verify_workspace(&ctx, workspace)
+            } else {
+                let overlay = WorkspaceOverlay {
+                    paths: paths.prepared.iter().map(RelPath::new).collect(),
+                    secret_files: Vec::new(),
+                };
+                input.verify_workspace_with_overlay(&ctx, workspace, &overlay)
+            }
+            .map_err(|e| ExecuteError::Workspace(format!("{e:#}")))?;
             let opts = Opts {
                 parallel: 1,
                 traffic_controller: None,
@@ -296,6 +308,7 @@ pub(crate) mod tests {
         let at = area.join(name);
         TaskPaths {
             root: at.join("ws"),
+            prepared: Vec::new(),
             run_dir: at.join("run"),
             tools: at.join("tools"),
             lock_file: at.join("lock"),
@@ -526,8 +539,9 @@ jobs:
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
     }
 
-    /// `fast-worktree` with Git alone: no dependency is copied in.
-    struct GitOnly(BTreeMap<String, String>);
+    /// `fast-worktree` with Git alone, then `prepare` over the new worktree:
+    /// what its dependency hooks and `[[clone]]` rules would write.
+    struct GitOnly(BTreeMap<String, String>, fn(&Path));
     impl crate::workspace::FastWorktree for GitOnly {
         fn add(
             &self,
@@ -542,6 +556,7 @@ jobs:
                 repo,
                 &["worktree", "add", "-q", "-b", branch, dest, start],
             );
+            (self.1)(Path::new(dest));
             Ok(())
         }
         fn remove(
@@ -560,9 +575,16 @@ jobs:
 
     /// The default input of `ci`: a Git worktree with staged, unstaged and
     /// untracked changes, in the workspace a worker makes of it (its clone,
-    /// the bundle, HEAD and index put back to the original's).
-    #[test]
-    fn a_task_runs_in_the_workspace_a_worker_makes_of_a_dirty_git_worktree() {
+    /// the bundle, HEAD and index put back to the original's) with
+    /// `prepare` as the preparation, and `tamper` done to the workspace
+    /// after it was made. The task `build` run there.
+    fn run_in_worker_workspace(
+        prepare: fn(&Path),
+        tamper: fn(&Path),
+    ) -> (
+        crate::workspace::Workspace,
+        Result<TaskResult, ExecuteError>,
+    ) {
         let root = crate::test_tmp::tempdir().unwrap();
         let area = std::fs::canonicalize(root.path()).unwrap();
         std::fs::create_dir_all(area.join("home")).unwrap();
@@ -572,12 +594,15 @@ jobs:
         git(&env, &work, &["init", "-q", "-b", "main"]);
         std::fs::write(work.join(".github/workflows/ci.yml"), WORKFLOW).unwrap();
         std::fs::write(work.join("a.txt"), "a\n").unwrap();
+        std::fs::write(work.join(".gitignore"), "node_modules\n").unwrap();
         git(&env, &work, &["add", "."]);
         git(&env, &work, &["commit", "-qm", "base"]);
         std::fs::write(work.join("a.txt"), "staged\n").unwrap();
         git(&env, &work, &["add", "a.txt"]);
         std::fs::write(work.join("a.txt"), "unstaged\n").unwrap();
         std::fs::write(work.join("new.txt"), "untracked\n").unwrap();
+        std::fs::create_dir_all(work.join("gen")).unwrap();
+        std::fs::write(work.join("gen/kept.txt"), "untracked\n").unwrap();
 
         let store = SourceStore::open(&area.join("state")).unwrap();
         let captured = capture(
@@ -620,7 +645,7 @@ jobs:
         let workspaces = crate::workspace::Workspaces::new(
             area.join("worker"),
             env.clone(),
-            Arc::new(GitOnly(env.clone())),
+            Arc::new(GitOnly(env.clone(), prepare)),
         );
         let repo = workspaces
             .ensure_clone(manifest.repository_id.as_deref().unwrap(), None)
@@ -643,6 +668,7 @@ jobs:
             "unstaged\n"
         );
 
+        tamper(&ws.root);
         let exec = Arc::new(Plain::default());
         let at = area.join("attempt");
         let built = execute_task(
@@ -653,6 +679,7 @@ jobs:
             &TaskInputs::default(),
             TaskPaths {
                 root: ws.root.clone(),
+                prepared: ws.prepared.clone(),
                 run_dir: at.join("run"),
                 tools: at.join("tools"),
                 lock_file: at.join("lock"),
@@ -661,10 +688,103 @@ jobs:
                 cancel: CancelHandle::new(),
             },
             exec.clone(),
-        )
-        .unwrap();
+        );
+        if built.is_err() {
+            assert!(exec.0.lock().unwrap().is_empty(), "a step ran");
+        }
+        (ws, built)
+    }
+
+    fn nothing(_: &Path) {}
+
+    /// What `fast-worktree add` writes for a project with npm dependencies:
+    /// an ignored `node_modules` and an untracked file of a hook.
+    fn installs_dependencies(dest: &Path) {
+        std::fs::create_dir_all(dest.join("node_modules/dep")).unwrap();
+        std::fs::write(dest.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::write(dest.join("hook.log"), "installed\n").unwrap();
+    }
+
+    fn built(result: Result<TaskResult, ExecuteError>) {
+        let built = result.unwrap();
         assert_eq!(built.outcomes[0].status, JobStatus::Success);
         assert_eq!(built.outcomes[0].outputs["version"], "1.2.3");
-        assert_eq!(exec.0.lock().unwrap().len(), 1);
+    }
+
+    fn refused(result: Result<TaskResult, ExecuteError>) {
+        assert!(
+            matches!(result, Err(ExecuteError::Workspace(_))),
+            "{:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn a_task_runs_in_the_workspace_a_worker_makes_of_a_dirty_git_worktree() {
+        let (ws, result) = run_in_worker_workspace(nothing, nothing);
+        assert!(ws.prepared.is_empty(), "{:?}", ws.prepared);
+        built(result);
+    }
+
+    /// Run 4: `fast-worktree add` installed `node_modules` for the npm
+    /// projects of the repository, and every task there was refused as "not
+    /// the captured source". What preparation wrote is recorded and left
+    /// out of the check (spec 22.5).
+    #[test]
+    fn what_preparation_wrote_is_not_taken_for_a_changed_source() {
+        let (ws, result) = run_in_worker_workspace(installs_dependencies, nothing);
+        assert_eq!(ws.prepared, ["hook.log", "node_modules"]);
+        built(result);
+    }
+
+    #[test]
+    fn a_file_added_after_preparation_is_still_refused() {
+        let (_, result) = run_in_worker_workspace(installs_dependencies, |root| {
+            std::fs::write(root.join("late.txt"), "late\n").unwrap();
+        });
+        refused(result);
+    }
+
+    #[test]
+    fn a_changed_captured_file_is_still_refused_after_preparation() {
+        let (_, result) = run_in_worker_workspace(installs_dependencies, |root| {
+            std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        });
+        refused(result);
+    }
+
+    /// The worktree is made at the execution commit, which holds every
+    /// captured file: what preparation writes next to captured files is
+    /// recorded file by file, and a captured file it overwrote is never
+    /// recorded (the source laid over it puts the captured bytes back).
+    #[test]
+    fn a_prepared_path_never_hides_a_captured_file() {
+        let (ws, result) = run_in_worker_workspace(
+            |dest| {
+                std::fs::create_dir_all(dest.join("gen")).unwrap();
+                std::fs::write(dest.join("gen/junk.txt"), "junk\n").unwrap();
+            },
+            nothing,
+        );
+        assert_eq!(ws.prepared, ["gen/junk.txt"]);
+        built(result);
+        let (ws, result) = run_in_worker_workspace(
+            |dest| std::fs::write(dest.join("new.txt"), "junk\n").unwrap(),
+            nothing,
+        );
+        assert!(ws.prepared.is_empty(), "{:?}", ws.prepared);
+        built(result);
+    }
+
+    /// A listed path that is a captured entry, or a directory above one, is
+    /// never recorded: leaving it out would leave captured bytes unchecked.
+    #[test]
+    fn a_path_that_holds_a_captured_entry_is_never_recorded() {
+        let f = fixture(WORKFLOW);
+        let listing = ".github/\0.github/workflows/ci.yml\0.git\0node_modules/\0";
+        assert_eq!(
+            crate::workspace::prepared_of(listing, &f.manifest),
+            [".git", "node_modules"]
+        );
     }
 }

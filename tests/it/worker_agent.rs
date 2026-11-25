@@ -157,6 +157,7 @@ impl Host for DirHost {
             kind: WorkspaceKind::Directory,
             index_reproduced: true,
             warnings: Vec::new(),
+            prepared: Vec::new(),
         })
     }
     fn setup_poll(

@@ -256,6 +256,7 @@ mod large_template_proof {
                 kind: WorkspaceKind::Directory,
                 index_reproduced: true,
                 warnings: Vec::new(),
+                prepared: Vec::new(),
             }
         }
     }

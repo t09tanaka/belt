@@ -100,6 +100,14 @@ pub struct Workspace {
     /// workspace from being made but a user should know.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// What `fast-worktree add` wrote into the worktree before the source
+    /// was laid over it (installed or cloned dependencies, hook output):
+    /// the paths, relative to `root`, that Git did not track right after the
+    /// add, minus any that is or holds a captured entry (spec 22.5). Only
+    /// these are left out when the task checks the workspace against the
+    /// captured source; every other byte must still match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared: Vec<String>,
 }
 
 impl Workspace {
@@ -110,6 +118,7 @@ impl Workspace {
             kind,
             index_reproduced: true,
             warnings: Vec::new(),
+            prepared: Vec::new(),
         }
     }
 }
@@ -124,6 +133,27 @@ pub struct Workspaces {
 
 fn internal(e: anyhow::Error) -> ApiError {
     api_error_of(&e)
+}
+
+/// The paths of `git ls-files -z --others --directory` (a directory ends in
+/// `/`), without the trailing `/`, leaving out each one that is a captured
+/// entry of `m` or a directory above one.
+pub(crate) fn prepared_of(listing: &str, m: &CiManifest) -> Vec<String> {
+    let holds_captured = |p: &str| {
+        m.object_manifest.entries.iter().any(|entry| {
+            let e = entry.path.0.as_slice();
+            e == p.as_bytes() || (e.starts_with(p.as_bytes()) && e.get(p.len()) == Some(&b'/'))
+        })
+    };
+    let mut out: Vec<String> = listing
+        .split('\0')
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty() && !holds_captured(p))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn io_err(what: &str, e: std::io::Error) -> ApiError {
@@ -584,9 +614,12 @@ impl Workspaces {
         };
         let made = added
             .map_err(|f| plan::fw_error("add", &f))
-            .and_then(|()| self.lay_source(store, m, dest))
-            .and_then(|()| self.reproduce_head(repo, dest, m, commit))
-            .map(|(index_reproduced, warnings)| Workspace {
+            .and_then(|()| self.prepared_paths(dest, m))
+            .and_then(|prepared| {
+                self.lay_source(store, m, dest)?;
+                Ok((prepared, self.reproduce_head(repo, dest, m, commit)?))
+            })
+            .map(|(prepared, (index_reproduced, warnings))| Workspace {
                 cwd: dest.join(m.cwd_relative.to_path()),
                 root: dest.to_path_buf(),
                 kind: WorkspaceKind::Worktree {
@@ -595,6 +628,7 @@ impl Workspaces {
                 },
                 index_reproduced,
                 warnings,
+                prepared,
             });
         if made.is_err() {
             // best effort: the original error is the one to report
@@ -662,6 +696,23 @@ impl Workspaces {
         let mut roots = vec![self.workspaces_root()];
         roots.extend(std::fs::canonicalize(self.workspaces_root()).ok());
         plan::registered_for(&listing, &roots, attempt)
+    }
+
+    /// What `fast-worktree add` put into the fresh worktree besides the
+    /// commit's files: every path Git does not track (ignored ones included,
+    /// a wholly untracked directory as one path), read before the source is
+    /// laid over it. A path that is, or lies above, an entry of the captured
+    /// source is never returned: declaring it would leave captured bytes
+    /// unchecked (spec 22.5).
+    fn prepared_paths(&self, dest: &Path, m: &CiManifest) -> Result<Vec<String>, ApiError> {
+        let listing = git::run_in_worktree(
+            &self.env,
+            dest,
+            &self.workspaces_root(),
+            &["ls-files", "-z", "--others", "--directory"],
+        )
+        .map_err(internal)?;
+        Ok(prepared_of(&listing, m))
     }
 
     /// Unpack the source into a scratch directory (verified there, working

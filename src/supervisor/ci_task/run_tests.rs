@@ -91,6 +91,7 @@ impl Sup {
             inputs: serde_json::to_value(inputs).unwrap(),
             ci_source_id: self.f.manifest.source_id.clone(),
             workspace: workspace.clone(),
+            prepared: Vec::new(),
             scratch: at.join("ci"),
             env: [
                 ("PATH".to_string(), std::env::var("PATH").unwrap()),
