@@ -314,13 +314,8 @@ async fn shutdown(client: &Client) {
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while client.socket_path().exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let state = client.socket_path().parent().unwrap().parent().unwrap();
+    crate::common::wait_owner_released(state).await;
 }
 fn load(spec: &Spec) -> Client {
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();

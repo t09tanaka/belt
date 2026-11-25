@@ -214,20 +214,7 @@ async fn shutdown(spec: &Spec) {
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while client.socket_path().exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // The socket goes first (`Resident::drop`); the database is closed,
-        // and its WAL checkpointed, only when the owner lock is let go.
-        let lock = std::fs::File::open(spec.state_dir.join("coordinator.lock")).unwrap();
-        while lock.try_lock_shared().is_err() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        lock.unlock().unwrap();
-    })
-    .await
-    .unwrap();
+    crate::common::wait_owner_released(&spec.state_dir).await;
 }
 
 /// A post that failed, and one skipped by `--no-status`, are posted again
