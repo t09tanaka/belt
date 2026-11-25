@@ -1066,6 +1066,109 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
 }
 
 #[test]
+fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_waiting() {
+    // The ledger lock of task-traffic-controller is held, so registering
+    // the command waits for it. The wait is not bounded by the lease: the
+    // supervisor must go on observing renewals meanwhile, and a lease kept
+    // renewed must not lapse behind a slow registration.
+    let mut f = fx(vec![node("n", &crate::fixture_process::script("true"))]);
+    f.spec.lease_ms = 700;
+    std::fs::create_dir_all(&f.spec.traffic_state_dir).unwrap();
+    let ledger_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(f.spec.traffic_state_dir.join("ledger.lock"))
+        .unwrap();
+    ledger_lock.lock().unwrap();
+    let second = f.open_second();
+    let attempt = f.attempt().clone();
+    let held = Instant::now();
+    let report = std::thread::scope(|s| {
+        let spec = &f.spec;
+        let runner = s.spawn(move || run(spec));
+        // Renewed every 50 ms for the whole run. The lock is let go once the
+        // supervisor has observed a renewal made two leases after it was
+        // taken, or when the bound runs out.
+        let (mut seq, mut late, mut observed) = (1, None, None);
+        let mut errors = Vec::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        while !runner.is_finished() {
+            if let Err(e) = second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+                errors.push(format!("renewal {seq}: {e}"));
+            }
+            if observed.is_none() {
+                if late.is_none() && held.elapsed() > Duration::from_millis(2 * 700) {
+                    late = Some(seq);
+                }
+                let newest = f
+                    .events(&attempt, "lease_renewal_observed")
+                    .iter()
+                    .filter_map(|e| e["key"]["lease_seq"].as_u64())
+                    .max();
+                if late.zip(newest).is_some_and(|(l, n)| n >= l) {
+                    observed = Some(true);
+                } else if Instant::now() >= until {
+                    observed = Some(false);
+                }
+                if observed.is_some() {
+                    ledger_lock.unlock().unwrap();
+                }
+            }
+            seq += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let report = runner.join().unwrap();
+        assert_eq!(
+            observed,
+            Some(true),
+            "no renewal observed while registration waited; errors: {errors:?}"
+        );
+        report
+    });
+    assert_eq!(settled(&report.unwrap()).outcome(), Outcome::Succeeded);
+}
+
+#[test]
+fn a_cancel_is_seen_while_registration_waits_and_nothing_is_launched() {
+    // As above, registration waits for the ledger lock; a cancel made
+    // meanwhile is seen (the stop is recorded) before the lock is let go,
+    // and once registration ends nothing is launched.
+    let f = fx(vec![node("n", &crate::fixture_process::script("true"))]);
+    std::fs::create_dir_all(&f.spec.traffic_state_dir).unwrap();
+    let ledger_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(f.spec.traffic_state_dir.join("ledger.lock"))
+        .unwrap();
+    ledger_lock.lock().unwrap();
+    let second = f.open_second();
+    let attempt = f.attempt().clone();
+    let report = std::thread::scope(|s| {
+        let spec = &f.spec;
+        let runner = s.spawn(move || run(spec));
+        second.cancel(&attempt, CoordinatorEpoch(1), 100).unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        let seen = loop {
+            if !f.events(&attempt, "supervisor_stop").is_empty() {
+                break true;
+            }
+            if Instant::now() >= until || runner.is_finished() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        ledger_lock.unlock().unwrap();
+        let report = runner.join().unwrap();
+        assert!(seen, "the cancel was not seen while registration waited");
+        report
+    });
+    assert_eq!(settled(&report.unwrap()).outcome(), Outcome::Cancelled);
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+}
+
+#[test]
 fn a_replayed_renewal_does_not_extend_the_lease() {
     let mut f = fx(vec![node("n", &crate::fixture_process::script("sleep 30"))]);
     f.spec.lease_ms = 900;

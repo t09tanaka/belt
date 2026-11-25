@@ -1002,58 +1002,38 @@ impl Control<'_> {
             stdout_log: Some(pipe.path().to_path_buf()),
         };
         let limits = self.traffic.cfg.limits();
-        let registration = managed::register(
-            &self.traffic.ctx,
-            &self.traffic.cfg,
-            &CommandSpec {
-                command_id: id.clone(),
-                spec_digest: spec_digest(node),
-                opts: opts.clone(),
-                attempt: Some(json!({
-                    "attempt_id": attempt,
-                    "node_id": node.node_id,
-                })),
-                services: vec![],
-            },
-        )
-        .map_err(SupervisorError::traffic)?;
-        let guard = match registration {
-            Registration::Registered(_, guard) => guard,
-            // The id already ended: nothing may run for it again.
-            Registration::AlreadyTerminal(_) => {
+        let command = CommandSpec {
+            command_id: id.clone(),
+            spec_digest: spec_digest(node),
+            opts: opts.clone(),
+            attempt: Some(json!({
+                "attempt_id": attempt,
+                "node_id": node.node_id,
+            })),
+            services: vec![],
+        };
+        // Registration and admission. Nothing has been started yet, so any
+        // stop reason just withdraws the registration. Waiting counts from
+        // here: registering is part of the wait.
+        let waiting_since = platform::monotonic_ms();
+        self.waiting_since_ms = Some(waiting_since);
+        let stage = timeouts::Stage::Waiting {
+            since_ms: waiting_since,
+        };
+        let guard = match self.admit(&command, limits, stage)? {
+            Admission::AlreadyTerminal => {
+                // The id already ended: nothing may run for it again.
                 return Ok(NodeEnd {
                     reason: None,
                     exit: None,
                     unconfirmed: false,
                     identity_unknown: false,
                     times: NodeTimes::default(),
-                })
+                });
             }
+            Admission::Stopped(guard, reason) => return self.release(guard, reason),
+            Admission::Admitted(guard) => guard,
         };
-        self.store
-            .mark_receipt(&attempt, Receipt::CommandRegistered, platform::wall_ms())?;
-
-        // Admission. Nothing has been started yet, so any stop reason just
-        // withdraws the registration.
-        let waiting_since = platform::monotonic_ms();
-        self.waiting_since_ms = Some(waiting_since);
-        loop {
-            let stage = timeouts::Stage::Waiting {
-                since_ms: waiting_since,
-            };
-            if let Some(reason) = absorb_retryable(self.look(stage))? {
-                return self.withdraw(guard, reason);
-            }
-            let waited = platform::monotonic_ms().saturating_sub(waiting_since) as f64 / 1000.0;
-            match managed::try_admit(&self.traffic.ctx, limits, &id, waited)
-                .map_err(SupervisorError::traffic)?
-            {
-                TryAdmit::Admitted => break,
-                TryAdmit::Wait(_) | TryAdmit::LockBusy => {
-                    std::thread::sleep(Duration::from_millis(spec.poll_ms))
-                }
-            }
-        }
 
         // The launch intent. The last look comes first so that an expired
         // lease or a cancel seen now never starts anything; the claim itself
@@ -1087,6 +1067,96 @@ impl Control<'_> {
             Err(e) => return Err(e.into()),
         }
         self.run_piped(guard, &opts, node, &id, limits, &pipe)
+    }
+
+    /// Register `command` with task-traffic-controller and wait for its
+    /// admission. The calls to task-traffic-controller run on their own
+    /// thread, one after another as before; this thread goes on looking at
+    /// the cancel request, the lease and the timeouts every `poll_ms`, so a
+    /// slow registration or admission round never delays noticing a renewal
+    /// or an expiry. A stop reason seen meanwhile lets the call in flight
+    /// end, and nothing is admitted after it.
+    fn admit(
+        &mut self,
+        command: &CommandSpec,
+        limits: task_traffic_controller::admit::Limits,
+        stage: timeouts::Stage,
+    ) -> Result<Admission> {
+        let (ctx, cfg) = (self.traffic.ctx.clone(), self.traffic.cfg.clone());
+        let poll = Duration::from_millis(self.spec.poll_ms);
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<AdmitStep>();
+        let attempt = self.spec.attempt_id.clone();
+        std::thread::scope(|s| {
+            let stop = &stop;
+            let handle =
+                s.spawn(move || admission_rounds(&ctx, &cfg, command, limits, poll, stop, &tx));
+            let mut registered = false;
+            let mut seen: Result<Option<StopReason>> = Ok(None);
+            let mut done = false;
+            while !done {
+                match rx.recv_timeout(poll) {
+                    Ok(AdmitStep::Registered) => registered = true,
+                    Ok(AdmitStep::Done) | Err(_) if handle.is_finished() => done = true,
+                    _ => {}
+                }
+                if registered {
+                    // Shown once, as soon as it is known.
+                    registered = false;
+                    if let Err(e) = self.store.mark_receipt(
+                        &attempt,
+                        Receipt::CommandRegistered,
+                        platform::wall_ms(),
+                    ) {
+                        seen = Err(e.into());
+                        break;
+                    }
+                }
+                match absorb_retryable(self.look(stage)) {
+                    Ok(None) => {}
+                    other => {
+                        seen = other;
+                        break;
+                    }
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+            // The stop is shown at once, not after the call in flight.
+            if let Ok(Some(r)) = seen {
+                if let Err(e) = self.begin_stop(r) {
+                    seen = Err(e);
+                }
+            }
+            let ended = handle
+                .join()
+                .map_err(|_| SupervisorError::State("the admission thread panicked".into()))?;
+            // A registration that ended before this thread saw its step.
+            if let Ok(AdmitEnd::Admitted(_) | AdmitEnd::Withdrawn(_)) = &ended {
+                while let Ok(step) = rx.try_recv() {
+                    if matches!(step, AdmitStep::Registered) {
+                        self.store.mark_receipt(
+                            &attempt,
+                            Receipt::CommandRegistered,
+                            platform::wall_ms(),
+                        )?;
+                    }
+                }
+            }
+            let ended = ended.map_err(SupervisorError::traffic)?;
+            let reason = seen?;
+            Ok(match (ended, reason) {
+                (AdmitEnd::AlreadyTerminal, _) => Admission::AlreadyTerminal,
+                (AdmitEnd::Admitted(g) | AdmitEnd::Withdrawn(g), Some(r)) => {
+                    Admission::Stopped(g, r)
+                }
+                (AdmitEnd::Admitted(g), None) => Admission::Admitted(g),
+                (AdmitEnd::Withdrawn(_), None) => {
+                    return Err(SupervisorError::State(
+                        "admission was given up without a reason".into(),
+                    ))
+                }
+            })
+        })
     }
 
     /// Run the admitted command with its output pumped into the spool, and
@@ -1154,6 +1224,11 @@ impl Control<'_> {
     /// Stop before anything was started: release the registration.
     fn withdraw(&self, guard: managed::OwnerGuard, reason: StopReason) -> Result<NodeEnd> {
         self.begin_stop(reason)?;
+        self.release(guard, reason)
+    }
+
+    /// [`Self::withdraw`] once the stop has been shown.
+    fn release(&self, guard: managed::OwnerGuard, reason: StopReason) -> Result<NodeEnd> {
         managed::finish(&self.traffic.ctx, guard, TerminalKind::Cancelled)
             .map_err(SupervisorError::traffic)?;
         Ok(NodeEnd {
@@ -1557,6 +1632,61 @@ fn child_target(ctx: &Context, id: &str) -> Option<StopTarget> {
 /// Supervise the attempt in `spec` from its start. An attempt that already
 /// has a launch intent is never started again: it goes to
 /// [`super::recover::recover`].
+/// What [`Control::admit`] came to.
+enum Admission {
+    AlreadyTerminal,
+    Admitted(managed::OwnerGuard),
+    /// A stop reason was seen before the command was admitted (or in the
+    /// same round): the registration is to be withdrawn.
+    Stopped(managed::OwnerGuard, StopReason),
+}
+
+/// What the admission thread tells the supervisor's thread.
+enum AdmitStep {
+    Registered,
+    Done,
+}
+
+enum AdmitEnd {
+    AlreadyTerminal,
+    Admitted(managed::OwnerGuard),
+    /// `stop` was set before admission.
+    Withdrawn(managed::OwnerGuard),
+}
+
+/// The task-traffic-controller side of [`Control::admit`]: register, then
+/// try to be admitted every `poll` until admitted or `stop` is set.
+fn admission_rounds(
+    ctx: &Context,
+    cfg: &Config,
+    command: &CommandSpec,
+    limits: task_traffic_controller::admit::Limits,
+    poll: Duration,
+    stop: &AtomicBool,
+    tx: &std::sync::mpsc::Sender<AdmitStep>,
+) -> std::result::Result<AdmitEnd, task_traffic_controller::error::Error> {
+    let ended = (|| {
+        let guard = match managed::register(ctx, cfg, command)? {
+            Registration::Registered(_, guard) => guard,
+            Registration::AlreadyTerminal(_) => return Ok(AdmitEnd::AlreadyTerminal),
+        };
+        let _ = tx.send(AdmitStep::Registered);
+        let since = platform::monotonic_ms();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(AdmitEnd::Withdrawn(guard));
+            }
+            let waited = platform::monotonic_ms().saturating_sub(since) as f64 / 1000.0;
+            match managed::try_admit(ctx, limits, &command.command_id, waited)? {
+                TryAdmit::Admitted => return Ok(AdmitEnd::Admitted(guard)),
+                TryAdmit::Wait(_) | TryAdmit::LockBusy => std::thread::sleep(poll),
+            }
+        }
+    })();
+    let _ = tx.send(AdmitStep::Done);
+    ended
+}
+
 pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     run_using(spec, &super::ci_task::run_task)
 }
