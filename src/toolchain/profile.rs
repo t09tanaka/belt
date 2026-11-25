@@ -541,7 +541,7 @@ impl Profile {
     /// and is measured again in the background. Without one, or after drift,
     /// it is measured now (at most the startup bound).
     pub(crate) fn measured_profile(&self) -> (WorkerCapabilities, Vec<String>) {
-        self.from_measurement(false)
+        self.answer_measured(false)
     }
     /// What admission and toolchain activation check a task against: the
     /// same measured profile, so a task's start probes no tool. It is
@@ -551,10 +551,10 @@ impl Profile {
     /// seen; a tool whose calls all ran out of time keeps the version
     /// measured before.
     pub(crate) fn accepted_profile(&self) -> (WorkerCapabilities, Vec<String>) {
-        self.from_measurement(true)
+        self.answer_measured(true)
     }
     /// `measured_profile`, or with `stale_now` the `accepted_profile`.
-    fn from_measurement(&self, stale_now: bool) -> (WorkerCapabilities, Vec<String>) {
+    fn answer_measured(&self, stale_now: bool) -> (WorkerCapabilities, Vec<String>) {
         let current = self.drift_identity();
         let cached = self.resolution.lock().ok().and_then(|slot| slot.clone());
         match cached {

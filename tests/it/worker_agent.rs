@@ -4427,6 +4427,8 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
     let bin = f.path("bin");
     std::fs::create_dir(&bin).unwrap();
     let (hang, probing) = (f.path("hang"), f.path("probing"));
+    let rustup = f.path("rustup");
+    std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
     let node = bin.join("node");
     std::fs::write(
         &node,
@@ -4441,6 +4443,7 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
         &[
             ("PATH".into(), bin.to_str().unwrap().into()),
             ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), rustup.to_str().unwrap().into()),
         ]
         .into(),
     )
@@ -4457,7 +4460,8 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
         ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
     let a = AttemptId::generate();
     // Accepted and checked with the tool answering; the workspace is held
-    // until the tool hangs, so the next measurement (the supervisor spec's)
+    // until the tool hangs and the rustup toolchains change (a drift
+    // signal), so the next measurement (the supervisor spec's) probes and
     // is the one the stop meets.
     f.host.block_prepare.store(true, Ordering::SeqCst);
     submit(&client, &a, &p).await;
@@ -4467,6 +4471,7 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
         std::thread::sleep(Duration::from_millis(5));
     }
     std::fs::write(&hang, b"").unwrap();
+    drift(&rustup);
     f.host.block_prepare.store(false, Ordering::SeqCst);
     while !probing.exists() && f.rec(&a).state != AttemptState::Terminal {
         assert!(Instant::now() < end, "the preparation never measured");
@@ -4487,6 +4492,14 @@ async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() 
     assert_eq!(events(&f, &a, "agent_prepare_failed"), 0);
 }
 
+/// Change the rustup toolchains directory (a drift signal) without
+/// changing what is in it.
+fn drift(rustup: &std::path::Path) {
+    let entry = rustup.join("toolchains").join("drift");
+    std::fs::create_dir(&entry).unwrap();
+    std::fs::remove_dir(&entry).unwrap();
+}
+
 #[tokio::test]
 async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
     use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
@@ -4495,6 +4508,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let bin = f.path("bin");
         std::fs::create_dir(&bin).unwrap();
         let marker = f.path("probe-fails");
+        // HOME, which a profile from profiles.toml keeps too, places the
+        // rustup toolchains.
+        let home = f.path("home");
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
         let node = bin.join("node");
         std::fs::write(
             &node,
@@ -4510,7 +4528,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         }
         let profile = Profile::load(
             &f.state(),
-            &[("PATH".into(), bin.to_str().unwrap().into())].into(),
+            &[
+                ("PATH".into(), bin.to_str().unwrap().into()),
+                ("HOME".into(), home.to_str().unwrap().into()),
+            ]
+            .into(),
         )
         .unwrap();
         let mut cfg = f.cfg("boot-1");
@@ -4520,6 +4542,9 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let agent = f.start_with(cfg);
         let client = f.connect(&agent).await;
         std::fs::write(&marker, "fail").unwrap();
+        // Acceptance answers from the measured profile; a drift signal
+        // makes it measure again and see the failing tool.
+        drift(&rustup);
         let mut p = payload("exit 0");
         p.commands[0].env.clear();
         let a = AttemptId::generate();
