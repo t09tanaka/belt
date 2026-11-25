@@ -119,9 +119,15 @@ fn commands_run_with_the_given_env_and_the_identity_is_part_of_the_key() {
         3,
         "different identities must never share a tree"
     );
-    // The same identity again: cloned, not installed.
+    // The same identity again: cloned, not installed (clones are made on
+    // macOS only; elsewhere every worktree installs).
+    let cloned = if cfg!(target_os = "macos") { 0 } else { 1 };
     create("wt4", Some("toolchain-1"));
-    assert_eq!(installs(), 3, "the same identity shares its tree");
+    assert_eq!(installs(), 3 + cloned, "the same identity shares its tree");
     create("wt5", None);
-    assert_eq!(installs(), 3, "no identity is the CLI's key, as before");
+    assert_eq!(
+        installs(),
+        3 + 2 * cloned,
+        "no identity is the CLI's key, as before"
+    );
 }
