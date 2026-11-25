@@ -7,6 +7,11 @@
 /// starting its command (payload `{reason}`), read by `ci` for the job line.
 pub const FAILURE_REASON_EVENT: &str = "attempt_failure_reason";
 
+/// The coordinator's event that keeps why a collection closed as
+/// `required_missing` (payload `{reason}`: which required output, and why),
+/// read by `ci` for the job line.
+pub const COLLECTION_MISSING_EVENT: &str = "collection_required_missing";
+
 pub mod advance;
 pub(crate) mod artifact_exchange;
 pub mod discovery;

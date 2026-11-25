@@ -385,6 +385,10 @@ impl Drop for Driving {
 /// (spec 25.8 5b (d)), and the pause between the passes of a round.
 const RECEIVED_PASS_EVERY: Duration = Duration::from_secs(60);
 const RECEIVED_PASS_PAUSE: Duration = Duration::from_millis(100);
+/// How often a wait for the capability measurement looks at `stopping`.
+const STOP_LOOK: Duration = Duration::from_millis(10);
+/// The measurement was not waited for: the agent stops.
+const AGENT_STOPPING: &str = "the agent is stopping";
 
 struct Ticking<'a>(&'a AtomicBool);
 
@@ -1112,7 +1116,15 @@ impl Agent {
                     if rec.state == AttemptState::Ready && self.spec_path(attempt).is_file() {
                         self.launch(&rec)
                     } else {
-                        if let Err(e) = self.prepare(&rec) {
+                        // An error met while the agent stops (a probe it
+                        // left) is not the attempt's: the next agent resumes it.
+                        if let Err(e) = self.prepare(&rec).or_else(|e| {
+                            if self.stopping() {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        }) {
                             note(
                                 &self.store,
                                 &rec,
@@ -1204,6 +1216,11 @@ impl Agent {
             .and_then(|_| self.check_profile_identity(rec))
             .and_then(|_| self.check_execution_binding(rec))
         {
+            // The agent stops: the check may have been left unfinished, and
+            // the next agent looks again.
+            if self.stopping() {
+                return Ok(None);
+            }
             self.note_once(a, "agent_environment_changed", json!({ "code": error.code, "blocked_reason": error.blocked_reason, "message": error.message }));
             settle(
                 &self.cfg,
@@ -1394,6 +1411,7 @@ impl Agent {
         &self,
         rec: &AcceptedAttempt,
         payload: &AttemptPayload,
+        toolchain: Option<super::host::PrepareToolchain>,
     ) -> Result<Option<Workspace>, ApiError> {
         let a = &rec.attempt_id;
         let permit = loop {
@@ -1412,8 +1430,10 @@ impl Agent {
             .name("prepare".into())
             .spawn(move || {
                 let _permit = permit;
-                let made = catch_unwind(AssertUnwindSafe(|| host.prepare(&rec2, &payload2)))
-                    .unwrap_or_else(|_| Err(internal("workspace", "the preparation panicked")));
+                let made = catch_unwind(AssertUnwindSafe(|| {
+                    host.prepare(&rec2, &payload2, toolchain.as_ref())
+                }))
+                .unwrap_or_else(|_| Err(internal("workspace", "the preparation panicked")));
                 let mut slot = lock(&theirs);
                 if matches!(*slot, Slot::Abandoned) {
                     drop(slot);
@@ -1464,13 +1484,32 @@ impl Agent {
         }
         let dir = self.attempt_dir(attempt);
         private_dir(&dir).map_err(|e| internal("attempt directory", e))?;
+        // The toolchains first: the workspace's preparation runs with them
+        // activated (spec 22.1), as setup-node runs before npm ci. Nothing
+        // is installed for a bundle the source does not read back to.
+        self.host.check_toolchain_source(rec, &payload)?;
+        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
+            return Ok(());
+        };
+        let binding = binding.as_ref();
         // An agent that died after making the workspace left its record.
         let ws = match self.workspace_of(attempt) {
             Some(ws) if ws.root.is_dir() => ws,
-            _ => match self.host_prepare(rec, &payload)? {
-                Some(ws) => ws,
-                None => return Ok(()),
-            },
+            _ => {
+                let bin = self
+                    .cfg
+                    .capability_profile
+                    .as_ref()
+                    .and_then(|p| p.embedded_bin());
+                let toolchain = binding
+                    .map(|b| super::host::PrepareToolchain::of(bin, b))
+                    .transpose()
+                    .map_err(invalid)?;
+                match self.host_prepare(rec, &payload, toolchain)? {
+                    Some(ws) => ws,
+                    None => return Ok(()),
+                }
+            }
         };
         let ws_json = serde_json::to_vec(&ws).map_err(|e| internal("workspace record", e))?;
         write_atomic(&self.workspace_path(attempt), &ws_json)
@@ -1478,10 +1517,6 @@ impl Agent {
 
         // The prepared setup steps are copied in (or waited for); the
         // commands that are such a step are left out.
-        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
-            return Ok(());
-        };
-        let binding = binding.as_ref();
         let Some(skip) = self.setup_wait(rec, &payload, &ws, binding)? else {
             return Ok(());
         };
@@ -1706,9 +1741,18 @@ impl Agent {
             .validate_partial(&bundle.frozen.source_manifest)
             .map_err(invalid)?;
         requirements.validate().map_err(invalid)?;
-        let report = self
-            .capabilities()
+        // Answered from the measured profile, not by probing every tool per
+        // question: a probe that runs late on a loaded host is no answer,
+        // and the parent waits only `forecast_wait_ms` for this one.
+        let started = Instant::now();
+        let (report, held) = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .map(|profile| profile.measured_profile())
+            .filter(|(report, _)| report.profile_fingerprint == self.cfg.profile_fingerprint)
             .ok_or_else(|| invalid("proposal profile unavailable"))?;
+        self.note_slow_resolution(started.elapsed(), &held);
         let observed = crate::toolchain::contract::observations(&report);
         for baseline in &bundle.frozen.baseline {
             if bundle.frozen.policy.compare(
@@ -1894,7 +1938,7 @@ impl Agent {
         // One report decides what is native and is what the activation is
         // checked against.
         let measured = std::cell::OnceCell::new();
-        let measure = || measured.get_or_init(|| self.capabilities()).clone();
+        let measure = || measured.get_or_init(|| self.measured()).clone();
         let ProvidedToolchains { requests, native } = self.toolchain_requests(&bundle, &measure)?;
         let mut receipts = Vec::with_capacity(requests.len());
         for request in &requests {
@@ -1980,9 +2024,8 @@ impl Agent {
         // made from: two probes could differ and refuse a tool that did not
         // change. With no native tool nothing is measured here.
         let measured = std::cell::OnceCell::new();
-        let ProvidedToolchains { requests, native } = self.toolchain_requests(bundle, &|| {
-            measured.get_or_init(|| self.capabilities()).clone()
-        })?;
+        let ProvidedToolchains { requests, native } =
+            self.toolchain_requests(bundle, &|| measured.get_or_init(|| self.measured()).clone())?;
         let profile = self
             .cfg
             .capability_profile
@@ -2034,16 +2077,21 @@ impl Agent {
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
         let (native, report) = if native.is_empty() {
-            (native, profile.report())
+            (native, self.measured().unwrap_or_else(|| profile.report()))
         } else if requests.is_empty() {
             // Nothing was waited for: the report that named the native tools.
             let report = measured.into_inner().flatten();
-            (native, report.unwrap_or_else(|| profile.report()))
+            (
+                native,
+                report
+                    .or_else(|| self.measured())
+                    .unwrap_or_else(|| profile.report()),
+            )
         } else {
             // An install may have taken long. What is native is decided again
             // from the report of this moment, and the activation uses that
             // same report: a tool that changed meanwhile is refused here.
-            let report = self.capabilities().ok_or_else(|| {
+            let report = self.measured().ok_or_else(|| {
                 ApiError::blocked(
                     crate::error::BlockedReason::EnvironmentMismatch,
                     "accepted base profile changed",
@@ -3018,6 +3066,25 @@ impl Agent {
     }
 
     /// A diagnostic event of no attempt, written once while it repeats.
+    /// A toolchain question that took long, or tools that kept an earlier
+    /// answer because their last probe gave none, go to the journal. The time
+    /// is a bucket, so one event stands for a stretch of the same slowness.
+    fn note_slow_resolution(&self, took: Duration, held: &[String]) {
+        if !held.is_empty() {
+            self.note_global("agent_toolchain_probe_held", "", json!({ "tools": held }));
+        }
+        let Some(at_least_ms) = [5_000u64, 1_000, 250]
+            .into_iter()
+            .find(|ms| took >= Duration::from_millis(*ms))
+        else {
+            return;
+        };
+        self.note_global(
+            "agent_toolchain_resolution_slow",
+            "",
+            json!({ "at_least_ms": at_least_ms }),
+        );
+    }
     fn note_global(&self, kind: &str, subject: &str, payload: Value) {
         if self.is_news(format!("/{kind}/{subject}"), &payload) {
             let _ = self.store.append_event(None, None, kind, &payload, now());
@@ -4106,6 +4173,67 @@ impl Agent {
     pub(crate) fn capabilities(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
         self.capabilities_with_diagnostic().ok().flatten()
     }
+    /// The report admission and toolchain activation check a task against
+    /// ([`crate::toolchain::profile::Profile::accepted_profile`]): the
+    /// measured profile, measured again only on a drift signal or once it is
+    /// old. A probe that runs late keeps the version measured before; it is
+    /// never taken for a mismatch. A real version change still is one.
+    fn measured_with_diagnostic(
+        &self,
+    ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
+        let Some(profile) = &self.cfg.capability_profile else {
+            return Ok(None);
+        };
+        let (report, held) = self.checked_report_unless_stopping(profile)?;
+        if !held.is_empty() {
+            self.note_global("agent_toolchain_probe_held", "", json!({ "tools": held }));
+        }
+        if report.profile_fingerprint == self.cfg.profile_fingerprint {
+            Ok(Some(report))
+        } else {
+            Err(profile.identity_failure_message(&report))
+        }
+    }
+    /// The profile's measurement, on a thread of its own: it can take
+    /// seconds (each tool probe has its own deadline), and a stopping agent
+    /// does not wait for it. A measurement left behind only updates the
+    /// profile's own record and ends at its deadlines.
+    fn checked_report_unless_stopping(
+        &self,
+        profile: &Arc<crate::toolchain::profile::Profile>,
+    ) -> Result<
+        (
+            crate::toolchain::capability::WorkerCapabilities,
+            Vec<String>,
+        ),
+        &'static str,
+    > {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let theirs = profile.clone();
+        let spawned = std::thread::Builder::new()
+            .name("profile-probe".into())
+            .spawn(move || {
+                let _ = send.send(theirs.accepted_profile());
+            });
+        if spawned.is_err() {
+            return Ok(profile.accepted_profile());
+        }
+        loop {
+            match receive.recv_timeout(STOP_LOOK) {
+                Ok(checked) => return Ok(checked),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.stopping() => {
+                    return Err(AGENT_STOPPING)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the capability measurement panicked")
+                }
+            }
+        }
+    }
+    fn measured(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
+        self.measured_with_diagnostic().ok().flatten()
+    }
     fn check_profile_identity(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
         if let Some(expected) = rec.spec.get("_worker_profile_fingerprint") {
             if expected
@@ -4124,7 +4252,7 @@ impl Agent {
         payload.requirements.validate().map_err(invalid)?;
         if let Some(bundle) = &payload.toolchains {
             bundle.validate(&payload.manifest_digest).map_err(invalid)?;
-            self.toolchain_requests(bundle, &|| self.capabilities())?;
+            self.toolchain_requests(bundle, &|| self.measured())?;
         }
         if let Some(profile) = &self.cfg.capability_profile {
             for command in &payload.commands {
@@ -4138,7 +4266,7 @@ impl Agent {
                 }
             }
         }
-        let report = self.capabilities_with_diagnostic().map_err(|message| {
+        let report = self.measured_with_diagnostic().map_err(|message| {
             ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, message)
         })?;
         if let Some(bundle) = &payload.toolchains {

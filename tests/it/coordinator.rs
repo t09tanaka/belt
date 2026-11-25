@@ -817,6 +817,44 @@ async fn dispatch_fills_the_free_active_slots_and_the_prefetch_and_no_more() {
     assert!(queued(&c).is_empty());
 }
 
+/// A resident that stops lets a running tick finish its step, but no
+/// submit starts after the stop: the tasks stay queued for the next one.
+#[tokio::test]
+async fn a_stopping_coordinator_starts_no_submit() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 1));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 2).await;
+    c.stop_submitting();
+    let report = c.tick().await.unwrap();
+    assert!(report.placed.is_empty(), "{:?}", report.placed);
+    assert!(a.holds().is_empty());
+    assert_eq!(queued(&c).len(), tasks.len());
+}
+
+/// Nor is an attempt sent again while stopping: the next coordinator
+/// sends it.
+#[tokio::test]
+async fn a_stopping_coordinator_sends_no_attempt_again() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 1).await;
+    a.set(|s| s.lose.push((Op::Submit, Lost::Request)));
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    assert!(a.holds().is_empty(), "the submit never arrived");
+    drop(c);
+    let c = f.open(&[&a]);
+    c.stop_submitting();
+    c.tick().await.unwrap();
+    assert!(a.holds().is_empty(), "sent again while stopping");
+    drop(c);
+    let c = f.open(&[&a]);
+    c.tick().await.unwrap();
+    assert_eq!(a.holds(), vec![first.attempt_id]);
+}
+
 #[tokio::test]
 async fn the_coordinators_own_limits_hold_when_the_worker_allows_more() {
     let f = fx();
@@ -3780,4 +3818,120 @@ async fn a57_a_parent_on_trial_adopts_and_renews_and_promises_nothing_more() {
     let report = c.tick().await.unwrap();
     assert_eq!(report.settled, vec![before[0].attempt_id.clone()]);
     assert_eq!(a.count(Op::Retire), 1);
+}
+
+/// Stays silent on a frozen-toolchain question until `answer` is set, then
+/// answers with the bundle asked; counts the questions.
+struct LateAttestor {
+    worker: Arc<FakeWorker>,
+    answer: Arc<AtomicBool>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl WorkerLink for LateAttestor {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        self.worker.call(request)
+    }
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            match request {
+                Request::ResolveToolchains(r) => {
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    if !self.answer.load(Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(Response::ResolveToolchains(ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle: r.bundle,
+                    }))
+                }
+                other => self.worker.call(other).await,
+            }
+        })
+    }
+}
+
+/// run5: a worker that does not answer the frozen-toolchain question within
+/// the wait is "not answered in time", never "unavailable", and is asked
+/// again on the next tick: once it answers, the task is placed on it.
+#[tokio::test]
+async fn a_silent_toolchain_answer_is_no_answer_and_is_asked_again() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let mut f = fx();
+    f.sched.forecast_wait_ms = 50;
+    let worker = f.worker("w-a", (4, 0));
+    let c = f.open(&[]);
+    let answer = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    c.attach(
+        worker.id.clone(),
+        Arc::new(LateAttestor {
+            worker: worker.clone(),
+            answer: answer.clone(),
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    let mut task_spec = spec();
+    let scope = Scope::project("");
+    task_spec.toolchains = Some(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                task_spec.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let task = TaskId::generate();
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    let waiting = c
+        .store()
+        .events_after(0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "task_waiting")
+        .unwrap();
+    let excluded = &waiting.payload["decision"]["excluded"][0];
+    assert_eq!(excluded["why"], "capability_mismatch");
+    assert_eq!(
+        excluded["unmet"],
+        serde_json::json!(["toolchain node=20.0.0 not answered in time"])
+    );
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the silent worker is asked again"
+    );
+    answer.store(true, Ordering::SeqCst);
+    c.tick().await.unwrap();
+    assert_eq!(only(&c, &task).worker_id, worker.id);
 }

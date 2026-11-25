@@ -1036,3 +1036,75 @@ async fn a_resident_initialized_without_a_worker_binding_is_upgraded_and_gets_on
     .unwrap();
     assert_eq!(fs::read(&binding).unwrap(), expected);
 }
+
+#[tokio::test]
+async fn refresh_env_runs_the_same_build_with_the_login_path_and_a_rollback_restores_the_old_one() {
+    let h = Host::new().await;
+    control::write(&h.paths.worker, Control::draining()).unwrap();
+    let mut fake = h.fake.clone();
+    let same = h.exe(&h.old);
+    let login = "/opt/homebrew/bin:/usr/bin:/bin";
+    // A failed health check restores the PATH the resident ran with.
+    let error = upgrade_with(
+        &h.env,
+        &same,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |spec: &Spec, _: &mut Fake| {
+            assert_eq!(spec.env.get("PATH").map(String::as_str), Some(login));
+            anyhow::bail!("unhealthy")
+        },
+        Some(login),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("restored"), "{error:#}");
+    let spec = bootstrap::read_input(&h.paths.input).unwrap();
+    assert_eq!(
+        spec.env.get("PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
+    );
+    assert!(!control::held(&h.paths.worker));
+    // A healthy trial commits the new PATH, on the same build.
+    let upgraded = upgrade_with(
+        &h.env,
+        &same,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+        Some(login),
+    )
+    .unwrap();
+    assert_eq!(upgraded.from, h.old);
+    assert_eq!(upgraded.to, h.old);
+    let spec = bootstrap::read_input(&h.paths.input).unwrap();
+    assert_eq!(spec.env.get("PATH").map(String::as_str), Some(login));
+    assert_eq!(spec.executable, same);
+    let (journal, _) = managed_journal(&spec).unwrap();
+    assert_eq!(
+        journal.spec.env.get("PATH").map(String::as_str),
+        Some(login)
+    );
+    assert!(fs::read(&same).is_ok());
+    h.assert_finished();
+    // The user's own drain stays; the upgrade's hold is lifted.
+    assert_eq!(control::read(&h.paths.worker).unwrap(), Control::draining());
+    assert!(!control::held(&h.paths.worker));
+    // The same PATH again changes nothing and holds nothing.
+    let again = upgrade_with(
+        &h.env,
+        &same,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+        Some(login),
+    )
+    .unwrap_err();
+    assert!(
+        again.to_string().contains("login shell's PATH"),
+        "{again:#}"
+    );
+    assert!(!control::held(&h.paths.worker));
+}

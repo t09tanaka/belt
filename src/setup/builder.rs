@@ -69,6 +69,16 @@ const MAX_UNKEPT: usize = 1024;
 /// How the builders get their workspaces: the same way the consumers do.
 pub trait BuilderWorkspaces: Send + Sync {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError>;
+    /// [`Self::create`] with the workspace's preparation run under the
+    /// setup's activated toolchains (spec 22.1).
+    fn create_with(
+        &self,
+        attempt: &AttemptId,
+        payload: &AttemptPayload,
+        _toolchain: Option<&crate::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
+        self.create(attempt, payload)
+    }
     fn remove(&self, ws: &Workspace) -> Result<(), ApiError>;
 }
 
@@ -1454,7 +1464,14 @@ impl Setups {
         if self.wanted(id).0 == 0 {
             return BuildEnd::Cancelled;
         }
-        let ws = match self.ws.create(attempt, payload) {
+        let toolchain = match binding
+            .map(|b| crate::worker::host::PrepareToolchain::of(self.cfg.embedded_bin.as_deref(), b))
+            .transpose()
+        {
+            Ok(t) => t,
+            Err(why) => return crashed("builder workspace", &why),
+        };
+        let ws = match self.ws.create_with(attempt, payload, toolchain.as_ref()) {
             Ok(ws) => ws,
             Err(e) => return crashed("builder workspace", &e.message),
         };

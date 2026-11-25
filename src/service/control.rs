@@ -186,6 +186,19 @@ pub async fn cancel_and_stop(
     signals: &mut mpsc::UnboundedReceiver<()>,
     budget: Duration,
 ) -> Report {
+    cancel_and_stop_observed(spec, target, signals, budget, &mut || {}).await
+}
+
+/// `cancel_and_stop` that calls `on_acknowledged` once the resident's answer
+/// to the cancellation has been read. Tests use it to end the wait at that
+/// point instead of racing a wall-clock budget against the round trip.
+pub(crate) async fn cancel_and_stop_observed(
+    spec: &super::bootstrap::Spec,
+    target: Target,
+    signals: &mut mpsc::UnboundedReceiver<()>,
+    budget: Duration,
+    on_acknowledged: &mut (dyn FnMut() + Send),
+) -> Report {
     let deadline = tokio::time::Instant::now() + budget;
     let mut acknowledged = false;
     // exec owns a newly generated run ID; retain the initial revision across retries.
@@ -215,6 +228,9 @@ pub async fn cancel_and_stop(
                 return unknown(target, last, acknowledged);
             }
             acknowledged_revision = Some(snapshot.control_revision);
+            if !acknowledged {
+                on_acknowledged();
+            }
             acknowledged = true;
             if snapshot.stop_confirmed() {
                 let exit = snapshot.exit_code().unwrap_or_else(|| {

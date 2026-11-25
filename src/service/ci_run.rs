@@ -185,6 +185,7 @@ pub fn task_specs(
                         &demand,
                         &crate::ci::timing::task_scope(plan, &task.id),
                     ),
+                    duration_key: Some(crate::ci::timing::task_scope(plan, &task.id)),
                     dynamic_origin: task.dynamic_matrix,
                     core_outcome: None,
                     matrix: matrix_admission(plan, task)?,
@@ -852,6 +853,19 @@ fn job_report(
                             .and_then(|e| e.payload.get("reason")?.as_str().map(str::to_string))
                     }),
                 _ => None,
+            })
+            // A task whose collection closed as `required_missing` says
+            // which required output is missing, and why.
+            .or_else(|| {
+                let attempt = row.attempt.as_ref()?;
+                store
+                    .events_of(&attempt.attempt_id, crate::ci::COLLECTION_MISSING_EVENT)
+                    .ok()?
+                    .last()?
+                    .payload
+                    .get("reason")?
+                    .as_str()
+                    .map(str::to_string)
             });
         lines.extend(lines::row_lines(
             &row.task_id,
@@ -944,10 +958,7 @@ mod tests {
     use super::*;
     use crate::ci::execute::tests::{fixture, task_of};
 
-    /// A Rust-only job of a source whose tracked npm example the workspace
-    /// preparation installs runs `node -v` before any toolchain is active:
-    /// a worker without node is no candidate, even when the task's frozen
-    /// toolchain would select node (spec 22.1, run4 of the acceptance).
+    /// run5: the coverage job's setup steps are its requirements (spec 22.1).
     #[test]
     fn the_coverage_job_requires_its_setup_tools_and_the_other_job_does_not() {
         use crate::toolchain::capability::*;
@@ -1011,8 +1022,12 @@ mod tests {
         assert!(missing_with_installable(&of("test"), Some(&mini), None).is_empty());
     }
 
+    /// A Rust-only job of a source whose tracked npm example the workspace
+    /// preparation installs runs `node -v`: without a node selection a
+    /// worker without node is no candidate (run4 of the acceptance), and
+    /// with one the activated node serves preparation too (spec 22.1).
     #[test]
-    fn a_worker_without_node_is_no_candidate_when_preparation_runs_node() {
+    fn a_worker_without_node_is_a_candidate_only_when_the_task_selects_node() {
         use crate::toolchain::capability::{missing_with_installable, ToolObservation};
         use crate::toolchain::versions::*;
         let f = fixture(WORKFLOW);
@@ -1085,10 +1100,14 @@ mod tests {
             worker(&["cargo", "node", "npm"]),
         );
         for (_, spec) in &specs {
+            let unmet = missing_with_installable(&spec.requirements, Some(&mini), Some(&node));
+            assert!(unmet.is_empty(), "the selected node prepares: {unmet:?}");
             for bundle in [None, Some(&node)] {
-                let unmet = missing_with_installable(&spec.requirements, Some(&mini), bundle);
-                let node = unmet.iter().any(|u| u.contains("\"node\""));
-                assert!(node, "mini cannot run `node -v`: {unmet:?}");
+                if bundle.is_none() {
+                    let unmet = missing_with_installable(&spec.requirements, Some(&mini), None);
+                    let node = unmet.iter().any(|u| u.contains("\"node\""));
+                    assert!(node, "mini cannot run `node -v`: {unmet:?}");
+                }
                 assert!(
                     missing_with_installable(&spec.requirements, Some(&studio), bundle).is_empty()
                 );

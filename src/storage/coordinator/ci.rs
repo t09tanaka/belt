@@ -8,6 +8,12 @@
 //! ([`super::queue`] leaves a held task out of the queue).
 use super::*;
 
+/// How many of the newest runs the duration of a CI job is looked up in
+/// (spec 配置の手順 1).
+const DURATION_RUNS: i64 = 20;
+/// How old a run may be for its durations to count: 30 days.
+pub const DURATION_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 /// One task of a run, as the progression of the run reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CiTaskRow {
@@ -373,6 +379,48 @@ impl CoordinatorStore {
                 )?;
             }
             Ok(changed)
+        })
+    }
+
+    /// How long each CI job named by `keys` (`CiSpec::duration_key`) took
+    /// the last time it succeeded (from the attempt's creation to its end),
+    /// looked up in the newest [`DURATION_RUNS`] runs created at or after
+    /// `since_ms` (spec 配置の手順 1). A failed, cancelled or retired attempt,
+    /// a discovery probe and a shard member are not a measure of the job.
+    pub fn ci_job_durations(
+        &self,
+        keys: std::collections::BTreeSet<String>,
+        since_ms: u64,
+    ) -> Result<std::collections::BTreeMap<String, u64>> {
+        let mut found = std::collections::BTreeMap::new();
+        if keys.is_empty() {
+            return Ok(found);
+        }
+        self.db.call(move |c| {
+            let mut query = c.prepare_cached(
+                "SELECT json_extract(t.spec_json,'$.ci.duration_key'), a.terminal_at_ms - a.created_at_ms
+                 FROM (SELECT run_id FROM run WHERE created_at_ms >= ?1 ORDER BY created_at_ms DESC LIMIT ?2) r
+                 JOIN task t ON t.run_id = r.run_id
+                 JOIN attempt a ON a.task_id = t.task_id
+                 WHERE json_extract(t.spec_json,'$.ci.duration_key') IS NOT NULL
+                   AND json_extract(t.spec_json,'$.ci.shard_group') IS NULL
+                   AND json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery') IS NULL
+                   AND t.cancel_requested_at_ms IS NULL
+                   AND a.cancel_requested_at_ms IS NULL
+                   AND a.retired = 0
+                   AND a.state = 'terminal'
+                   AND json_extract(a.termination_json,'$.outcome') = 'succeeded'
+                 ORDER BY a.terminal_at_ms DESC",
+            )?;
+            let mut rows = query.query(params![to_i64(since_ms)?, DURATION_RUNS])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let millis: i64 = row.get(1)?;
+                if keys.contains(&key) && !found.contains_key(&key) {
+                    found.insert(key, u64::try_from(millis).unwrap_or(0));
+                }
+            }
+            Ok(found)
         })
     }
 

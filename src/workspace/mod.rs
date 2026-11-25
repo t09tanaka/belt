@@ -157,6 +157,21 @@ pub(crate) fn prepared_of(listing: &str, m: &CiManifest) -> Vec<String> {
     out
 }
 
+/// The empty file that tells Spotlight not to index a directory tree.
+pub const SPOTLIGHT_MARKER: &str = ".metadata_never_index";
+
+/// On macOS, keep the workspaces (sources, build output) out of the
+/// Spotlight index (spec 25.10): `mds` would read every file a job writes.
+/// Best effort: a marker that cannot be written only costs indexing.
+fn keep_out_of_spotlight(root: &Path) {
+    if cfg!(target_os = "macos") {
+        let marker = root.join(SPOTLIGHT_MARKER);
+        if std::fs::symlink_metadata(&marker).is_err() {
+            let _ = std::fs::File::create(&marker);
+        }
+    }
+}
+
 fn io_err(what: &str, e: std::io::Error) -> ApiError {
     ApiError::new(ErrorCode::Internal, format!("{what}: {e}"))
 }
@@ -553,6 +568,7 @@ impl Workspaces {
         let root = self.workspaces_root();
         std::fs::create_dir_all(&root)
             .map_err(|e| io_err("cannot create the workspaces directory", e))?;
+        keep_out_of_spotlight(&root);
         let dest = plan::workspace_dir(&root, attempt);
         match flavor {
             Flavor::Directory => {

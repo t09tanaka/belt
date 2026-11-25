@@ -2237,3 +2237,25 @@ fn a_source_lock_that_cannot_be_taken_fails_the_worker() {
     let text = detail(&checks, "source_lock");
     assert!(text.contains("is not a plain file") && text.contains("INTERNAL"));
 }
+
+#[test]
+fn a_path_gap_names_the_command_that_recaptures_it_for_the_parent_and_a_worker() {
+    let mut facts = healthy();
+    facts.service_path = Some(env_gaps::PathFacts {
+        login: Some("/opt/homebrew/bin:/usr/bin".into()),
+        gaps: vec![env_gaps::PathGap {
+            dir: "/opt/homebrew/bin".into(),
+            tools: vec!["node".into()],
+        }],
+    });
+    let parent = evaluate("parent", &facts);
+    assert!(
+        detail(&parent, "service_path").contains("run `belt upgrade --refresh-env`"),
+        "{parent:?}"
+    );
+    let worker = evaluate("mini", &facts);
+    assert!(
+        detail(&worker, "service_path").contains("run `belt workers refresh-env mini`"),
+        "{worker:?}"
+    );
+}
