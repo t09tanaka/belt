@@ -22,7 +22,7 @@ fn workers_lists_registrations_without_starting_a_resident() {
     assert_eq!(
         value["result"]["workers"],
         serde_json::json!([{
-            "id":"mini-a","ssh":"user@mini-a","ephemeral":true,"connection":"unknown","identity":null
+            "id":"mini-a","ssh":"user@mini-a","ephemeral":true,"connection":"unknown","identity":null,"cpu_cores":null,"memory_bytes":null
         }])
     );
 }

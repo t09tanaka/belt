@@ -118,11 +118,15 @@ HOME="$home" exec {} worker --stdio
     assert_eq!(
         unreached,
         serde_json::json!([{"id":"colab","ssh":home.display().to_string(),
-            "ephemeral":true,"connection":"disconnected","identity":null}])
+            "ephemeral":true,"connection":"disconnected","identity":null,
+            "cpu_cores":null,"memory_bytes":null}])
     );
     assert_eq!(
         text(root),
-        format!("colab  {}  ephemeral  disconnected  -\n", home.display())
+        format!(
+            "colab  {}  ephemeral  disconnected  -  -, -\n",
+            home.display()
+        )
     );
 
     // Connected: the identity it admitted is the one shown.
@@ -133,17 +137,24 @@ HOME="$home" exec {} worker --stdio
     .await;
     let identity = store.worker_identity(&worker).unwrap().unwrap();
     let connected = listing(root);
+    // The cores and memory are what the worker reported, if it has yet.
+    let mut connected = connected;
+    for row in connected.as_array_mut().unwrap() {
+        let row = row.as_object_mut().unwrap();
+        assert!(row.remove("cpu_cores").is_some() && row.remove("memory_bytes").is_some());
+    }
     assert_eq!(
         connected,
         serde_json::json!([{"id":"colab","ssh":home.display().to_string(),
             "ephemeral":true,"connection":"connected","identity":identity}])
     );
-    assert_eq!(
-        text(root),
-        format!(
-            "colab  {}  ephemeral  connected  {identity}\n",
+    let line = text(root);
+    assert!(
+        line.starts_with(&format!(
+            "colab  {}  ephemeral  connected  {identity}  ",
             home.display()
-        )
+        )),
+        "{line}"
     );
 
     // Disconnected again: the link is cut and cannot be re-dialled.
@@ -167,11 +178,15 @@ HOME="$home" exec {} worker --stdio
     assert_eq!(
         listing(root),
         serde_json::json!([{"id":"colab","ssh":home.display().to_string(),
-            "ephemeral":true,"connection":"disconnected","identity":null}])
+            "ephemeral":true,"connection":"disconnected","identity":null,
+            "cpu_cores":null,"memory_bytes":null}])
     );
     assert_eq!(
         text(root),
-        format!("colab  {}  ephemeral  disconnected  -\n", home.display())
+        format!(
+            "colab  {}  ephemeral  disconnected  -  -, -\n",
+            home.display()
+        )
     );
 
     assert!(matches!(

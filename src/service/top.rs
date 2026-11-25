@@ -26,6 +26,8 @@ pub(crate) fn interval(value: &str) -> Result<Duration, String> {
 struct Snapshot {
     observed_at_ms: u64,
     workers: BTreeMap<WorkerId, &'static str>,
+    /// Cores and memory each worker reported; a worker that has not is absent.
+    resources: BTreeMap<WorkerId, crate::coordinator::WorkerResources>,
     tasks: Vec<MonitorTask>,
     resident_observed: bool,
 }
@@ -72,7 +74,12 @@ fn read() -> Result<Snapshot, ApiError> {
                 .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?,
         );
     }
-    let observed = super::workers::observed_connections(&spec, names.iter().cloned().collect())?;
+    let listing = super::workers::observed_listing(&spec, names.iter().cloned().collect())?;
+    let resident_observed = listing.is_some();
+    let (observed, resources) = match listing {
+        Some((connections, resources)) => (Some(connections), resources),
+        None => (None, Default::default()),
+    };
     let workers = names
         .into_iter()
         .map(|id| {
@@ -87,8 +94,9 @@ fn read() -> Result<Snapshot, ApiError> {
     Ok(Snapshot {
         observed_at_ms: crate::platform::wall_ms(),
         workers,
+        resources,
         tasks,
-        resident_observed: observed.is_some(),
+        resident_observed,
     })
 }
 
@@ -119,7 +127,11 @@ fn lines(s: &Snapshot) -> Vec<Line<'static>> {
         ));
     }
     for (name, state) in &s.workers {
-        out.push(Line::from(format!("  {}  {state}", plain(name.as_str()))));
+        out.push(Line::from(format!(
+            "  {}  {state}  {}",
+            plain(name.as_str()),
+            super::workers::describe_resources(s.resources.get(name))
+        )));
     }
     for title in ["Active", "Waiting", "Uncertain"] {
         let rows: Vec<_> = s.tasks.iter().filter(|t| section(t) == title).collect();
@@ -359,6 +371,7 @@ mod tests {
         let view = Snapshot {
             observed_at_ms: 3,
             workers: BTreeMap::new(),
+            resources: BTreeMap::new(),
             tasks: vec![task],
             resident_observed: false,
         };
@@ -366,5 +379,34 @@ mod tests {
         assert!(rendered.iter().any(|s| s == "Uncertain (1)"));
         assert!(rendered.iter().any(|s| s.contains("label��[2J")));
         assert!(rendered.iter().all(|s| !s.chars().any(char::is_control)));
+    }
+
+    #[test]
+    fn a_worker_line_and_the_json_carry_its_cores_and_memory() {
+        let id = WorkerId::parse("mini").unwrap();
+        let view = Snapshot {
+            observed_at_ms: 1,
+            workers: BTreeMap::from([(id.clone(), "connected")]),
+            resources: BTreeMap::from([(
+                id.clone(),
+                crate::coordinator::WorkerResources {
+                    cpu_cores: Some(8),
+                    memory_bytes: Some(16 << 30),
+                },
+            )]),
+            tasks: Vec::new(),
+            resident_observed: true,
+        };
+        let rendered: Vec<_> = lines(&view).iter().map(ToString::to_string).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|s| s == "  mini  connected  8 cores, 16 GiB"),
+            "{rendered:?}"
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["resources"]["mini"]["cpu_cores"], 8);
+        assert_eq!(json["resources"]["mini"]["memory_bytes"], 16u64 << 30);
+        assert_eq!(json["workers"]["mini"], "connected");
     }
 }

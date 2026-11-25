@@ -3,6 +3,10 @@
 //! Snapshot capture and CLI wiring belong to the caller. This module never
 //! interprets CLI arguments, captures source, registers demand or runs steps.
 
+/// The coordinator's event that keeps why a worker ended an attempt without
+/// starting its command (payload `{reason}`), read by `ci` for the job line.
+pub const FAILURE_REASON_EVENT: &str = "attempt_failure_reason";
+
 pub mod advance;
 pub(crate) mod artifact_exchange;
 pub mod discovery;

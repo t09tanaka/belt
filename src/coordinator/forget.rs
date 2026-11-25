@@ -42,6 +42,16 @@ impl Coordinator {
         .await
     }
 
+    /// The cores and memory the workers last reported at `inspect`.
+    pub(crate) fn worker_resources(
+        &self,
+    ) -> std::collections::BTreeMap<WorkerId, super::WorkerResources> {
+        self.resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// An ephemeral worker reported `boot` at `hello`. A retired identity is
     /// refused (`Admission::Retired`) and must not be attached. A different identity must wait for explicit forget.
     pub async fn admit_identity(

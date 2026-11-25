@@ -603,6 +603,46 @@ async fn a_ci_run_whose_plan_is_gone_ends_with_the_reason_instead_of_waiting() {
 }
 
 #[tokio::test]
+async fn a_task_that_left_no_result_shows_why_its_attempt_ended() {
+    let f = fx();
+    let store = f.c.store();
+    let (run, _first, placed, _held) = ci_run_of_three(&f).await;
+    let (state, results) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let line = |lines: &[crate::service::ci_run::JobLine]| {
+        lines.iter().find(|l| l.task_id == placed).unwrap().clone()
+    };
+    let before =
+        crate::service::ci_run::job_lines(store, state.path(), results.path(), &run).unwrap();
+    assert_eq!(line(&before).reason, None);
+    let attempt = store
+        .ci_run_tasks(&run)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.task_id == placed)
+        .and_then(|r| r.attempt)
+        .unwrap()
+        .attempt_id;
+    let why = "agent_prepare_failed: BLOCKED fast-worktree add failed: node: command not found";
+    store
+        .append_event(
+            None,
+            Some(&attempt),
+            crate::ci::FAILURE_REASON_EVENT,
+            &serde_json::json!({ "reason": why }),
+            3,
+        )
+        .unwrap();
+    let lines =
+        crate::service::ci_run::job_lines(store, state.path(), results.path(), &run).unwrap();
+    assert_eq!(line(&lines).reason.as_deref(), Some(why));
+    let text = crate::service::ci_run::render_jobs(&lines);
+    assert!(
+        text.contains(&format!("ci.yml/placed: no_result ({why})")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn a_ci_run_that_only_could_not_be_read_now_is_left_as_it_is_and_tried_again() {
     let f = fx();
     let store = f.c.store();

@@ -149,7 +149,7 @@ belt workers forget colab-1
 belt estimate --json -- pnpm test
 ```
 
-`belt workers` は登録したworkerを1行ずつ出す。形式は `id  ssh  ephemeral|persistent  connection  identity|-` とし、列は空白2つで区切る。`connection` は `connected`・`disconnected`・`unknown` のどれかで、residentが実際に観測できたときだけ前の2つになり、residentが動いていないとき、または観測できなかったときは `unknown` とする。`identity` は観測した現在のidentityで、無ければ `-` とする。登録が1つも無いときは `no registered workers` と出す。`--json` は `workers` の配列に `id`・`ssh`・`ephemeral`・`connection`・`identity` を入れる。residentが動いていなくても登録の一覧は出せる。
+`belt workers` は登録したworkerを1行ずつ出す。形式は `id  ssh  ephemeral|persistent  connection  identity|-  <N> cores, <M> GiB` とし、列は空白2つで区切る。`connection` は `connected`・`disconnected`・`unknown` のどれかで、residentが実際に観測できたときだけ前の2つになり、residentが動いていないとき、または観測できなかったときは `unknown` とする。`identity` は観測した現在のidentityで、無ければ `-` とする。登録が1つも無いときは `no registered workers` と出す。最後の列は、workerが直近の `inspect` で報告したCPUコア数とメモリで、報告が無い項目は `-` とする。`--json` は `workers` の配列に `id`・`ssh`・`ephemeral`・`connection`・`identity`・`cpu_cores`・`memory_bytes`（報告が無ければ `null`）を入れる。`belt top` も各workerの行に同じ表記を足し、`--json` には `resources`（worker名からコア数とメモリへの対応。報告の無いworkerは含まない）を足す。residentが動いていなくても登録の一覧は出せる。
 
 相手のマシンは他のメンバーの仕事も受け、自分でも投入する（第24章）。`drain`・`resume` はそのworker全体に働く。`stop` はそのマシンのresident（両方の役割）を止める操作なので、相手が他のメンバーの仕事か、自分で投げた非terminalのrunを持つときは、理由を示して断る。`stop --all-submitters` を明示したときだけ、drainの後に止める（そのマシンが投げたrunは、process停止と同じ扱いになる。24.6）。`stop --cancel-running` も同じ条件で `--all-submitters` を要する。`start` はresidentを起動し、両方の役割が戻る。`forget` は、一時workerのほか、鍵の更新で外したメンバーにも使える（24.2）。
 
@@ -425,7 +425,7 @@ supervisorは、coreがstepの外で作業している間（workspaceの照合�
 - 進められないことが親の持つ状態から決まる場合（FrozenPlanのfileが無い、digestが一致しない、planとして読めない、runのtaskがplanのtaskと対応しない、進行の規則が入力を拒む）は、何度見直しても同じなので、そのrunのまだ配置されていないCI task（待機中のものと、queueにあるもの）をすべてcancelする。理由はtaskのspecの `ci.unrunnable` に書き、taskごとにevent `ci_task_unrunnable`（`task`、`reason`）を残す。理由の書き込み・cancel・eventは1つのtransactionで行う。すでにattemptを持つtaskには触れず、そのまま終わらせる。runは成功にならずに完了する。inputsが上限を超えたtaskも同じ手順でcancelする。親がplanを読めないことは、workerへplanを届けるとき（待機中のtaskを持たないrunを含む）にも同じ扱いにする。
 - その時だけ読めなかった場合（親のDBが使用中、planのfileの読み取りがその他の理由で失敗）は、runを変えずに次のheartbeatでやり直す。理由はrunのevent `ci_run_stalled`（`reason`）に、障害が始まったときと理由が変わったときに1回だけ残す（親のprocessの中で数えるので、再起動すると同じ理由をもう一度残すことがある）。
 
-cancelした理由は、`show`・`ls` のtaskの `unrunnable`、`logs` のそのtaskのstatus（`reason`。followの途中でcancelされた場合も、理由が付いたstatusをもう一度出す）、`ci` のJobごとの結果（`reason`、textでは `no_result (理由)`）に出す。
+cancelした理由は、`show`・`ls` のtaskの `unrunnable`、`logs` のそのtaskのstatus（`reason`。followの途中でcancelされた場合も、理由が付いたstatusをもう一度出す）、`ci` のJobごとの結果（`reason`、textでは `no_result (理由)`）に出す。workerがcommandを開始せずにattemptを終えたとき（workspaceの準備に失敗したとき）は、その理由（`agent_prepare_failed: <code> <message>`。改行を空白に直し、400文字で切る）をattemptのstatusの `failure_reason` で親へ渡し、親は `attempt_failure_reason` のeventに1回だけ残す。resultが無いtaskの `reason` はこのeventから出す。
 
 workerがFrozenPlanを受け取らなかった場合（保持できるplanの件数・合計bytesの上限、途中のfileの上限に達していて `blob_put` を断った。workerがerrorを答えた場合に限り、接続の失敗は含めない）は、そのworkerではrunの入力がreadyにならない。親はそのworkerを、runのtaskの配置から理由付きで外す（`input_refused`、理由は `unmet`）。ほかのworkerがplanを受け取っていれば、そこへ配置する。外したことは配置の判断に残り、どのworkerにも配置できない間は `task_waiting` に残るので、`show` のtaskの `placement` と、`logs` のそのtaskのstatus（`placement`。followの途中で変わったらもう一度出す）に出る。runにはevent `ci_plan_refused`（`worker`、`reason`）を、接続ごと・理由ごとに1回残す。配送は同じworkerへ繰り返し試し、workerが受け取った時点（GCで空きができた後など）で除外は終わる。workerが別のboot・agent epochになったときも終わる。この除外は一時的なもので、`worker_cannot_run` の記録は作らず、`blocked_reason` も付けない。
 

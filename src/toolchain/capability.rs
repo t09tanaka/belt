@@ -133,6 +133,12 @@ pub struct WorkerCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// TTC admission budget; None means not observed.
     pub resource_budget: Option<u32>,
+    /// Logical CPU cores of the worker's host; None when not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    /// Physical memory of the worker's host in bytes; None when not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
     pub schema_version: u32,
     pub os: String,
     pub arch: String,
@@ -255,6 +261,8 @@ mod tests {
         WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
             schema_version: 1,
             os: "macos".into(),
             arch: "aarch64".into(),
