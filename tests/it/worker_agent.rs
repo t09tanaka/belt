@@ -2522,26 +2522,34 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    // Never renewed: the supervisor starts 2 s into a 4 s lease and would
-    // count 4 s of its own (ending 6 s after the acceptance). It is given
-    // what is left and ends the lease when the grant ends.
+    // Never renewed: the supervisor starts after the acceptance, and is
+    // given what is left of the grant, not a full lease of its own. The
+    // seed it gets is checked, so how long the start takes on a loaded
+    // host does not matter.
     f.host.block_prepare.store(true, Ordering::SeqCst);
     let (script, marker, _) = stay(&f);
-    let mut p = payload(&script);
-    p.lease_ms = 4_000;
+    let p = payload(&script);
     let a = AttemptId::generate();
+    let before = belt::platform::monotonic_ms();
     submit(&c, &a, &p).await;
-    std::thread::sleep(Duration::from_millis(2_000));
+    let after = belt::platform::monotonic_ms();
+    wait_for("preparation to begin", || {
+        f.host.count(&format!("prepare {a}")) == 1
+    });
+    // A distinct tick: a lease counted from the start ends after the grant.
+    wait_for("a tick after acceptance", || {
+        belt::platform::monotonic_ms() > after
+    });
     f.host.block_prepare.store(false, Ordering::SeqCst);
-    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    assert_eq!(lines(&marker), 1, "the command did start");
-    // The supervisor saw it on its own clock, when the grant ended: the
-    // time of the expiry itself, however long the stop took after it.
-    let expired = f.store().events_of(&a, "lease_expired").unwrap();
-    assert_eq!(expired.len(), 1);
-    let after = expired[0].at_ms - f.rec(&a).accepted_at_ms;
-    assert!((3_500..5_500).contains(&after), "{after} ms");
+    wait_for("the command to start", || lines(&marker) == 1);
+    let end = seed_of(&f, &a)["ends_mono_ms"].as_u64().unwrap();
+    assert!(
+        (before + p.lease_ms..=after + p.lease_ms).contains(&end),
+        "seed {end}, acceptance bracket {before}..={after}"
+    );
     assert_eq!(events(&f, &a, "agent_lease_expired"), 0);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
