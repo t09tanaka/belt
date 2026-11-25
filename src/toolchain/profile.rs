@@ -1131,15 +1131,16 @@ pub fn rustup_host() -> Option<String> {
     Some(format!("{arch}-{rest}"))
 }
 /// The toolchain directories of `toolchains` for `host`, in the order they
-/// are probed: names that start with a version, highest first, then the
-/// others (channels) by name. A link, a file, a name that is not UTF-8 or
+/// are probed: `stable` first (a `stable` request resolves to it, so the
+/// bounds never leave it out), then names that start with a version, highest
+/// first, then the other channels by name. A link, a file, a name that is not UTF-8 or
 /// that is for another host is skipped.
 fn rustup_candidates(toolchains: &Path, host: &str) -> Vec<(String, PathBuf)> {
     let Ok(entries) = fs::read_dir(toolchains) else {
         return Vec::new();
     };
     let suffix = format!("-{host}");
-    let mut found: Vec<(Option<node_semver::Version>, String, PathBuf)> = Vec::new();
+    let mut found: Vec<Candidate> = Vec::new();
     for entry in entries.take(MAX_RUSTUP_ENTRIES).flatten() {
         let Ok(name) = entry.file_name().into_string() else {
             continue;
@@ -1157,17 +1158,26 @@ fn rustup_candidates(toolchains: &Path, host: &str) -> Vec<(String, PathBuf)> {
         };
         found.push((version, name, path));
     }
-    found.sort_by(|a, b| match (&a.0, &b.0) {
-        (Some(x), Some(y)) => y.cmp(x).then(a.1.cmp(&b.1)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.1.cmp(&b.1),
+    let stable = format!("stable{suffix}");
+    found.sort_by(|a, b| {
+        (b.1 == stable)
+            .cmp(&(a.1 == stable))
+            .then_with(|| by_version(a, b))
     });
     found
         .into_iter()
         .take(MAX_DETECTED_RUSTUP)
         .map(|(_, name, path)| (name, path))
         .collect()
+}
+type Candidate = (Option<node_semver::Version>, String, PathBuf);
+fn by_version(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    match (&a.0, &b.0) {
+        (Some(x), Some(y)) => y.cmp(x).then(a.1.cmp(&b.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    }
 }
 /// What the toolchain in `bin` reports of itself: `rustc -V` and `cargo -V`
 /// must both answer, with the same version.
@@ -2548,13 +2558,15 @@ mod rustup_tests {
         toolchain(&home, &format!("stable-{host}"), "1.99.0");
         let candidates = rustup_candidates(&home.join("toolchains"), &host);
         assert_eq!(candidates.len(), MAX_DETECTED_RUSTUP);
-        assert_eq!(candidates[0].0, format!("1.89.0-{host}"));
-        assert_eq!(candidates[15].0, format!("1.74.0-{host}"));
+        // `stable` is probed first, whatever else is installed.
+        assert_eq!(candidates[0].0, format!("stable-{host}"));
+        assert_eq!(candidates[1].0, format!("1.89.0-{host}"));
+        assert_eq!(candidates[15].0, format!("1.75.0-{host}"));
         // The probes share one time bound, so a loaded host may find fewer;
         // never more, and never one outside the candidates.
         let report = profile(root.path(), &home).startup_report();
         assert!(!report.rustup.is_empty() && report.rustup.len() <= MAX_DETECTED_RUSTUP);
-        assert!(report.rustup.iter().all(|r| r.version.as_str() >= "1.74.0"));
+        assert!(report.rustup.iter().all(|r| r.version.as_str() >= "1.75.0"));
     }
     #[test]
     fn a_changed_or_removed_toolchain_is_drift_and_a_new_one_waits_for_restart() {

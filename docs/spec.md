@@ -143,6 +143,7 @@ belt workers drain mini-a
 belt workers resume mini-a
 belt workers stop mini-a
 belt workers upgrade mini-a
+belt workers refresh-env mini-a
 belt workers diff mini-a
 belt workers sync mini-a
 belt workers forget colab-1
@@ -965,6 +966,14 @@ launchd配下のagentはforegroundで動作する。attempt supervisorをagent�
 
 system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用できるとは限らない。doctorが実際のservice user・service環境でprofileを検査し、必要能力を持つworkerだけを選ぶ。専用Macのreboot後の自動agent復帰はこのmodeで受入検証する。
 
+### serviceの環境とlogin shellの差
+
+serviceの `PATH` は、`workers add --install` がSSHの非login sessionではなく、その利用者のlogin shellから取る（login shellを `-l -c` で非対話に起動し、環境は `HOME`・`USER`・`SHELL` だけ、時間を区切る。読めなければSSHの `PATH` のまま入れ、doctorがそう言う）。
+
+- doctorは各workerのserviceの `PATH` を、同じ利用者のlogin shellの `PATH` と比べる。login shellにありserviceに無いdirectoryごとに警告し、その中の目立つtool（`brew`・`node`・`mise` など）を挙げ、直すcommand `belt workers refresh-env <name>` を示す。login shellが読めないときは比べていないと言う。親（coordinator）のserviceは `init` が記録した `PATH` のままで、取り直すcommandはまだ無い。
+- `belt workers refresh-env <name>` はworkerのhostでlogin shellの `PATH` を取り直し、違えば、受けた仕事の終わりを待って（`stop` と同じ。`--cancel-running` は無い）serviceを止め、service file・入力・journalを新しい `PATH` で書き直して起動する。同じなら何もしない。login shellが読めない、版の切替が途中、system-user modeのときは何も変えずに断る。
+- macOSでは、選ばれた開発directory（`xcode-select -p`）の同梱SDKのうち最新のものが、`xcrun --show-sdk-path` のSDK（リンク先）より古い、またはCommand Line Toolsが選ばれていてその版（`pkgutil --pkg-info=com.apple.pkg.CLTools_Executables`）のmajorがSDKより古いとき、doctorは「linkerがそのSDKの `.tbd` を読めず、C・Objective-Cのlinkがすべて失敗する」と警告し、Xcodeの更新か `sudo xcode-select --switch /Library/Developer/CommandLineTools`、CLTの更新（`softwareupdate --list` と `softwareupdate --install`）を示す。何もbuildしない。読めなければ比べていないと言う。
+
 ## Linuxの常駐
 
 LinuxのworkerもSSHで導入・起動する。既定はsystemdのuser serviceとする。ログアウト後も動かすにはlingerの有効化が要るため、doctorが確認する（`loginctl show-user <uid> --property=Linger`。offは警告とし、直すcommand `loginctl enable-linger <uid>` を示す。答えが得られないときは未確認とし、合格にしない）。親（coordinator）の `init` もLinuxではsystemdのuser serviceを使う。無人の専用機には、macOSのsystem-user modeに対応する明示選択の `service_mode = "system-user"` を提供し、systemdのsystem serviceを非rootの `User=` で動かす。service登録に管理権限が必要でも、CI自体をrootで実行しない。systemdを使わない環境（コンテナ内等）は常駐workerの対象にせず、必要なら一時workerとして扱う。
@@ -1372,7 +1381,7 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 **`ci` のtaskが固定するtoolchain（PR #135）。** `ci` は、taskごとに1つの束を固定する。プロジェクトの版指定ファイルに、そのtaskが走らせるjobの `setup-*` stepの `*-version` 入力（と `*-version-file` が指すファイル）を足したものである。親とworkerは同じ関数（`ci::toolchains`）で導出する。stepが要件を作るのは、beltが入力を読めるときだけである。
 - 版、範囲、`${{ matrix.<key> }}`（そのtask自身のmatrixの値。脚ごとに別の要件になる）、`${{ env.<NAME> }}`（stepとjobとworkflowの `env:` の順に見つかるリテラル）。`dtolnay/rust-toolchain@1.89` は、`toolchain:` 入力が無ければその版を宣言する。満たせない要件は、既存の拒否・blockedの経路に入る。
-- `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する。解決できなければ何も要求せず、noticeを出す。
+- `stable`・`lts/*`・`latest` などのchannelとaliasは、手元の在庫か持ち主のworkerが具体版へ解決できたときだけ固定する（Rustの `stable` は、workerの `stable-<host>` toolchainから解決する。下の「導入済みのrustup toolchainによる充足」）。解決できなければ何も要求せず、noticeを出す。
 - 読めない入力（`pypy3.10` のような版の文字列、`go.mod`・`pyproject.toml` のような独自形式の版ファイル、captureに無い版ファイル、matrixに無いkey、動的なmatrix、`if:` の付いたsetup step）は、何も要求せずnoticeを出す。noticeは `belt ci` のstderrに `warning:` 行（task、job、stepの `file:line`）で出し、runには保存しない。
 - そのtaskが走らせるjobだけを数える。`if:` の無いsetup stepが要件を作るtoolは、プロジェクトの版ファイルをそのtaskの要件にしない。同じtoolを別の版に固定する `if:` の無いsetup stepが1つのtaskに2つあれば、提出時に `conflicting_versions` で拒否する。reusable workflowとcomposite actionの中は読まない。
 - setup stepが無いtaskの束は、従来と同じである。`exec` はworkflowを読まない。`workers sync --project` は従来どおりで、setup stepが指す独自形式の版ファイルだけを、`warning:` を出して読み飛ばす。
@@ -1381,10 +1390,12 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 **導入済みのrustup toolchainによる充足。** 設定なしで、workerの利用者のrustupに、そのworker自身のhost向けに既に入っているtoolchainを、そのRustの具体版を満たすものとして数える。理由: 利用者は機械ごとの設定なしに普段の環境で `belt ci` を使いたい。MSRVのjob（例 `toolchain: "1.89"`）は、既定のRustが違う機械でも、その版のtoolchainが入っていれば動かせる。
 - 見つけ方は読むだけとする。`$RUSTUP_HOME/toolchains/`（未設定ならprofileの `HOME` の `.rustup`）をdirectoryとして列挙する。`rustup` は実行せず、導入・更新・network・`~/.rustup` への書き込みはしない。名前がhostで終わらないもの、symlink、directoryでないもの、UTF-8でない名前は飛ばす。読む項目は最大1024とする。
-- 候補は、名前が版で始まるものを版の降順、その後にchannel（`stable` など）を名前順に並べ、最大16個をprobeする。各候補の `bin/rustc -V` と `bin/cargo -V` を既存のbounded probe（固定argv、環境の消去、deadline）で呼び、両方が同じ版を答えたときだけ、その版のtoolchainとする。名前だけでは決めない。nightly・betaは版がprereleaseになるので、releaseの固定には一致しない。1回の検出のprobeは合わせて最大8秒（1回の呼び出しは起動時2秒、それ以外300ms）とし、使い切れば残りは検出しない。
+- 候補は、`stable-<host>` を先頭に、次に名前が版で始まるものを版の降順、その後に他のchannelを名前順に並べ、最大16個をprobeする（`stable` は下の解決に使うので、上限と時間で落とさない）。各候補の `bin/rustc -V` と `bin/cargo -V` を既存のbounded probe（固定argv、環境の消去、deadline）で呼び、両方が同じ版を答えたときだけ、その版のtoolchainとする。名前だけでは決めない。nightly・betaは版がprereleaseになるので、releaseの固定には一致しない。1回の検出のprobeは合わせて最大8秒（1回の呼び出しは起動時2秒、それ以外300ms）とし、使い切れば残りは検出しない。
 - 検出したtoolchainの名前・版・`rustc` と `cargo` のbyte identityはworker profileの報告（`rustup`）に入り、fingerprintに含まれる（無ければfingerprintは従来と同じ）。最初の報告で見つけた集合を基準とし、以後はその集合だけを見直す。ファイルが変わらなければprobeし直さない。消えた・変わったtoolchainはprofile drift（既存の規則）となる。後から入れたtoolchainは、residentの再起動まで使わない。
 - 優先: `toolchains.toml` のrecipeが満たせるならそれを使う。registryが無い、またはregistryが満たせない（native toolを許す拒否）ときだけ、範囲を満たす検出済みtoolchainの最高版で解決する（根拠の領域tagは `worker_detected_rustup_v1`。wire・保存形式は変わらない）。
 - activationは、そのtoolchainの `bin` をPATHの先頭（管理されたinstallの後、profileのPATHの前）に置き、`RUSTUP_TOOLCHAIN` にtoolchain名を設定する。何も導入しない。identityはinstallの領収の代わりになる。
+- **`stable` はstable channelであり、機械の既定ではない。** Rustの要件のchannel `stable`（`rust-toolchain` の `stable`、`dtolnay/rust-toolchain@stable`、`toolchain: stable`）は、workerに検出済みの `stable-<host>` toolchainが報告する版へ解決する（`resolved_inputs` に `stable` とその版を記録する）。利用者の `rustup default` やPATHの `rustc` が答える版には解決しない。理由: GitHub Actionsの `stable` は最新のstable releaseを意味し、機械の既定版で走らせると結果がGitHubと食い違う（既定が1.92、`stable` が1.100の機械で、coverageのjobが1.92で走った）。beltは `rustup` を実行せず、既定も変えない。`stable-<host>` が無いworkerは `stable` を解決しない。`beta`・`nightly` などの他のchannelは検出から解決しない。
+  - 版の揃え方: 解決した版は提出時にそのtaskの束へ具体版として固定される（他の要件と同じ）。そのため、そのrunのtaskは全workerで同じstableの版で走り、その版のtoolchainを持たないworker（`stable` が別の版のworkerを含む）は候補から外れる。GitHubの1回のrunが1つのstable版で走るのと同じ意味であり、`[toolchain] match` のbaselineで近い版を許す規則は使わない（channelの要件は束の固定で決まり、baselineではない）。実際に走った版は束の選択として記録される。
 - `workers diff` と `doctor` は検出したtoolchainを `rustup` の行に示す（失敗にはしない）。検出した版は `rustc`／`cargo` の行で導入済みの版として数える。
 
 **導入済みのほかのtoolの版による充足。** 同じ理由と同じ規則で、利用者の版管理ツールが既に持つnode・python・go・rubyの版も、その具体版を満たすものとして数える。証拠: あるMacではnode 20.xがnodenvにだけ入っていたが、どのworkerにもnode 20が無いとされた。
@@ -1458,6 +1469,7 @@ workerのattempt workspaceは、beltに組み込んだfast-worktreeのライブ�
 - **hookとcommandが呼ぶ `portool`・`fast-worktree`**: `.fast-worktree.toml` のhook（例: `pre_remove` の `portool release`）や、commandの中の `portool exec` は、その名前のcommandを呼ぶ。beltだけを入れたworkerでも動くように、workerはstate directoryの中の私用のbin directoryに、belt自身を指す `portool` と `fast-worktree` のlinkを置き、hookとattemptのcommand、CI taskのstep、setupのstepのPATHの先頭に足す（PATHが無い、または空のときは、このbin directoryだけにする。空のentryはcurrent directoryを意味するので作らない）。beltは起動名（argv[0]）がこの2つのどちらかのとき、組み込んだライブラリの単独CLIの入口として動く。引数・出力・終了コードは同じ版の単独CLIと同じである。hookの中身をbeltが解釈することはしない。beltのsubcommand（`belt port` など）にもしない。workerのPATHに単独CLIがあっても、attemptの中では組み込みの版が先に見つかるので、`workers diff` が示す版と実際に動く版が一致する。linkは第15章のversion別directoryごとに置き、そのversionのbeltを指す。更新とrollback（24.8）ではversion別directoryと一緒に切り替わり、動いているattemptは開始したときのversionのlinkを使い続ける。
 - **割当の解放**: terminal後の削除では、`pre_remove` のhookを通常どおり実行し、その後で、そのworkspaceに紐づくportoolの割当を組み込みのportoolで解放する（解放済みなら何もしない）。hookがportool releaseを書いていないプロジェクトや、hookが失敗した場合も割当を残さないためである。解放するのは、workspaceのdirectoryが実際に無くなったときだけで、まだ残っているworkspaceの割当は残す。解放に失敗したら、workspaceの削除の失敗と同じくcleanupのeventに残し、workerの起動時のreconcileでやり直す。
 - **単独CLIとの共存**: 同じhostで単独のfast-worktree・portoolを使っていても、組み込みの版は同じstate directory、lock、registry（portoolの割当表、fast-worktreeのcache・pool・trash・kept ref）を、単独CLIと同じ規則で使う。どちらが割り当てたポートも他方から見え、同じポートを二重に割り当てない。組み込みの版が読めない形式（新しい単独CLIが書いたもの）は書き換えずに断り、そのworkerを `blocked: environment_mismatch` にして（portoolのregistryの版が組み込みの版で読めないときに限る。attemptの準備でも、workspaceの割当の解放でも同じ）、`doctor` と `workers diff` が単独CLIとbeltの版を示す。組み込みの版（fast-worktree 0.7.0、portool 0.14.0）が持つ自動の保持（古いkept ref・cache・spareの削除と、無くなったworktreeの割当の自動解放）は、attemptの中の `fast-worktree` の呼び出しがそのまま行い、beltは別の掃除を持たない。fast-worktreeの裏の掃除（`cache retire`）は、beltのlinkを起動した版が自分を指す `fast-worktree` として再実行するので、beltだけを入れたworkerでも動く。beltはその出力（削除した行）をeventにしない。beltは `portool prune` と `sync` を呼ばない。beltのcanonical cloneとattempt workspaceはworkerのstate directoryの中にあり、利用者が単独のfast-worktreeで作ったworktreeとは混ざらない。
+- **準備が実行するtoolは配置の要件**（2026-11-25の決定）: Gitのworkspaceの準備（`fast-worktree add`）は、task用のtoolchainを有効にする前に、workerの素の環境で、準備する各プロジェクトのkey command・install・verify・afterと、`requires` の無い `post_add` を実行する。準備できないworkerを選ばないため、親はcaptureしたsnapshotからこれらのtoolを求め、runの全taskの要件（`Requirement::Prepare`）に加える。求め方はfast-worktree 0.7.0の規則に合わせる。`.fast-worktree.toml` に `[[clone]]` があればその項目だけ（presetの既定のtoolと、各commandの代入を除いた最初の語）、無ければ追跡されたpresetのlockfile（`package-lock.json` はnodeとnpm、`pubspec.lock` はdart）から `[[ignore]]` を除いたもの。snapshotはworktreeの元のcommitに上書きを重ねたものだが、その代わりとして読む。要件は版を持たない存在の要件で、frozen toolchainの選択では満たされず、workerがその名前のtoolを持つと報告したときだけ満たされる。workerの報告に無い名前（`ruby`・`bundle`・`pod`、shellの組み込みなど）は観測できないので要件にしない。`requires` 付きの `post_add` はtoolが無ければfast-worktreeが飛ばすので、準備を失敗させず、要件にしない。`.fast-worktree.toml` を読めない、または知らないpresetを名指すときは、どのworkerでも準備できないので、受付で断る。どのworkerも要件を満たさないtaskは、要件を満たさない他のtaskと同じく配置されない。ディレクトリのsnapshotと `--in-place` は準備しないので、要件を加えない。
 - **準備が書いたものと、captured sourceとの照合**: `fast-worktree add` は `[[clone]]` と依存のhookで、Gitが追跡しないもの（npmの `node_modules` などignoredな依存、hookの出力）をworktreeに書く。CI taskはworkspaceがcaptured sourceとbyte単位で一致することを確かめてから実行するので、これを数えると、依存を準備するプロジェクトのtaskはすべて「the workspace is not the captured source」で失敗する（2026-11-25の二台での受け入れ試験run4で、npmのプロジェクトを含むリポジトリのtaskが全部これで失敗した）。そこでworkerは、addの直後、sourceを重ねる前に、Gitが追跡しないpath（`git ls-files -z --others --directory`。ignoredも含み、丸ごと追跡外のdirectoryは1つのpathにする）を記録し、CI taskはそのpathとその下だけを照合から除く（local-ciの `verify_workspace_with_overlay`）。除いたpathの中身は準備の言い分のまま確かめない。それ以外のbyteは従来どおり一致しなければ断る。記録はaddの直後に取り、実行の時点で余分に見つかったものは除かない（後から足されたfileは断る）。captured sourceのentryそのもの、またはentryを含むdirectoryであるpathは記録しない（除くとcaptured byteを確かめないことになるため）。worktreeはcaptureしたfileをすべて持つexecution commitで作るので、準備がcaptured fileを上書きしても追跡外には数えず、重ねたsourceがcaptured byteに戻す。captured fileと同じdirectoryに準備が書いたfileは、file単位で記録する。
 - **`.worktreeinclude`**: 一致するignoredファイルは、親でcaptureして22.3の経路で送る。workerがcanonical cloneからコピーすることはしない。
 - **Linux**: clonefileが効かないため、npmの依存は毎回 `npm ci` になる。add・remove・pool・hookは同じく動く。組み込みなので、Linuxでも別のバイナリは要らない。

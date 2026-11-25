@@ -68,6 +68,9 @@ pub enum Action {
     Commit,
     /// Report facts about this host for the parent's `doctor`.
     Doctor,
+    /// Recapture `PATH` from the user's login shell and restart the service
+    /// with it once accepted work has finished.
+    RefreshEnv,
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
@@ -1437,7 +1440,100 @@ pub fn handle<L: Launcher>(
             upgrade::commit(env, &request, launcher)
         }
         Action::Doctor => anyhow::bail!("doctor reports facts, not a service status"),
+        Action::RefreshEnv => refresh_env(env, launcher, options.wait, options.ready_timeout),
     }
+}
+
+/// The environment `install` and `refresh-env` record: the caller's, with
+/// `PATH` taken from the user's login shell (`process` gives its `HOME`,
+/// `USER` and `SHELL`), not from the non-login ssh session that runs the
+/// helper. `install` keeps the caller's `PATH` when the login shell cannot
+/// be read (`doctor` then says so); `refresh-env` changes nothing.
+pub(crate) fn login_captured(
+    action: Action,
+    mut env: BTreeMap<String, String>,
+    process: &BTreeMap<String, String>,
+    runner: &mut dyn super::doctor::Runner,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if matches!(action, Action::Install | Action::RefreshEnv) {
+        match super::doctor::env_gaps::login_path(process, runner) {
+            Some(path) => {
+                env.insert("PATH".into(), path);
+            }
+            None => ensure!(
+                action == Action::Install,
+                "the login shell's PATH could not be read; nothing was changed"
+            ),
+        }
+    }
+    Ok(env)
+}
+
+/// `worker-service refresh-env`: record `env`'s `PATH` (the login shell's,
+/// see [`login_captured`]) and restart the service with it. The service is
+/// stopped only after its accepted work has finished, exactly as `stop`
+/// without `--cancel-running`; an equal `PATH` changes nothing.
+pub fn refresh_env<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    launcher: L,
+    wait: Duration,
+    ready_timeout: Duration,
+) -> anyhow::Result<Status> {
+    let path = env.get("PATH").context("no PATH to record")?.clone();
+    let paths = Paths::resolve_for(&worker_env(env), launcher.backend())?;
+    let _lock = exclusive_lock(&paths)?;
+    let mut journal = require_journal(&paths)?;
+    ensure!(
+        journal.switch.is_none(),
+        "a version switch is unfinished on this host; finish it with upgrade or rollback first"
+    );
+    ensure!(
+        journal.system_user.is_none(),
+        "a system service's environment is the administrator's; reinstall it to change PATH"
+    );
+    let receipt = journal
+        .receipt
+        .clone()
+        .context("service was never installed")?;
+    let plan_now = plan(&paths, &journal)?;
+    if journal.env.get("PATH") == Some(&path) {
+        let mut launcher = launcher;
+        let ready = agent_reachable(&paths.state);
+        return status_with(&paths, &journal, &plan_now, &receipt, &mut launcher, ready);
+    }
+    let files = services(&paths, &journal)?;
+    let (mut files, mut launcher) =
+        upgrade::retire(&paths, &journal, &receipt, files, launcher, wait)?;
+    // The old service file goes, then the journal records both the new PATH
+    // and that no file is published, in one write: a helper killed between
+    // the two finds the file absent and removes nothing more.
+    if !matches!(fs::symlink_metadata(receipt.path()), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        let _lease = files.lifecycle_lock()?;
+        files.remove(&receipt)?;
+    }
+    journal.receipt = None;
+    journal.env.insert("PATH".into(), path);
+    save_journal(&paths, &journal)?;
+    let mut spec: super::worker::WorkerSpec =
+        serde_json::from_slice(&fs::read(&paths.input)?).context("worker input unreadable")?;
+    spec.env = journal.env.clone();
+    publish_exact(&paths.input, &serde_json::to_vec(&spec)?, 0o600, true)?;
+    let plan = plan(&paths, &journal)?;
+    {
+        let _lease = files.lifecycle_lock()?;
+        files
+            .install_journaled(&plan, |receipt, _stage| {
+                journal.receipt = Some(receipt.clone());
+                save_journal(&paths, &journal)
+            })
+            .map_err(|e| anyhow::anyhow!("service file publication failed ({e})"))?;
+    }
+    let receipt = journal.receipt.clone().context("service receipt missing")?;
+    clear_cancel(&paths.state)?;
+    ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
+    let ready = wait_ready(&paths.state, ready_timeout);
+    status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
 
 /// The environment of this worker, measured with the persisted inputs its
@@ -1521,10 +1617,26 @@ pub fn main(
     if action == Action::Doctor {
         return super::doctor::host_main();
     }
-    let env: BTreeMap<String, String> = ENV
-        .iter()
-        .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))
-        .collect();
+    let read = |keys: &[&str]| -> BTreeMap<String, String> {
+        keys.iter()
+            .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))
+            .collect()
+    };
+    let env = match login_captured(
+        action,
+        read(ENV),
+        &read(&["HOME", "USER", "SHELL"]),
+        &mut super::doctor::SystemRunner::default(),
+    ) {
+        Ok(env) => env,
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": format!("{error:#}")})
+            );
+            return 1;
+        }
+    };
     if action == Action::Env {
         return match env_report(&env) {
             Ok(report) => {

@@ -161,7 +161,7 @@ Without any recipe, a worker counts a Rust version as available when the user's
 own rustup already has that toolchain for the worker's host (spec 22.1). The
 profile lists `$RUSTUP_HOME/toolchains` (default `~/.rustup`) read-only, skips
 links, non-directories and other hosts, and probes at most 16 candidates
-(version-named highest first, then channels) with the bounded `rustc -V` /
+(`stable-<host>` first, then version-named highest first, then other channels) with the bounded `rustc -V` /
 `cargo -V` probe, sharing one 8 s bound. It never runs `rustup`, installs,
 updates or writes there. The toolchains and their rustc/cargo identities are part
 of the profile report and fingerprint; the first report's set is the baseline,
@@ -170,6 +170,10 @@ A recipe wins: only when the registry is absent or refuses with a native-allowin
 reason does worker resolution pick the highest detected version in range
 (`worker_detected_rustup_v1` evidence). Activation puts that toolchain's `bin`
 first on PATH (after managed installs) and sets `RUSTUP_TOOLCHAIN` to its name.
+The channel `stable` resolves only to the detected `stable-<host>` toolchain's
+version (recorded in `resolved_inputs`), never to `rustup default` or the PATH
+`rustc`; the bundle then pins that version, so every worker of the run serves the
+same one. Other channels are not resolved from detection.
 
 ### Installed versions of other tools (no configuration)
 

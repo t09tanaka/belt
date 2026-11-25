@@ -433,7 +433,7 @@ pub fn with_steps(
     report: Option<&WorkerCapabilities>,
 ) -> Vec<String> {
     let named = requires.iter().find_map(|r| match r {
-        Requirement::Tool(name) => {
+        Requirement::Tool(name) | Requirement::Prepare(name) => {
             let line = capability::unmet_line(r);
             unmet
                 .iter()

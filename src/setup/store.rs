@@ -730,10 +730,18 @@ fn map_modes(path: &Path, f: &dyn Fn(u32) -> u32) -> io::Result<()> {
 
 /// Write `path` (a file or a directory) through to the disk.
 fn sync_path(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    FULL_SYNCS.with(|n| n.set(n.get() + 1));
     fs::File::open(path)?.sync_all()
 }
 
 /// Write every file and directory under `root` through to the disk.
+///
+/// Each entry is handed to the drive with a plain `fsync`, and one full
+/// flush of `root` at the end empties the drive's cache for all of them.
+/// `sync_all` is `F_FULLFSYNC` on macOS, a flush of the whole drive cache
+/// that costs milliseconds even on an idle disk; one per file made a
+/// template of a thousand files take tens of seconds on a busy machine.
 fn sync_tree(root: &Path) -> io::Result<()> {
     let mut todo = vec![root.to_path_buf()];
     while let Some(path) = todo.pop() {
@@ -746,9 +754,14 @@ fn sync_tree(root: &Path) -> io::Result<()> {
                 todo.push(ent?.path());
             }
         }
-        sync_path(&path)?;
+        rustix::fs::fsync(fs::File::open(&path)?)?;
     }
-    Ok(())
+    sync_path(root)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Remove `path` (a sealed tree too). A path that is not there is removed.
@@ -775,6 +788,20 @@ pub fn digest_of(path: &Path) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_is_written_through_with_one_full_flush() {
+        let tmp = crate::test_tmp::tempdir().unwrap();
+        let root = tmp.path().join("tree");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        for i in 0..20 {
+            fs::write(root.join(format!("a/b/f{i}")), [i as u8]).unwrap();
+        }
+        symlink("a", root.join("link")).unwrap();
+        FULL_SYNCS.with(|n| n.set(0));
+        sync_tree(&root).unwrap();
+        assert_eq!(FULL_SYNCS.with(|n| n.get()), 1);
+    }
 
     #[test]
     fn interruption_before_replacement_keeps_the_original_leaf() {
