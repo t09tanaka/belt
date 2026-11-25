@@ -175,18 +175,24 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Fi
     let mut reader = TableReader::new();
     let mut tracked = Tracked::default();
     let mut missed = Vec::new();
+    let mut gaps = 0;
+    // Some look failed: the record may have a gap (see `lineage::GAP_LIMIT`),
+    // so it does not cover the command's whole life.
+    let mut gapped = false;
     let mut writes = Writes::default();
     loop {
-        tick(
+        let step = tick(
             &mut reader,
             root,
             false,
             &mut tracked,
             &mut missed,
+            &mut gaps,
             record,
             &mut writes,
             Instant::now(),
         );
+        gapped |= step.failed;
         match stop.recv_timeout(INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {}
             // One last look: the leader is likely reaped by now, and the
@@ -199,11 +205,18 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<bool>) -> Fi
                     reaped,
                     &mut tracked,
                     &mut missed,
+                    &mut gaps,
                     record,
                     &mut writes,
                     Instant::now(),
                 );
-                let covered = !step.failed && !tracked.truncated && !writes.pending;
+                // A gap still open at the last look is never closed by a
+                // good one: what it hid is unknown.
+                if step.failed {
+                    tracked.truncated = true;
+                }
+                gapped |= step.failed;
+                let covered = !gapped && !tracked.truncated && !writes.pending;
                 return Finished { tracked, covered };
             }
         }
@@ -224,6 +237,7 @@ fn tick(
     reaped: bool,
     tracked: &mut Tracked,
     missed: &mut Vec<ProcRef>,
+    gaps: &mut u32,
     record: &Record,
     writes: &mut Writes,
     now: Instant,
@@ -232,7 +246,7 @@ fn tick(
     let gone = lineage::root_is_gone(reaped, lineage::contains_root(&table, root), || {
         process::root_gone(root.pid)
     });
-    let step = lineage::step(&table, root, gone, tracked, missed, MAX_DESCENDANTS);
+    let step = lineage::step(&table, root, gone, tracked, missed, gaps, MAX_DESCENDANTS);
     let plan = lineage::plan(
         step,
         writes.pending,
@@ -371,6 +385,7 @@ mod tests {
             false,
             &mut Tracked::default(),
             &mut Vec::new(),
+            &mut 0,
             &record,
             writes,
             now,
@@ -409,9 +424,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_look_is_handed_over_without_the_stamp() {
+    fn a_long_gap_is_handed_over_without_the_stamp() {
         // A command the table does not list although it is not gone: the
-        // look fails, so the record is truncated and not stamped.
+        // look fails. Up to `GAP_LIMIT` of them in a row change nothing and
+        // write nothing; the next truncates the record, unstamped.
         let mut child = std::process::Command::new("sleep")
             .arg("5")
             .spawn()
@@ -428,18 +444,45 @@ mod tests {
         });
         let mut w = Writes::default();
         let mut tracked = Tracked::default();
-        let step = tick(
-            &mut TableReader::new(),
-            root,
-            false,
-            &mut tracked,
-            &mut Vec::new(),
-            &record,
-            &mut w,
-            Instant::now(),
-        );
-        assert!(step.failed && tracked.truncated);
+        let mut gaps = 0;
+        let mut reader = TableReader::new();
+        for n in 1..=crate::lineage::GAP_LIMIT + 1 {
+            let step = tick(
+                &mut reader,
+                root,
+                false,
+                &mut tracked,
+                &mut Vec::new(),
+                &mut gaps,
+                &record,
+                &mut w,
+                Instant::now(),
+            );
+            assert!(step.failed);
+            assert_eq!(tracked.truncated, n > crate::lineage::GAP_LIMIT);
+        }
         assert_eq!(*seen.lock().unwrap(), vec![(true, false)]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_gap_still_open_at_the_last_look_is_unknown() {
+        // Every look fails (the command is never listed as itself), and the
+        // command is not reported reaped: the last look ends inside a gap.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let root = ProcRef {
+            pid: child.id(),
+            start_time: Some(1),
+        };
+        let record: Record = Arc::new(|_, _| true);
+        let (tx, rx) = mpsc::channel::<bool>();
+        tx.send(false).unwrap();
+        let f = track_loop(root, &record, &rx);
+        assert!(f.tracked.truncated && !f.covered, "{f:?}");
         child.kill().unwrap();
         child.wait().unwrap();
     }

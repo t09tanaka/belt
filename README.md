@@ -455,6 +455,16 @@ How descendants are found, and what this cannot see:
   hides, and it is stopped like a marked one (SIGTERM, then SIGKILL, after
   checking pid and start time again). If descendants were dropped, a clear
   scan cannot be believed and the entry is kept as "could not be checked".
+  A look that cannot be believed (the table does not list the command
+  although it still runs) changes nothing in the record. Up to 3 such looks
+  in a row are a longer pause between two good looks: the tracker only sees
+  processes at its looks, a process that forks and leaves the tree between
+  two looks is not recorded however far apart they are, and the next good
+  look walks the whole tree again from the command and every recorded
+  process, so such a gap loses nothing a pause of the same length would not.
+  A longer gap, or one still open at the last look, marks the record
+  truncated for good. After any gap the record does not count as covering
+  the command's whole life, so the window for hidden orphans stays open.
 - **A launch intent and hidden processes.** A launch intent (the supervisor
   died around the spawn) is released by the reaper once the lease is gone,
   60 seconds have passed, no marked or recorded process runs, *and* no
