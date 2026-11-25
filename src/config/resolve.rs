@@ -1007,6 +1007,14 @@ mod tests {
         assert_eq!(default_max_active_task(Some(2), None), 2);
         assert_eq!(default_max_active_task(None, None), 2);
         assert_eq!(default_max_active_task(Some(4), Some(1 << 30)), 2);
+        assert_eq!(
+            host_default_max_active_task(),
+            default_max_active_task(
+                crate::toolchain::profile::host_cores(),
+                crate::toolchain::profile::host_memory_bytes(),
+            )
+        );
+        assert!(host_default_max_active_task() >= MIN_DEFAULT_MAX_ACTIVE_TASK);
     }
     #[test]
     fn generic_output_admission_checks_paths_and_folded_names() {
