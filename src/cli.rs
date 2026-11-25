@@ -50,6 +50,10 @@ pub enum Command {
         /// The build to install instead of this one; it runs the upgrade.
         #[arg(long, value_name = "PATH")]
         binary: Option<std::path::PathBuf>,
+        /// Also recapture the resident's PATH from the login shell; with
+        /// this build already running, only the PATH changes.
+        #[arg(long)]
+        refresh_env: bool,
     },
     /// Watch an upgrade's commit deadline and roll it back (internal).
     #[command(hide = true)]
@@ -474,9 +478,17 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::UpgradeGuard { config } = &cli.command {
         return crate::service::init::upgrade::guard_main(config);
     }
-    if let Command::Upgrade { binary } = &cli.command {
+    if let Command::Upgrade {
+        binary,
+        refresh_env,
+    } = &cli.command
+    {
         use crate::service::init::upgrade::Ran;
-        return match crate::service::init::upgrade::command(binary.as_deref(), cli.json) {
+        return match crate::service::init::upgrade::command(
+            binary.as_deref(),
+            *refresh_env,
+            cli.json,
+        ) {
             Ok(Ran::Delegated(code)) => code,
             Ok(Ran::Here(result)) => {
                 if cli.json {
