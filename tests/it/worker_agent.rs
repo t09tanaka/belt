@@ -185,7 +185,9 @@ impl Host for DirHost {
         base: Digest,
     ) -> Result<Option<belt::toolchain::registry::Registry>, ApiError> {
         let state = self.base.join("state");
-        if !state.join("toolchains.toml").exists() {
+        // As the real worker, a private tool root alone is a registry: the
+        // user's mise or rustup may install into it.
+        if !state.join("toolchains.toml").exists() && !state.join("toolchains").is_dir() {
             return Ok(None);
         }
         belt::toolchain::registry::Registry::load(&state, profile, base)
@@ -6679,4 +6681,185 @@ async fn a_worker_without_recipes_resolves_node_from_its_nodenv_versions() {
     assert!(call(&client, ask_tool(&p, "node", ".node-version", "22"))
         .await
         .is_err());
+}
+
+/// A worker with no recipes: its profile PATH has a fake `mise` that only
+/// records that it ran (when `mise`), and its fake nodenv has `versions`.
+/// Everything is under the test directory; no real manager is reachable.
+fn mise_agent(f: &Fx, versions: &[&str], mise: bool) -> Arc<Agent> {
+    use belt::toolchain::profile::Profile;
+    let state = f.state();
+    std::fs::create_dir_all(state.join("toolchains")).unwrap();
+    for dir in [state.clone(), state.join("toolchains")] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let base = std::fs::canonicalize(f.dir.path()).unwrap();
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    if mise {
+        crate::common::write_executable(
+            &bin.join("mise"),
+            &format!(
+                "#!/bin/sh\necho ran >> {:?}\nexit 91\n",
+                base.join("mise-ran").to_str().unwrap()
+            ),
+        );
+    }
+    let root = base.join("nodenv");
+    std::fs::create_dir_all(root.join("versions")).unwrap();
+    for version in versions {
+        let dir = root.join(format!("versions/{version}/bin"));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::common::write_executable(
+            &dir.join("node"),
+            &format!("#!/bin/sh\necho 'v{version}'\n"),
+        );
+    }
+    let path = |name: &str| base.join(name).to_str().unwrap().to_string();
+    let profile = Profile::load(
+        &state,
+        &[
+            ("PATH".into(), path("bin")),
+            ("HOME".into(), path("")),
+            ("NODENV_ROOT".into(), path("nodenv")),
+            ("HOMEBREW_PREFIX".into(), path("brew")),
+            ("MISE_DATA_DIR".into(), path("user-mise")),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    f.start_with(cfg)
+}
+
+fn mise_session() -> Session {
+    Session {
+        coordinator_id: CoordinatorId::nil(),
+        coordinator_epoch: CoordinatorEpoch(1),
+    }
+}
+
+/// A worker whose user has mise counts as able to serve a node version it
+/// does not have: it answers with the same bundle, so placement takes it
+/// (spec 22.1). A worker without mise is no candidate, and says how to get
+/// mise. Resolving never runs mise.
+#[test]
+fn a_worker_with_the_users_mise_is_a_candidate_for_a_version_it_lacks() {
+    let p = payload("exit 0");
+    let ask = || ask_tool(&p, "node", ".node-version", "22.1.0");
+    let Request::ResolveToolchains(asked) = ask() else {
+        panic!()
+    };
+    let f = fx();
+    let with = mise_agent(&f, &[], true);
+    let Response::ResolveToolchains(answer) = with
+        .handle(mise_session(), ask())
+        .unwrap_or_else(|e| panic!("a worker with mise refused: {e:?}"))
+    else {
+        panic!()
+    };
+    assert_eq!(answer.bundle, asked.bundle);
+    assert!(!f.dir.path().join("mise-ran").exists());
+    let g = fx();
+    let without = mise_agent(&g, &[], false);
+    let refused = without
+        .handle(mise_session(), ask())
+        .expect_err("a worker without mise was a candidate");
+    let said = format!("{refused:?}");
+    assert!(said.contains("no mise"), "{said}");
+    assert!(said.contains("brew install mise"), "{said}");
+}
+
+/// Placement prefers a worker that already has the version: only where the
+/// user's mise must install it does the forecast count an install (spec
+/// 22.1). Neither forecast runs mise.
+#[test]
+fn a_forecast_counts_a_mise_install_only_where_the_version_is_missing() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let forecast = |agent: &Arc<Agent>| {
+        let a = AttemptId::generate();
+        let n = NodeId::parse("main").unwrap();
+        let Response::Forecast(r) = agent
+            .handle(
+                mise_session(),
+                Request::Forecast(ForecastRequest {
+                    schema_version: SchemaVersion::CURRENT,
+                    request_id: RequestId::generate(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    workload: WorkloadPlan {
+                        attempt_id: a.clone(),
+                        plan_digest: Digest::of_bytes(b"plan"),
+                        expansion_seq: 0,
+                        nodes: vec![WorkloadNode {
+                            node_id: n.clone(),
+                            depends_on: vec![],
+                            priority: 0,
+                            weight: Some(1),
+                            predicted_rss_bytes: Some(1),
+                            predicted_runtime_ms: Some(5_000),
+                            ci_history_key: None,
+                            external_delay_ms: None,
+                            ready_in_ms: Some(0),
+                            concurrency: ConcurrencyLimits::default(),
+                            correlation: Correlation {
+                                attempt_id: a.clone(),
+                                node_id: n,
+                                ledger_entry: None,
+                            },
+                            shared_builder: None,
+                        }],
+                    },
+                    pending: vec![],
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("a forecast answer")
+        };
+        r.target.assumptions.join("\n")
+    };
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    let scope = Scope::project("");
+    p.toolchains = Some(Box::new(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                p.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("22.1.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    ));
+    for (versions, installs) in [(&["22.1.0"][..], false), (&[][..], true)] {
+        let f = fx();
+        *f.host.tool_poll.lock().unwrap() = Some(None);
+        let agent = mise_agent(&f, versions, true);
+        agent
+            .handle(mise_session(), submit_req(&AttemptId::generate(), &p))
+            .unwrap();
+        let said = forecast(&agent);
+        assert_eq!(
+            said.contains("toolchain installs"),
+            installs,
+            "node {versions:?}: {said}"
+        );
+        assert!(!f.dir.path().join("mise-ran").exists());
+    }
 }

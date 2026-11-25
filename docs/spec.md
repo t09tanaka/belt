@@ -1404,6 +1404,14 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 - 検出した版（tool・版・管理ツール・`bin`・実行ファイルのidentity）はworker profileの報告（`installs`）に入り、fingerprintに含まれる（無ければfingerprintは従来と同じ）。最初の報告の集合を基準とし、以後はその集合だけを見直す。消えた・変わった版はprofile drift、後から入れた版はresidentの再起動まで使わない。
 - 優先はrustupと同じで、recipeが満たせないときだけ範囲を満たす検出済みの最高版で解決する（根拠の領域tagは `worker_detected_install_v1`）。activationはその版の `bin` をPATHの先頭に置く。`doctor` と `workers diff` はその版を導入済みとして数える。
 
+**不足した版の、利用者のmise・rustupによる導入（2026-11-25の決定）。** 設定なしで、GitHub Actionsの `setup-*` のように、固定した具体版がworkerに無ければ導入する。miseとrustupは利用者が入れる前提であり、belt自身はmiseを導入しない。
+- 見つけ方: profileのPATHの先頭から、`mise`（node・python・go・ruby）と `rustup`（rust）という名前の実行ファイルを探し、linkを解いた先の名前も同じときだけ使う（rustupとそのproxyは名前で動作を変えるため、`rustup-init` などへのlinkは使わない）。実行はせず、byte identityを取るだけとする。そのtoolに `toolchains.toml` のrecipeがあれば使わない（在庫に無い版もrecipeに従う）。
+- 導入の形: 既存のadapterの計画をそのまま使う。miseは `mise install-into <tool>@<具体版> <private payload>` を、`MISE_DATA_DIR`・`MISE_CONFIG_DIR`・`MISE_STATE_DIR`・`MISE_CACHE_DIR`・`MISE_TMP_DIR` とHOMEをすべて `<state>/toolchains/` の下にし、`MISE_NO_CONFIG=1`・hook無効・自動導入無効で動かす。Rustは `rustup toolchain install <具体版>-<host> --profile minimal --no-self-update` を、`RUSTUP_HOME`・`CARGO_HOME` をprivateにして動かす。利用者のmiseの設定・既定・data directory、`~/.rustup` には書かない。導入のlock、領収、検証、admission、setupのsingleflightは管理されたinstallと同じである（`docs/toolchain-adapters.md`）。
+- 範囲と上限: 導入するのは、束がすでに固定した具体版だけで、版を選ぶこと（範囲・channelの解決）には使わない。導入したrootは管理されたinstallのrootと同じ `toolchains/<identity>/` であり、25.7 (b) の規則（参照の無いものを、14日使われないか合計20 GiBを超えたとき古い順に消す）で消える。消すのはbeltが導入したrootだけで、利用者のmise・rustupの版には触れない。
+- 優先: recipe、次にworkerに既にある版（native、検出済みのrustup toolchainとほかの管理ツールの版）、最後にこの導入の順とする。既にある版を導入し直さない。
+- 候補: 導入できるworker（miseまたはrustupがある）は、その版を持たなくても候補になる。配置は既に持つworkerを優先する。見積は、この導入を待つ導入として数える（最後に測ったprofileの報告がその版を持つときは数えない。報告がまだ無ければ数える）。
+- miseが無いworker: その版を持たなければ候補にならず、拒否の文に「this worker has no mise」と導入の方法（`brew install mise`、または公式のinstaller `curl https://mise.run | sh`）を書く。`workers diff` と `doctor` は `mise` の行を出し、無ければ `manual_required` として同じ導入の方法を示す（miseの有無を測っていない古いworkerの報告には行を出さない）。
+
 baselineが分からないtoolの要求（profileの `required_tools` と、`requires` に挙げたtoolのうち、提出時にこのhostで版を測れなかったもの）は、提出時に `BLOCKED`、`environment_mismatch` で拒否する。理由は `toolchain baseline unknown; capture requires an observed required tool (<tool>, ...)` とし、配置時の `no_compatible_worker` にはならない。
 
 公開 command submit は検証済み capture から版指定・必要 baseline を固定し、完全な resolution evidence とともに `FrozenBundle` として保持する。worker-local registry・既存 setup admission/singleflight・attempt ごとの activation 経路は [private adapter API](toolchain-adapters.md) に記録する。実 manager による受入確認と installed-version 一覧・diff/sync は別の検証範囲とする。

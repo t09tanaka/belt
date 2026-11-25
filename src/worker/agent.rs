@@ -1836,12 +1836,37 @@ impl Agent {
                 .and_then(|report| {
                     crate::toolchain::contract::native_tool(&bundle.frozen, &evidence.tool, report)
                 });
+            // Neither a recipe nor the worker's own tool serves it: the
+            // user's mise or rustup may install that exact version (spec 22.1).
+            let installed = match (&native, &self.toolchains) {
+                (None, Some(registry)) if refused.allows_native() => registry
+                    .install_request(&bundle.frozen, &evidence.tool, evidence)
+                    .ok(),
+                _ => None,
+            };
+            if let Some(request) = installed {
+                provided.requests.push(request);
+                continue;
+            }
             match native {
                 Some(native) => provided.native.push(native),
                 None => {
                     return Err(ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
                         match &self.toolchains {
+                            Some(registry)
+                                if refused.allows_native()
+                                    && crate::toolchain::registry::MISE_TOOLS
+                                        .contains(&evidence.tool.as_str())
+                                    && !registry.can_install(evidence.tool.as_str()) =>
+                            {
+                                format!(
+                                    "toolchain unavailable: {} {} is not installed and this worker has no mise; {}",
+                                    evidence.tool.as_str(),
+                                    evidence.concrete,
+                                    crate::toolchain::registry::MISE_INSTALL_HINT
+                                )
+                            }
                             Some(_) => format!("toolchain unavailable: {refused:?}"),
                             None => "toolchain registry unavailable".into(),
                         },
@@ -4033,11 +4058,33 @@ impl Agent {
         };
         // A selection the registry does not plan is served natively or not at
         // all (admission decides); neither is an install to wait for, and
-        // this forecast path must not probe the profile.
+        // this forecast path must not probe the profile. A selection only the
+        // user's mise or rustup can serve is an install unless the last
+        // completed report already has that version (spec 22.1): so a
+        // worker that has it forecasts sooner than one that must install it.
+        let last = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .and_then(|p| p.last_report(&self.cfg.profile_fingerprint));
         bundle
             .evidence
             .iter()
-            .filter_map(|e| registry.request(&bundle.frozen, &e.tool, Some(e)).ok())
+            .filter_map(
+                |e| match registry.request(&bundle.frozen, &e.tool, Some(e)) {
+                    Ok(request) => Some(request),
+                    Err(refused) if refused.allows_native() => {
+                        let native = last.as_ref().is_some_and(|report| {
+                            crate::toolchain::contract::native_tool(&bundle.frozen, &e.tool, report)
+                                .is_some()
+                        });
+                        (!native)
+                            .then(|| registry.install_request(&bundle.frozen, &e.tool, e).ok())
+                            .flatten()
+                    }
+                    Err(_) => None,
+                },
+            )
             .filter(|r| {
                 !matches!(
                     registry.detect(r),

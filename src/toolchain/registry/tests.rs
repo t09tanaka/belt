@@ -698,3 +698,157 @@ fn a_manual_tool_is_served_by_an_exact_native_match_with_a_registry_present() {
     assert_eq!(native.version.to_string(), "16.2.0");
     assert_eq!(native_tool(&bundle.frozen, &xcode, &report("16.1")), None);
 }
+
+/// A fake `mise` in the profile PATH (the fixture's only directory) that
+/// records its arguments and environment, and changes nothing else.
+fn fake_mise(f: &Fixture) -> PathBuf {
+    let mise = f.state.join("mise");
+    std::fs::write(
+        &mise,
+        format!(
+            "#!/bin/sh\necho \"$@\" > '{0}/mise-args'\n{{\necho \"MISE_DATA_DIR=$MISE_DATA_DIR\"\necho \"MISE_CONFIG_DIR=$MISE_CONFIG_DIR\"\necho \"MISE_STATE_DIR=$MISE_STATE_DIR\"\necho \"MISE_CACHE_DIR=$MISE_CACHE_DIR\"\necho \"MISE_TMP_DIR=$MISE_TMP_DIR\"\necho \"HOME=$HOME\"\necho \"MISE_NO_CONFIG=$MISE_NO_CONFIG\"\n}} > '{0}/mise-env'\nexit 0\n",
+            f.state.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o700)).unwrap();
+    mise
+}
+
+/// With no configuration, the user's own mise installs an exact version the
+/// contract already selected, into belt's private root (spec 22.1): its
+/// data, config, state, cache and tmp directories are all under
+/// `state/toolchains`, so the user's own mise data is never written. It
+/// never chooses a version, and the registry's own request does not take it.
+#[test]
+fn the_users_mise_installs_an_exact_selected_version_into_the_private_root() {
+    let f = Fixture::new(AdapterKind::Mise, "node");
+    std::fs::remove_file(f.state.join("toolchains.toml")).unwrap();
+    let mise = fake_mise(&f);
+    let registry = f.load().unwrap();
+    let tool = ToolId::parse("node").unwrap();
+    assert_eq!(registry.installer("node"), Some(mise.as_path()));
+    assert!(registry.can_install("python") && !registry.can_install("flutter"));
+    let bundle =
+        crate::toolchain::contract::FrozenBundle::seal_exact(f.frozen("1.2.3", b"source")).unwrap();
+    let evidence = &bundle.evidence[0];
+    // The registry's own request leaves room for a native tool first.
+    let refused = registry
+        .request(&bundle.frozen, &tool, Some(evidence))
+        .unwrap_err();
+    assert!(refused.allows_native(), "{refused:?}");
+    // An installer never resolves a range.
+    assert!(registry
+        .request(&f.frozen("^1.2", b"source"), &tool, None)
+        .is_err());
+    let request = registry
+        .install_request(&bundle.frozen, &tool, evidence)
+        .unwrap();
+    assert_eq!(request.kind, AdapterKind::Mise);
+    assert_eq!(registry.detect(&request).unwrap(), Availability::Missing);
+    let plan = request.plan(&f.state.join("toolchains")).unwrap();
+    let command = &plan.commands()[0];
+    assert_eq!(command.program, mise);
+    assert_eq!(command.argv[..2], ["install-into", "node@1.2.3"]);
+    // The installer creates its working directory; here the test does.
+    std::fs::create_dir_all(&command.cwd).unwrap();
+    let status = std::process::Command::new(&command.program)
+        .args(&command.argv)
+        .env_clear()
+        .envs(&command.env)
+        .current_dir(&command.cwd)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let env = std::fs::read_to_string(f.state.join("mise-env")).unwrap();
+    let private = f.state.join("toolchains");
+    for key in [
+        "MISE_DATA_DIR",
+        "MISE_CONFIG_DIR",
+        "MISE_STATE_DIR",
+        "MISE_CACHE_DIR",
+        "MISE_TMP_DIR",
+        "HOME",
+    ] {
+        let line = env
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("{key} unset: {env}"));
+        assert!(
+            Path::new(line).starts_with(&private),
+            "{key}={line} is outside the private root"
+        );
+    }
+    assert!(env.contains("MISE_NO_CONFIG=1"), "{env}");
+}
+
+/// A recipe for a tool leaves no room for the user's installer for that
+/// tool: the operator's inventory governs it. Other tools still get one.
+#[test]
+fn a_recipe_for_the_tool_leaves_no_room_for_the_users_installer() {
+    let f = Fixture::new(AdapterKind::Mise, "node");
+    fake_mise(&f);
+    let registry = f.load().unwrap();
+    assert_eq!(registry.installer("node"), None);
+    assert!(registry.installer("python").is_some());
+    assert!(registry.can_install("node"));
+}
+
+/// An installer is taken by its own name only: a `rustup` that is a link to
+/// a file with another name is not taken (rustup and its proxies act by
+/// that name), and one that is a link to a file named `rustup` is taken
+/// through the link.
+#[test]
+fn an_installer_is_found_by_its_own_name_only() {
+    let t = crate::test_tmp::tempdir().unwrap();
+    let base = std::fs::canonicalize(t.path()).unwrap();
+    let (bin, real) = (base.join("bin"), base.join("real"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    for name in ["rustup", "rustup-init"] {
+        std::fs::write(real.join(name), "#!/bin/sh\nexit 91\n").unwrap();
+        std::fs::set_permissions(real.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::os::unix::fs::symlink(real.join("rustup-init"), bin.join("rustup")).unwrap();
+    let dirs = [bin.clone()];
+    assert_eq!(find_installer(&dirs, "rustup"), None);
+    std::fs::remove_file(bin.join("rustup")).unwrap();
+    std::os::unix::fs::symlink(real.join("rustup"), bin.join("rustup")).unwrap();
+    assert_eq!(find_installer(&dirs, "rustup"), Some(real.join("rustup")));
+    assert_eq!(find_installer(&dirs, "mise"), None);
+}
+
+/// The user's own rustup installs a missing exact Rust toolchain for this
+/// host with RUSTUP_HOME and CARGO_HOME under belt's private root, never the
+/// user's `~/.rustup` (spec 22.1). Nothing runs while planning.
+#[test]
+fn the_users_rustup_installs_an_exact_toolchain_with_a_private_rustup_home() {
+    let f = Fixture::new(AdapterKind::Rustup, "rust");
+    std::fs::remove_file(f.state.join("toolchains.toml")).unwrap();
+    let rustup = f.state.join("rustup");
+    std::fs::copy(f.state.join("manager"), &rustup).unwrap();
+    let registry = f.load().unwrap();
+    let tool = ToolId::parse("rust").unwrap();
+    assert_eq!(registry.installer("rust"), Some(rustup.as_path()));
+    let bundle =
+        crate::toolchain::contract::FrozenBundle::seal_exact(f.frozen("1.2.3", b"source")).unwrap();
+    let request = registry
+        .install_request(&bundle.frozen, &tool, &bundle.evidence[0])
+        .unwrap();
+    let plan = request.plan(&f.state.join("toolchains")).unwrap();
+    let command = &plan.commands()[0];
+    let host = crate::toolchain::profile::rustup_host().unwrap();
+    assert_eq!(command.program, rustup);
+    assert_eq!(
+        command.argv[..3],
+        ["toolchain", "install", &format!("1.2.3-{host}")]
+    );
+    for key in ["RUSTUP_HOME", "CARGO_HOME"] {
+        assert!(
+            Path::new(&command.env[key]).starts_with(f.state.join("toolchains")),
+            "{key}={}",
+            command.env[key]
+        );
+    }
+    assert!(!f.state.join("manager-ran").exists());
+}
