@@ -300,6 +300,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
     TaskSpec {
         ci: Some(CiSpec {
             history_keys: Vec::new(),
+            duration_key: None,
             dynamic_origin: false,
             core_outcome: None,
             matrix: None,
@@ -1147,4 +1148,92 @@ async fn preparation_no_worker_reports_is_refused_with_what_each_lacks() {
     });
     f.c.try_attach(studio, link).unwrap();
     f.c.check_preparation(prepare).await.unwrap();
+}
+
+/// Spec 配置の手順 1: a submission is queued, so placed, longest job first
+/// by what the same jobs took when they last succeeded; a job never
+/// measured keeps the workflow's order after them.
+#[tokio::test]
+async fn a_ci_run_is_queued_longest_job_first() {
+    let f = fx();
+    let source = SourceId::generate();
+    let store = f.c.store();
+    store
+        .put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1)
+        .unwrap();
+    let job = |key: &str| {
+        let mut spec = ci_spec(false, 1);
+        spec.ci.as_mut().unwrap().duration_key = Some(Digest::of_bytes(key.as_bytes()));
+        spec
+    };
+    let now = wall_ms();
+    let earlier: Vec<_> = [("short", 1_000), ("long", 9_000)]
+        .into_iter()
+        .map(|(key, took)| (TaskId::generate(), job(key), took))
+        .collect();
+    f.c.enqueue(
+        RunId::generate(),
+        source.clone(),
+        earlier
+            .iter()
+            .map(|(task, spec, _)| (task.clone(), spec.clone()))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    for (task, _, took) in &earlier {
+        let a = store
+            .create_attempt(
+                crate::storage::NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task.clone(),
+                    worker_id: f.worker.clone(),
+                    payload_hash: crate::ids::PayloadHash::parse(&format!(
+                        "sha256:{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                    permit_id: None,
+                },
+                now,
+            )
+            .unwrap();
+        for s in [
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ] {
+            store.transition_attempt(&a.attempt_id, s, now).unwrap();
+        }
+        let done = crate::state::Termination::new(
+            crate::state::Outcome::Succeeded,
+            Some(crate::state::Exit::Code(0)),
+            None,
+        )
+        .unwrap();
+        store
+            .finalize_attempt(&a.attempt_id, done, now + took)
+            .unwrap();
+    }
+    let (short, new, long) = (TaskId::generate(), TaskId::generate(), TaskId::generate());
+    f.c.enqueue(
+        RunId::generate(),
+        source,
+        vec![
+            (short.clone(), job("short")),
+            (new.clone(), job("new")),
+            (long.clone(), job("long")),
+        ],
+    )
+    .await
+    .unwrap();
+    let queued: Vec<TaskId> = store
+        .queued_tasks(16)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(queued, [long, short, new]);
 }

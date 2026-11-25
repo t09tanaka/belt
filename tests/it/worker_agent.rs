@@ -4253,7 +4253,10 @@ async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
         std::fs::read_dir(state.join("setup/builders")).map_or(true, |rd| rd.count() == 0)
     });
     wait_for("the workspaces to go", || {
-        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| rd.count() == 0)
+        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| {
+            rd.flatten()
+                .all(|e| e.file_name() == belt::workspace::SPOTLIGHT_MARKER)
+        })
     });
     assert!(f.supervisors_under(&state.join("setup")).is_empty());
 }

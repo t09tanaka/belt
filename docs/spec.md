@@ -494,6 +494,7 @@ generic execの依存準備もプロジェクトに宣言できる。`.fast-work
 coordinator内の1つのscheduler actorが、配置のcommitを直列化する。複数利用者からの投入やworkerへの見積照会は並行してよい。
 
 1. 親のready queueから対象taskを選ぶ。通常優先度では投入順と待機時間を考慮し、依存未解決の仕事で独立した後続を塞がない。
+   1つの投入のtaskは、queueへ入れる時に長い順へ並べる（queueは入れた順に読まれるので、これが配置の順になる）。長さは、同じprojectの同じplan task（`ci.duration_key` = `ci::timing::task_scope`）が最後に成功したattemptの実時間（attemptの作成から終了まで）である。見るのは、作られてから30日以内のrunのうち新しい20個だけで、失敗・取り消し・retireされたattempt、取り消されたtask、discoveryのprobe、shardのmemberは使わない。新しい表は作らず、runの刈り取り（25.5）で消えたものは使われなくなる。長さの分からないtaskは、workflowの順のまま、長さの分かるtaskの後に置く（最初のrunの順を変えない）。同じ長さは元の順を保つ。長いjobを最後に始めると、終わりの数分を1-2個のjobだけで走ることになるためである。
 2. OS・arch・profile・tool・必要disk・明示resource要件で候補を絞る。
 3. 各workerへ、現在のキューと候補workloadを含むforecastを照会する。
 4. source差分転送、setup（第22章のtoolchain導入を含む）、実行、成果物回収を含む予測完了時間で比較する。
@@ -2839,6 +2840,7 @@ workerのagentのtick（既存の監視の周期）で、60秒に1回まで行�
 | 捨てたattemptの一覧 | `worker.db` の `dropped_attempt` | agentの片付け | directoryを消した直後に消す | 同じ | 既存 | directoryが無いこと |
 | attemptのdirectory | `attempts/<attempt>/`（`supervise.json`・`execution-binding.json`・`cleanup-pending`・`ci/` を含む） | supervisor、回収、別のscopeのsupervisorの照合 | 規則のとおり（段階3で入れた） | ACKか `release_attempt` の受理でその場（行のcommitの直後、lockより先）。無ければterminalから7日 | 3 | 25.6 |
 | workspace | `workspaces/<attempt>` | attemptのcommand | terminalで消す。32個まで | 同じ | 既存 | terminalと、supervisorのlock |
+| Spotlightの除外 | `workspaces/.metadata_never_index`（macOSだけ） | workspaceを作る時（無ければ作る） | 空のfile 1つ。消さない（起動時の走査はattemptでも作業用でもない名前を残す） | 同じ | 既存 | 無し |
 | supervisorのlock | `supervisors/<attempt>.lock` | supervisor、agent（5か所）、別のscopeのsupervisorの照合 | 規則のとおり（段階3で入れた） | attemptの行とdirectoryの後に消す | 3 | 25.1の (A)、25.6 |
 | secretの配置 | workspaceの中、`secret-index/<attempt>.json`、`.secrets.tmp-*`、`secrets/` | attemptのcommand | terminalで消す | 同じ | 既存 | terminal |
 | 受け取ったsource | `sources/manifests/`、`sources/objects/` | `blob_verify`、workspaceの準備 | 消さない | 参照されていない（terminalでないattemptも、他の受け取ったsourceのgraphも名指さない）ものを、最後に使ってから14日で消す。store全体が20 GiBを超える間は、古い順に消す。共有のobjectは最後のmemberと一緒に消える。公開に失敗した受け取りのblobは、tokenの解放で消す | 5b | sourceの変更lockの排他と `worker.db` の確認（25.8の5bの (a)） |

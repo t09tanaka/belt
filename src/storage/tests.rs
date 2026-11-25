@@ -6922,3 +6922,62 @@ fn the_rows_of_a_cancel_before_the_enqueue_exist_only_for_a_capture_and_are_forg
             .accepted
     );
 }
+
+/// Spec 配置の手順 1: the duration of a CI job is its last succeeded
+/// attempt in a recent run; a failure, a discovery probe and an old run
+/// do not count.
+#[test]
+fn a_ci_job_duration_is_its_last_success_in_a_recent_run() {
+    let f = fx();
+    let finish = |run_at: u64, spec: serde_json::Value, outcome: Outcome, start: u64, end: u64| {
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        f.store
+            .create_run(&run, None, None, &json!({}), run_at)
+            .unwrap();
+        f.store.create_task(&task, &run, &spec, run_at).unwrap();
+        let a = f
+            .store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task,
+                    worker_id: f.worker.clone(),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                start,
+            )
+            .unwrap();
+        for s in [
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ] {
+            f.store.transition_attempt(&a.attempt_id, s, start).unwrap();
+        }
+        f.store
+            .finalize_attempt(&a.attempt_id, done(outcome), end)
+            .unwrap();
+    };
+    let job = |key: &str| json!({"ci": {"duration_key": key}});
+    finish(100, job("long"), Outcome::Succeeded, 100, 900);
+    finish(200, job("long"), Outcome::Succeeded, 1_000, 1_500);
+    finish(300, job("long"), Outcome::Failed, 300, 5_000);
+    finish(100, job("short"), Outcome::Succeeded, 100, 200);
+    let probe = json!({"ci": {"duration_key": "short",
+        "task": {"inputs": {"belt_discovery": {}}}}});
+    finish(400, probe, Outcome::Succeeded, 400, 9_000);
+    finish(10, job("old"), Outcome::Succeeded, 10, 20);
+    let keys = ["long", "short", "old", "none"]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    let found = f.store.ci_job_durations(keys, 50).unwrap();
+    assert_eq!(
+        found,
+        [("long".to_string(), 500), ("short".to_string(), 100)].into()
+    );
+}
