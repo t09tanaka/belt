@@ -284,6 +284,36 @@ mod tests {
             rustup: Vec::new(),
         }
     }
+    /// The tools preparation runs are added once each, beside what was
+    /// configured, and only a worker that reports them meets them.
+    #[test]
+    fn prepare_tools_are_added_as_native_requirements() {
+        let base = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+        let tools = ["node".to_string(), "npm".to_string(), "npm".to_string()];
+        let req = base.with_prepare(&tools).unwrap();
+        assert_eq!(
+            req.requires,
+            [
+                Requirement::Tool("node".into()),
+                Requirement::Prepare("node".into()),
+                Requirement::Prepare("npm".into()),
+            ]
+        );
+        assert_eq!(
+            missing(&req, Some(&report())),
+            [
+                "Tool(\"node\") unavailable",
+                "Prepare(\"node\") unavailable",
+                "Prepare(\"npm\") unavailable",
+            ]
+        );
+        let many: Vec<String> = (0..33).map(|_| "node".to_string()).collect();
+        assert!(ExecutionRequirements::default().with_prepare(&many).is_ok());
+        let unknown = ["magic".to_string()];
+        assert!(ExecutionRequirements::default()
+            .with_prepare(&unknown)
+            .is_err());
+    }
     /// A report's detected rustup toolchains are bounded and well formed
     /// (spec 22.1); each rule refuses alone.
     #[test]
