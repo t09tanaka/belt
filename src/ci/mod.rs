@@ -12,6 +12,7 @@ pub(crate) mod artifact_exchange;
 pub mod discovery;
 pub mod execute;
 pub mod progress;
+pub mod setup_tools;
 pub mod shards;
 pub mod status;
 pub mod summary;

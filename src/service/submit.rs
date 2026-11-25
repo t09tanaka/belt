@@ -659,6 +659,28 @@ async fn check_preparation(
 }
 
 /// Only the owner's answer that a worker can prepare lets the submit go on.
+/// Asks the owner whether some worker meets `requirements` (the setup tools
+/// of a task, spec 22.1): `None` when one does, the reason when none does.
+/// Only a failure to ask is an error.
+pub(crate) async fn ask_preparation(
+    owner: &super::resident::Client,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+) -> Result<Option<String>, ApiError> {
+    let reply = owner
+        .request(Operation::CheckPreparation {
+            requirements: requirements.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    match preparation_reply(reply) {
+        Ok(()) => Ok(None),
+        Err(e) if e.blocked_reason == Some(crate::error::BlockedReason::EnvironmentMismatch) => {
+            Ok(Some(e.message))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn preparation_reply(reply: Reply) -> Result<(), ApiError> {
     match reply {
         Reply::PreparationChecked => Ok(()),

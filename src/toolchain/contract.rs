@@ -584,6 +584,7 @@ mod tests {
             features: Default::default(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
         };
         let mut frozen = bundle("20.0.0").frozen;
         assert_eq!(check_baselines(&frozen, None), Ok(()));
@@ -897,6 +898,7 @@ mod tests {
             features: Default::default(),
             rustup: Vec::new(),
             installs: Vec::new(),
+            path_tools: Vec::new(),
         }
     }
     #[test]
@@ -971,6 +973,7 @@ mod tests {
                     bin: format!("/rustup/toolchains/{name}/bin").into(),
                     rustc: Digest::of_bytes(name.as_bytes()),
                     cargo: Digest::of_bytes(version.as_bytes()),
+                    components: Vec::new(),
                 },
             )
             .collect();

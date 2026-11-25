@@ -1064,7 +1064,11 @@ impl WorkerLink for Reports {
             let Request::Inspect(_) = request else {
                 return Err(LinkError::Unconfirmed);
             };
-            let tools = self.tools.iter().map(|t| {
+            let known = self
+                .tools
+                .iter()
+                .filter(|t| crate::toolchain::capability::TOOLS.contains(t));
+            let tools = known.map(|t| {
                 let seen = ToolObservation::Available {
                     version: "1.0.0".into(),
                     identity: Digest::of_bytes(t.as_bytes()),
@@ -1089,9 +1093,19 @@ impl WorkerLink for Reports {
                     protocol_versions: vec![1],
                     profile_fingerprint: Digest::of_bytes(b"p"),
                     tools: tools.collect(),
-                    features: [FEATURE.into()].into(),
+                    features: [
+                        FEATURE.into(),
+                        crate::toolchain::capability::SETUP_TOOLS_FEATURE.into(),
+                    ]
+                    .into(),
                     rustup: Vec::new(),
                     installs: Vec::new(),
+                    path_tools: self
+                        .tools
+                        .iter()
+                        .filter(|t| crate::toolchain::capability::path_tool_name(t))
+                        .map(|t| t.to_string())
+                        .collect(),
                 }),
                 schema_version: SchemaVersion::CURRENT,
                 worker_id: self.worker.clone(),
@@ -1147,4 +1161,44 @@ async fn preparation_no_worker_reports_is_refused_with_what_each_lacks() {
     });
     f.c.try_attach(studio, link).unwrap();
     f.c.check_preparation(prepare).await.unwrap();
+}
+
+/// A task whose setup step installs a tool no worker has is refused with
+/// what is missing; a worker with it on its PATH serves it (spec 22.1).
+#[tokio::test]
+async fn setup_tools_no_worker_has_are_refused_with_the_reason() {
+    use crate::toolchain::capability::{ExecutionRequirements, Requirement};
+    let f = fx();
+    let setup = ExecutionRequirements {
+        profile: None,
+        requires: vec![Requirement::Setup("cargo-llvm-cov".into())],
+    };
+    let mini = Arc::new(Reports {
+        worker: f.worker.clone(),
+        tools: vec!["cargo", "cargo-schemata"],
+    });
+    f.c.try_attach(f.worker.clone(), mini).unwrap();
+    let refused = f.c.check_preparation(setup.clone()).await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Blocked);
+    assert!(
+        refused
+            .message
+            .starts_with("the job's setup steps install cargo-llvm-cov: no worker reports them"),
+        "{}",
+        refused.message
+    );
+    assert!(
+        refused
+            .message
+            .contains("cargo install --locked cargo-llvm-cov"),
+        "{}",
+        refused.message
+    );
+    let studio = WorkerId::parse("studio").unwrap();
+    let link = Arc::new(Reports {
+        worker: studio.clone(),
+        tools: vec!["cargo", "cargo-llvm-cov"],
+    });
+    f.c.try_attach(studio, link).unwrap();
+    f.c.check_preparation(setup).await.unwrap();
 }
