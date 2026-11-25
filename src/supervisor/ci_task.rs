@@ -77,8 +77,14 @@ pub struct CiTaskSpec {
     pub inputs: serde_json::Value,
     /// The source of the attempt, as the worker's source store names it.
     pub ci_source_id: String,
-    /// The attempt's workspace root: the captured source, nothing added.
+    /// The attempt's workspace root: the captured source, plus only what
+    /// preparation wrote at `prepared`.
     pub workspace: PathBuf,
+    /// What `fast-worktree add` wrote into the workspace (relative paths,
+    /// see `Workspace::prepared`): left out of the check against the
+    /// captured source, and nothing else is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared: Vec<String>,
     /// The attempt's own directory for step logs, scripts and the result.
     pub scratch: PathBuf,
     /// The environment every step starts from.
@@ -128,6 +134,7 @@ impl CiTaskSpec {
     fn paths(&self, cancel: CancelHandle) -> TaskPaths {
         TaskPaths {
             root: self.workspace.clone(),
+            prepared: self.prepared.clone(),
             run_dir: self.scratch.join("run"),
             tools: self.scratch.join("tools"),
             lock_file: self.scratch.join("lock"),
@@ -754,6 +761,7 @@ mod tests {
             inputs: serde_json::json!({}),
             ci_source_id: "src-0".into(),
             workspace: "/a/ws".into(),
+            prepared: Vec::new(),
             scratch: "/a/ci".into(),
             env: [("TOKEN".to_string(), "hunter2-secret".to_string())].into(),
         };

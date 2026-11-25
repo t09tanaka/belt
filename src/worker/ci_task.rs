@@ -557,6 +557,7 @@ pub fn prepare(
         inputs: task.inputs.clone(),
         ci_source_id,
         workspace: workspace.root.clone(),
+        prepared: workspace.prepared.clone(),
         scratch: attempt_dir.join("ci"),
         env,
     })
@@ -809,6 +810,7 @@ mod tests {
             kind,
             index_reproduced: true,
             warnings: Vec::new(),
+            prepared: Vec::new(),
         };
         let env = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into();
         prepare(
