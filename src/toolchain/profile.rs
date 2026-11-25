@@ -69,6 +69,10 @@ enum ProbeMiss {
 }
 const PROBE_DIR_PREFIX: &str = "belt-tool-probe-";
 const PREPARATION_SNAPSHOT_TTL_MS: u64 = 5_000;
+/// The measured profile that answers toolchain questions is measured again,
+/// in the background, once it is this old. A changed tool file or rustup
+/// toolchain list is drift and is measured at once.
+const RESOLUTION_REFRESH: Duration = Duration::from_secs(30);
 // Tool discovery must not bootstrap a manager-selected tool behind admission.
 const INSTALL_GUARDS: &[(&str, &str)] = &[
     ("COREPACK_ENABLE_NETWORK", "0"),
@@ -136,6 +140,41 @@ pub struct Profile {
     /// The live deadline of one fixed call; only tests that are not about the
     /// deadline replace it.
     probe_timeout: Duration,
+    /// The measured profile toolchain questions are answered from.
+    resolution: Arc<Mutex<Option<Resolution>>>,
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A determinate measurement: startup probes, and a tool that gave no answer
+/// keeps what it answered before (`held`).
+#[derive(Clone)]
+struct Resolution {
+    report: WorkerCapabilities,
+    files: Digest,
+    measured: Instant,
+    held: Vec<String>,
+}
+
+/// `next`, where a tool that is no longer `Available` only because it gave
+/// no answer keeps the `Available` of `previous`. Any other answer, a new
+/// version, an absent or failing tool, replaces it. The names kept are
+/// returned.
+fn settle(
+    previous: Option<&WorkerCapabilities>,
+    mut next: WorkerCapabilities,
+) -> (WorkerCapabilities, Vec<String>) {
+    let mut held = Vec::new();
+    if let Some(previous) = previous {
+        for (tool, observed) in next.tools.iter_mut() {
+            if matches!(observed, ToolObservation::Unknown) {
+                if let Some(before @ ToolObservation::Available { .. }) = previous.tools.get(tool) {
+                    *observed = before.clone();
+                    held.push(tool.clone());
+                }
+            }
+        }
+    }
+    (next, held)
 }
 
 #[derive(Clone)]
@@ -345,6 +384,8 @@ impl Profile {
             rustup_seen: Arc::new(Mutex::new(BTreeMap::new())),
             installs_seen: Arc::new(Mutex::new(BTreeMap::new())),
             probe_timeout: PROBE_TIMEOUT,
+            resolution: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Loading is part of startup: a cold required tool gets the startup
         // deadline and repeats, and is refused only once it stays undetermined.
@@ -489,7 +530,75 @@ impl Profile {
     /// unavailable/unknown and does not prevent unconstrained shell work; if it
     /// answers after this baseline, that is drift.
     pub fn startup_report(&self) -> WorkerCapabilities {
-        self.measured_report(Some(STARTUP_PROBES))
+        self.remeasure().0
+    }
+    /// The measured profile toolchain questions are answered from, and the
+    /// tools in it that kept an earlier answer because the last measurement
+    /// got none. No tool is probed per question: the last determinate
+    /// measurement answers while the tool files and the rustup toolchains
+    /// are unchanged; once it is [`RESOLUTION_REFRESH`] old it still answers
+    /// and is measured again in the background. Without one, or after drift,
+    /// it is measured now (at most the startup bound).
+    pub(crate) fn measured_profile(&self) -> (WorkerCapabilities, Vec<String>) {
+        let current = self.drift_identity();
+        let cached = self.resolution.lock().ok().and_then(|slot| slot.clone());
+        match cached {
+            Some(cached) if cached.files == current => {
+                if cached.measured.elapsed() >= RESOLUTION_REFRESH
+                    && !self.refreshing.swap(true, Ordering::SeqCst)
+                {
+                    let profile = self.clone();
+                    std::thread::spawn(move || {
+                        profile.remeasure();
+                        profile.refreshing.store(false, Ordering::SeqCst);
+                    });
+                }
+                (cached.report, cached.held)
+            }
+            _ => {
+                let (_, measured) = self.remeasure();
+                (measured.report, measured.held)
+            }
+        }
+    }
+    /// The published measurement, and what toolchain questions are
+    /// answered from.
+    fn remeasure(&self) -> (WorkerCapabilities, Resolution) {
+        let files = self.drift_identity();
+        let report = self.measured_report(Some(STARTUP_PROBES));
+        let mut slot = match self.resolution.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (settled, held) = settle(slot.as_ref().map(|r| &r.report), report.clone());
+        let measured = Resolution {
+            report: settled,
+            files,
+            measured: Instant::now(),
+            held,
+        };
+        *slot = Some(measured.clone());
+        (report, measured)
+    }
+    /// What a measurement depends on that can change without a probe: the
+    /// tool files and the rustup toolchain directory.
+    fn drift_identity(&self) -> Digest {
+        let toolchains = self
+            .rustup_home()
+            .and_then(|home| fs::metadata(home.join("toolchains")).ok())
+            .map(|m| {
+                (
+                    m.ino(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            });
+        Digest::of_bytes(
+            &serde_json::to_vec(&(self.executable_identity(), toolchains))
+                .expect("drift identity serializes"),
+        )
     }
     fn measured_report(&self, startup: Option<StartupProbes>) -> WorkerCapabilities {
         let files_before = self.executable_identity();
@@ -1648,6 +1757,54 @@ mod tests {
     fn write_profile(dir: &Path, active: &str, extra: &str) {
         fs::write(dir.join("profiles.toml"), format!("schema_version = 1\nactive = {active:?}\n[profiles.node22]\npath = [{:?}]\nshell = \"/bin/sh\"\ncache_namespace = \"node22\"\n{extra}", dir.to_str().unwrap())).unwrap();
         fs::set_permissions(dir.join("profiles.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    /// The measured profile: a tool that gave no answer keeps its earlier
+    /// `Available`; a new version or an absent tool replaces it.
+    #[test]
+    fn a_tool_without_an_answer_keeps_its_measured_version() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        fake(dir.path(), "node", "printf 'v22.0.0\\n'", 0o700);
+        fake(dir.path(), "npm", "printf '10.0.0\\n'", 0o700);
+        let profile = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        let before = profile.startup_report();
+        let mut next = before.clone();
+        next.tools.insert("node".into(), ToolObservation::Unknown);
+        next.tools
+            .insert("npm".into(), ToolObservation::Unavailable);
+        let (settled, held) = settle(Some(&before), next.clone());
+        assert_eq!(settled.tools["node"], before.tools["node"]);
+        assert_eq!(settled.tools["npm"], ToolObservation::Unavailable);
+        assert_eq!(held, ["node"]);
+        let (first, held) = settle(None, next);
+        assert_eq!(first.tools["node"], ToolObservation::Unknown);
+        assert!(held.is_empty());
+    }
+    /// Questions are answered from the measured profile: no probe per
+    /// question while the tool files are unchanged, and a changed file is
+    /// measured again.
+    #[test]
+    fn the_measured_profile_answers_without_a_probe_until_a_tool_changes() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let node =
+            |version: &str| format!("echo x >> '{}'; printf '{version}\\n'", calls.display());
+        fake(dir.path(), "node", &node("v22.0.0"), 0o700);
+        let profile = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        profile.startup_report();
+        let count = || fs::read_to_string(&calls).unwrap().lines().count();
+        let measured = count();
+        for _ in 0..3 {
+            let (report, _) = profile.measured_profile();
+            assert!(
+                matches!(&report.tools["node"], ToolObservation::Available { version, .. } if version == "v22.0.0")
+            );
+        }
+        assert_eq!(count(), measured, "a question probed node");
+        fake(dir.path(), "node", &node("v23.0.0"), 0o700);
+        let (report, _) = profile.measured_profile();
+        assert!(
+            matches!(&report.tools["node"], ToolObservation::Available { version, .. } if version == "v23.0.0")
+        );
     }
     #[test]
     fn actual_path_versions_and_private_profile_are_authoritative() {

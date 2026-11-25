@@ -6967,3 +6967,92 @@ fn the_workspace_is_prepared_with_the_activated_toolchain() {
         g.host.calls()
     );
 }
+
+/// run5: a loaded host answers `node -v` after the live 300ms probe deadline.
+/// The worker measured node at startup, so resolving a task whose baseline is
+/// that node is answered from the measured profile, with no probe per
+/// question. Before, every question probed every tool, the late node became
+/// unknown, and the worker refused with `proposal baseline mismatch`, which
+/// the parent shows as `toolchain rust=stable unavailable`. A real version
+/// change is still drift: the changed file is measured again and refused.
+#[tokio::test]
+async fn a_slow_tool_probe_does_not_make_resolution_refuse_the_worker() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let f = fx();
+    let node = f.dir.path().join("node");
+    let count = f.dir.path().join("node-calls");
+    let write_node = |version: &str| {
+        std::fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\necho call >> '{}'\n/bin/sleep 0.6\necho {version}\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_node("v22.23.5");
+    let calls = || {
+        std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let client = rustup_worker(&f, &["stable=1.100.0"]).await;
+    let p = payload("exit 0");
+    let scope = Scope::project("");
+    let location = Location {
+        path: "rust-toolchain".into(),
+        first_line: 1,
+        last_line: 1,
+    };
+    let node_id = ToolId::parse("node").unwrap();
+    let bundle = FrozenBundle::seal_exact(
+        FrozenToolchains::freeze(
+            p.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("stable").unwrap(),
+                scope: scope.clone(),
+                location: location.clone(),
+            }],
+            &[(node_id.clone(), location)],
+            &[(
+                node_id.clone(),
+                VersionObservation::parse_for(&node_id, "v22.23.5"),
+            )]
+            .into(),
+            MatchPolicy::Exact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bundle.frozen.baseline.len(), 1);
+    let ask = || {
+        Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            bundle: bundle.clone(),
+            requirements: Default::default(),
+        })
+    };
+    let measured = calls();
+    assert!(measured > 0, "startup measured node");
+    for _ in 0..2 {
+        let Response::ResolveToolchains(resolved) = call(&client, ask())
+            .await
+            .unwrap_or_else(|e| panic!("refused: {e:?}"))
+        else {
+            panic!()
+        };
+        assert_eq!(resolved.bundle.evidence[0].concrete.to_string(), "1.100.0");
+    }
+    assert_eq!(calls(), measured, "a question probed node");
+    write_node("v23.0.0");
+    assert!(
+        call(&client, ask()).await.is_err(),
+        "a changed node version was not refused"
+    );
+}

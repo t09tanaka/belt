@@ -1724,9 +1724,18 @@ impl Agent {
             .validate_partial(&bundle.frozen.source_manifest)
             .map_err(invalid)?;
         requirements.validate().map_err(invalid)?;
-        let report = self
-            .capabilities()
+        // Answered from the measured profile, not by probing every tool per
+        // question: a probe that runs late on a loaded host is no answer,
+        // and the parent waits only `forecast_wait_ms` for this one.
+        let started = Instant::now();
+        let (report, held) = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .map(|profile| profile.measured_profile())
+            .filter(|(report, _)| report.profile_fingerprint == self.cfg.profile_fingerprint)
             .ok_or_else(|| invalid("proposal profile unavailable"))?;
+        self.note_slow_resolution(started.elapsed(), &held);
         let observed = crate::toolchain::contract::observations(&report);
         for baseline in &bundle.frozen.baseline {
             if bundle.frozen.policy.compare(
@@ -3036,6 +3045,25 @@ impl Agent {
     }
 
     /// A diagnostic event of no attempt, written once while it repeats.
+    /// A toolchain question that took long, or tools that kept an earlier
+    /// answer because their last probe gave none, go to the journal. The time
+    /// is a bucket, so one event stands for a stretch of the same slowness.
+    fn note_slow_resolution(&self, took: Duration, held: &[String]) {
+        if !held.is_empty() {
+            self.note_global("agent_toolchain_probe_held", "", json!({ "tools": held }));
+        }
+        let Some(at_least_ms) = [5_000u64, 1_000, 250]
+            .into_iter()
+            .find(|ms| took >= Duration::from_millis(*ms))
+        else {
+            return;
+        };
+        self.note_global(
+            "agent_toolchain_resolution_slow",
+            "",
+            json!({ "at_least_ms": at_least_ms }),
+        );
+    }
     fn note_global(&self, kind: &str, subject: &str, payload: Value) {
         if self.is_news(format!("/{kind}/{subject}"), &payload) {
             let _ = self.store.append_event(None, None, kind, &payload, now());

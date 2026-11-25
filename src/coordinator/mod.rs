@@ -2505,6 +2505,8 @@ impl Coordinator {
             return Ok(());
         }
         let mut toolchain_eligible = BTreeSet::new();
+        // Asked and silent within the wait: no answer, not a refusal.
+        let mut toolchain_silent = BTreeSet::new();
         if let Some(bundle) = &spec.toolchains {
             // The same question of the same worker is asked once a tick: the
             // tasks of a run share one bundle.
@@ -2539,14 +2541,18 @@ impl Coordinator {
                     requirements: spec.requirements.clone(),
                 });
                 // Only an answer is kept; a silent worker is asked again.
-                if let Ok(Ok(Response::ResolveToolchains(response))) =
-                    tokio::time::timeout(wait, link.read_only_call(request)).await
-                {
-                    let eligible = response.bundle == *bundle;
-                    round.toolchain_eligible.insert(key, eligible);
-                    if eligible {
-                        toolchain_eligible.insert(worker_id);
+                match tokio::time::timeout(wait, link.read_only_call(request)).await {
+                    Ok(Ok(Response::ResolveToolchains(response))) => {
+                        let eligible = response.bundle == *bundle;
+                        round.toolchain_eligible.insert(key, eligible);
+                        if eligible {
+                            toolchain_eligible.insert(worker_id);
+                        }
                     }
+                    Err(_) => {
+                        toolchain_silent.insert(worker_id);
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -2641,13 +2647,16 @@ impl Coordinator {
                     // asks for.
                     if unmet.is_empty() && !toolchain_eligible.contains(&w.worker_id) {
                         if let Some(bundle) = &spec.toolchains {
-                            unmet.extend(
-                                bundle
-                                    .frozen
-                                    .requirements
-                                    .iter()
-                                    .map(|r| format!("toolchain {} unavailable", r.describe())),
-                            );
+                            unmet.extend(bundle.frozen.requirements.iter().map(|r| {
+                                match toolchain_silent.contains(&w.worker_id) {
+                                    true => {
+                                        format!("toolchain {} not answered in time", r.describe())
+                                    }
+                                    false => {
+                                        format!("toolchain {} unavailable", r.describe())
+                                    }
+                                }
+                            }));
                         }
                     }
                     unmet
