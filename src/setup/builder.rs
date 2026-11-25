@@ -2640,6 +2640,7 @@ mod tool_validation_tests {
             kind: WorkspaceKind::Directory,
             index_reproduced: true,
             warnings: vec![],
+            prepared: vec![],
         };
         let dir = temp.path().join("builder");
         private_dir(&dir).unwrap();

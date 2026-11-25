@@ -855,6 +855,7 @@ fn only_attempt_workspaces_can_be_removed() {
             kind: WorkspaceKind::Directory,
             index_reproduced: true,
             warnings: vec![],
+            prepared: Vec::new(),
         };
         let e = ws.remove(&w).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput);
@@ -1111,6 +1112,7 @@ fn a_symlink_at_the_workspaces_place_is_not_followed() {
         },
         index_reproduced: true,
         warnings: vec![],
+        prepared: Vec::new(),
     };
     ws.remove(&w).unwrap();
     assert!(std::fs::symlink_metadata(&place).is_err());
