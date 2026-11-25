@@ -4416,6 +4416,77 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
     assert!(f.store().get(&b).unwrap().is_none());
 }
 
+/// The capability measurement of a preparation can take seconds (each tool
+/// probe has its own deadline). A stopping agent does not wait for it, and
+/// what it left unfinished does not end the attempt: the next agent looks
+/// again.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() {
+    use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    let f = fx();
+    let bin = f.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (hang, probing) = (f.path("hang"), f.path("probing"));
+    let node = bin.join("node");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nif [ -f {hang:?} ]; then : > {probing:?}; exec /bin/sleep 30; fi\necho v22.0.0\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements =
+        ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    // Accepted and checked with the tool answering; the workspace is held
+    // until the tool hangs, so the next measurement (the supervisor spec's)
+    // is the one the stop meets.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    submit(&client, &a, &p).await;
+    let end = Instant::now() + T;
+    while f.host.preparing_now.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < end, "the workspace was never prepared");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::write(&hang, b"").unwrap();
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    while !probing.exists() && f.rec(&a).state != AttemptState::Terminal {
+        assert!(Instant::now() < end, "the preparation never measured");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(probing.exists(), "the attempt ended before it was measured");
+    let at = Instant::now();
+    tokio::task::spawn_blocking(move || agent.shutdown())
+        .await
+        .unwrap();
+    // The probe's own deadline is 2 s, the measurement's 5 s.
+    let took = at.elapsed();
+    assert!(
+        took < Duration::from_millis(1_000),
+        "the stop took {took:?}"
+    );
+    assert_ne!(f.rec(&a).state, AttemptState::Terminal);
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 0);
+}
+
 #[tokio::test]
 async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
     use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
