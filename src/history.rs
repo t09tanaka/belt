@@ -49,18 +49,64 @@ impl Record {
     }
 }
 
+/// How long an append or a trim waits for the other on the history file
+/// itself. Both hold it for a few system calls only.
+const FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const FILE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Append `rec` as one line. The append holds a shared lock on the file it
+/// writes to, and writes only once that file is still the one `path`
+/// names: a trim replaces the file under an exclusive lock on the old one
+/// taken before its last look ([`trim_collect`]), so an append either lands
+/// before that last look and is carried over, or finds the file replaced
+/// and goes to the new one. This holds with or without the history lock.
+/// Only an append that waits [`FILE_LOCK_WAIT`] on a trim stopped inside
+/// that window writes without the lock, and can then be lost.
 pub fn append(path: &Path, rec: &Record) -> Result<()> {
+    append_with(path, rec, &mut || {})
+}
+
+/// [`append`], calling `after_open` once the file is open and before it is
+/// locked (a seam for tests).
+fn append_with(path: &Path, rec: &Record, after_open: &mut dyn FnMut()) -> Result<()> {
+    use fs2::FileExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
     let mut line = serde_json::to_string(rec)?;
     line.push('\n');
-    f.write_all(line.as_bytes())?;
-    Ok(())
+    let start = std::time::Instant::now();
+    loop {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        after_open();
+        let locked = loop {
+            match FileExt::try_lock_shared(&f) {
+                Ok(()) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= FILE_LOCK_WAIT {
+                        break false;
+                    }
+                    std::thread::sleep(FILE_LOCK_POLL);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if locked && !crate::lock::names(&f, path) {
+            // Replaced (or removed) by a trim since it was opened.
+            let _ = FileExt::unlock(&f);
+            continue;
+        }
+        let out = f.write_all(line.as_bytes());
+        if locked {
+            // Explicitly: a child forked meanwhile holds a copy of the fd.
+            let _ = FileExt::unlock(&f);
+        }
+        out?;
+        return Ok(());
+    }
 }
 
 /// All records, oldest first. Malformed lines are skipped.
@@ -178,29 +224,34 @@ fn appended_since(path: &Path, from: u64) -> Result<Vec<u8>> {
 /// at once. A history left with no record is removed, not kept as an empty
 /// file.
 ///
-/// The file is replaced by a new one. Callers serialise with every writer
-/// of this version through the history lock; a released version appends
-/// without it, so what was appended while the new file was being written is
-/// carried over before the replacement. Only an append that lands between
-/// that last look and the rename (two system calls apart) is lost, and a
-/// line still half written at the last look is cut off (its writer holds
-/// the old file, so nothing could finish it).
+/// The file is replaced by a new one. What was appended while the new file
+/// was being written is carried over: the last look is taken under an
+/// exclusive lock on the old file, held until it is replaced, so an
+/// [`append`] of this version cannot land after it (it waits, sees the file
+/// replaced and writes to the new one), with or without the history lock.
+/// When an append holds that lock for [`FILE_LOCK_WAIT`] the trim does
+/// nothing. A released version appends without the file lock: its append
+/// that lands between the last look and the rename is lost, and its line
+/// still half written at the last look is cut off (its writer holds the old
+/// file, so nothing could finish it).
 pub fn trim_collect(
     path: &Path,
     keep: usize,
     cutoff: Option<DateTime<Utc>>,
 ) -> Result<(usize, Vec<String>)> {
-    trim_collect_with(path, keep, cutoff, &mut || {})
+    trim_collect_with(path, keep, cutoff, &mut || {}, &mut || {})
 }
 
 /// [`trim_collect`], calling `before_last_look` after the kept lines are
 /// written and before what was appended meanwhile is carried over (a seam
-/// for tests).
+/// for tests), and `before_replace` after that last look, with the old file
+/// locked, before it is replaced.
 fn trim_collect_with(
     path: &Path,
     keep: usize,
     cutoff: Option<DateTime<Utc>>,
     before_last_look: &mut dyn FnMut(),
+    before_replace: &mut dyn FnMut(),
 ) -> Result<(usize, Vec<String>)> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -230,6 +281,12 @@ fn trim_collect_with(
     }
     let mut cut = written;
     before_last_look();
+    // From here until the file is replaced, no append of this version can
+    // write to it ([`append`]): what the last look sees is everything.
+    let Some(old) = lock_exclusive_named(path)? else {
+        // An append holds it longer than it ever should: trim another time.
+        return Ok((0, Vec::new()));
+    };
     let mut at = whole as u64;
     loop {
         let more = appended_since(path, at)?;
@@ -249,12 +306,45 @@ fn trim_collect_with(
     if cut < written {
         tmp.as_file_mut().set_len(cut)?;
     }
+    before_replace();
     if cut == 0 {
         std::fs::remove_file(path)?;
     } else {
         tmp.persist(path).map_err(|e| e.error)?;
     }
+    let _ = fs2::FileExt::unlock(&old);
     Ok((dropped, gone_ids))
+}
+
+/// An exclusive lock on the file `path` names, waiting at most
+/// [`FILE_LOCK_WAIT`]; `None` when it stays busy or `path` is gone.
+fn lock_exclusive_named(path: &Path) -> Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(&f) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() >= FILE_LOCK_WAIT {
+                    return Ok(None);
+                }
+                std::thread::sleep(FILE_LOCK_POLL);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Under the history lock nobody else replaces it; a released version
+    // does not take this lock, and then the file may already be another.
+    if !crate::lock::names(&f, path) {
+        let _ = FileExt::unlock(&f);
+        return Ok(None);
+    }
+    Ok(Some(f))
 }
 
 #[cfg(test)]
@@ -412,7 +502,7 @@ mod tests {
             f.write_all(text.as_bytes()).unwrap();
         };
         add(head);
-        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || add(tail)).unwrap();
+        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || add(tail), &mut || {}).unwrap();
         assert_eq!(dropped, 2);
         let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
         assert_eq!(walls, vec![3.0, 4.0]);
@@ -424,6 +514,37 @@ mod tests {
         append(&r, &rec("k", 1.0)).unwrap();
         assert_eq!(trim(&r, 0).unwrap(), 1);
         assert!(!r.exists());
+    }
+
+    /// An append that opened the file before a trim's last look and writes
+    /// after it, while the trim has not replaced the file yet, is not lost:
+    /// it waits for the replacement and writes to the new file.
+    #[test]
+    fn an_append_between_the_last_look_and_the_replacement_goes_to_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        for w in [1.0, 2.0, 3.0] {
+            append(&p, &rec("k", w)).unwrap();
+        }
+        let mut writer = None;
+        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || {}, &mut || {
+            // The writer opens the old file now, past the last look, and
+            // writes whenever it can.
+            let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+            let path = p.clone();
+            writer = Some(std::thread::spawn(move || {
+                append_with(&path, &rec("late", 9.0), &mut || {
+                    let _ = opened_tx.send(());
+                })
+                .unwrap();
+            }));
+            opened_rx.recv().unwrap();
+        })
+        .unwrap();
+        writer.unwrap().join().unwrap();
+        assert_eq!(dropped, 2);
+        let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
+        assert_eq!(walls, vec![3.0, 9.0]);
     }
 
     /// A half line nobody finishes (a writer that died, or one whose tail

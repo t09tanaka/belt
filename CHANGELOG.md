@@ -7,6 +7,10 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- A history record could be lost when its append met a trim. `append_record` waits at most a second for the history lock and then appends without it; a trim's rename then dropped a record written to the old file after the trim's last look. Under CPU load an append can miss the lock for that second (seen as 599 of 600 records in `appends_during_trims_are_not_lost`). Now every append takes a shared lock on the history file it writes to and writes only while the path still names that file, and a trim takes an exclusive lock on the old file for its last look and the rename, so such an append waits and goes to the new file. A trim that cannot get that lock within a second leaves the file as it is. An append from a released version takes no file lock and keeps the old exposure.
+
 ## [0.12.1] - 2026-11-26
 
 ### Fixed
