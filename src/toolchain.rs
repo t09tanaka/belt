@@ -11,6 +11,7 @@ pub mod declarations;
 pub mod envdiff;
 pub mod envreport;
 pub mod envsync;
+pub(crate) mod installs;
 pub mod snapshot;
 pub mod versions;
 

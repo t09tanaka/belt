@@ -154,6 +154,33 @@ pub struct WorkerCapabilities {
     /// without them serializes as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rustup: Vec<DetectedRustup>,
+    /// Versions of other tools the user's version managers already have
+    /// (mise, nodenv, nvm, Homebrew), found read-only (spec 22.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installs: Vec<DetectedInstall>,
+}
+/// Most installed tool versions a worker probes, over every manager
+/// (spec 22.1).
+pub const MAX_DETECTED_INSTALLS: usize = 32;
+/// The tools detection looks for, with the executable that reports the
+/// version and its argument.
+pub const DETECTED_TOOLS: &[(&str, &str, &str)] = &[
+    ("node", "node", "-v"),
+    ("python", "python3", "--version"),
+    ("go", "go", "version"),
+    ("ruby", "ruby", "-v"),
+];
+/// The version managers detection reads.
+pub const DETECTED_SOURCES: &[&str] = &["mise", "nodenv", "nvm", "homebrew"];
+/// One installed version of a tool, as its own executable reports it.
+/// `bin` is the directory that holds the executable on this worker.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DetectedInstall {
+    pub tool: String,
+    pub version: String,
+    pub source: String,
+    pub bin: std::path::PathBuf,
+    pub identity: Digest,
 }
 /// Most installed rustup toolchains a worker probes (spec 22.1).
 pub const MAX_DETECTED_RUSTUP: usize = 16;
@@ -193,6 +220,13 @@ impl WorkerCapabilities {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                     && r.bin.is_absolute()
+            })
+            && self.installs.len() <= MAX_DETECTED_INSTALLS
+            && self.installs.iter().all(|i| {
+                DETECTED_TOOLS.iter().any(|(t, _, _)| *t == i.tool)
+                    && DETECTED_SOURCES.contains(&i.source.as_str())
+                    && valid_version(&i.version)
+                    && i.bin.is_absolute()
             })
     }
 }
@@ -274,6 +308,7 @@ mod tests {
             tools: BTreeMap::new(),
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         }
     }
     /// A report's detected rustup toolchains are bounded and well formed

@@ -1604,6 +1604,7 @@ fn compose_activation(
         if !selected
             || !tools.insert(tool.tool.clone())
             || tool.rustup.is_none()
+                && tool.bin.is_none()
                 && MatchPolicy::Exact.compare(
                     &VersionObservation::Known(tool.version.clone()),
                     base_observations
@@ -1612,6 +1613,12 @@ fn compose_activation(
                 ) != Match::Match
         {
             return Err("activation_native_mismatch");
+        }
+        if let Some(bin) = &tool.bin {
+            if !clean_absolute(bin) {
+                return Err("activation_native_mismatch");
+            }
+            paths.push(bin.clone());
         }
         if let Some((bin, name)) = &tool.rustup {
             if !clean_absolute(bin) {

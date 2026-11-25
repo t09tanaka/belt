@@ -1786,6 +1786,7 @@ fn a_native_selection_adds_no_private_path_and_its_identity_is_the_receipt() {
         version: Version::parse(version).unwrap(),
         identity: Digest::of_bytes(identity),
         rustup: None,
+        bin: None,
     };
     let seen =
         |version: &str| BTreeMap::from([(f.plan.tool.clone(), VersionObservation::parse(version))]);
@@ -1961,6 +1962,7 @@ fn a_managed_install_that_would_run_in_place_of_a_native_tool_is_refused() {
             version: Version::parse("1.2.3").unwrap(),
             identity: Digest::of_bytes(b"measured on the profile path"),
             rustup: None,
+            bin: None,
         }];
         let activate = |f: &Fixture,
                         frozen: &FrozenToolchains,
@@ -2065,6 +2067,7 @@ fn a_detected_rustup_toolchain_goes_first_on_the_path_and_is_named() {
         version: selected.clone(),
         identity: Digest::of_bytes(b"detected"),
         rustup: Some((bin.clone(), "x-host".into())),
+        bin: None,
     };
     // The profile's own rust is another version: the toolchain still serves.
     let observed = BTreeMap::from([(f.plan.tool.clone(), VersionObservation::parse("9.9.9"))]);
@@ -2087,12 +2090,53 @@ fn a_detected_rustup_toolchain_goes_first_on_the_path_and_is_named() {
     // A tool of the profile path at another version is no match.
     let plain = NativeTool {
         rustup: None,
+        bin: None,
         ..detected.clone()
     };
     assert_eq!(activate(&[plain]), Err("activation_native_mismatch"));
     // A relative bin is refused.
     let relative = NativeTool {
         rustup: Some(("bin".into(), "x-host".into())),
+        bin: None,
+        ..detected
+    };
+    assert_eq!(activate(&[relative]), Err("activation_native_mismatch"));
+}
+#[test]
+fn a_detected_manager_install_goes_first_on_the_path() {
+    use crate::toolchain::contract::NativeTool;
+    use crate::toolchain::versions::VersionObservation;
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let frozen = &f.plan.frozen;
+    let env = base_env(&f.plan);
+    let bin = PathBuf::from("/fake-nodenv/versions/20.11.1/bin");
+    let detected = NativeTool {
+        tool: f.plan.tool.clone(),
+        version: f.plan.version.clone(),
+        identity: Digest::of_bytes(b"detected"),
+        rustup: None,
+        bin: Some(bin.clone()),
+    };
+    // The profile's own node is another version: the install still serves.
+    let observed = BTreeMap::from([(f.plan.tool.clone(), VersionObservation::parse("9.9.9"))]);
+    let activate = |native: &[NativeTool]| {
+        activate_with_native(
+            frozen,
+            &[],
+            native,
+            Digest::of_bytes(b"base"),
+            &observed,
+            &env,
+            Digest::of_bytes(b"policy"),
+            &f.shell,
+        )
+    };
+    let receipt = activate(std::slice::from_ref(&detected)).unwrap();
+    let path = &receipt.environment["PATH"];
+    assert!(path.starts_with(&format!("{}:", bin.display())), "{path}");
+    assert!(!receipt.environment.contains_key("RUSTUP_TOOLCHAIN"));
+    let relative = NativeTool {
+        bin: Some("bin".into()),
         ..detected
     };
     assert_eq!(activate(&[relative]), Err("activation_native_mismatch"));

@@ -233,6 +233,14 @@ fn measure(
             rust.installed.push(detected.version.clone());
         }
     }
+    // So is a version another manager of the user (mise, nodenv, nvm,
+    // Homebrew) already has.
+    for detected in &report.installs {
+        let tool = managed.entry(detected.tool.clone()).or_default();
+        if !tool.installed.contains(&detected.version) {
+            tool.installed.push(detected.version.clone());
+        }
+    }
     let tools = TOOLS
         .iter()
         .filter(|name| crate::workspace::embedded::version(name).is_none())

@@ -2772,6 +2772,7 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
             .into(),
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
+            installs: Vec::new(),
             disk_free_bytes: None,
             resource_budget: None,
             cpu_cores: None,
