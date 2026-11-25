@@ -155,18 +155,19 @@ struct Resolution {
     held: Vec<String>,
 }
 
-/// `next`, where a tool that is no longer `Available` only because it gave
-/// no answer keeps the `Available` of `previous`. Any other answer, a new
-/// version, an absent or failing tool, replaces it. The names kept are
-/// returned.
+/// `next`, where a tool that is no longer `Available` only because its
+/// probe ran out of time (`timed_out`) keeps the `Available` of `previous`.
+/// Any answer, a new version, an absent or failing tool, replaces it. The
+/// names kept are returned.
 fn settle(
     previous: Option<&WorkerCapabilities>,
     mut next: WorkerCapabilities,
+    timed_out: &[String],
 ) -> (WorkerCapabilities, Vec<String>) {
     let mut held = Vec::new();
     if let Some(previous) = previous {
         for (tool, observed) in next.tools.iter_mut() {
-            if matches!(observed, ToolObservation::Unknown) {
+            if matches!(observed, ToolObservation::Unknown) && timed_out.contains(tool) {
                 if let Some(before @ ToolObservation::Available { .. }) = previous.tools.get(tool) {
                     *observed = before.clone();
                     held.push(tool.clone());
@@ -561,16 +562,27 @@ impl Profile {
             }
         }
     }
+    /// What admission and toolchain activation check a task against,
+    /// measured now with the startup bounds: a probe that runs late is
+    /// called again (at most 5s + 14 calls x 300ms), and a tool whose calls
+    /// all ran out of time keeps the version measured before. A failing,
+    /// absent or changed tool is reported as it is now. Also refreshes what
+    /// toolchain questions are answered from.
+    pub(crate) fn checked_report(&self) -> (WorkerCapabilities, Vec<String>) {
+        let (_, checked) = self.remeasure();
+        (checked.report, checked.held)
+    }
     /// The published measurement, and what toolchain questions are
     /// answered from.
     fn remeasure(&self) -> (WorkerCapabilities, Resolution) {
         let files = self.drift_identity();
-        let report = self.measured_report(Some(STARTUP_PROBES));
+        let mut timed_out = Vec::new();
+        let report = self.measured_report_noting(Some(STARTUP_PROBES), &mut timed_out);
         let mut slot = match self.resolution.lock() {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let (settled, held) = settle(slot.as_ref().map(|r| &r.report), report.clone());
+        let (settled, held) = settle(slot.as_ref().map(|r| &r.report), report.clone(), &timed_out);
         let measured = Resolution {
             report: settled,
             files,
@@ -601,9 +613,18 @@ impl Profile {
         )
     }
     fn measured_report(&self, startup: Option<StartupProbes>) -> WorkerCapabilities {
+        self.measured_report_noting(startup, &mut Vec::new())
+    }
+    /// The same, adding to `timed_out` the tools whose startup probes all
+    /// ran out of time.
+    fn measured_report_noting(
+        &self,
+        startup: Option<StartupProbes>,
+        timed_out: &mut Vec<String>,
+    ) -> WorkerCapabilities {
         let files_before = self.executable_identity();
         let tools: BTreeMap<_, _> = match startup {
-            Some(limits) => self.startup_probes(TOOLS.iter().copied(), limits),
+            Some(limits) => self.startup_probes_noting(TOOLS.iter().copied(), limits, timed_out),
             None => TOOLS
                 .iter()
                 .map(|t| (t.to_string(), self.probe(t)))
@@ -1057,6 +1078,14 @@ impl Profile {
         tools: impl Iterator<Item = &'a str>,
         limits: StartupProbes,
     ) -> BTreeMap<String, ToolObservation> {
+        self.startup_probes_noting(tools, limits, &mut Vec::new())
+    }
+    fn startup_probes_noting<'a>(
+        &self,
+        tools: impl Iterator<Item = &'a str>,
+        limits: StartupProbes,
+        noted: &mut Vec<String>,
+    ) -> BTreeMap<String, ToolObservation> {
         let clock = StartupClock::start(limits);
         let mut observed = BTreeMap::new();
         let mut timed_out = Vec::new();
@@ -1085,6 +1114,7 @@ impl Profile {
             timed_out = still;
         }
         for tool in timed_out {
+            noted.push(tool.to_string());
             observed.insert(tool.to_string(), ToolObservation::Unknown);
         }
         observed
@@ -1771,11 +1801,16 @@ mod tests {
         next.tools.insert("node".into(), ToolObservation::Unknown);
         next.tools
             .insert("npm".into(), ToolObservation::Unavailable);
-        let (settled, held) = settle(Some(&before), next.clone());
+        let timed_out = ["node".to_string()];
+        let (settled, held) = settle(Some(&before), next.clone(), &timed_out);
         assert_eq!(settled.tools["node"], before.tools["node"]);
         assert_eq!(settled.tools["npm"], ToolObservation::Unavailable);
         assert_eq!(held, ["node"]);
-        let (first, held) = settle(None, next);
+        // A probe that failed is an answer: unknown, not held.
+        let (failed, held) = settle(Some(&before), next.clone(), &[]);
+        assert_eq!(failed.tools["node"], ToolObservation::Unknown);
+        assert!(held.is_empty());
+        let (first, held) = settle(None, next, &timed_out);
         assert_eq!(first.tools["node"], ToolObservation::Unknown);
         assert!(held.is_empty());
     }

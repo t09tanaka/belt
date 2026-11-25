@@ -1921,7 +1921,7 @@ impl Agent {
         // One report decides what is native and is what the activation is
         // checked against.
         let measured = std::cell::OnceCell::new();
-        let measure = || measured.get_or_init(|| self.capabilities()).clone();
+        let measure = || measured.get_or_init(|| self.measured()).clone();
         let ProvidedToolchains { requests, native } = self.toolchain_requests(&bundle, &measure)?;
         let mut receipts = Vec::with_capacity(requests.len());
         for request in &requests {
@@ -2007,9 +2007,8 @@ impl Agent {
         // made from: two probes could differ and refuse a tool that did not
         // change. With no native tool nothing is measured here.
         let measured = std::cell::OnceCell::new();
-        let ProvidedToolchains { requests, native } = self.toolchain_requests(bundle, &|| {
-            measured.get_or_init(|| self.capabilities()).clone()
-        })?;
+        let ProvidedToolchains { requests, native } =
+            self.toolchain_requests(bundle, &|| measured.get_or_init(|| self.measured()).clone())?;
         let profile = self
             .cfg
             .capability_profile
@@ -2061,16 +2060,21 @@ impl Agent {
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
         let (native, report) = if native.is_empty() {
-            (native, profile.report())
+            (native, self.measured().unwrap_or_else(|| profile.report()))
         } else if requests.is_empty() {
             // Nothing was waited for: the report that named the native tools.
             let report = measured.into_inner().flatten();
-            (native, report.unwrap_or_else(|| profile.report()))
+            (
+                native,
+                report
+                    .or_else(|| self.measured())
+                    .unwrap_or_else(|| profile.report()),
+            )
         } else {
             // An install may have taken long. What is native is decided again
             // from the report of this moment, and the activation uses that
             // same report: a tool that changed meanwhile is refused here.
-            let report = self.capabilities().ok_or_else(|| {
+            let report = self.measured().ok_or_else(|| {
                 ApiError::blocked(
                     crate::error::BlockedReason::EnvironmentMismatch,
                     "accepted base profile changed",
@@ -4152,6 +4156,30 @@ impl Agent {
     pub(crate) fn capabilities(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
         self.capabilities_with_diagnostic().ok().flatten()
     }
+    /// The report admission and toolchain activation check a task against
+    /// ([`crate::toolchain::profile::Profile::checked_report`]): a probe that
+    /// runs late on a loaded host is called again within the startup bound,
+    /// and one that still gives no answer keeps the version measured before;
+    /// it is never taken for a mismatch. A real version change still is one.
+    fn measured_with_diagnostic(
+        &self,
+    ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
+        let Some(profile) = &self.cfg.capability_profile else {
+            return Ok(None);
+        };
+        let (report, held) = profile.checked_report();
+        if !held.is_empty() {
+            self.note_global("agent_toolchain_probe_held", "", json!({ "tools": held }));
+        }
+        if report.profile_fingerprint == self.cfg.profile_fingerprint {
+            Ok(Some(report))
+        } else {
+            Err(profile.identity_failure_message(&report))
+        }
+    }
+    fn measured(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
+        self.measured_with_diagnostic().ok().flatten()
+    }
     fn check_profile_identity(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
         if let Some(expected) = rec.spec.get("_worker_profile_fingerprint") {
             if expected
@@ -4170,7 +4198,7 @@ impl Agent {
         payload.requirements.validate().map_err(invalid)?;
         if let Some(bundle) = &payload.toolchains {
             bundle.validate(&payload.manifest_digest).map_err(invalid)?;
-            self.toolchain_requests(bundle, &|| self.capabilities())?;
+            self.toolchain_requests(bundle, &|| self.measured())?;
         }
         if let Some(profile) = &self.cfg.capability_profile {
             for command in &payload.commands {
@@ -4184,7 +4212,7 @@ impl Agent {
                 }
             }
         }
-        let report = self.capabilities_with_diagnostic().map_err(|message| {
+        let report = self.measured_with_diagnostic().map_err(|message| {
             ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, message)
         })?;
         if let Some(bundle) = &payload.toolchains {
