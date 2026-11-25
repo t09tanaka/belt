@@ -956,6 +956,7 @@ mod tests {
                 .collect(),
             features: [capability::FEATURE.to_string()].into(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         }
     }
 

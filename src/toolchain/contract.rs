@@ -148,6 +148,9 @@ pub struct NativeTool {
     /// the attempt's PATH and `RUSTUP_TOOLCHAIN` names it. `None` for a tool
     /// on the profile path.
     pub rustup: Option<(std::path::PathBuf, String)>,
+    /// The `bin` directory of a version a manager of the user installed
+    /// (spec 22.1): it goes first on the attempt's PATH. `None` otherwise.
+    pub bin: Option<std::path::PathBuf>,
 }
 /// The native tool that serves the selection of `tool`, if the profile probe
 /// reports exactly the selected version.
@@ -164,7 +167,8 @@ pub fn native_tool(
         observed.get(tool).unwrap_or(&VersionObservation::Unknown),
     ) != Match::Match
     {
-        return detected_rustup(&selection.concrete, tool, report);
+        return detected_rustup(&selection.concrete, tool, report)
+            .or_else(|| detected_install(&selection.concrete, tool, report));
     }
     let probes: Vec<_> = report
         .tools
@@ -179,6 +183,7 @@ pub fn native_tool(
                 .expect("native identity serializes"),
         ),
         rustup: None,
+        bin: None,
     })
 }
 /// The rustup toolchain of `report` that reports exactly `version`, as the
@@ -204,11 +209,35 @@ fn detected_rustup(
                 .expect("detected identity serializes"),
         ),
         rustup: Some((found.bin.clone(), found.name.clone())),
+        bin: None,
+    })
+}
+/// The install of a manager of the user in `report` whose executable
+/// reports exactly `version`, as the native tool for `tool`.
+fn detected_install(
+    version: &node_semver::Version,
+    tool: &super::versions::ToolId,
+    report: &super::capability::WorkerCapabilities,
+) -> Option<NativeTool> {
+    let found = report.installs.iter().find(|i| {
+        i.tool == tool.as_str()
+            && node_semver::Version::parse(&i.version).ok().as_ref() == Some(version)
+    })?;
+    Some(NativeTool {
+        tool: tool.clone(),
+        version: version.clone(),
+        identity: Digest::of_bytes(
+            &serde_json::to_vec(&("install_detected_v1", version, found))
+                .expect("detected identity serializes"),
+        ),
+        rustup: None,
+        bin: Some(found.bin.clone()),
     })
 }
 /// The highest version of the user's rustup toolchains in `report` that
 /// every constraint of `requirement` accepts, as resolution evidence
-/// (domain `worker_detected_rustup_v1`). Only `rust` is detected.
+/// (domain `worker_detected_rustup_v1`); for another tool, the highest
+/// version the user's version managers have (`worker_detected_install_v1`).
 ///
 /// The channel `stable` means the worker's installed `stable-<host>`
 /// toolchain, as GitHub's `stable` means the latest stable release: never
@@ -220,35 +249,49 @@ pub fn detected_rustup_evidence(
     report: &super::capability::WorkerCapabilities,
 ) -> Option<ResolutionEvidence> {
     use super::versions::{Constraint, Match, VersionObservation};
-    if requirement.tool.as_str() != "rust" {
-        return None;
-    }
+    let tool = requirement.tool.as_str();
     let mut channel = None;
     let mut ranges = Vec::new();
     for constraint in &requirement.constraints {
         match constraint {
-            Constraint::Resolve(name) if name == "stable" => channel = Some(name.clone()),
+            Constraint::Resolve(name) if tool == "rust" && name == "stable" => {
+                channel = Some(name.clone())
+            }
             Constraint::Range(_) | Constraint::Pub(_) => ranges.push(constraint),
             _ => return None,
         }
     }
-    let best = report
-        .rustup
-        .iter()
-        .filter(|r| channel.is_none() || r.name.starts_with("stable-"))
-        .filter_map(|r| node_semver::Version::parse(&r.version).ok())
+    let (found, domain): (Vec<(&str, &str)>, _) = if tool == "rust" {
+        (
+            report
+                .rustup
+                .iter()
+                .map(|r| (r.name.as_str(), r.version.as_str()))
+                .collect(),
+            "worker_detected_rustup_v1",
+        )
+    } else {
+        (
+            report
+                .installs
+                .iter()
+                .filter(|i| i.tool == tool)
+                .map(|i| (i.source.as_str(), i.version.as_str()))
+                .collect(),
+            "worker_detected_install_v1",
+        )
+    };
+    let best = found
+        .into_iter()
+        .filter(|(name, _)| channel.is_none() || name.starts_with("stable-"))
+        .filter_map(|(_, v)| node_semver::Version::parse(v).ok())
         .filter(|v| channel.is_none() || !v.is_prerelease())
         .filter(|v| {
             let seen = VersionObservation::Known(v.clone());
             ranges.iter().all(|c| c.matches(&seen) == Match::Match)
         })
         .max()?;
-    let mut evidence = proof(
-        frozen,
-        requirement,
-        best.clone(),
-        "worker_detected_rustup_v1",
-    );
+    let mut evidence = proof(frozen, requirement, best.clone(), domain);
     if let Some(channel) = channel {
         evidence.resolved_inputs.insert(channel, best);
     }
@@ -540,6 +583,7 @@ mod tests {
             tools: Default::default(),
             features: Default::default(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         };
         let mut frozen = bundle("20.0.0").frozen;
         assert_eq!(check_baselines(&frozen, None), Ok(()));
@@ -852,6 +896,7 @@ mod tests {
                 .collect(),
             features: Default::default(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         }
     }
     #[test]
@@ -972,6 +1017,46 @@ mod tests {
         assert!(
             detected_rustup_evidence(&node.frozen, &node.frozen.requirements[0], &report).is_none()
         );
+    }
+    /// Spec 22.1: a node version a manager of the user has resolves a
+    /// range and serves it from its own `bin`.
+    #[test]
+    fn an_installed_manager_version_resolves_and_serves_a_node_range() {
+        let node = ToolId::parse("node").unwrap();
+        let open = bundle_for("node", "20");
+        let requirement = open.frozen.requirements[0].clone();
+        let mut report = rustup_report(&[]);
+        report.installs = [
+            ("18.19.0", "nvm"),
+            ("20.11.1", "nodenv"),
+            ("20.12.0-rc.1", "mise"),
+        ]
+        .iter()
+        .map(
+            |(version, source)| crate::toolchain::capability::DetectedInstall {
+                tool: "node".into(),
+                version: (*version).into(),
+                source: (*source).into(),
+                bin: format!("/{source}/{version}/bin").into(),
+                identity: Digest::of_bytes(version.as_bytes()),
+            },
+        )
+        .collect();
+        let evidence = detected_rustup_evidence(&open.frozen, &requirement, &report).unwrap();
+        assert_eq!(evidence.concrete.to_string(), "20.11.1");
+        let mut sealed = open.clone();
+        sealed.frozen = adapters::resolve(&open.frozen, &evidence).unwrap();
+        sealed.evidence.push(evidence);
+        sealed.validate(&sealed.frozen.source_manifest).unwrap();
+        let native = native_tool(&sealed.frozen, &node, &report).unwrap();
+        assert_eq!(native.bin, Some("/nodenv/20.11.1/bin".into()));
+        assert_eq!(native.rustup, None);
+        // A version of another tool never serves node.
+        for install in &mut report.installs {
+            install.tool = "python".into();
+        }
+        assert!(detected_rustup_evidence(&open.frozen, &requirement, &report).is_none());
+        assert!(native_tool(&sealed.frozen, &node, &report).is_none());
     }
     /// `stable` is the worker's installed `stable-<host>` toolchain, as
     /// GitHub's `stable` is the latest stable release: not the profile's own

@@ -1,7 +1,7 @@
 //! Private worker-local profiles. No submitted project can supply this file.
 use super::capability::{
-    valid_name, valid_version, DetectedRustup, ToolObservation, WorkerCapabilities, FEATURES,
-    MAX_DETECTED_RUSTUP, TOOLS,
+    valid_name, valid_version, DetectedInstall, DetectedRustup, ToolObservation,
+    WorkerCapabilities, FEATURES, MAX_DETECTED_RUSTUP, TOOLS,
 };
 use crate::ids::Digest;
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,8 @@ pub struct Profile {
     /// What each detected rustup toolchain answered, by name, with the file
     /// identities it answered for: unchanged files are not probed again.
     rustup_seen: Arc<Mutex<BTreeMap<String, (RustupFiles, DetectedRustup)>>>,
+    /// The same for each detected install, by tool and `bin` directory.
+    installs_seen: Arc<Mutex<InstallsSeen>>,
     /// The live deadline of one fixed call; only tests that are not about the
     /// deadline replace it.
     probe_timeout: Duration,
@@ -155,6 +157,8 @@ struct ReportIdentity {
     /// these only: a toolchain installed after it is not used before a
     /// restart, and one removed or changed is drift.
     rustup: Vec<DetectedRustup>,
+    /// The same for the installs of the user's version managers.
+    installs: Vec<DetectedInstall>,
 }
 
 impl std::fmt::Debug for Profile {
@@ -339,6 +343,7 @@ impl Profile {
             completed_report: Arc::new(Mutex::new(None)),
             report_sequence: Arc::new(AtomicU64::new(0)),
             rustup_seen: Arc::new(Mutex::new(BTreeMap::new())),
+            installs_seen: Arc::new(Mutex::new(BTreeMap::new())),
             probe_timeout: PROBE_TIMEOUT,
         };
         // Loading is part of startup: a cold required tool gets the startup
@@ -495,10 +500,12 @@ impl Profile {
                 .map(|t| (t.to_string(), self.probe(t)))
                 .collect(),
         };
-        let rustup = self.detect_rustup(match startup {
+        let call = match startup {
             Some(limits) => limits.call,
             None => self.probe_timeout,
-        });
+        };
+        let rustup = self.detect_rustup(call);
+        let installs = self.detect_installs(call);
         let os = match std::env::consts::OS {
             "macos" => "macos",
             other => other,
@@ -539,6 +546,9 @@ impl Profile {
         if !rustup.is_empty() {
             bytes.extend(serde_json::to_vec(&rustup).expect("rustup serializes"));
         }
+        if !installs.is_empty() {
+            bytes.extend(serde_json::to_vec(&installs).expect("installs serialize"));
+        }
         let files = self.executable_identity();
         let observed_fingerprint = Digest::of_bytes(
             &serde_json::to_vec(&(&bytes, &files_before, &files))
@@ -556,9 +566,11 @@ impl Profile {
                     fingerprint: observed_fingerprint.clone(),
                     tools: tools.clone(),
                     rustup: rustup.clone(),
+                    installs: installs.clone(),
                 });
                 let unchanged = files_before == files
                     && baseline.rustup == rustup
+                    && baseline.installs == installs
                     && baseline.files == files
                     && baseline.context == context
                     && tools.iter().all(|(tool, observed)| {
@@ -599,6 +611,7 @@ impl Profile {
             tools,
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
             rustup,
+            installs,
         };
         // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
         #[allow(deprecated)]
@@ -828,6 +841,94 @@ impl Profile {
         found.sort();
         found
     }
+    /// The tool versions the user's version managers already have, read
+    /// only (spec 22.1): directory listings of mise, nodenv, nvm and
+    /// Homebrew, then each candidate's own executable with a bounded probe.
+    /// Nothing runs a manager, installs or writes. Same bounds as
+    /// [`Self::detect_rustup`]: at most [`super::capability::MAX_DETECTED_INSTALLS`]
+    /// candidates, one shared deadline, only the first report's installs are
+    /// looked at again, and unchanged files are not probed again.
+    fn detect_installs(&self, call: Duration) -> Vec<DetectedInstall> {
+        let env = self.host_environment();
+        let baseline = match self.report_identity.lock() {
+            Ok(retained) => retained.as_ref().map(|r| r.installs.clone()),
+            Err(_) => return Vec::new(),
+        };
+        let candidates: Vec<super::installs::Candidate> = match baseline {
+            Some(baseline) => baseline
+                .into_iter()
+                .filter_map(|d| {
+                    let (tool, exe, arg) = super::capability::DETECTED_TOOLS
+                        .iter()
+                        .find(|(t, _, _)| *t == d.tool)?;
+                    let source = super::capability::DETECTED_SOURCES
+                        .iter()
+                        .find(|s| **s == d.source)?;
+                    Some(super::installs::Candidate {
+                        tool,
+                        exe,
+                        arg,
+                        source,
+                        bin: d.bin,
+                    })
+                })
+                .collect(),
+            None => super::installs::candidates(&env),
+        };
+        let started = Instant::now();
+        let mut found = Vec::new();
+        for c in candidates
+            .into_iter()
+            .take(super::capability::MAX_DETECTED_INSTALLS)
+        {
+            let exe = c.bin.join(c.exe);
+            let Some(stamp) = file_stamp(&exe) else {
+                continue;
+            };
+            let key = (c.tool.to_string(), c.bin.clone());
+            let seen = self.installs_seen.lock().ok().and_then(|seen| {
+                seen.get(&key)
+                    .filter(|(at, _)| *at == stamp)
+                    .map(|(_, detected)| detected.clone())
+            });
+            if let Some(detected) = seen {
+                found.push(detected);
+                continue;
+            }
+            let deadline = INSTALL_DETECTION_TOTAL
+                .saturating_sub(started.elapsed())
+                .min(call);
+            if deadline.is_zero() {
+                break;
+            }
+            let Ok(out) = bounded_probe(&exe, &[c.arg], &env, deadline) else {
+                continue;
+            };
+            let Some(version) = super::installs::reported_version(c.tool, &out) else {
+                continue;
+            };
+            // The file must be the one that answered.
+            if file_stamp(&exe).as_ref() != Some(&stamp) {
+                continue;
+            }
+            let detected = DetectedInstall {
+                tool: c.tool.into(),
+                version: version.clone(),
+                source: c.source.into(),
+                bin: c.bin.clone(),
+                identity: Digest::of_bytes(
+                    &serde_json::to_vec(&("detected_install_v1", &stamp, &version))
+                        .expect("install identity serializes"),
+                ),
+            };
+            if let Ok(mut seen) = self.installs_seen.lock() {
+                seen.insert(key, (stamp, detected.clone()));
+            }
+            found.push(detected);
+        }
+        found.sort();
+        found
+    }
     fn probe(&self, tool: &str) -> ToolObservation {
         self.probe_within(tool, &|| self.probe_timeout)
             .unwrap_or(ToolObservation::Unknown)
@@ -983,8 +1084,12 @@ impl Profile {
 }
 /// The whole time one detection of rustup toolchains may take (spec 22.1).
 const RUSTUP_DETECTION_TOTAL: Duration = Duration::from_secs(8);
+/// The whole time one detection of other installed tools may take.
+const INSTALL_DETECTION_TOTAL: Duration = Duration::from_secs(8);
 /// Entries of the toolchains directory read at most.
 const MAX_RUSTUP_ENTRIES: usize = 1024;
+/// What each detected install answered, by tool and bin directory.
+type InstallsSeen = BTreeMap<(String, PathBuf), (FileStamp, DetectedInstall)>;
 /// File identities of a toolchain's `rustc` and `cargo`.
 type RustupFiles = (FileStamp, FileStamp);
 type FileStamp = (PathBuf, u64, u64, u64, i64, i64, i64, i64, u32);
@@ -2502,5 +2607,51 @@ mod rustup_tests {
         assert!(report.rustup.is_empty());
         let json = serde_json::to_value(&report).unwrap();
         assert!(json.get("rustup").is_none());
+    }
+
+    /// Spec 22.1: a node version the user's nodenv has is in the report,
+    /// as its own executable reports it. A version installed after the
+    /// first report is not looked at before a restart; a changed one is
+    /// drift.
+    #[test]
+    fn installed_node_versions_are_detected_and_a_change_is_drift() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let bin = root.path().join(".nodenv/versions/20.11.1/bin");
+        fs::create_dir_all(&bin).unwrap();
+        script(&bin.join("node"), "echo v20.11.1");
+        let mut env: BTreeMap<String, String> = [
+            ("PATH".into(), root.path().to_str().unwrap().into()),
+            ("HOME".into(), root.path().to_str().unwrap().into()),
+        ]
+        .into();
+        for (key, dir) in [("HOMEBREW_PREFIX", "brew"), ("MISE_DATA_DIR", "mise")] {
+            env.insert(key.into(), root.path().join(dir).to_str().unwrap().into());
+        }
+        let profile = patient(Profile::load(root.path(), &env).unwrap());
+        let initial = profile.startup_report();
+        assert!(initial.validate());
+        let found: Vec<_> = initial
+            .installs
+            .iter()
+            .map(|i| {
+                (
+                    i.tool.as_str(),
+                    i.version.as_str(),
+                    i.source.as_str(),
+                    &i.bin,
+                )
+            })
+            .collect();
+        assert_eq!(found, [("node", "20.11.1", "nodenv", &bin)]);
+        let later = root.path().join(".nodenv/versions/22.1.0/bin");
+        fs::create_dir_all(&later).unwrap();
+        script(&later.join("node"), "echo v22.1.0");
+        let again = profile.report();
+        assert_eq!(again.installs, initial.installs);
+        assert_eq!(again.profile_fingerprint, initial.profile_fingerprint);
+        script(&bin.join("node"), "echo v20.11.2");
+        let changed = profile.report();
+        assert_eq!(changed.installs[0].version, "20.11.2");
+        assert_ne!(changed.profile_fingerprint, initial.profile_fingerprint);
     }
 }

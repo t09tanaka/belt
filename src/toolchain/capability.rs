@@ -170,6 +170,33 @@ pub struct WorkerCapabilities {
     /// without them serializes as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rustup: Vec<DetectedRustup>,
+    /// Versions of other tools the user's version managers already have
+    /// (mise, nodenv, nvm, Homebrew), found read-only (spec 22.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installs: Vec<DetectedInstall>,
+}
+/// Most installed tool versions a worker probes, over every manager
+/// (spec 22.1).
+pub const MAX_DETECTED_INSTALLS: usize = 32;
+/// The tools detection looks for, with the executable that reports the
+/// version and its argument.
+pub const DETECTED_TOOLS: &[(&str, &str, &str)] = &[
+    ("node", "node", "-v"),
+    ("python", "python3", "--version"),
+    ("go", "go", "version"),
+    ("ruby", "ruby", "-v"),
+];
+/// The version managers detection reads.
+pub const DETECTED_SOURCES: &[&str] = &["mise", "nodenv", "nvm", "homebrew"];
+/// One installed version of a tool, as its own executable reports it.
+/// `bin` is the directory that holds the executable on this worker.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DetectedInstall {
+    pub tool: String,
+    pub version: String,
+    pub source: String,
+    pub bin: std::path::PathBuf,
+    pub identity: Digest,
 }
 /// Most installed rustup toolchains a worker probes (spec 22.1).
 pub const MAX_DETECTED_RUSTUP: usize = 16;
@@ -209,6 +236,13 @@ impl WorkerCapabilities {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                     && r.bin.is_absolute()
+            })
+            && self.installs.len() <= MAX_DETECTED_INSTALLS
+            && self.installs.iter().all(|i| {
+                DETECTED_TOOLS.iter().any(|(t, _, _)| *t == i.tool)
+                    && DETECTED_SOURCES.contains(&i.source.as_str())
+                    && valid_version(&i.version)
+                    && i.bin.is_absolute()
             })
     }
 }
@@ -290,6 +324,7 @@ mod tests {
             tools: BTreeMap::new(),
             features: [FEATURE.into()].into(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         }
     }
     /// The tools preparation runs are added once each, beside what was
@@ -346,6 +381,36 @@ mod tests {
         assert!(!with(vec![one("1.89.0", "1.89.0", "r/bin")]).validate());
         // A bad entry after a good one still refuses the report.
         assert!(!with(vec![good, one("", "1.89.0", "/r/bin")]).validate());
+    }
+    #[test]
+    fn detected_installs_are_validated() {
+        let one = |tool: &str, source: &str, version: &str, bin: &str| DetectedInstall {
+            tool: tool.into(),
+            version: version.into(),
+            source: source.into(),
+            bin: bin.into(),
+            identity: Digest::of_bytes(b"node"),
+        };
+        let with = |installs: Vec<DetectedInstall>| WorkerCapabilities {
+            installs,
+            ..report()
+        };
+        let good = one("node", "nodenv", "20.11.1", "/n/bin");
+        assert!(with(vec![good.clone()]).validate());
+        assert!(with(vec![good.clone(); MAX_DETECTED_INSTALLS]).validate());
+        assert!(!with(vec![good.clone(); MAX_DETECTED_INSTALLS + 1]).validate());
+        for (source, _) in DETECTED_SOURCES.iter().zip(0..) {
+            assert!(with(vec![one("node", source, "20.11.1", "/n/bin")]).validate());
+        }
+        for (tool, _, _) in DETECTED_TOOLS {
+            assert!(with(vec![one(tool, "mise", "1.2.3", "/n/bin")]).validate());
+        }
+        assert!(!with(vec![one("rustc", "mise", "20.11.1", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "asdf", "20.11.1", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "nodenv", "not a version", "/n/bin")]).validate());
+        assert!(!with(vec![one("node", "nodenv", "20.11.1", "n/bin")]).validate());
+        // A bad entry after a good one still refuses the report.
+        assert!(!with(vec![good, one("node", "asdf", "20.11.1", "/n/bin")]).validate());
     }
     #[test]
     fn eligible_selected_tool_is_distinct_from_its_native_unavailable_observation() {

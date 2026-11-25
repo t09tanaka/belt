@@ -6453,6 +6453,12 @@ async fn serve_rustup_worker(f: &Fx, home: &std::path::Path) -> Client {
 
 /// A request to resolve the Rust `constraint` of `p`'s source.
 fn ask_rust(p: &AttemptPayload, constraint: &str) -> Request {
+    ask_tool(p, "rust", "rust-toolchain", constraint)
+}
+
+/// A request to resolve the `tool` `constraint` that `path` of `p`'s source
+/// declares.
+fn ask_tool(p: &AttemptPayload, tool: &str, path: &str, constraint: &str) -> Request {
     use belt::toolchain::{contract::FrozenBundle, versions::*};
     let scope = Scope::project("");
     let bundle = FrozenBundle::seal_exact(
@@ -6461,11 +6467,11 @@ fn ask_rust(p: &AttemptPayload, constraint: &str) -> Request {
             Digest::of_bytes(b"parent"),
             scope.clone(),
             &[Declaration {
-                tool: ToolId::parse("rust").unwrap(),
+                tool: ToolId::parse(tool).unwrap(),
                 constraint: Constraint::parse(constraint).unwrap(),
                 scope: scope.clone(),
                 location: Location {
-                    path: "rust-toolchain".into(),
+                    path: path.into(),
                     first_line: 1,
                     last_line: 1,
                 },
@@ -6610,4 +6616,67 @@ async fn a_stable_task_activates_the_stable_toolchain_not_the_rustup_default() {
     let (bin, name) = native.rustup.unwrap();
     assert_eq!(name, format!("stable-{host}"));
     assert_eq!(bin, home.join(format!("toolchains/stable-{host}/bin")));
+}
+
+/// A worker with no toolchain registry whose user has node `versions` in a
+/// fake nodenv under the test directory, served over a connection. Homebrew
+/// and mise point at empty test directories too.
+async fn nodenv_worker(f: &Fx, versions: &[&str]) -> Client {
+    use belt::toolchain::profile::Profile;
+    let root = f.dir.path().join("nodenv");
+    std::fs::create_dir_all(root.join("versions")).unwrap();
+    for version in versions {
+        let bin = root.join(format!("versions/{version}/bin"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("node");
+        std::fs::write(&path, format!("#!/bin/sh\necho 'v{version}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let dir = |name: &str| f.dir.path().join(name).to_str().unwrap().to_string();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), f.dir.path().to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("NODENV_ROOT".into(), root.to_str().unwrap().into()),
+            ("HOMEBREW_PREFIX".into(), dir("brew")),
+            ("MISE_DATA_DIR".into(), dir("mise")),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(serve_connection(
+        agent,
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    connect(a, client_cfg(&f.cluster)).await.unwrap().client
+}
+
+/// The run4 evidence: a Mac whose node 20 lives only in nodenv was not a
+/// candidate for node 20. A worker without recipes resolves a node range
+/// from a version its user's version manager already has (spec 22.1).
+#[tokio::test]
+async fn a_worker_without_recipes_resolves_node_from_its_nodenv_versions() {
+    let f = fx();
+    let client = nodenv_worker(&f, &["18.19.0", "20.11.1"]).await;
+    let p = payload("exit 0");
+    let Response::ResolveToolchains(resolved) =
+        call(&client, ask_tool(&p, "node", ".node-version", "20"))
+            .await
+            .unwrap()
+    else {
+        panic!()
+    };
+    resolved.bundle.validate(&p.manifest_digest).unwrap();
+    assert_eq!(resolved.bundle.evidence[0].concrete.to_string(), "20.11.1");
+    assert!(call(&client, ask_tool(&p, "node", ".node-version", "22"))
+        .await
+        .is_err());
 }

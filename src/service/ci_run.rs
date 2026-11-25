@@ -938,6 +938,7 @@ mod tests {
                 .collect(),
             features: [crate::toolchain::capability::FEATURE.into()].into(),
             rustup: Vec::new(),
+            installs: Vec::new(),
         };
         let (mini, studio) = (
             worker(&["cargo", "rustc"]),
