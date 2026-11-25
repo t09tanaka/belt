@@ -197,7 +197,13 @@ fn defaults_apply_without_any_file() {
     assert_eq!(r.lease_seconds, v(60, d.clone()));
     assert_eq!(r.term_grace_seconds, v(10, d.clone()));
     assert_eq!(r.warmup_idle_seconds, v(60, d.clone()));
-    assert_eq!(r.max_active_task, v(2, d.clone()));
+    assert_eq!(
+        r.max_active_task,
+        v(
+            belt::config::resolve::host_default_max_active_task(),
+            d.clone()
+        )
+    );
     assert_eq!(r.log_spool_limit_bytes, v(1 << 30, d.clone()));
     assert_eq!(r.retention_days, v(7, d.clone()));
     assert_eq!(r.strategy, v(Strategy::EarliestFinish, d.clone()));
@@ -329,7 +335,10 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get2("coordinator.local_worker"), "true");
     assert_eq!(get2("coordinator.term_grace_seconds"), "10");
     assert_eq!(get2("coordinator.warmup_idle_seconds"), "60");
-    assert_eq!(get2("coordinator.max_active_task"), "2");
+    assert_eq!(
+        get2("coordinator.max_active_task"),
+        belt::config::resolve::host_default_max_active_task().to_string()
+    );
     assert_eq!(get2("coordinator.log_spool_limit_bytes"), "1073741824");
     assert_eq!(get2("coordinator.retention_days"), "7");
     assert_eq!(get2("scheduler.forecast_ttl_ms"), "2000");
@@ -1203,6 +1212,8 @@ fn runtime_settings_map_non_default_limits_and_timing() {
     let r = run(Some(text), None, None, &Overlay::default()).unwrap();
     let s = r.runtime_settings().unwrap();
     assert_eq!(s.coordinator.limits.max_active_task, 7);
+    assert_eq!(s.own_limits.max_active_task, 7);
+    assert_eq!(s.own_limits.prefetch_per_worker, 4);
     assert_eq!(s.coordinator.limits.prefetch_per_worker, 4);
     assert_eq!(s.coordinator.lease_ms, 12_000);
     assert_eq!(s.coordinator.worker_budget_ms, 3000);
@@ -1217,6 +1228,26 @@ fn runtime_settings_map_non_default_limits_and_timing() {
     assert_eq!(s.scheduler.rules.priority_step_ms, 9000);
     assert_eq!(s.scheduler.rules.tie_window_ms, 1000);
     assert_eq!(s.scheduler.forecast_wait_ms, 1000);
+}
+
+#[test]
+fn the_default_window_is_the_workers_own_and_an_explicit_value_wins() {
+    let r = run(None, None, None, &Overlay::default()).unwrap();
+    let s = r.runtime_settings().unwrap();
+    // The built-in window is this host's own, answered in inspect; as a
+    // parent it does not cap other workers, whose own answer applies.
+    assert_eq!(
+        s.own_limits.max_active_task,
+        belt::config::resolve::host_default_max_active_task()
+    );
+    assert_eq!(s.coordinator.limits.max_active_task, u32::MAX);
+    assert_eq!(s.own_limits.prefetch_per_worker, 1);
+    assert_eq!(s.coordinator.limits.prefetch_per_worker, 1);
+    let text = "schema_version = 1\n[coordinator]\nmax_active_task = 3\n";
+    let r = run(Some(text), None, None, &Overlay::default()).unwrap();
+    let s = r.runtime_settings().unwrap();
+    assert_eq!(s.own_limits.max_active_task, 3);
+    assert_eq!(s.coordinator.limits.max_active_task, 3);
 }
 
 #[test]
