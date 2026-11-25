@@ -29,6 +29,8 @@ struct Fixture {
     _temp: tempfile::TempDir,
     plan: InstallPlan,
     shell: FileIdentity,
+    /// What the plan was made from.
+    made: (ResolutionEvidence, PathBuf, HostTools),
 }
 fn fixture(kind: AdapterKind, tool: &str) -> Fixture {
     fixture_for_host(kind, tool, "aarch64-apple-darwin")
@@ -109,6 +111,7 @@ fn fixture_with(kind: AdapterKind, tool: &str, rust_host: &str, grown: &[(&str, 
         _temp: temp,
         plan,
         shell,
+        made: (evidence, state, host),
     }
 }
 #[derive(Default)]
@@ -2182,6 +2185,19 @@ fn preparation_probe_reads_a_large_manager_under_its_own_cap() {
     assert_eq!(f.plan.external[0].size, large);
     let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
     let budget = IdentityReadBudget::probe();
+    // Planning under the probe budget reads the manager as well.
+    let (evidence, state, host) = &f.made;
+    let planned = plan_with_limit(
+        AdapterKind::Mise,
+        &f.plan.frozen,
+        &f.plan.tool,
+        evidence,
+        state,
+        host,
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(planned.key(), f.plan.key());
     let verified = inspect_installation(f.plan.clone(), &budget).unwrap();
     assert_eq!(verified.digest(), hash(&(&f.plan.key(), &receipt.digest())));
     // The shared pool paid for none of the manager's bytes.
