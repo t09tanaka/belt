@@ -7056,3 +7056,80 @@ async fn a_slow_tool_probe_does_not_make_resolution_refuse_the_worker() {
         "a changed node version was not refused"
     );
 }
+
+/// run5 (`activation_baseline_mismatch` under load): a task whose baseline
+/// is the worker's npm runs although `npm --version` answers after the live
+/// 300ms probe deadline. Admission and activation check the measured
+/// profile, so a late probe is never a mismatch. A real version change is
+/// still refused.
+#[test]
+fn a_slow_tool_probe_is_no_baseline_mismatch_at_activation() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let task = |npm: &str| {
+        let mut p = payload("exit 0");
+        p.commands[0].env.clear();
+        let scope = Scope::project("");
+        let location = Location {
+            path: ".node-version".into(),
+            first_line: 1,
+            last_line: 1,
+        };
+        let npm_id = ToolId::parse("npm").unwrap();
+        p.toolchains = Some(Box::new(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    p.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse("22.1.0").unwrap(),
+                        scope,
+                        location: location.clone(),
+                    }],
+                    &[(npm_id.clone(), location)],
+                    &[(npm_id.clone(), VersionObservation::parse_for(&npm_id, npm))].into(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ));
+        p
+    };
+    let f = fx();
+    let base = std::fs::canonicalize(f.dir.path()).unwrap();
+    std::fs::create_dir_all(base.join("bin")).unwrap();
+    crate::common::write_executable(
+        &base.join("bin/npm"),
+        "#!/bin/sh\n/bin/sleep 0.6\necho 10.9.9\n",
+    );
+    let agent = mise_agent(&f, &["22.1.0"], false);
+    let p = task("10.9.9");
+    assert_eq!(p.toolchains.as_ref().unwrap().frozen.baseline.len(), 1);
+    let a = AttemptId::generate();
+    agent
+        .handle(mise_session(), submit_req(&a, &p))
+        .unwrap_or_else(|e| panic!("refused at admission: {e:?}"));
+    wait_for("the preparation", || {
+        f.host.prepared_with.lock().unwrap().len() == 1
+            || f.host.calls().iter().any(|c| c.starts_with("prepare"))
+    });
+    assert!(
+        f.host.prepared_with.lock().unwrap()[0].is_some(),
+        "prepared without the activated toolchain"
+    );
+    // npm now says another version: that is a mismatch.
+    let g = fx();
+    let base = std::fs::canonicalize(g.dir.path()).unwrap();
+    std::fs::create_dir_all(base.join("bin")).unwrap();
+    crate::common::write_executable(&base.join("bin/npm"), "#!/bin/sh\necho 10.9.9\n");
+    let agent = mise_agent(&g, &["22.1.0"], false);
+    crate::common::write_executable(&base.join("bin/npm"), "#!/bin/sh\necho 11.0.0\n");
+    assert!(agent
+        .handle(
+            mise_session(),
+            submit_req(&AttemptId::generate(), &task("10.9.9"))
+        )
+        .is_err());
+}
