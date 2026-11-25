@@ -119,6 +119,42 @@ fn metadata(context: &super::context::Context) -> (Option<String>, String, Strin
         .to_string();
     (id, cwd, "git".into())
 }
+/// The tools preparing a workspace of the Git working tree at `root` runs,
+/// from the files a capture would take (tracked and untracked, not ignored)
+/// and the root `.fast-worktree.toml`. Outside Git nothing is prepared.
+fn working_tree_prepare_tools(
+    root: Option<&std::path::Path>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<crate::workspace::prepare_tools::PrepareTools, String> {
+    let Some(root) = root else {
+        return Ok(Default::default());
+    };
+    let out = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(root)
+        .env_clear()
+        .envs(env)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("cannot list the working tree: {e}"))?;
+    if !out.status.success() {
+        return Err("cannot list the working tree".into());
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let config = match std::fs::read_to_string(root.join(".fast-worktree.toml")) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!(".fast-worktree.toml: {e}")),
+    };
+    let paths = listing.split('\0').filter(|p| !p.is_empty());
+    crate::workspace::prepare_tools::prepare_tools(paths, config.as_deref())
+}
 pub async fn command(
     context: super::context::Context,
     argv: Vec<String>,
@@ -129,11 +165,17 @@ pub async fn command(
         argv,
         repository_id,
         cwd_relative,
-        requirements: crate::toolchain::capability::ExecutionRequirements::parse(
-            context.config.profile.value.clone(),
-            &context.config.requires.value,
-        )
-        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e))?,
+        // As the submit does: with the tools the workspace's preparation
+        // runs, read from the working tree instead of a capture (spec 22.1).
+        requirements: super::ci_run::run_requirements(
+            crate::toolchain::capability::ExecutionRequirements::parse(
+                context.config.profile.value.clone(),
+                &context.config.requires.value,
+            )
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e))?,
+            &working_tree_prepare_tools(context.repo_root.as_deref(), &context.env)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e))?,
+        )?,
     };
     query.check()?;
     let store = super::bootstrap::read_only_store(&context.bootstrap)
@@ -257,5 +299,47 @@ pub fn cli(args: &crate::cli::EstimateArgs, json: bool) -> i32 {
             }
             error.code.exit_code()
         }
+    }
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    /// An estimate asks for the tools the workspace preparation runs, as the
+    /// submit does (spec 22.1): from the working tree, ignored files aside.
+    #[test]
+    fn estimate_requirements_include_the_preparation_tools_of_the_working_tree() {
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let root = temp.path();
+        let env: std::collections::BTreeMap<String, String> =
+            std::env::vars().filter(|(k, _)| k == "PATH").collect();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env_clear()
+                .envs(&env)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("Cargo.lock"), "").unwrap();
+        std::fs::create_dir(root.join("web")).unwrap();
+        std::fs::write(root.join("web/package-lock.json"), "{}").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/pubspec.lock"), "").unwrap();
+        let found = super::working_tree_prepare_tools(Some(root), &env).unwrap();
+        assert_eq!(
+            found.tools.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["node", "npm"]
+        );
+        assert!(super::working_tree_prepare_tools(None, &env)
+            .unwrap()
+            .tools
+            .is_empty());
+        std::fs::write(root.join(".fast-worktree.toml"), "[[clone]\n").unwrap();
+        assert!(super::working_tree_prepare_tools(Some(root), &env).is_err());
     }
 }

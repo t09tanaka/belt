@@ -409,6 +409,10 @@ async fn freeze_resolved_each(
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+    // Every task of the run shares the tools its preparation runs: when no
+    // worker reports them, no task can be placed, and the submit is refused
+    // with the reason, as when no worker resolves the toolchain (spec 22.1).
+    check_preparation(owner, requirements).await?;
     let plan = std::sync::Arc::new(plan);
     let (prepared, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
@@ -630,6 +634,40 @@ fn unresolved_aliases(
         !bundle.evidence.iter().any(|e| &e.tool == *tool)
     };
     aliases.iter().filter(open).cloned().collect()
+}
+
+/// Asks the owner whether some worker reports every tool the workspace's
+/// preparation runs. Requirements without such a tool ask nothing.
+async fn check_preparation(
+    owner: &super::resident::Client,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+) -> Result<(), ApiError> {
+    let prepares = requirements
+        .requires
+        .iter()
+        .any(|r| matches!(r, crate::toolchain::capability::Requirement::Prepare(_)));
+    if !prepares {
+        return Ok(());
+    }
+    let reply = owner
+        .request(Operation::CheckPreparation {
+            requirements: requirements.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    preparation_reply(reply)
+}
+
+/// Only the owner's answer that a worker can prepare lets the submit go on.
+fn preparation_reply(reply: Reply) -> Result<(), ApiError> {
+    match reply {
+        Reply::PreparationChecked => Ok(()),
+        Reply::ControlError { error } => Err(error),
+        _ => Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            "the owner did not say whether a worker can prepare the workspace",
+        )),
+    }
 }
 
 async fn resolve_bundle(
@@ -1480,5 +1518,29 @@ mod tests {
         assert_eq!(left_out(open(), &[false, false, false]), open());
         assert_eq!(left_out(open(), &[true, true, true]), []);
         assert_eq!(left_out(vec![tool("rust")], &[false]), [tool("rust")]);
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    /// Only the owner's yes goes on; its refusal is the submit's error, and
+    /// any other reply is no answer (spec 22.1).
+    #[test]
+    fn preparation_only_the_owners_yes_lets_the_submit_go_on() {
+        assert!(preparation_reply(Reply::PreparationChecked).is_ok());
+        let refused = ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "workspace preparation runs node: no worker reports them",
+        );
+        let error = preparation_reply(Reply::ControlError {
+            error: refused.clone(),
+        })
+        .unwrap_err();
+        assert_eq!(error.message, refused.message);
+        assert_eq!(error.code, ErrorCode::Blocked);
+        let error = preparation_reply(Reply::Stopping).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CommunicationUnknown);
     }
 }

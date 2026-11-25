@@ -190,27 +190,36 @@ fn read(
     file: &mut File,
     budget: &IdentityReadBudget,
     max: u64,
+    consume: impl FnMut(&[u8]),
+) -> Result<u64> {
+    read_from(file, budget, &budget.remaining, max, consume)
+}
+/// [`read`], charged to `pool`: the shared byte budget, or the separate one
+/// of the version manager's executable.
+fn read_from(
+    file: &mut File,
+    budget: &IdentityReadBudget,
+    pool: &std::cell::Cell<u64>,
+    max: u64,
     mut consume: impl FnMut(&[u8]),
 ) -> Result<u64> {
     let mut bytes = 0u64;
     let mut buf = [0u8; 65536];
     loop {
         elapsed(budget)?;
-        let left = budget.remaining.get();
+        let left = pool.get();
         if left == 0 {
             return Err("identity_byte_budget");
         }
         let want = buf
             .len()
             .min(usize::try_from((max.saturating_sub(bytes) + 1).min(left)).unwrap_or(usize::MAX));
-        budget.remaining.set(left - want as u64);
+        pool.set(left - want as u64);
         budget.reads.set(budget.reads.get().saturating_add(1));
         // Failed reads retain their attempted byte charge; successful reads refund
         // unread capacity. Growth sentinels are charged even when rejected.
         let n = file.read(&mut buf[..want]).map_err(|_| "identity_read")?;
-        budget
-            .remaining
-            .set(budget.remaining.get() + want as u64 - n as u64);
+        pool.set(pool.get() + want as u64 - n as u64);
         if n == 0 {
             break;
         }
@@ -223,18 +232,40 @@ fn read(
     Ok(bytes)
 }
 pub(super) fn capture(path: &Path, budget: &IdentityReadBudget) -> Result<FileIdentity> {
+    capture_from(path, budget, budget.per_file, &budget.remaining)
+}
+/// The identity of the version manager's executable (spec 22.1): read in
+/// streamed chunks under its own cap and byte pool, never the shared ones,
+/// and once per probe. Every other file keeps the shared bounds.
+pub(super) fn capture_manager(path: &Path, budget: &IdentityReadBudget) -> Result<FileIdentity> {
+    if let Some(seen) = budget.managers.borrow().iter().find(|m| m.path == path) {
+        return Ok(seen.clone());
+    }
+    let identity = capture_from(
+        path,
+        budget,
+        super::MAX_PROBE_MANAGER_BYTES,
+        &budget.manager_remaining,
+    )?;
+    budget.managers.borrow_mut().push(identity.clone());
+    Ok(identity)
+}
+fn capture_from(
+    path: &Path,
+    budget: &IdentityReadBudget,
+    per_file: u64,
+    pool: &std::cell::Cell<u64>,
+) -> Result<FileIdentity> {
     elapsed(budget)?;
     let mut file = budget.snapshot.borrow_mut().open(path, false)?;
     let m = file.metadata().map_err(|_| "probe_metadata")?;
-    let limit = budget
-        .per_file
-        .min(budget.remaining.get().saturating_sub(1));
+    let limit = per_file.min(pool.get().saturating_sub(1));
     if !m.is_file() || m.len() > limit {
         return Err("identity_not_bounded_regular");
     }
     let before = Stamp::of(&m);
     let mut hash = Sha256::new();
-    let size = read(&mut file, budget, limit, |b| hash.update(b))?;
+    let size = read_from(&mut file, budget, pool, limit, |b| hash.update(b))?;
     if size != m.len() || Stamp::of(&file.metadata().map_err(|_| "probe_metadata")?) != before {
         return Err("identity_changed");
     }
@@ -422,8 +453,15 @@ pub(crate) fn inspect_installation<'a>(
     if !receipt.tree.links.is_empty() {
         return Err("probe_unsupported_link");
     }
-    for dep in &receipt.external {
-        if capture(&dep.path, budget)? != *dep {
+    // The first external file is the version manager (as the plan puts it),
+    // read under its own cap; the rest keep the shared bounds.
+    for (index, dep) in receipt.external.iter().enumerate() {
+        let seen = if index == 0 {
+            capture_manager(&dep.path, budget)?
+        } else {
+            capture(&dep.path, budget)?
+        };
+        if seen != *dep {
             return Err("external_identity_changed");
         }
     }

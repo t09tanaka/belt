@@ -29,6 +29,8 @@ struct Fixture {
     _temp: tempfile::TempDir,
     plan: InstallPlan,
     shell: FileIdentity,
+    /// What the plan was made from.
+    made: (ResolutionEvidence, PathBuf, HostTools),
 }
 fn fixture(kind: AdapterKind, tool: &str) -> Fixture {
     fixture_for_host(kind, tool, "aarch64-apple-darwin")
@@ -44,6 +46,10 @@ fn an_x86_64_rust_host_with_an_underscore_plans_a_rustup_install() {
         .any(|a| a == "1.2.3-x86_64-unknown-linux-gnu"));
 }
 fn fixture_for_host(kind: AdapterKind, tool: &str, rust_host: &str) -> Fixture {
+    fixture_with(kind, tool, rust_host, &[])
+}
+/// [`fixture_for_host`] with these host files grown (sparse) to these sizes.
+fn fixture_with(kind: AdapterKind, tool: &str, rust_host: &str, grown: &[(&str, u64)]) -> Fixture {
     let temp = crate::test_tmp::tempdir().unwrap();
     let state = fs::canonicalize(temp.path()).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -51,6 +57,14 @@ fn fixture_for_host(kind: AdapterKind, tool: &str, rust_host: &str) -> Fixture {
     fs::create_dir(&hostdir).unwrap();
     for name in ["manager", "node", "node-build", "shell", "shim.js"] {
         executable(&hostdir.join(name), name.as_bytes());
+    }
+    for (name, len) in grown {
+        File::options()
+            .write(true)
+            .open(hostdir.join(name))
+            .unwrap()
+            .set_len(*len)
+            .unwrap();
     }
     let tool = ToolId::parse(tool).unwrap();
     let scope = Scope::project("");
@@ -97,6 +111,7 @@ fn fixture_for_host(kind: AdapterKind, tool: &str, rust_host: &str) -> Fixture {
         _temp: temp,
         plan,
         shell,
+        made: (evidence, state, host),
     }
 }
 #[derive(Default)]
@@ -2153,4 +2168,66 @@ fn a_detected_manager_install_goes_first_on_the_path() {
         ..detected
     };
     assert_eq!(activate(&[relative]), Err("activation_native_mismatch"));
+}
+
+/// A real mise is about 50 MB, more than the 16 MiB a probe reads of one
+/// file: the manager is read under its own cap, outside the shared budget,
+/// once per probe; every other file keeps the shared bounds (spec 22.1).
+#[test]
+fn preparation_probe_reads_a_large_manager_under_its_own_cap() {
+    let large = 50 * 1024 * 1024;
+    let f = fixture_with(
+        AdapterKind::Mise,
+        "python",
+        "aarch64-apple-darwin",
+        &[("manager", large)],
+    );
+    assert_eq!(f.plan.external[0].size, large);
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let budget = IdentityReadBudget::probe();
+    // Planning under the probe budget reads the manager as well.
+    let (evidence, state, host) = &f.made;
+    let planned = plan_with_limit(
+        AdapterKind::Mise,
+        &f.plan.frozen,
+        &f.plan.tool,
+        evidence,
+        state,
+        host,
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(planned.key(), f.plan.key());
+    let verified = inspect_installation(f.plan.clone(), &budget).unwrap();
+    assert_eq!(verified.digest(), hash(&(&f.plan.key(), &receipt.digest())));
+    // The shared pool paid for none of the manager's bytes.
+    assert!(64 * 1024 * 1024 - budget.remaining.get() < 16 * 1024 * 1024);
+    // A second look in the same probe reads it no more.
+    let left = budget.manager_remaining.get();
+    assert_eq!(
+        super::probe::capture_manager(&f.plan.external[0].path, &budget).unwrap(),
+        f.plan.external[0]
+    );
+    assert_eq!(budget.manager_remaining.get(), left);
+    drop(verified);
+    budget.finish().unwrap();
+    // A dependency as large is still refused by the shared bounds.
+    let f = fixture_with(
+        AdapterKind::Mise,
+        "python",
+        "aarch64-apple-darwin",
+        &[("node", large)],
+    );
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert!(inspect_installation(f.plan.clone(), &IdentityReadBudget::probe()).is_err());
+    // And a manager above its own cap is refused.
+    let over = super::MAX_PROBE_MANAGER_BYTES + 1;
+    let f = fixture_with(
+        AdapterKind::Mise,
+        "python",
+        "aarch64-apple-darwin",
+        &[("manager", over)],
+    );
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert!(inspect_installation(f.plan.clone(), &IdentityReadBudget::probe()).is_err());
 }

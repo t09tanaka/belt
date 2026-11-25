@@ -1050,3 +1050,101 @@ async fn input_missing_marks_are_pruned_and_the_oldest_evicted() {
     assert!(!marks.contains_key(&ids[0]), "the oldest goes");
     assert!(ids[1..].iter().all(|id| marks.contains_key(id)));
 }
+
+/// A worker that reports these tools in its capabilities.
+struct Reports {
+    worker: WorkerId,
+    tools: Vec<&'static str>,
+}
+
+impl WorkerLink for Reports {
+    fn call(&self, request: Request) -> LinkFuture<'_> {
+        Box::pin(async move {
+            use crate::toolchain::capability::{ToolObservation, WorkerCapabilities, FEATURE};
+            let Request::Inspect(_) = request else {
+                return Err(LinkError::Unconfirmed);
+            };
+            let tools = self.tools.iter().map(|t| {
+                let seen = ToolObservation::Available {
+                    version: "1.0.0".into(),
+                    identity: Digest::of_bytes(t.as_bytes()),
+                };
+                (t.to_string(), seen)
+            });
+            Ok(Response::Inspect(InspectResponse {
+                own_runs_active: None,
+                admission: None,
+                preparation_observations: None,
+                capabilities: Some(WorkerCapabilities {
+                    disk_free_bytes: None,
+                    cpu_cores: None,
+                    memory_bytes: None,
+                    resource_budget: None,
+                    schema_version: 1,
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                    profile: "default".into(),
+                    profile_digest: Digest::of_bytes(b"definition"),
+                    execution_uid: 1,
+                    protocol_versions: vec![1],
+                    profile_fingerprint: Digest::of_bytes(b"p"),
+                    tools: tools.collect(),
+                    features: [FEATURE.into()].into(),
+                    rustup: Vec::new(),
+                    installs: Vec::new(),
+                }),
+                schema_version: SchemaVersion::CURRENT,
+                worker_id: self.worker.clone(),
+                worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
+                agent_epoch: AgentEpoch(1),
+                snapshot_digest: Digest::of_bytes(b"s"),
+                policy_digest: Digest::of_bytes(b"p"),
+                active_task: 0,
+                prefetch_pending: 0,
+                max_active_task: 1,
+                prefetch_per_worker: 0,
+                disk_free_bytes: 1,
+                draining: false,
+            }))
+        })
+    }
+}
+
+/// A run whose preparation runs a tool no worker reports is refused at
+/// submit with the reason, instead of waiting unplaced (spec 22.1).
+#[tokio::test]
+async fn preparation_no_worker_reports_is_refused_with_what_each_lacks() {
+    use crate::toolchain::capability::ExecutionRequirements;
+    let f = fx();
+    let node: Vec<String> = vec!["node".into(), "npm".into()];
+    let prepare = ExecutionRequirements::default()
+        .with_prepare(&node)
+        .unwrap();
+    // Requirements without a preparation tool ask no worker.
+    f.c.check_preparation(ExecutionRequirements::default())
+        .await
+        .unwrap();
+    // No worker at all: nothing can prepare.
+    assert!(f.c.check_preparation(prepare.clone()).await.is_err());
+    let mini = Arc::new(Reports {
+        worker: f.worker.clone(),
+        tools: vec!["cargo", "rustc"],
+    });
+    f.c.try_attach(f.worker.clone(), mini).unwrap();
+    let refused = f.c.check_preparation(prepare.clone()).await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Blocked);
+    assert!(refused.message.contains("node, npm"), "{}", refused.message);
+    assert!(
+        refused.message.contains(&f.worker.to_string())
+            && refused.message.contains("Prepare(\"node\") unavailable"),
+        "{}",
+        refused.message
+    );
+    let studio = WorkerId::parse("studio").unwrap();
+    let link = Arc::new(Reports {
+        worker: studio.clone(),
+        tools: vec!["node", "npm"],
+    });
+    f.c.try_attach(studio, link).unwrap();
+    f.c.check_preparation(prepare).await.unwrap();
+}

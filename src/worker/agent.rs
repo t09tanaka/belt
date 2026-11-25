@@ -4074,11 +4074,7 @@ impl Agent {
                 |e| match registry.request(&bundle.frozen, &e.tool, Some(e)) {
                     Ok(request) => Some(request),
                     Err(refused) if refused.allows_native() => {
-                        let native = last.as_ref().is_some_and(|report| {
-                            crate::toolchain::contract::native_tool(&bundle.frozen, &e.tool, report)
-                                .is_some()
-                        });
-                        (!native)
+                        install_is_pending(last.as_ref(), &bundle.frozen, &e.tool)
                             .then(|| registry.install_request(&bundle.frozen, &e.tool, e).ok())
                             .flatten()
                     }
@@ -4602,6 +4598,53 @@ fn changes_state(request: &Request) -> bool {
             | Request::BlobPut(_)
             | Request::EnvSync(_)
     )
+}
+
+/// Whether a forecast counts the user's mise or rustup installing `tool`:
+/// unless the last completed profile report already has the version. With
+/// no completed report yet, the install is counted (spec 22.1).
+fn install_is_pending(
+    last: Option<&crate::toolchain::capability::WorkerCapabilities>,
+    frozen: &crate::toolchain::versions::FrozenToolchains,
+    tool: &crate::toolchain::versions::ToolId,
+) -> bool {
+    !last.is_some_and(|report| {
+        crate::toolchain::contract::native_tool(frozen, tool, report).is_some()
+    })
+}
+
+#[cfg(test)]
+mod install_pending_tests {
+    use crate::ids::Digest;
+    use crate::toolchain::versions::*;
+
+    /// A worker that has not finished a profile report yet cannot be shown
+    /// to hold the version: its forecast counts the install (spec 22.1).
+    #[test]
+    fn a_forecast_without_a_completed_report_counts_the_install() {
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("22.1.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &Default::default(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let node = ToolId::parse("node").unwrap();
+        assert!(super::install_is_pending(None, &frozen, &node));
+    }
 }
 
 #[cfg(test)]
