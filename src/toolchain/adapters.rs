@@ -1540,10 +1540,19 @@ fn install_holding(
         mkdir(&plan.root.join(sub))?;
     }
     for command in &plan.commands {
-        let out = executor.execute(command)?;
-        if !out.success {
-            return Err(COMMAND_FAILED);
-        }
+        let out = match executor.execute(command) {
+            Ok(out) if out.success => out,
+            failed => {
+                if plan.kind == AdapterKind::Cargo {
+                    // A failed build leaves no registry or target behind.
+                    for sub in ["cargo", "tmp"] {
+                        let _ = fs::remove_dir_all(plan.root.join(sub));
+                    }
+                }
+                failed?;
+                return Err(COMMAND_FAILED);
+            }
+        };
         if out.stdout.len() > 8192 {
             return Err("installer_output_limit");
         }

@@ -2721,9 +2721,17 @@ impl Coordinator {
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,
             }));
+            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
+                .into_iter()
+                .partition(|w| !refused.contains(&w.worker_id));
+            excluded.extend(left_out.into_iter().map(|w| Excluded {
+                unmet: Vec::new(),
+                worker_id: w.worker_id.clone(),
+                why: Exclusion::RefusedTask,
+            }));
             // A worker that has the job's setup tools is preferred to one
-            // that would install them (spec 22.1): while one is a candidate,
-            // the others are not asked.
+            // that would install them (spec 22.1): once the workers that refused
+            // the task are left out, while one is asked the others are not.
             let setup_tools: Vec<&String> = spec
                 .requirements
                 .requires
@@ -2738,9 +2746,9 @@ impl Coordinator {
                     .as_ref()
                     .is_some_and(|c| setup_tools.iter().all(|t| c.path_tools.contains(*t)))
             };
-            let compatible = if compatible.iter().any(|w| has_setup_tools(w)) {
+            let asked = if asked.iter().any(|w| has_setup_tools(w)) {
                 let (has, installs): (Vec<&Reached>, Vec<&Reached>) =
-                    compatible.into_iter().partition(|w| has_setup_tools(w));
+                    asked.into_iter().partition(|w| has_setup_tools(w));
                 excluded.extend(installs.into_iter().map(|w| Excluded {
                     unmet: vec![format!(
                         "another worker has {} on its PATH; belt installs setup tools only where none has them",
@@ -2755,16 +2763,8 @@ impl Coordinator {
                 }));
                 has
             } else {
-                compatible
+                asked
             };
-            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
-                .into_iter()
-                .partition(|w| !refused.contains(&w.worker_id));
-            excluded.extend(left_out.into_iter().map(|w| Excluded {
-                unmet: Vec::new(),
-                worker_id: w.worker_id.clone(),
-                why: Exclusion::RefusedTask,
-            }));
             let sessions: BTreeMap<_, _> = asked
                 .iter()
                 .filter_map(|w| readiness(w).map(|generation| (w.worker_id.clone(), generation)))

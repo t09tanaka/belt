@@ -371,10 +371,19 @@ impl adapters::AdmittedExecutor for HelperExecutor {
             .map_err(|_| "installer_spawn")?;
         let stdout = child.stdout.take().ok_or("installer_stdout")?;
         let stderr = child.stderr.take().ok_or("installer_stderr")?;
+        // cargo install writes a line per dependency to stderr: only its
+        // last MAX_OUTPUT bytes are kept, as a diagnostic tail (spec 22.1).
+        let tail = cargo_install(command);
         // Drain both pipes concurrently, retaining at most the contract's limit.
         let (out, err, status) = std::thread::scope(|scope| {
             let out = scope.spawn(|| drain(stdout));
-            let err = scope.spawn(|| drain(stderr));
+            let err = scope.spawn(|| {
+                if tail {
+                    drain_tail(stderr)
+                } else {
+                    drain(stderr)
+                }
+            });
             let status = child.wait();
             (out.join(), err.join(), status)
         });
@@ -385,6 +394,26 @@ impl adapters::AdmittedExecutor for HelperExecutor {
             stdout,
         })
     }
+}
+fn cargo_install(command: &adapters::CommandSpec) -> bool {
+    command.program.file_name().is_some_and(|n| n == "cargo")
+        && command.argv.first().is_some_and(|a| a == "install")
+}
+/// Read to the end, keeping only the last MAX_OUTPUT bytes.
+fn drain_tail(mut stream: impl Read) -> Result<Vec<u8>, &'static str> {
+    let mut kept = std::collections::VecDeque::new();
+    let mut buf = [0; 4096];
+    loop {
+        let n = stream.read(&mut buf).map_err(|_| "installer_output_read")?;
+        if n == 0 {
+            break;
+        }
+        kept.extend(&buf[..n]);
+        while kept.len() > MAX_OUTPUT {
+            kept.pop_front();
+        }
+    }
+    Ok(kept.into())
 }
 fn drain(mut stream: impl Read) -> Result<Vec<u8>, &'static str> {
     let mut kept = Vec::new();
@@ -411,6 +440,31 @@ fn drain(mut stream: impl Read) -> Result<Vec<u8>, &'static str> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    /// #220 H1: a cargo install that writes more than MAX_OUTPUT to stderr
+    /// (a line per dependency) succeeds; another installer's still fails.
+    #[test]
+    fn a_cargo_install_with_a_long_stderr_succeeds() {
+        use adapters::AdmittedExecutor;
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let script = b"#!/bin/sh\ni=0\nwhile [ $i -lt 400 ]; do echo \"   Compiling dependency-$i v1.0.0\" >&2; i=$((i+1)); done\n";
+        let spec = |name: &str| {
+            let program = temp.path().join(name);
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            adapters::CommandSpec {
+                program,
+                argv: vec!["install".into()],
+                env: Default::default(),
+                cwd: temp.path().to_path_buf(),
+            }
+        };
+        let out = HelperExecutor.execute(&spec("cargo")).unwrap();
+        assert!(out.success);
+        assert_eq!(
+            HelperExecutor.execute(&spec("mise")).err(),
+            Some("installer_output_limit")
+        );
+    }
     #[test]
     fn preparation_files_are_bounded_owned_private_regular_and_not_links() {
         let temp = crate::test_tmp::tempdir().unwrap();
