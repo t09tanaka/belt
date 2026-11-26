@@ -1953,7 +1953,10 @@ impl<'a> Runner<'a> {
             .truncate(false)
             .write(true)
             .open(&self.lock_file)?;
-        f.lock_exclusive()?;
+        if f.try_lock_exclusive().is_err() {
+            eprintln!("local-ci: waiting for the repository lock");
+            f.lock_exclusive()?;
+        }
         Ok(f)
     }
 
@@ -1983,6 +1986,7 @@ impl<'a> Runner<'a> {
         use fs2::FileExt;
         let dir = self.lock_file.parent().context("no lock directory")?;
         fs::create_dir_all(dir)?;
+        let mut told = false;
         loop {
             for i in 0..self.opts.containers.max(1) {
                 let f = OpenOptions::new()
@@ -1996,6 +2000,10 @@ impl<'a> Runner<'a> {
             }
             if self.ctx.cancel.is_cancelled() {
                 return Ok(None);
+            }
+            if !told {
+                eprintln!("local-ci: waiting for a container slot");
+                told = true;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
