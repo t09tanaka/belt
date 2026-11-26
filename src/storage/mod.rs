@@ -56,10 +56,11 @@ pub use lock::ProcessLock;
 pub use toolchain_roots::{Bind, RootRow, RootsStatus};
 pub(crate) use worker::MembershipImage;
 pub use worker::{
-    uptime_step, AcceptedAttempt, CancelOutcome, DedupRecord, KeyGeneration, LaunchClaim,
-    LeaseOutcome, LogPosition, MemberPin, NewAcceptance, ProcessIdentity, Released, SubmitOutcome,
-    Uptime, WorkerStore, DEFAULT_ACK_WAIT_MS, MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS,
-    MAX_UNDELIVERED_TOMBSTONES, MAX_UNRELEASED_PAGE, RELEASE_BATCH, UPTIME_WRITE_MS,
+    uptime_step, AcceptedAttempt, AcceptedLease, CancelOutcome, DedupRecord, GrantStamp,
+    KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition, MemberPin, NewAcceptance,
+    ProcessIdentity, Released, SubmitOutcome, Uptime, WorkerStore, DEFAULT_ACK_WAIT_MS,
+    MAX_ATTEMPT_RECORDS, MAX_REFUSED_MEMBERS, MAX_UNDELIVERED_TOMBSTONES, MAX_UNRELEASED_PAGE,
+    RELEASE_BATCH, UPTIME_WRITE_MS,
 };
 
 use crate::error::ErrorCode;

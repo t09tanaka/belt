@@ -1189,6 +1189,7 @@ mod tests {
         store
             .submit(
                 crate::storage::NewAcceptance {
+                    lease: None,
                     attempt_id: crate::ids::AttemptId::generate(),
                     run_id: crate::ids::RunId::generate(),
                     task_id: crate::ids::TaskId::generate(),

@@ -24,8 +24,8 @@ use crate::state::{
     AttemptState, Outcome, Receipt, Termination, TimeoutInfo, TimeoutKind, TimeoutPhase,
 };
 use crate::storage::{
-    AcceptedAttempt, CancelOutcome, GcReport, LeaseOutcome, NewAcceptance, ProcessLock,
-    StorageError, SubmitOutcome, WorkerStore,
+    AcceptedAttempt, AcceptedLease, CancelOutcome, GcReport, GrantStamp, LeaseOutcome,
+    NewAcceptance, ProcessLock, StorageError, SubmitOutcome, WorkerStore,
 };
 use crate::supervisor::lease::LeaseSeed;
 use crate::supervisor::lock::SupervisorLock;
@@ -1682,6 +1682,7 @@ impl Agent {
                 timeout_ms: c.timeout_ms,
             });
         }
+        let terms = self.store.lease_terms(attempt).map_err(api)?;
         let spec = SuperviseSpec {
             preparation: None,
             profile_fingerprint: binding.map(|b| b.fingerprint().clone()).or_else(|| {
@@ -1696,10 +1697,12 @@ impl Agent {
             traffic_state_dir: self.cfg.traffic_state_dir.clone(),
             traffic_config: self.cfg.traffic_config.clone(),
             nodes,
-            lease_ms: payload.lease_ms,
+            lease_ms: terms.map_or(payload.lease_ms, |t| t.0),
             term_grace_ms: self.cfg.term_grace_ms,
             kill_wait_ms: self.cfg.kill_wait_ms,
-            poll_ms: self.cfg.poll_ms,
+            // The window persisted at acceptance, the one the renewal check
+            // counts (spec 12), not this process's poll.
+            poll_ms: terms.map_or(self.cfg.poll_ms, |t| t.1),
             command_timeout_ms: payload.command_timeout_ms,
             resource_wait_timeout_ms: payload.resource_wait_timeout_ms,
             // What is left of both is written when the supervisor is started.
@@ -3507,6 +3510,9 @@ impl Agent {
                     .map_err(|e| internal("profile identity", e))?,
             );
         }
+        // Taken before the commit: the first window never counts from later
+        // than the acceptance.
+        let accepted = GrantStamp::now();
         let outcome = store
             .submit_within(
                 NewAcceptance {
@@ -3517,6 +3523,11 @@ impl Agent {
                     payload_hash: r.payload_hash,
                     coordinator_epoch: r.coordinator_epoch,
                     spec,
+                    lease: Some(AcceptedLease {
+                        lease_ms: r.payload.lease_ms,
+                        poll_ms: self.cfg.poll_ms,
+                        at: accepted.clone(),
+                    }),
                 },
                 Some(policy::window(
                     self.cfg.max_active_task,
@@ -3534,7 +3545,9 @@ impl Agent {
         drop(one);
         let (rec, duplicate) = match outcome {
             SubmitOutcome::Accepted(rec) => {
-                let at = platform::monotonic_ms();
+                // The persisted acceptance stamp: the renewal check counts
+                // the first window from it, and the seed from this.
+                let at = accepted.mono_ms;
                 lock(&self.clocks).insert(
                     rec.attempt_id.to_string(),
                     Clock {
@@ -3647,17 +3660,23 @@ impl Agent {
         // The new key and the time of its grant change as one step for a
         // start that measures the lease (`lease_step`).
         let renewing = lock(&self.lease_step);
+        // The store applies it only in time after the grant before it, as
+        // persisted (spec 12): a supervisor counts the lease from the last
+        // grant however late it looks, so a late grant would revive it.
+        let stamp = GrantStamp::now();
+        let mono = stamp.mono_ms;
         let outcome = store
-            .renew_lease(&r.attempt_id, r.key(), now())
+            .renew_lease(&r.attempt_id, r.key(), now(), stamp)
             .map_err(api)?;
         let extended = outcome == LeaseOutcome::Extended;
         if extended {
             self.at(ProbePoint::LeaseRenewed, &r.attempt_id);
             if let Some(c) = lock(&self.clocks).get_mut(r.attempt_id.as_str()) {
-                c.granted_ms = platform::monotonic_ms();
+                c.granted_ms = mono;
             }
         }
         drop(renewing);
+        // Only what the response reports; the check above does not use it.
         let lease_ms = serde_json::from_value::<AttemptPayload>(rec.spec)
             .map(|p| p.lease_ms)
             .unwrap_or(0);
@@ -3667,7 +3686,7 @@ impl Agent {
             lease_seq: r.lease_seq,
             extended,
             // The supervisor counts the lease on its own monotonic clock; a
-            // renewal that extended starts a full period there.
+            // renewal that extended starts a full period from its grant.
             lease_remaining_ms: if extended { lease_ms } else { 0 },
             state: rec.state,
         })
@@ -4805,6 +4824,7 @@ mod settle_lock_tests {
         store
             .submit(
                 NewAcceptance {
+                    lease: None,
                     attempt_id: a.clone(),
                     run_id: RunId::generate(),
                     task_id: TaskId::generate(),

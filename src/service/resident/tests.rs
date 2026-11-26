@@ -817,7 +817,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
         super::super::resident::secure_file(&captured.sources.root().join("transfer.lock"), true)
             .unwrap();
     transfer_file.try_lock().unwrap();
-    drop(transfer_file);
+    transfer_file.unlock().unwrap();
     drop(guard);
     let restart = tokio::time::timeout(Duration::from_secs(20), Resident::start(&config, inputs()))
         .await

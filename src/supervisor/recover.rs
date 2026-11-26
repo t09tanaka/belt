@@ -296,6 +296,7 @@ mod tests {
         store
             .submit(
                 NewAcceptance {
+                    lease: None,
                     attempt_id: attempt.clone(),
                     run_id: RunId::generate(),
                     task_id: TaskId::generate(),

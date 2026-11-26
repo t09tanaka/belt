@@ -685,7 +685,7 @@ mod measured_lease_tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!job.is_finished());
         let released = crate::platform::monotonic_ms();
-        drop(lock);
+        lock.unlock().unwrap();
         let acquired = tokio::time::timeout(Duration::from_secs(1), &mut job)
             .await
             .unwrap()

@@ -1416,6 +1416,7 @@ fn blob_get_serves_the_artifacts_of_the_attempt_in_chunks_and_nothing_else() {
         store
             .submit(
                 NewAcceptance {
+                    lease: None,
                     attempt_id: a.clone(),
                     run_id: p.run_id.clone(),
                     task_id: p.task_id.clone(),

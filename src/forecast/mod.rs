@@ -535,6 +535,7 @@ mod tests {
         store
             .submit(
                 crate::storage::NewAcceptance {
+                    lease: None,
                     attempt_id: attempt.clone(),
                     run_id: payload.run_id.clone(),
                     task_id: payload.task_id.clone(),
