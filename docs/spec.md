@@ -783,7 +783,7 @@ lease seedは、agentがsupervisorを起動する直前に測った「受理ま�
 - これで、時刻の記録された行のkeyはどれも、受理から一度も切れずにつながったgrantの最後である。supervisorは最新の行しか見ないが、記録のある行はこの判定を通った書き込みでしか作られないので、最新のgrantから数えても、切れた後のrenewでleaseが復活することはない。
 - 断ったrenewも、運んできたcoordinator epochは記録する。延長にならないrenew（同じkeyの再送など）は判定より先に従来どおり扱い、期限の後に届いた再送も `extended=false` で返す。
 
-supervisorは、cancel・retire・lease・timeoutを `poll_ms` ごとに見る。この間隔は、task-traffic-controllerへの登録と受付（`register`、`try_admit` の繰り返し）に左右されない。登録と受付は別のthreadで従来どおり1つずつ行い、supervisorの見る側はそれを待たずに見続ける（負荷の高いhostでは1回の登録や受付に数百msから秒単位かかり、その間に届いたrenewに気付けずleaseを切らすことがあったため）。停止の理由を見つけたら、実行中の1回の呼び出しが終わるのを待ってから登録を取り下げ、そのあと受付も起動もしない。受付まで済んでいた場合も同じく取り下げる。待ち（`resource_wait_ms`）とnodeの待ち時間は登録の開始から数える。
+supervisorは、cancel・retire・lease・timeoutを `poll_ms` ごとに見る。この間隔は、task-traffic-controllerへの登録と受付（`register`、`try_admit` の繰り返し）に左右されない。登録と受付は別のthreadで従来どおり1つずつ行い、supervisorの見る側はそれを待たずに見続ける（負荷の高いhostでは1回の登録や受付に数百msから秒単位かかり、その間に届いたrenewに気付けずleaseを切らすことがあったため）。停止の理由を見つけたら、実行中の1回の呼び出しが終わるのを待ってから登録を取り下げ、そのあと受付も起動もしない。受付まで済んでいた場合も同じく取り下げる。待ち（`resource_wait_ms`・Waitingのtimeout）とnodeの待ち時間は登録の開始から数える。ただし `try_admit` に渡す待ち時間（`waited`）は、登録が済んだときから数える。
 
 renewはsequenceとrequest IDで冪等にし、同じrenewの再送で期限を再延長しない。失効・cancel・retireが確定したattemptは、遅延renewで実行許可を復活させない。共有setup builderには独立leaseを設け、少なくとも1つの有効なconsumer参照がある間だけ更新する。全参照の失効時はbuilder自身のsupervisorが停止する。
 
