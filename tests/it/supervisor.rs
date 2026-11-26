@@ -1085,9 +1085,9 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
 #[test]
 fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_waiting() {
     // The ledger lock of task-traffic-controller is held, so registering
-    // the command waits for it. The wait is not bounded by the lease: the
-    // supervisor must go on observing renewals meanwhile, and a lease kept
-    // renewed must not lapse behind a slow registration.
+    // the command waits for it. The supervisor must go on looking meanwhile:
+    // a renewal made while registration waits is observed
+    // (lease_renewal_observed), not only after registration returns.
     let mut f = fx(vec![node("n", &crate::fixture_process::script("true"))]);
     f.spec.lease_ms = 700;
     std::fs::create_dir_all(&f.spec.traffic_state_dir).unwrap();
