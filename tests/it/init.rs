@@ -811,7 +811,29 @@ async fn initialized_worker_bridge_shares_local_database_and_admission_window() 
         remote.list_attempts(None, false, 10).unwrap()[0].attempt_id,
         remote_attempt
     );
-    assert_eq!(member.list_attempts(None, false, 10).unwrap().len(), 1);
+    // The local attempt is still running: it waits for `release`. When it is
+    // not, say how it ended.
+    let local_attempts: Vec<_> = member
+        .list_attempts(None, true, 10)
+        .unwrap()
+        .into_iter()
+        .map(|a| {
+            format!(
+                "{} state {:?} termination {:?} cancel {:?} retired {} after {:?} ms",
+                a.attempt_id,
+                a.state,
+                a.termination,
+                a.cancel_requested_at_ms,
+                a.retired,
+                a.terminal_at_ms.map(|t| t.saturating_sub(a.accepted_at_ms)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        member.list_attempts(None, false, 10).unwrap().len(),
+        1,
+        "local attempts: {local_attempts:?}"
+    );
     let rejected = AttemptId::generate();
     remote_payload.task_id = TaskId::generate();
     let response = connected
