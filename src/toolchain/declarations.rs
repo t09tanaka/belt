@@ -515,6 +515,11 @@ fn rust_reference(reference: &str) -> bool {
         || (reference.contains('.') && reference.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
 }
 
+/// The tool the setup action `action` (without `@ref`) sets up.
+pub fn setup_action_tool(action: &str) -> Option<&'static str> {
+    action_tool(action).map(|(tool, _)| tool)
+}
+
 fn action_tool(action: &str) -> Option<(&'static str, &'static str)> {
     Some(match action {
         "actions/setup-node" => ("node", "node-version"),

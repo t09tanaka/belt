@@ -353,8 +353,17 @@ pub(super) async fn freeze_resolved(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     guard: crate::source::retention::Guard,
 ) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
-    let (mut all, _) =
-        freeze_resolved_each(context, owner, manifest, digest, requirements, None, guard).await?;
+    let (mut all, _) = freeze_resolved_each(
+        context,
+        owner,
+        manifest,
+        digest,
+        requirements,
+        &[],
+        None,
+        guard,
+    )
+    .await?;
     // A plain command is refused as a whole when nothing resolves it.
     all.pop().transpose().map(Option::flatten)
 }
@@ -367,18 +376,29 @@ pub(super) async fn freeze_resolved(
 /// no worker resolves is that refusal (spec 22.1): the run goes on without
 /// it. When that is every task of the plan, nothing would run, and the
 /// refusal of the first is the error of the submit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn freeze_resolved_tasks(
     context: &Context,
     owner: &super::resident::Client,
     manifest: &crate::source::manifest::SourceManifest,
     digest: &Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
+    tasks: &[crate::toolchain::capability::ExecutionRequirements],
     plan: &local_ci::FrozenPlan,
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
     let plan = Some(plan.clone());
-    let (tasks, notices) =
-        freeze_resolved_each(context, owner, manifest, digest, requirements, plan, guard).await?;
+    let (tasks, notices) = freeze_resolved_each(
+        context,
+        owner,
+        manifest,
+        digest,
+        requirements,
+        tasks,
+        plan,
+        guard,
+    )
+    .await?;
     Ok((all_unplaceable(tasks)?, notices))
 }
 
@@ -399,12 +419,14 @@ pub(crate) type Selection = Result<Option<crate::toolchain::contract::FrozenBund
 /// The selection of each task, and the notices of the freeze.
 type Frozen = (Vec<Selection>, Vec<String>);
 
+#[allow(clippy::too_many_arguments)]
 async fn freeze_resolved_each(
     context: &Context,
     owner: &super::resident::Client,
     manifest: &crate::source::manifest::SourceManifest,
     digest: &Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
+    tasks: &[crate::toolchain::capability::ExecutionRequirements],
     plan: Option<local_ci::FrozenPlan>,
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
@@ -413,10 +435,12 @@ async fn freeze_resolved_each(
     let (prepared, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
         let (requirements, plan) = (requirements.clone(), plan.clone());
+        let tasks = tasks.to_vec();
         tokio::task::spawn_blocking(move || {
             // Blocking source IO retains ownership even when the submit future
             // is cancelled. Return the guard only after that IO has drained.
-            let prepared = prepare(&context, &manifest, &requirements, plan.as_ref().as_ref());
+            let plan = plan.as_ref().as_ref();
+            let prepared = prepare(&context, &manifest, &requirements, &tasks, plan);
             (prepared, guard)
         })
         .await
@@ -444,11 +468,13 @@ async fn freeze_resolved_each(
     };
     let (resolved, notices) = resolve_each(tasks, freeze, ask).await?;
     drop(guard);
-    // Every task of the run shares the tools its preparation runs: when no
-    // worker has them, no task can be placed, and the submit is refused
-    // with the reason, as when no worker resolves the toolchain (spec 22.1).
-    // Preparation runs with the activated toolchains, so a tool whose
-    // toolchain every task's resolved bundle selects is served by it.
+    // A plain command's requirements carry the tools its preparation runs:
+    // when no worker has them, it cannot be placed, and the submit is
+    // refused with the reason, as when no worker resolves the toolchain
+    // (spec 22.1). Preparation runs with the activated toolchains, so a tool
+    // whose toolchain the resolved bundle selects is served by it. The tasks
+    // of a CI run carry their own preparation in `tasks`, not in
+    // `requirements`, and are checked one by one (`ci_run::check_setup_tools`).
     check_preparation(owner, &unserved_preparation(requirements, &resolved)).await?;
     Ok((resolved, crate::ci::toolchains::render(&notices)))
 }
@@ -645,18 +671,10 @@ fn unserved_preparation(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     resolved: &[Selection],
 ) -> crate::toolchain::capability::ExecutionRequirements {
-    use crate::toolchain::capability::{prepare_toolchain, Requirement};
+    use crate::toolchain::capability::{prepare_served, Requirement};
     let bundles: Vec<_> = resolved.iter().filter_map(|s| s.as_ref().ok()).collect();
     let served = |name: &str| {
-        !bundles.is_empty()
-            && bundles.iter().all(|b| {
-                b.as_ref().is_some_and(|b| {
-                    b.frozen
-                        .selections
-                        .iter()
-                        .any(|s| s.tool.as_str() == prepare_toolchain(name))
-                })
-            })
+        !bundles.is_empty() && bundles.iter().all(|b| prepare_served(name, b.as_ref()))
     };
     let mut rest = requirements.clone();
     rest.requires
@@ -814,24 +832,77 @@ struct Prepared {
     /// What each task of the plan reads of its workflow, in plan order.
     sources: Vec<crate::ci::toolchains::TaskSource>,
     profile: crate::toolchain::profile::Profile,
-    required: Vec<(
-        crate::toolchain::versions::ToolId,
-        crate::toolchain::versions::Location,
-    )>,
+    /// The native baseline of every task: the profile's required tools and
+    /// the run's requirements.
+    required: Vec<Required>,
+    /// For each task of the plan, in plan order, the native baseline its own
+    /// workspace preparation adds (spec 22.1).
+    task_required: Vec<Vec<Required>>,
 }
 
-/// Read the captured source for a plain command (`plan` is `None`: no
-/// workflow is read) or for each task of `plan`.
-fn prepare(
-    context: &Context,
-    captured: &crate::source::manifest::SourceManifest,
-    requirements: &crate::toolchain::capability::ExecutionRequirements,
-    plan: Option<&local_ci::FrozenPlan>,
-) -> Result<Prepared, ApiError> {
+type Required = (
+    crate::toolchain::versions::ToolId,
+    crate::toolchain::versions::Location,
+);
+
+/// Where a native baseline tool comes from, as the freeze labels it: the
+/// profile's required tools, or the tools a workspace's preparation runs.
+const PROFILE_LABEL: &str = "profile:required_tools";
+const PREPARATION_LABEL: &str = "workspace:preparation";
+
+/// The native baseline tool of a requirement: a [`Requirement::Tool`], or
+/// the toolchain of a [`Requirement::Prepare`] (npm comes with the node it
+/// is prepared with: a declared node covers it, and only an undeclared node
+/// is a native baseline).
+///
+/// [`Requirement::Tool`]: crate::toolchain::capability::Requirement::Tool
+/// [`Requirement::Prepare`]: crate::toolchain::capability::Requirement::Prepare
+fn baseline_of(r: &crate::toolchain::capability::Requirement) -> Option<(String, &'static str)> {
+    use crate::toolchain::capability::{prepare_toolchain, Requirement};
+    match r {
+        Requirement::Tool(name) => Some((name.clone(), PROFILE_LABEL)),
+        Requirement::Prepare(name) => {
+            Some((prepare_toolchain(name).to_string(), PREPARATION_LABEL))
+        }
+        _ => None,
+    }
+}
+
+fn labelled((name, label): (String, &str)) -> Result<Required, ApiError> {
     use crate::toolchain::{
         contract,
         versions::{Location, ToolId},
     };
+    ToolId::parse(contract::canonical_tool(&name))
+        .map(|tool| {
+            (
+                tool,
+                Location {
+                    path: label.into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            )
+        })
+        .map_err(|e| {
+            let why: String = e.into();
+            ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, why)
+        })
+}
+
+/// Read the captured source for a plain command (`plan` is `None`: no
+/// workflow is read) or for each task of `plan`, whose own requirements
+/// `tasks` holds in plan order (only their [`Requirement::Prepare`] add to
+/// the run's).
+///
+/// [`Requirement::Prepare`]: crate::toolchain::capability::Requirement::Prepare
+fn prepare(
+    context: &Context,
+    captured: &crate::source::manifest::SourceManifest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    tasks: &[crate::toolchain::capability::ExecutionRequirements],
+    plan: Option<&local_ci::FrozenPlan>,
+) -> Result<Prepared, ApiError> {
     let blocked =
         |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
     let store = crate::source::SourceStore::open(context.state_dir())
@@ -873,33 +944,22 @@ fn prepare(
         &context.bootstrap.env,
     )
     .map_err(blocked)?;
-    let generic = requirements.requires.iter().filter_map(|r| match r {
-        crate::toolchain::capability::Requirement::Tool(name) => Some(name.clone()),
-        // npm comes with the node it is prepared with: a declared node
-        // covers it, and only an undeclared node is a native baseline.
-        crate::toolchain::capability::Requirement::Prepare(name) => {
-            Some(crate::toolchain::capability::prepare_toolchain(name).to_string())
-        }
-        _ => None,
-    });
     let required = profile
         .required_tools()
         .iter()
-        .cloned()
-        .chain(generic)
-        .map(|name| {
-            ToolId::parse(contract::canonical_tool(&name))
-                .map(|tool| {
-                    (
-                        tool,
-                        Location {
-                            path: "profile:required_tools".into(),
-                            first_line: 1,
-                            last_line: 1,
-                        },
-                    )
-                })
-                .map_err(|e| blocked(e.into()))
+        .map(|name| (name.clone(), PROFILE_LABEL))
+        .chain(requirements.requires.iter().filter_map(baseline_of))
+        .map(labelled)
+        .collect::<Result<Vec<_>, _>>()?;
+    let task_required = tasks
+        .iter()
+        .map(|task| {
+            task.requires
+                .iter()
+                .filter(|r| matches!(r, crate::toolchain::capability::Requirement::Prepare(_)))
+                .filter_map(baseline_of)
+                .map(labelled)
+                .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Prepared {
@@ -908,6 +968,7 @@ fn prepare(
         sources,
         profile,
         required,
+        task_required,
     })
 }
 
@@ -979,14 +1040,27 @@ fn freeze_prepared(
     };
     let observations = contract::observations(&profile.report());
     let mut bundles: Vec<Option<FrozenBundle>> = Vec::with_capacity(sets.len());
+    // What each task requires natively: the run's, and the tools its own
+    // workspace preparation runs (spec 22.1).
+    let required = |index: usize| {
+        let mut all = prepared.required.clone();
+        if let Some(task) = prepared.task_required.get(index) {
+            all.extend(task.iter().cloned());
+        }
+        all
+    };
     for (index, (who, scope, declarations)) in sets.iter().enumerate() {
-        // Tasks with the same declarations in the same scope share a bundle.
-        let same = |(_, s, d): &(String, Scope, Vec<_>)| s == scope && d == declarations;
-        if let Some(earlier) = sets[..index].iter().position(same) {
+        let task_required = required(index);
+        // Tasks with the same declarations in the same scope and the same
+        // preparation share a bundle.
+        let same = |(earlier, (_, s, d)): &(usize, &(String, Scope, Vec<_>))| {
+            s == scope && d == declarations && required(*earlier) == task_required
+        };
+        if let Some((earlier, _)) = sets[..index].iter().enumerate().find(same) {
             bundles.push(bundles[earlier].clone());
             continue;
         }
-        if declarations.is_empty() && prepared.required.is_empty() {
+        if declarations.is_empty() && task_required.is_empty() {
             bundles.push(None);
             continue;
         }
@@ -995,7 +1069,7 @@ fn freeze_prepared(
             profile.definition_digest().clone(),
             scope.clone(),
             declarations,
-            &prepared.required,
+            &task_required,
             &observations,
             policy,
         )
@@ -1093,8 +1167,10 @@ mod tests {
     use super::worker_inventory;
 
     /// A worker without node on its bare PATH but with mise can prepare a
-    /// node project once every task resolved a node: the submit asks no
-    /// worker for a native node or npm then (spec 22.1).
+    /// node project once its task resolved a node: the submit asks no worker
+    /// for a native node or npm then (spec 22.1). A plain command asks of its
+    /// one bundle; each task of a CI run asks of its own bundle alone, with
+    /// the presets it skips.
     #[test]
     fn preparation_served_by_every_resolved_node_asks_for_no_native_tool() {
         use super::unserved_preparation;
@@ -1130,9 +1206,22 @@ mod tests {
         let rest = unserved_preparation(&req, &[Ok(Some(node.clone())), Ok(Some(node.clone()))]);
         assert_eq!(rest.requires, [Requirement::Prepare("dart".into())]);
         // A task without a node selection still needs a native one.
-        let rest = unserved_preparation(&req, &[Ok(Some(node)), Ok(None)]);
+        let rest = unserved_preparation(&req, &[Ok(Some(node.clone())), Ok(None)]);
         assert_eq!(rest, req);
         assert_eq!(unserved_preparation(&req, &[]), req);
+        let mut task = req.clone();
+        task.requires
+            .push(Requirement::SkipPreset("bundler".into()));
+        let asked = crate::service::ci_run::placement_requirements(&task, Some(&node));
+        assert_eq!(
+            asked.requires,
+            [
+                Requirement::Prepare("dart".into()),
+                Requirement::SkipPreset("bundler".into())
+            ]
+        );
+        let asked = crate::service::ci_run::placement_requirements(&task, None);
+        assert_eq!(asked.requires.len(), 4, "{asked:?}");
     }
 
     /// A range is sealed to the observed version only after the refusal that

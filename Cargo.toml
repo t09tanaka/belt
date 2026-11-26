@@ -20,7 +20,7 @@ path = "src/main.rs"
 toml = "0.8"
 
 [dependencies]
-fast-worktree = { version = "=0.8.0", features = ["cli"] }
+fast-worktree = { version = "=0.9.0", features = ["cli"] }
 portool = "=0.14.0"
 anyhow = "1"
 base64 = "0.22"

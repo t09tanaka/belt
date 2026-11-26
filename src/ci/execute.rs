@@ -549,6 +549,7 @@ jobs:
             dest: &Path,
             branch: &str,
             start: &str,
+            _skip: &[String],
         ) -> Result<(), crate::workspace::plan::FwFailure> {
             let dest = dest.to_str().unwrap();
             git(

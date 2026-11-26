@@ -81,7 +81,14 @@ struct GitFw {
 static GIT_WORKTREE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl FastWorktree for GitFw {
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        _skip: &[String],
+    ) -> Result<(), FwFailure> {
         let _g = GIT_WORKTREE.lock().unwrap_or_else(|e| e.into_inner());
         let out = Command::new("git")
             .args(["worktree", "add", "-q", "-b", branch])
@@ -790,7 +797,7 @@ fn a_missing_or_failing_fast_worktree_is_an_environment_mismatch() {
     // a stand-in that fails
     struct Broken;
     impl FastWorktree for Broken {
-        fn add(&self, _: &Path, _: &Path, _: &str, _: &str) -> Result<(), FwFailure> {
+        fn add(&self, _: &Path, _: &Path, _: &str, _: &str, _: &[String]) -> Result<(), FwFailure> {
             Err(FwFailure::Failed {
                 code: Some(1),
                 stderr: "FAILED post_add".into(),
@@ -1025,7 +1032,7 @@ struct Half {
 }
 
 impl FastWorktree for Half {
-    fn add(&self, _: &Path, dest: &Path, _: &str, _: &str) -> Result<(), FwFailure> {
+    fn add(&self, _: &Path, dest: &Path, _: &str, _: &str, _: &[String]) -> Result<(), FwFailure> {
         std::fs::create_dir_all(dest).unwrap();
         if let Some(g) = &self.gitfile {
             std::fs::write(dest.join(".git"), g).unwrap();
@@ -1453,9 +1460,16 @@ fn in_place_wants_the_top_of_a_worktree_inside_which_the_cwd_stays() {
 struct Slow(Arc<dyn FastWorktree>);
 
 impl FastWorktree for Slow {
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        _skip: &[String],
+    ) -> Result<(), FwFailure> {
         std::thread::sleep(std::time::Duration::from_millis(150));
-        self.0.add(repo, dest, branch, start)
+        self.0.add(repo, dest, branch, start, _skip)
     }
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
         self.0.remove(repo, path)
@@ -1548,7 +1562,9 @@ fn a_flood_of_output_is_kept_to_its_tail() {
     );
     let fw = CliFastWorktree::new(env);
     let started = std::time::Instant::now();
-    let e = fw.add(&f.dir, &f.root.join("d"), "b", "c").unwrap_err();
+    let e = fw
+        .add(&f.dir, &f.root.join("d"), "b", "c", &[])
+        .unwrap_err();
     let FwFailure::Failed { code, stderr } = e else {
         panic!("{e:?}")
     };
@@ -1584,7 +1600,9 @@ fn a_hook_that_never_ends_is_killed_with_its_children() {
     // The hook still cannot complete, so timeout and group cleanup are required.
     let fw = CliFastWorktree::with_timeout(env, std::time::Duration::from_secs(10));
     let started = std::time::Instant::now();
-    let e = fw.add(&f.dir, &f.root.join("d"), "b", "c").unwrap_err();
+    let e = fw
+        .add(&f.dir, &f.root.join("d"), "b", "c", &[])
+        .unwrap_err();
     assert!(started.elapsed().as_secs() < 30);
     let FwFailure::TimedOut { secs, stderr } = e else {
         panic!("{e:?}")
@@ -1655,8 +1673,15 @@ struct PortSpy {
 }
 
 impl FastWorktree for PortSpy {
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
-        self.inner.add(repo, dest, branch, start)
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        _skip: &[String],
+    ) -> Result<(), FwFailure> {
+        self.inner.add(repo, dest, branch, start, _skip)
     }
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
         if self.remove_fails {
@@ -1807,8 +1832,15 @@ struct NewerRegistry {
 }
 
 impl FastWorktree for NewerRegistry {
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
-        self.inner.add(repo, dest, branch, start)
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        _skip: &[String],
+    ) -> Result<(), FwFailure> {
+        self.inner.add(repo, dest, branch, start, _skip)
     }
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
         self.inner.remove(repo, path)
@@ -2540,4 +2572,69 @@ fn the_clone_gc_stalls_no_setup() {
         assert_eq!(gc.join().unwrap().unwrap(), CloneGc::Ran);
         ws.remove(&w).unwrap();
     });
+}
+
+/// A Rust-only task of a repository with a tracked npm project skips the
+/// npm preset (spec 22.1): the embedded fast-worktree runs neither node nor
+/// npm for it, while a task that sets up node runs `npm ci` as before.
+#[test]
+fn a_skipped_npm_preset_runs_no_node_or_npm() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let bin = f.root.join("embedded-bin");
+    std::fs::create_dir(&bin).unwrap();
+    for tool in ["portool", "fast-worktree"] {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_belt"), bin.join(tool)).unwrap();
+    }
+    // A node and an npm that record each call; `npm ci` makes node_modules.
+    let calls = f.root.join("calls.log");
+    for tool in ["node", "npm"] {
+        let script = format!(
+            "#!/bin/sh\necho \"{tool} $*\" >> \"{}\"\ncase \"$1\" in\n  ci|install) mkdir -p node_modules ;;\n  --version|-v) echo v20.0.0 ;;\nesac\nexit 0\n",
+            calls.display()
+        );
+        std::fs::write(bin.join(tool), script).unwrap();
+        std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut embedded_env = f.env();
+    embedded_env.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+    std::fs::create_dir(f.dir.join("web")).unwrap();
+    f.commit(
+        "web/package.json",
+        "{\"name\":\"web\",\"version\":\"1.0.0\"}\n",
+    );
+    let rev = f.commit(
+        "web/package-lock.json",
+        "{\"name\":\"web\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"web\",\"version\":\"1.0.0\"}}}\n",
+    );
+    let store = f.store();
+    let manifest = f.capture_commit(&store, &rev);
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(embedded_env));
+    let ws = f.workspaces(&fw);
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &manifest);
+    let log = || std::fs::read_to_string(&calls).unwrap_or_default();
+
+    let rust = ws
+        .create_skipping(
+            &AttemptId::generate(),
+            &store,
+            &manifest,
+            Some(&repo),
+            &["npm".to_string()],
+        )
+        .unwrap();
+    assert_eq!(log(), "", "a skipped preset runs no node or npm");
+    assert!(!rust.root.join("web/node_modules").exists());
+    ws.remove(&rust).unwrap();
+
+    let node = ws
+        .create(&AttemptId::generate(), &store, &manifest, Some(&repo))
+        .unwrap();
+    assert!(
+        log().lines().any(|l| l.starts_with("npm ci")),
+        "a task that sets up node runs npm ci: {}",
+        log()
+    );
+    ws.remove(&node).unwrap();
 }

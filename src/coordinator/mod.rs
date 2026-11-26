@@ -910,7 +910,10 @@ impl Coordinator {
                 .filter(|r| {
                     matches!(
                         r,
-                        Requirement::Prepare(_) | Requirement::Setup(_) | Requirement::Component(_)
+                        Requirement::Prepare(_)
+                            | Requirement::Setup(_)
+                            | Requirement::Component(_)
+                            | Requirement::SkipPreset(_)
                     )
                 })
                 .cloned()
@@ -989,6 +992,17 @@ impl Coordinator {
             parts.push(format!(
                 "the job's setup steps add the rust components {}",
                 components.join(", ")
+            ));
+        }
+        let skipped = named(|r| match r {
+            Requirement::SkipPreset(name) => Some(name),
+            _ => None,
+        });
+        if !skipped.is_empty() {
+            parts.push(format!(
+                "workspace preparation skips the presets {} ({})",
+                skipped.join(", "),
+                crate::toolchain::capability::PREPARE_SKIP_FEATURE
             ));
         }
         let mut why = format!("{}: no worker reports them", parts.join("; "));

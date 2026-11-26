@@ -38,6 +38,47 @@ pub fn of_task(plan: &FrozenPlan, task: &ExecutionTask) -> SetupTools {
     out
 }
 
+/// The tools the setup steps of `task`'s own jobs set up (`node` for
+/// `actions/setup-node`, `flutter`, `ruby`, ...), whatever their version
+/// inputs say: on GitHub Actions the step sets the tool up even when belt
+/// cannot read the version it asks for. These decide which presets the
+/// task's workspace preparation runs (spec 22.1).
+pub fn set_up_tools(plan: &FrozenPlan, task: &ExecutionTask) -> std::collections::BTreeSet<String> {
+    plan.workflows
+        .iter()
+        .filter(|w| w.file == task.workflow)
+        .flat_map(|w| &w.jobs)
+        .filter(|j| task.jobs.contains(&j.id))
+        .flat_map(|j| &j.steps)
+        .filter_map(|s| {
+            let uses = s.uses.as_deref()?;
+            let action = uses.split_once('@').map_or(uses, |(a, _)| a);
+            crate::toolchain::declarations::setup_action_tool(action)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The workspace preparation of `task` (spec 22.1): the presets its setup
+/// steps set up, or the run's `--requires` tools name, are prepared, and
+/// every other preset is skipped. Its tools are the task's
+/// [`Requirement::Prepare`] and its skip set the worker's `--skip-preset`:
+/// the parent's checks, the owner's, placement and the worker's preparation
+/// all read this one result.
+pub fn task_preparation(
+    prepare: &crate::workspace::prepare_tools::PrepareTools,
+    plan: &FrozenPlan,
+    task: &ExecutionTask,
+    configured: &crate::toolchain::capability::ExecutionRequirements,
+) -> crate::workspace::prepare_tools::TaskPreparation {
+    let mut set_up = set_up_tools(plan, task);
+    set_up.extend(configured.requires.iter().filter_map(|r| match r {
+        Requirement::Tool(name) => Some(name.clone()),
+        _ => None,
+    }));
+    prepare.for_task(&set_up)
+}
+
 /// A reference of `taiki-e/install-action` that names no tool: a major
 /// version tag (`v2`), a branch, or a commit.
 fn names_no_tool(reference: &str) -> bool {

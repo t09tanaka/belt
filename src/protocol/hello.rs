@@ -45,6 +45,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     crate::wire::INPUT_MISSING_FEATURE,
     crate::toolchain::capability::SETUP_TOOLS_FEATURE,
     crate::toolchain::capability::SETUP_INSTALL_FEATURE,
+    crate::toolchain::capability::PREPARE_SKIP_FEATURE,
 ];
 
 /// The features no connection of this build goes without, on either side
