@@ -1007,6 +1007,37 @@ mod tests {
         );
         on_path.rustup = vec![rust_at("1.92.0", &["cargo", "rustc"])];
         assert!(missing_with_installable(&req, Some(&on_path), Some(&rust)).is_empty());
+        // A tool on the PATH serves without rust.
+        let holder = setup_report(&["cargo-llvm-cov"], vec![]);
+        assert!(missing_with_installable(&req, Some(&holder), None).is_empty());
+        // The cargo: the installed rust's, else the rustup one of the version.
+        let bin = std::path::Path::new("/installed/bin");
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&rust.frozen, &installer, Some(bin)),
+            Some(bin.to_path_buf())
+        );
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&rust.frozen, &installer, None),
+            None
+        );
+        let none = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            Scope::project(""),
+            &[],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&none, &on_path, None),
+            None
+        );
+        // The lines say what belt can install.
+        assert!(unmet_line(&req.requires[0]).contains(SETUP_INSTALL_FEATURE));
+        assert!(unmet_line(&Requirement::Setup("protoc".into()))
+            .contains("belt installs only `cargo-*` tools"));
         // Not a cargo tool: only the PATH serves it.
         let protoc = setup_req(vec![Requirement::Setup("protoc".into())]);
         assert_eq!(
