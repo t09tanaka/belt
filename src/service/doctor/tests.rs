@@ -189,13 +189,16 @@ fn the_policy_digest_is_the_one_task_traffic_controller_reports() {
     let state = h.state.join("traffic");
     let config = state.join("config.toml");
     fs::create_dir(&state).unwrap();
-    fs::write(&config, "budget = 3\n").unwrap();
+    // A budget equal to the logical CPU count is left out of our digest (it
+    // is the default), so pick one that is not the default here.
+    let budget = task_traffic_controller::config::logical_cpus() + 1;
+    fs::write(&config, format!("budget = {budget}\n")).unwrap();
     let ours = scope(&state, &config).policy_digest.unwrap();
     let context = task_traffic_controller::Context::new(Paths::new(&state, &config));
     let theirs = task_traffic_controller::inspect::inspect(&context).unwrap();
     assert_eq!(ours, theirs.policy_digest);
     // Another budget is another policy; a broken file has no digest.
-    fs::write(&config, "budget = 4\n").unwrap();
+    fs::write(&config, format!("budget = {}\n", budget + 1)).unwrap();
     assert_ne!(scope(&state, &config).policy_digest.unwrap(), ours);
     fs::write(&config, "budget = \"many\"\n").unwrap();
     assert_eq!(scope(&state, &config).policy_digest, None);
@@ -1418,10 +1421,15 @@ mod environment_diff {
         let items = [
             item("platform", Class::Same),
             item("node", Class::Differs),
-            item("ruby", Class::Missing),
+            item("git", Class::Missing),
             item("flutter", Class::AutoInstallable),
             item("xcode", Class::ManualRequired),
             item("policy_digest", Class::NotMeasured),
+            item("belt", Class::Differs),
+            item("disk", Class::Missing),
+            item("profile", Class::Differs),
+            item("policy_digest", Class::Differs),
+            item("platform", Class::Differs),
         ];
         let checks = diff_checks("mini-a", Ok(&items));
         assert!(checks
@@ -1432,13 +1440,21 @@ mod environment_diff {
             levels,
             [
                 Level::Ok,
-                Level::Fail,
-                Level::Fail,
+                Level::Notice,
+                Level::Notice,
+                Level::Notice,
+                Level::Notice,
                 Level::Notice,
                 Level::Fail,
-                Level::Notice
+                Level::Fail,
+                Level::Fail,
+                Level::Fail,
+                Level::Fail,
             ]
         );
+        assert!(checks[1]
+            .detail
+            .ends_with("(a notice: tasks that need it are placed on a member that has it)"));
         assert_eq!(checks[0].detail, "platform: same parent=22.1.0 worker=-");
         assert_eq!(
             checks[3].detail,
@@ -1448,6 +1464,88 @@ mod environment_diff {
             checks[5].detail,
             "policy_digest: not_measured parent=22.1.0 worker=- -> do this (not measured yet)"
         );
+    }
+
+    /// The two Macs of a working group (doctor-run6): other tool versions,
+    /// tools neither side could measure, Xcode with only the Command Line
+    /// Tools and docker with no engine on the worker. Nothing fails; every
+    /// row is still shown.
+    #[test]
+    fn a_healthy_two_mac_group_has_notices_and_no_failure() {
+        let fact = |observed, version: Option<&str>| ToolFact {
+            observed,
+            version: version.map(str::to_string),
+            managed: None,
+        };
+        let mut parent = environment("22.23.5");
+        let mut worker = environment("-");
+        let tools = |r: &mut EnvReport, rows: &[(&str, Observed, Option<&str>)]| {
+            r.tools = rows
+                .iter()
+                .map(|(n, o, v)| (n.to_string(), fact(*o, *v)))
+                .collect();
+        };
+        use Observed::{Available as A, Unavailable as U, Unknown as K};
+        tools(
+            &mut parent,
+            &[
+                ("cargo", A, Some("1.92.0")),
+                ("rustc", A, Some("1.92.0")),
+                ("git", A, Some("2.56.0")),
+                ("node", A, Some("22.23.5")),
+                ("npm", A, Some("10.9.9")),
+                ("xcode", A, Some("27.1")),
+                ("dart", K, None),
+                ("flutter", K, None),
+                ("pnpm", K, None),
+                ("yarn", K, None),
+            ],
+        );
+        tools(
+            &mut worker,
+            &[
+                ("cargo", A, Some("1.100.0")),
+                ("rustc", A, Some("1.100.0")),
+                ("git", A, Some("2.54.0")),
+                ("node", U, None),
+                ("npm", U, None),
+                ("xcode", K, None),
+                ("dart", K, None),
+                ("flutter", K, None),
+                ("pnpm", K, None),
+                ("yarn", K, None),
+            ],
+        );
+        parent.docker = Docker::Runnable;
+        worker.docker = Docker::Unknown;
+        parent.helpers.insert("mise".into(), Some("present".into()));
+        worker.helpers.insert("mise".into(), None);
+        let items = envdiff::diff(&parent, &worker);
+        let checks = diff_checks("mini", Ok(&items));
+        assert_eq!(checks.len(), items.len());
+        let failed: Vec<_> = checks.iter().filter(|c| c.level == Level::Fail).collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+        let row = |subject: &str| {
+            checks
+                .iter()
+                .find(|c| c.detail.starts_with(&format!("{subject}: ")))
+                .unwrap()
+                .detail
+                .clone()
+        };
+        assert!(row("dart").starts_with("dart: not_measured parent=unknown worker=unknown"));
+        assert!(row("node").starts_with("node: missing parent=22.23.5 worker=-"));
+        assert!(
+            row("xcode").contains("only the Command Line Tools"),
+            "{}",
+            row("xcode")
+        );
+        assert!(
+            row("docker").contains("no Docker engine is running"),
+            "{}",
+            row("docker")
+        );
+        assert!(row("mise").starts_with("mise: missing parent=present worker=absent"));
     }
 
     #[test]
@@ -1491,8 +1589,9 @@ mod environment_diff {
         assert!(left.is_empty(), "{left:?}");
         assert!(report.problem().is_none(), "{:?}", report.problem());
         // The same list with something a person must fix does fail.
-        let source =
-            |_: &mut dyn Remote, host: &str| diff_checks(host, Ok(&[item("node", Class::Missing)]));
+        let source = |_: &mut dyn Remote, host: &str| {
+            diff_checks(host, Ok(&[item("profile", Class::Differs)]))
+        };
         let report = run(
             &mut w.remote,
             &mut w.runner,
@@ -1528,7 +1627,7 @@ mod environment_diff {
         let checks = diff_checks("mini-a", Ok(&[one]));
         assert_eq!(
             checks[0].detail,
-            "node: differs parent=22.1.0 worker=20[2J[ok] parent -> do this"
+            "node: differs parent=22.1.0 worker=20[2J[ok] parent -> do this (a notice: tasks that need it are placed on a member that has it)"
         );
         let refused = diff_checks("mini-a", Err("refused\u{7}\nnow"));
         assert_eq!(
@@ -1580,7 +1679,7 @@ mod environment_diff {
         };
         assert_eq!(subject("platform").level, Level::Ok);
         let node = subject("node");
-        assert_eq!(node.level, Level::Fail);
+        assert_eq!(node.level, Level::Notice);
         assert!(
             node.detail
                 .starts_with("node: differs parent=22.1.0 worker=20.0.0 -> "),

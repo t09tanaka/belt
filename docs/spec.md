@@ -1445,9 +1445,11 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 `belt workers diff [<worker>] [--json]`（workerを省略すると、登録した全workerへ同時に尋ね、結果は登録順に出す。同時に尋ねるのは最大8台）は、親（local worker。commandを実行したメンバー自身のworker）と対象workerのprofile実効環境の差を示す。比べる基準は実行したメンバーなので、別のメンバーから実行すれば差の出方は変わり得る。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、belt自身の版（組み込んだtask-traffic-controller core・local-ci core・fast-worktree・portoolの版を添えて示す。22.4）、Docker実行可否、利用可能disk、profile digest、task-traffic-controller policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
 
-`doctor` は worker ごとの差を `environment_diff` として項目ごとに1 checkで載せ、区分は次のとおりとする。利用者が手を動かさないと直らない差だけが `fail`（exit 1相当のblocked）になる。
-- `fail`: `differs`、`missing`、`manual_required`、diskの不足。
-- `notice`（exitに影響しない）: `auto_installable`（execのウォームアップと `workers sync` が自動で入れるため。`workers sync <worker>` で今すぐ入れられると案内する）、親かworkerのどちらかが測れなかった項目（`not_measured`。例: scopeが決まらない、configが読めない。「まだ測っていない」と表示する）。policy digestは、親もworkerも、保持したservice環境が決めるtask-traffic-controllerのscopeの実効config（無ければ既定のpolicy）から測り、task-traffic-controller自身の `policy_digest` と同じ計算で出す。両方が測れて違えば `differs`（fail）とし、同じなら `same` とする。
+`doctor` は worker ごとの差を `environment_diff` として項目ごとに1 checkで載せ、区分は次のとおりとする（2026-11-25 決定）。fail にするのは、どの仕事も動かなくなる差と、group自身の働きを壊す差だけである。行はどれも隠さず出し、変わるのは区分だけとする（`workers diff` の class と `--json` は変えない）。
+- `fail`: platformの違い、belt（組み込みの版）の違い、diskの不足・測れないこと、profileの名前・required_toolsの違い、portool_registry、policy digestの違い。
+- `notice`（exitに影響しない）: toolの行（cargo・rustc・git・node・npm・dart・flutter・pnpm・yarn・xcode・docker・mise など）の `differs`・`missing`・`manual_required`。仕事ごとの配置が、そのtoolを持つメンバーへ仕事を送るためである。「tasks that need it are placed on a member that has it」と添える。XcodeがCommand Line Toolsだけの worker（`xcodebuild` が答えない）と、engineの動いていない docker（`docker info` が答えない）は `manual_required` とし、何が欠けているかと手順を示す。miseは親とworkerの両方の有無を `present`・`absent` で示し、片方だけに無ければ `missing` とする。
+- `notice`: `auto_installable`（execのウォームアップと `workers sync` が自動で入れるため。`workers sync <worker>` で今すぐ入れられると案内する）、親かworkerのどちらかが測れなかった項目（`not_measured`。例: scopeが決まらない、configが読めない、toolがPATHにあるが版を答えない。「まだ測っていない」と表示する）。toolの値は、無いものを `-`、あるが測れなかったものを `unknown` と書き分ける。両方が `unknown` の行も `same` にはしない（測っていないものを同じとは言えない）。
+- policy digest: 親もworkerも、保持したservice環境が決めるtask-traffic-controllerのscopeの実効config（無ければ既定のpolicy）から測る。計算は実効configのJSONのsha256だが、`budget` がその machine の論理CPU数（既定値）と等しいときは `budget` を除いて計算する。既定の `budget` は machine ごとの値で、configを書いていない2台が core 数の違いだけで `differs` にならないためである。両方が測れて違えば、書いたconfigが違うので `differs`（fail）とし、workerのscopeの `config.toml` を親と同じ内容にするよう案内する。同じなら `same` とする。
 - `not_checked`（healthyにならない）: 到達できなかったworker、worker・親の環境を測れなかった場合。親は `workers diff` と同じく保持したserviceの環境で測り、呼び出したshellの環境では測らない。
 
 `doctor` は、登録した全workerを同時に見る（最大8台。出力は登録順）。1台の中でも、doctor helperの答えを得た後の bridge `hello` と環境の比較は同時に尋ねる。答えなかったworkerには環境を尋ね直さない。
