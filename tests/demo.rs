@@ -751,7 +751,7 @@ fn container_slot_and_repository_lock_waits_are_counted() {
     let slot_hold = open(&locks.join("containers-0.lock"));
     repo_hold.lock_exclusive().unwrap();
     slot_hold.lock_exclusive().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_local-ci"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_local-ci"))
         .args([
             "run",
             "--no-status",
@@ -770,13 +770,36 @@ fn container_slot_and_repository_lock_waits_are_counted() {
             common::private_docker_path(&d.home, &std::env::var("PATH").unwrap()),
         )
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // The run needs a moment to get as far as the lock, longer on a busy machine.
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    // Release each lock only once the run says it is waiting on it, however
+    // long the run takes to get there, then hold it a little longer.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    let wait_for = |marker: &str| loop {
+        let line = rx
+            .recv()
+            .unwrap_or_else(|_| panic!("the run ended before printing {marker:?}"));
+        if line.contains(marker) {
+            break;
+        }
+    };
     // the lock comes first, then the slot
+    wait_for("waiting for the repository lock");
+    std::thread::sleep(std::time::Duration::from_secs(1));
     repo_hold.unlock().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    wait_for("waiting for a container slot");
+    std::thread::sleep(std::time::Duration::from_secs(2));
     slot_hold.unlock().unwrap();
     let o = child.wait_with_output().unwrap();
     let t = &job_times(&o)["e2e"];
