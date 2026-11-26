@@ -4,7 +4,7 @@
 use super::install;
 use crate::ecosystem::{target, Mode, Target};
 use crate::error::{bail, Result};
-use crate::hooks::Config;
+use crate::hooks::{Config, Skip};
 use crate::util::{errln, outln};
 use crate::{git, include, paths, pending, pool, trash, util};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,8 @@ pub struct Opts {
     pub start_point: Option<String>,
     /// How long the fetch of origin's default branch may take.
     pub fetch_limit: Duration,
+    /// Presets to leave out (`--skip-preset`).
+    pub skip_presets: Vec<String>,
 }
 
 pub fn run(opts: Opts) -> Result<i32> {
@@ -28,7 +30,8 @@ pub fn run(opts: Opts) -> Result<i32> {
         name: opts.branch,
         start,
     };
-    let made = create(here, &opts.path, &branch, false)?;
+    let skip: Vec<Skip> = opts.skip_presets.into_iter().map(Skip::preset).collect();
+    let made = create(here, &opts.path, &branch, false, &skip)?;
     Ok(if made.ok { 0 } else { 1 })
 }
 
@@ -86,15 +89,24 @@ pub struct Created {
 ///
 /// When the pool is on, a refill starts at the end, whether a spare was
 /// taken or not; it waits for the background install, if there is one.
-pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<Created> {
+pub fn create(
+    here: &Path,
+    path: &Path,
+    branch: &Branch,
+    defer: bool,
+    skip: &[Skip],
+) -> Result<Created> {
     let start = Instant::now();
+    install::check_skip(skip)?;
     let main = install::main_checkout(here)?;
     crate::retention::run(Some(&main));
     // Relative to the current directory, also for the git commands the
     // pool runs in the main checkout.
     let path = &std::env::current_dir()?.join(path);
     let pool_on = pool::size(&main).0 > 0;
-    let spare = if pool_on {
+    // A spare has every project prepared; one made for a skip must not
+    // run what the skip leaves out, so it is made from scratch.
+    let spare = if pool_on && skip.is_empty() {
         from_pool(&main, path, branch)
     } else {
         None
@@ -124,7 +136,7 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
         outln!("worktree from the pool in {}", util::elapsed(start));
     }
     let root = path.canonicalize()?;
-    let ok = match prepare(&root, spare.as_ref(), defer) {
+    let ok = match prepare(&root, spare.as_ref(), defer, skip) {
         Ok(ok) => ok,
         Err(e) => {
             errln!("fast-worktree: {e}");
@@ -191,7 +203,7 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
 }
 
 /// Everything after the worktree exists. Returns whether it all succeeded.
-fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
+fn prepare(root: &Path, spare: Option<&Spare>, defer: bool, skip: &[Skip]) -> Result<bool> {
     copy_included(root);
     let cfg = Config::load(root)?;
     if let Some(s) = spare {
@@ -203,7 +215,7 @@ fn prepare(root: &Path, spare: Option<&Spare>, defer: bool) -> Result<bool> {
         (true, false) => Mode::Changed,
         (true, true) => Mode::ChangedCloneOnly,
     };
-    let mut done = install::install_deps(root, &[], &cfg, mode)?;
+    let mut done = install::install_deps(root, &[], skip, &cfg, mode)?;
     if spare.is_some() {
         let failed = rerun_moved(root, &done.kept, &cfg);
         done.ok &= failed.is_empty();

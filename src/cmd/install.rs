@@ -2,7 +2,7 @@
 
 use crate::ecosystem::{target, Ctx, Mode, Report, Target};
 use crate::error::{bail, Result};
-use crate::hooks::{self, Config, Stage};
+use crate::hooks::{self, Config, Skip, Stage};
 use crate::util::outln;
 use crate::{git, paths, pending, util};
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ fn install(root: &Path, opts: &Opts) -> Result<i32> {
     } else {
         Mode::Missing
     };
-    let deps_ok = install_deps(root, &opts.projects, &cfg, mode)?.ok;
+    let deps_ok = install_deps(root, &opts.projects, &[], &cfg, mode)?.ok;
     let hooks_ok = run_post_add(root, &cfg)?;
     Ok(if deps_ok && hooks_ok { 0 } else { 1 })
 }
@@ -62,11 +62,22 @@ pub fn main_checkout(root: &Path) -> Result<PathBuf> {
 
 /// Install every target of `root` ([`target::targets`]: its `[[clone]]`
 /// entries, else the tracked projects), or only `only`, given relative to
-/// `root` or to the current directory. Prints one line per target.
-pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> Result<Installed> {
+/// `root` or to the current directory, leaving out those that `skip`
+/// covers. Prints one line per target.
+pub fn install_deps(
+    root: &Path,
+    only: &[String],
+    skip: &[Skip],
+    cfg: &Config,
+    mode: Mode,
+) -> Result<Installed> {
     let start = Instant::now();
     let root = root.canonicalize()?;
     let mut projects = target::targets(&root, cfg)?;
+    for p in projects.iter().filter(|p| skipped(skip, p)) {
+        outln!("skip   {} (left out by the caller)", p.label());
+    }
+    projects.retain(|p| !skipped(skip, p));
     if !only.is_empty() {
         let dirs: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
         let wanted: Vec<String> = only
@@ -100,6 +111,26 @@ pub fn install_deps(root: &Path, only: &[String], cfg: &Config, mode: Mode) -> R
     }
     outln!("deps done in {}", util::elapsed(start));
     Ok(out)
+}
+
+/// Whether `skip` leaves out the target `p`.
+pub fn skipped(skip: &[Skip], p: &Target) -> bool {
+    skip.iter().any(|s| s.covers(p.preset.name(), &p.dir))
+}
+
+/// Fail on a skip that names no preset.
+pub fn check_skip(skip: &[Skip]) -> Result<()> {
+    for s in skip {
+        if let Some(name) = &s.preset {
+            if name != "clone" && crate::ecosystem::preset(name).is_none() {
+                bail!("skip: no preset named {name}");
+            }
+        }
+        if s.preset.is_none() && s.dir.is_none() {
+            bail!("skip: an entry names neither a preset nor a directory");
+        }
+    }
+    Ok(())
 }
 
 /// What an install in the worktree `root` needs to know.

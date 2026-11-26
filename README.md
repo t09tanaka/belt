@@ -81,7 +81,7 @@ Or download a binary from the
 ## Usage
 
 ```sh
-fast-worktree add <path> -b <branch> [--fetch-timeout <secs>] [<start-point>]
+fast-worktree add <path> -b <branch> [--fetch-timeout <secs>] [--skip-preset <preset>]... [<start-point>]
 ```
 
 Native Git worktree metadata operations and branch deletion are serialized
@@ -639,6 +639,23 @@ lockfile of `dir` is left out. Without any `[[clone]]`, the projects an
 `[[ignore]]` names are not detected; with `[[clone]]` entries, a project
 they do not list gets nothing anyway, and the `[[ignore]]` keeps `config
 check` from reporting it and `config init` from adding it.
+
+### Leaving a preset out of one worktree: `--skip-preset`
+
+`[[ignore]]` is for every worktree. For one worktree only, `add
+--skip-preset npm` (repeatable) leaves out every project of that preset:
+none of its key commands (`node -v`), installs, verify commands or
+lifecycle scripts run, and its cache entries are neither read nor written,
+so the tools need not be installed at all. A caller that prepares per task
+uses it to give a Rust-only task no `npm ci`. The library's
+`CreateOptions::skip` takes projects by directory too (`Skip::dir`). A
+worktree made with a skip never takes a spare from the [pool](#the-pool),
+whose spares have every project installed, and leaves nothing that a
+later worktree without the skip would reuse; `fast-worktree install` in it
+installs what was left out. The `post_add` hooks still run, and a
+`[[clone]]` without a preset whose install needs a skipped project fails
+as it would without it. (`FAST_WORKTREE_SKIP=1` is unrelated: it only
+tells a post-checkout hook to do nothing.)
 
 ### `config init` and `config check`
 
@@ -1434,6 +1451,9 @@ let cfg = repo.config()?;
 
 - `Repository::create_worktree` is `add`: a new branch, an existing branch or
   a detached `HEAD`, starting at a revision or at origin's default branch.
+  `CreateOptions::with_skip([Skip::preset("npm")])` (or `Skip::dir`, or
+  both with `Skip::and`) leaves projects out of that one worktree (see
+  [`--skip-preset`](#leaving-a-preset-out-of-one-worktree---skip-preset)).
 - `Repository::remove_worktree` is `remove` (`RemoveMode::Strict`, which
   refuses a dirty worktree) or `hook remove` (`RemoveMode::Discard`, which
   keeps what has changes in the trash for a day and its `HEAD` in

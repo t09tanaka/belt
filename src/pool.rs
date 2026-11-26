@@ -510,7 +510,7 @@ fn make_spare(main: &Path, pool: &Path, base: &str) -> Result<()> {
     let _ = fs::remove_dir(&no_hooks);
     added?;
     let installed = Config::load(&building)
-        .and_then(|cfg| install::install_deps(&building, &[], &cfg, Mode::Missing))
+        .and_then(|cfg| install::install_deps(&building, &[], &[], &cfg, Mode::Missing))
         .map(|i| i.ok);
     if !matches!(installed, Ok(true)) {
         discard(main, &building);

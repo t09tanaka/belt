@@ -39,6 +39,11 @@ enum Cmd {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         fetch_timeout: u64,
+        /// Leave out every project of this preset (npm, dart, bundler, ...):
+        /// nothing of it runs and no spare is taken from the pool.
+        /// Repeatable
+        #[arg(long = "skip-preset", value_name = "PRESET")]
+        skip_preset: Vec<String>,
     },
     /// Install dependencies into an existing worktree
     Install {
@@ -261,11 +266,13 @@ fn dispatch(cli: Cli) -> i32 {
             branch,
             start_point,
             fetch_timeout,
+            skip_preset,
         } => cmd::add::run(cmd::add::Opts {
             path,
             branch,
             start_point,
             fetch_limit: std::time::Duration::from_secs(fetch_timeout),
+            skip_presets: skip_preset,
         }),
         Cmd::Install {
             root,

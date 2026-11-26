@@ -7,6 +7,20 @@ change bumps the minor version).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-26
+
+### Added
+
+- `CreateOptions::skip` / `with_skip` and `Skip` (`Skip::preset`,
+  `Skip::dir`, `Skip::and`): projects that `Repository::create_worktree`
+  leaves out of one worktree. Nothing of them runs (key commands, installs,
+  verify, lifecycle scripts) and their cache entries are neither read nor
+  written; such a worktree never takes a spare from the pool. An unknown
+  preset name is an error. For a caller that prepares only the dependency
+  kinds a task needs.
+- `add --skip-preset <preset>` (repeatable), the same for the command.
+  Without it `add` is as before.
+
 ## [0.8.0] - 2026-11-25
 
 ### Added

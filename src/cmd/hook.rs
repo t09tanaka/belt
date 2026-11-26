@@ -153,7 +153,7 @@ fn create_worktree() -> Result<PathBuf> {
             start: fresh_start(&main),
         }
     };
-    if !add::create(&main, &path, &branch, true)?.ok {
+    if !add::create(&main, &path, &branch, true, &[])?.ok {
         errln!(
             "fast-worktree: warning: the worktree was created, but setting it up failed (see above); \
              `fast-worktree install` in it tries again"

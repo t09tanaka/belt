@@ -121,7 +121,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::cmd::remove::Refusal;
-pub use crate::hooks::{CloneEntry, Config, Hook, Ignore, PoolConfig, SkipLifecycle};
+pub use crate::hooks::{CloneEntry, Config, Hook, Ignore, PoolConfig, Skip, SkipLifecycle};
 pub use crate::pool::Source as PoolSizeSource;
 
 /// The result of a library call.
@@ -288,6 +288,15 @@ pub struct CreateOptions {
     pub path: PathBuf,
     /// What it checks out.
     pub checkout: Checkout,
+    /// Projects to leave out: none of their key commands, installs, verify
+    /// commands or lifecycle scripts run, and their cache entries are
+    /// neither read nor written, so a caller that prepares per task gets
+    /// only the dependency kinds the task needs. A worktree made with a
+    /// skip never comes from the pool, whose spares have every project
+    /// installed. Empty by default: every project is prepared. An unknown
+    /// preset name is an error. `fast-worktree install` in the worktree
+    /// later installs what was left out.
+    pub skip: Vec<Skip>,
 }
 
 impl CreateOptions {
@@ -296,7 +305,14 @@ impl CreateOptions {
         CreateOptions {
             path: path.into(),
             checkout,
+            skip: Vec::new(),
         }
+    }
+
+    /// Leave out `skip` too (see [`CreateOptions::skip`]).
+    pub fn with_skip(mut self, skip: impl IntoIterator<Item = Skip>) -> Self {
+        self.skip.extend(skip);
+        self
     }
 }
 
@@ -580,7 +596,7 @@ impl Repository {
                     start: self.resolve(start)?,
                 },
             };
-            cmd::add::create(&self.main, &opts.path, &branch, false)
+            cmd::add::create(&self.main, &opts.path, &branch, false, &opts.skip)
         });
         let made = made?;
         Ok(Created {
