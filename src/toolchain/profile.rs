@@ -939,7 +939,7 @@ impl Profile {
     /// The `cargo-*` executables of [`Self::cargo_home_bin`] when that
     /// directory is not on the profile PATH, with their file identity. Read
     /// only: a listing and metadata, nothing runs or is written.
-    fn cargo_home_tools(&self) -> Vec<(String, (PathBuf, u64, u64, u64, i64, i64))> {
+    fn cargo_home_tools(&self) -> Vec<(String, CargoHomeStamp)> {
         let Some(bin) = self.cargo_home_bin() else {
             return Vec::new();
         };
@@ -1450,6 +1450,8 @@ pub(crate) fn rustup_components(bin: &Path, host: Option<&str>) -> Vec<String> {
 /// the directories of `path`, sorted, at most
 /// [`super::capability::MAX_PATH_TOOLS`] (spec 22.1). Only directory
 /// listings and metadata: nothing runs.
+/// A file's canonical path, device, inode, size and mtime.
+type CargoHomeStamp = (PathBuf, u64, u64, u64, i64, i64);
 pub(crate) fn path_tools(path: &[PathBuf]) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
     let mut found = std::collections::BTreeSet::new();
