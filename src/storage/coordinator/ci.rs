@@ -383,9 +383,13 @@ impl CoordinatorStore {
     }
 
     /// How long each CI job named by `keys` (`CiSpec::duration_key`) took
-    /// the last time it succeeded (from the attempt's creation to its end),
-    /// looked up in the newest [`DURATION_RUNS`] runs created at or after
-    /// `since_ms` (spec 配置の手順 1). A failed, cancelled or retired attempt,
+    /// (from the attempt's creation to its end), looked up in the newest
+    /// [`DURATION_RUNS`] runs created at or after `since_ms` that have one
+    /// of these jobs (spec 配置の手順 1): runs of other projects or of plain
+    /// commands do not push a job's history out. The newest success is the
+    /// measure; a job that has not succeeded there takes its newest failure,
+    /// which ran until the job itself stopped. A cancelled, interrupted,
+    /// timed-out or retired attempt ended when something else stopped it, and
     /// a discovery probe and a shard member are not a measure of the job.
     pub fn ci_job_durations(
         &self,
@@ -396,29 +400,42 @@ impl CoordinatorStore {
         if keys.is_empty() {
             return Ok(found);
         }
+        let wanted =
+            serde_json::to_string(&keys).map_err(|e| StorageError::Invalid(e.to_string()))?;
         self.db.call(move |c| {
             let mut query = c.prepare_cached(
-                "SELECT json_extract(t.spec_json,'$.ci.duration_key'), a.terminal_at_ms - a.created_at_ms
-                 FROM (SELECT run_id FROM run WHERE created_at_ms >= ?1 ORDER BY created_at_ms DESC LIMIT ?2) r
+                "SELECT json_extract(t.spec_json,'$.ci.duration_key'), a.terminal_at_ms - a.created_at_ms,
+                        json_extract(a.termination_json,'$.outcome') = 'succeeded'
+                 FROM (SELECT run_id FROM run r WHERE created_at_ms >= ?1
+                         AND EXISTS(SELECT 1 FROM task k WHERE k.run_id = r.run_id
+                           AND json_extract(k.spec_json,'$.ci.duration_key') IN (SELECT value FROM json_each(?3)))
+                       ORDER BY created_at_ms DESC LIMIT ?2) r
                  JOIN task t ON t.run_id = r.run_id
                  JOIN attempt a ON a.task_id = t.task_id
-                 WHERE json_extract(t.spec_json,'$.ci.duration_key') IS NOT NULL
+                 WHERE json_extract(t.spec_json,'$.ci.duration_key') IN (SELECT value FROM json_each(?3))
                    AND json_extract(t.spec_json,'$.ci.shard_group') IS NULL
                    AND json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery') IS NULL
                    AND t.cancel_requested_at_ms IS NULL
                    AND a.cancel_requested_at_ms IS NULL
                    AND a.retired = 0
                    AND a.state = 'terminal'
-                   AND json_extract(a.termination_json,'$.outcome') = 'succeeded'
+                   AND json_extract(a.termination_json,'$.outcome') IN ('succeeded','failed')
                  ORDER BY a.terminal_at_ms DESC",
             )?;
-            let mut rows = query.query(params![to_i64(since_ms)?, DURATION_RUNS])?;
+            let mut rows = query.query(params![to_i64(since_ms)?, DURATION_RUNS, wanted])?;
+            let mut failed = std::collections::BTreeMap::new();
             while let Some(row) = rows.next()? {
                 let key: String = row.get(0)?;
-                let millis: i64 = row.get(1)?;
-                if keys.contains(&key) && !found.contains_key(&key) {
-                    found.insert(key, u64::try_from(millis).unwrap_or(0));
-                }
+                let millis = u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                let target = if row.get::<_, bool>(2)? {
+                    &mut found
+                } else {
+                    &mut failed
+                };
+                target.entry(key).or_insert(millis);
+            }
+            for (key, millis) in failed {
+                found.entry(key).or_insert(millis);
             }
             Ok(found)
         })

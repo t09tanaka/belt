@@ -494,7 +494,7 @@ generic execの依存準備もプロジェクトに宣言できる。`.fast-work
 coordinator内の1つのscheduler actorが、配置のcommitを直列化する。複数利用者からの投入やworkerへの見積照会は並行してよい。
 
 1. 親のready queueから対象taskを選ぶ。通常優先度では投入順と待機時間を考慮し、依存未解決の仕事で独立した後続を塞がない。
-   1つの投入のtaskは、queueへ入れる時に長い順へ並べる（queueは入れた順に読まれるので、これが配置の順になる）。長さは、同じprojectの同じplan task（`ci.duration_key` = `ci::timing::task_scope`）が最後に成功したattemptの実時間（attemptの作成から終了まで）である。見るのは、作られてから30日以内のrunのうち新しい20個だけで、失敗・取り消し・retireされたattempt、取り消されたtask、discoveryのprobe、shardのmemberは使わない。新しい表は作らず、runの刈り取り（25.5）で消えたものは使われなくなる。長さの分からないtaskは、workflowの順のまま、長さの分かるtaskの後に置く（最初のrunの順を変えない）。同じ長さは元の順を保つ。長いjobを最後に始めると、終わりの数分を1-2個のjobだけで走ることになるためである。
+   1つの投入のtaskは、queueへ入れる時に長い順へ並べる（queueは入れた順に読まれるので、これが配置の順になる）。長さは、同じprojectの同じplan task（`ci.duration_key` = `ci::timing::task_scope`）が最後に成功したattemptの実時間（attemptの作成から終了まで）である。成功が無いjobは、最後に失敗したattemptの実時間を使う（失敗はjob自身が止まるまで走ったので、その長さの下限になる。成功があれば、どれだけ古くても成功を使う）。取り消し・中断（interrupted）・時間切れ・retireされたattemptは、外から止められた時刻で終わっており、jobの長さを表さないので使わない（受け入れ試験のrun6では、中断された9個のjobが全部同じ752秒で終わっていた）。見るのは、作られてから30日以内で、これらのjobのどれかを含むrunのうち新しい20個だけである（他のprojectや普通のcommandのrunが間に入っても、履歴は押し出されない）。取り消されたtask、discoveryのprobe、shardのmemberは使わない。新しい表は作らず、runの刈り取り（25.5）で消えたものは使われなくなる。長さの分からないtaskは、workflowの順のまま、長さの分かるtaskの後に置く（最初のrunの順を変えない）。同じ長さは元の順を保つ。長いjobを最後に始めると、終わりの数分を1-2個のjobだけで走ることになるためである。
 2. OS・arch・profile・tool・必要disk・明示resource要件で候補を絞る。
 3. 各workerへ、現在のキューと候補workloadを含むforecastを照会する。
 4. source差分転送、setup（第22章のtoolchain導入を含む）、実行、成果物回収を含む予測完了時間で比較する。
