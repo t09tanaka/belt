@@ -660,16 +660,23 @@ impl Profile {
                     .ok()
                     .map(|m| (path, m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
             });
-        let context = Digest::of_bytes(
-            &serde_json::to_vec(&(
-                &shell_identity,
-                &self.digest,
-                &os,
-                &arch,
-                rustix::process::geteuid().as_raw(),
-            ))
-            .expect("profile context serializes"),
-        );
+        // The `cargo-*` of the user's CARGO_HOME/bin that is not on the
+        // profile PATH: cargo finds it there for `cargo <name>` (spec 22.1),
+        // so the job uses it and its file identity is part of the profile.
+        let cargo_home = self.cargo_home_tools();
+        let mut context_bytes = serde_json::to_vec(&(
+            &shell_identity,
+            &self.digest,
+            &os,
+            &arch,
+            rustix::process::geteuid().as_raw(),
+        ))
+        .expect("profile context serializes");
+        // A worker without such tools keeps the identity it had.
+        if !cargo_home.is_empty() {
+            context_bytes.extend(serde_json::to_vec(&cargo_home).expect("cargo home serializes"));
+        }
+        let context = Digest::of_bytes(&context_bytes);
         let mut bytes = serde_json::to_vec(&(
             &shell_identity,
             &self.digest,
@@ -685,6 +692,9 @@ impl Profile {
         }
         if !installs.is_empty() {
             bytes.extend(serde_json::to_vec(&installs).expect("installs serialize"));
+        }
+        if !cargo_home.is_empty() {
+            bytes.extend(serde_json::to_vec(&cargo_home).expect("cargo home serializes"));
         }
         let files = self.executable_identity();
         let observed_fingerprint = Digest::of_bytes(
@@ -749,7 +759,14 @@ impl Profile {
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
             rustup,
             installs,
-            path_tools: path_tools(&self.definition.path),
+            path_tools: {
+                let mut names = path_tools(&self.definition.path);
+                names.extend(cargo_home.iter().map(|(name, _)| name.clone()));
+                names.sort();
+                names.dedup();
+                names.truncate(super::capability::MAX_PATH_TOOLS);
+                names
+            },
         };
         // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
         #[allow(deprecated)]
@@ -910,6 +927,38 @@ impl Profile {
     }
     /// The rustup home this profile's tools would use: `RUSTUP_HOME`, else
     /// `~/.rustup` of the profile's `HOME`.
+    /// `<CARGO_HOME>/bin` of the profile (default `~/.cargo/bin`).
+    fn cargo_home_bin(&self) -> Option<PathBuf> {
+        let env = self.host_environment();
+        let home = match env.get("CARGO_HOME") {
+            Some(home) => PathBuf::from(home),
+            None => PathBuf::from(env.get("HOME")?).join(".cargo"),
+        };
+        home.is_absolute().then(|| home.join("bin"))
+    }
+    /// The `cargo-*` executables of [`Self::cargo_home_bin`] when that
+    /// directory is not on the profile PATH, with their file identity. Read
+    /// only: a listing and metadata, nothing runs or is written.
+    fn cargo_home_tools(&self) -> Vec<(String, CargoHomeStamp)> {
+        let Some(bin) = self.cargo_home_bin() else {
+            return Vec::new();
+        };
+        if self.definition.path.iter().any(|p| p == &bin) {
+            return Vec::new();
+        }
+        path_tools(std::slice::from_ref(&bin))
+            .into_iter()
+            .filter(|name| name.starts_with("cargo-"))
+            .filter_map(|name| {
+                let path = fs::canonicalize(bin.join(&name)).ok()?;
+                let m = fs::metadata(&path).ok()?;
+                Some((
+                    name,
+                    (path, m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()),
+                ))
+            })
+            .collect()
+    }
     fn rustup_home(&self) -> Option<PathBuf> {
         let env = self.host_environment();
         let home = match env.get("RUSTUP_HOME") {
@@ -1401,6 +1450,8 @@ pub(crate) fn rustup_components(bin: &Path, host: Option<&str>) -> Vec<String> {
 /// the directories of `path`, sorted, at most
 /// [`super::capability::MAX_PATH_TOOLS`] (spec 22.1). Only directory
 /// listings and metadata: nothing runs.
+/// A file's canonical path, device, inode, size and mtime.
+type CargoHomeStamp = (PathBuf, u64, u64, u64, i64, i64);
 pub(crate) fn path_tools(path: &[PathBuf]) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
     let mut found = std::collections::BTreeSet::new();
@@ -2805,6 +2856,24 @@ mod rustup_tests {
         ]
         .into();
         patient(Profile::load(root, &env).unwrap())
+    }
+    /// #220 M2: a `cargo-*` in `~/.cargo/bin` off the profile PATH is
+    /// present (cargo finds it), another name there is not, and its file
+    /// identity is part of the profile fingerprint.
+    #[test]
+    fn a_cargo_tool_of_the_cargo_home_is_present_and_in_the_fingerprint() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        let before = profile(root.path(), &home).startup_report();
+        let bin = root.path().join(".cargo/bin");
+        fs::create_dir_all(&bin).unwrap();
+        script(&bin.join("cargo-x"), "exit 0");
+        script(&bin.join("just"), "exit 0");
+        let after = profile(root.path(), &home).startup_report();
+        assert_eq!(after.path_tools, ["cargo-x"]);
+        assert_ne!(after.profile_fingerprint, before.profile_fingerprint);
+        // Detection only reads.
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 2);
     }
     #[test]
     fn installed_toolchains_of_this_host_are_detected_by_their_own_probe() {

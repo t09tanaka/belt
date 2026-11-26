@@ -2232,3 +2232,146 @@ fn preparation_probe_reads_a_large_manager_under_its_own_cap() {
     install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
     assert!(inspect_installation(f.plan.clone(), &IdentityReadBudget::probe()).is_err());
 }
+/// Runs each command for real, with exactly the plan's environment.
+struct Spawn;
+impl AdmittedExecutor for Spawn {
+    fn execute(&mut self, command: &CommandSpec) -> Result<CommandOutput> {
+        let out = std::process::Command::new(&command.program)
+            .args(&command.argv)
+            .env_clear()
+            .envs(&command.env)
+            .current_dir(&command.cwd)
+            .output()
+            .map_err(|_| "spawn")?;
+        Ok(CommandOutput {
+            success: out.status.success(),
+            stdout: out.stdout,
+        })
+    }
+}
+/// A fake rust toolchain whose `cargo install --locked --root R NAME`
+/// writes the script `R/bin/NAME`, and fills CARGO_HOME and the target
+/// directory as a real build would.
+fn fake_rust(dir: &Path) -> HostTools {
+    let bin = dir.join("toolchain-bin");
+    executable(
+        &bin.join("cargo"),
+        br#"#!/bin/sh
+[ "$1" = install ] && [ "$2" = --locked ] && [ "$3" = --root ] || exit 3
+mkdir -p "$4/bin" "$CARGO_HOME/registry" "$CARGO_TARGET_DIR" || exit 4
+echo junk > "$CARGO_HOME/registry/index"
+echo junk > "$CARGO_TARGET_DIR/build"
+printf '#!/bin/sh\necho installed-%s\n' "$5" > "$4/bin/$5"
+chmod 700 "$4/bin/$5"
+"#,
+    );
+    executable(&bin.join("rustc"), b"#!/bin/sh\necho rustc\n");
+    HostTools {
+        manager: FileIdentity::capture(&bin.join("cargo")).unwrap(),
+        dependencies: vec![FileIdentity::capture(&bin.join("rustc")).unwrap()],
+        search_path: vec![bin, "/usr/bin".into(), "/bin".into()],
+        rust_host: String::new(),
+    }
+}
+#[test]
+fn a_missing_cargo_tool_is_installed_into_a_private_root_and_put_on_path() {
+    let f = fixture(AdapterKind::Rustup, "rust");
+    let (evidence, state, _) = &f.made;
+    let host = fake_rust(state);
+    let tool = ToolId::parse("cargo-fake").unwrap();
+    let plan = plan(
+        AdapterKind::Cargo,
+        &f.plan.frozen,
+        &tool,
+        evidence,
+        state,
+        &host,
+    )
+    .unwrap();
+    assert!(plan.root.starts_with(state));
+    assert_eq!(
+        plan.commands[0].env["CARGO_HOME"],
+        text(&plan.root.join("cargo")).unwrap()
+    );
+    assert_eq!(detect(&plan), Availability::Missing);
+    let receipt = install_admitted(&plan, &mut Spawn).unwrap();
+    assert_eq!(
+        detect(&plan),
+        Availability::Installed(Box::new(receipt.clone()))
+    );
+    // Only the executable stays: the registry and the build are gone.
+    assert_eq!(fs::read_dir(plan.root.join("cargo")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(plan.root.join("tmp")).unwrap().count(), 0);
+    let base = ActivationReceipt {
+        base_profile: Digest::of_bytes(b"p"),
+        frozen: f.plan.frozen.digest(),
+        setup_policy: Digest::of_bytes(b"s"),
+        installation: Digest::of_bytes(b"i"),
+        environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+        shell: f.shell.clone(),
+        binding_digest: Digest::of_bytes(b"b"),
+        execution_fingerprint: Digest::of_bytes(b"e"),
+    };
+    let activated = with_setup_tools(base.clone(), &[(&plan, &receipt)]).unwrap();
+    assert_ne!(activated.execution_fingerprint, base.execution_fingerprint);
+    let path = &activated.environment["PATH"];
+    assert!(path.starts_with(plan.payload.join("bin").to_str().unwrap()));
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", "cargo-fake"])
+        .env_clear()
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "installed-cargo-fake"
+    );
+    // Another rustc is another root.
+    let mut other = host.clone();
+    other.dependencies[0].digest = Digest::of_bytes(b"another rustc");
+    let again = cargo_plan(&f.plan.frozen, &tool, &evidence.concrete, state, &other).unwrap();
+    assert_ne!(again.root, plan.root);
+    assert_eq!(
+        cargo_plan(
+            &f.plan.frozen,
+            &ToolId::parse("protoc").unwrap(),
+            &evidence.concrete,
+            state,
+            &host
+        ),
+        Err("manual_required_unsupported_adapter_tool")
+    );
+}
+/// #220 L2: a failed `cargo install` leaves no registry or build behind.
+#[test]
+fn a_failed_cargo_install_leaves_no_registry_or_build() {
+    let f = fixture(AdapterKind::Rustup, "rust");
+    let (evidence, state, _) = &f.made;
+    let host = fake_rust(state);
+    executable(
+        &host.manager.path,
+        br#"#!/bin/sh
+mkdir -p "$CARGO_HOME/registry" "$CARGO_TARGET_DIR" || exit 4
+echo junk > "$CARGO_HOME/registry/index"
+echo junk > "$CARGO_TARGET_DIR/build"
+exit 101
+"#,
+    );
+    let host = HostTools {
+        manager: FileIdentity::capture(&host.manager.path).unwrap(),
+        ..host
+    };
+    let tool = ToolId::parse("cargo-fake").unwrap();
+    let plan = plan(
+        AdapterKind::Cargo,
+        &f.plan.frozen,
+        &tool,
+        evidence,
+        state,
+        &host,
+    )
+    .unwrap();
+    assert!(install_admitted(&plan, &mut Spawn).is_err());
+    assert!(!plan.root.join("cargo").exists());
+    assert!(!plan.root.join("tmp").exists());
+}

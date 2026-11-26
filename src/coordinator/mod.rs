@@ -2614,6 +2614,9 @@ impl Coordinator {
             }
         }
         let refused = self.refused_by(&task.task_id).await?;
+        // Holders of the setup tools that gave no usable forecast for this
+        // task: left out of its later passes only (spec 22.1).
+        let mut holders_out: BTreeSet<WorkerId> = BTreeSet::new();
         loop {
             // Who has room, counted from the parent's own record.
             let ids: Vec<WorkerId> = round.open.iter().map(|w| w.worker_id.clone()).collect();
@@ -2721,14 +2724,55 @@ impl Coordinator {
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,
             }));
-            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
-                .into_iter()
-                .partition(|w| !refused.contains(&w.worker_id));
+            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) =
+                compatible.into_iter().partition(|w| {
+                    !refused.contains(&w.worker_id) && !holders_out.contains(&w.worker_id)
+                });
             excluded.extend(left_out.into_iter().map(|w| Excluded {
                 unmet: Vec::new(),
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::RefusedTask,
             }));
+            // A worker that has the job's setup tools is preferred to one
+            // that would install them (spec 22.1): once the workers that refused
+            // the task are left out, while one is asked the others are not.
+            // If none of the holders gives a usable forecast, they are closed
+            // below and the installers are asked in the next pass.
+            let setup_tools: Vec<&String> = spec
+                .requirements
+                .requires
+                .iter()
+                .filter_map(|r| match r {
+                    crate::toolchain::capability::Requirement::Setup(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            let has_setup_tools = |w: &Reached| {
+                w.capabilities
+                    .as_ref()
+                    .is_some_and(|c| setup_tools.iter().all(|t| c.path_tools.contains(*t)))
+            };
+            let mut holders: Vec<WorkerId> = Vec::new();
+            let asked = if !setup_tools.is_empty() && asked.iter().any(|w| has_setup_tools(w)) {
+                let (has, installs): (Vec<&Reached>, Vec<&Reached>) =
+                    asked.into_iter().partition(|w| has_setup_tools(w));
+                holders = has.iter().map(|w| w.worker_id.clone()).collect();
+                excluded.extend(installs.into_iter().map(|w| Excluded {
+                    unmet: vec![format!(
+                        "another worker has {} on its PATH; belt installs setup tools only where none has them",
+                        setup_tools
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )],
+                    worker_id: w.worker_id.clone(),
+                    why: Exclusion::CapabilityMismatch,
+                }));
+                has
+            } else {
+                asked
+            };
             let sessions: BTreeMap<_, _> = asked
                 .iter()
                 .filter_map(|w| readiness(w).map(|generation| (w.worker_id.clone(), generation)))
@@ -2829,6 +2873,18 @@ impl Coordinator {
                     worker_id: worker_id.clone(),
                     why: Exclusion::NoForecast,
                 });
+            }
+            // The holders were silent, refused in their forecast or gave none
+            // that counts: they are out of this task's next pass, so the
+            // workers that install the tools are asked.
+            if !holders.is_empty()
+                && !candidates.iter().any(|c| {
+                    holders.contains(&c.worker_id)
+                        && c.outlook.unusable != Some(decide::Unusable::Refused)
+                })
+            {
+                holders_out.extend(holders);
+                continue;
             }
             let decision = decide::decide_for_shard(
                 candidates,

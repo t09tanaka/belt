@@ -1992,6 +1992,22 @@ impl Agent {
             &shell,
         )
         .map_err(|e| activation_refused(e, &native, &plans))?;
+        let setup = self.setup_tool_requests(&bundle, &payload.requirements, &plans, &report)?;
+        let mut setup_receipts = Vec::with_capacity(setup.len());
+        for request in &setup {
+            match self.toolchains.as_ref().map(|r| r.detect(request)) {
+                Some(Ok(adapters::Availability::Installed(receipt))) => {
+                    setup_receipts.push(receipt)
+                }
+                _ => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        "activated tool identity changed",
+                    ))
+                }
+            }
+        }
+        let current = self.with_setup_tools(current, &setup, &setup_receipts)?;
         if current != binding.activation {
             return Err(ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
@@ -1999,6 +2015,129 @@ impl Agent {
             ));
         }
         Ok(())
+    }
+    /// Wait for one install of the supervisor. `None`: the agent is
+    /// stopping or the attempt is being stopped.
+    fn poll_tool_install(
+        &self,
+        rec: &AcceptedAttempt,
+        request: &crate::toolchain::preparation::PreparationRequest,
+        begun: u64,
+    ) -> Result<Option<Box<crate::toolchain::adapters::InstallationReceipt>>, ApiError> {
+        use crate::toolchain::preparation::ToolPreparationPoll;
+        loop {
+            match self.host.toolchain_poll(&rec.attempt_id, request)? {
+                ToolPreparationPoll::Installed(receipt) => return Ok(Some(receipt)),
+                ToolPreparationPoll::Failed(reason) => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        format!("toolchain preparation failed: {reason:?}"),
+                    ))
+                }
+                ToolPreparationPoll::Pending => {
+                    if self.stopping() || self.stop_requested(&rec.attempt_id) {
+                        self.host.setup_release(&rec.attempt_id);
+                        return Ok(None);
+                    }
+                    if platform::monotonic_ms().saturating_sub(begun) >= self.cfg.prepare_timeout_ms
+                    {
+                        return Err(ApiError::blocked(
+                            crate::error::BlockedReason::EnvironmentMismatch,
+                            "toolchain preparation timed out",
+                        ));
+                    }
+                    self.pause(self.cfg.poll_ms);
+                }
+            }
+        }
+    }
+    /// The installs of the setup tools of the job that the worker does not
+    /// have on its PATH (spec 22.1): each `cargo-*` one, with the cargo of
+    /// the rust the attempt activates. A tool that cannot be installed so is
+    /// a refusal with the reason, never a silent omission.
+    fn setup_tool_requests(
+        &self,
+        bundle: &crate::toolchain::contract::FrozenBundle,
+        requirements: &crate::toolchain::capability::ExecutionRequirements,
+        plans: &[crate::toolchain::adapters::InstallPlan],
+        report: &crate::toolchain::capability::WorkerCapabilities,
+    ) -> Result<Vec<crate::toolchain::preparation::PreparationRequest>, ApiError> {
+        use crate::toolchain::capability::Requirement;
+        let wanted: Vec<&String> = requirements
+            .requires
+            .iter()
+            .filter_map(|r| match r {
+                Requirement::Setup(name)
+                    if crate::toolchain::adapters::cargo_installable(name)
+                        && !report.path_tools.contains(name) =>
+                {
+                    Some(name)
+                }
+                _ => None,
+            })
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let refuse =
+            |why: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, why);
+        let names = || {
+            wanted
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let rust_bin = crate::toolchain::contract::setup_cargo_bin(
+            &bundle.frozen,
+            report,
+            plans
+                .iter()
+                .find(|p| p.tool().as_str() == "rust")
+                .map(|p| p.activation_bin()),
+        );
+        let evidence = bundle.evidence.iter().find(|e| e.tool.as_str() == "rust");
+        let (Some(rust_bin), Some(evidence), Some(registry)) =
+            (rust_bin, evidence, self.toolchains.as_ref())
+        else {
+            return Err(refuse(format!(
+                "{} unavailable: belt installs a setup tool with the cargo of the rust toolchain the job sets up (one belt installs or a rustup toolchain of that version), and this attempt has none",
+                names()
+            )));
+        };
+        wanted
+            .iter()
+            .map(|name| {
+                let tool = crate::toolchain::versions::ToolId::parse(name)
+                    .map_err(|e| refuse(format!("{name} unavailable: {e}")))?;
+                registry
+                    .cargo_request(&bundle.frozen, &tool, evidence, &rust_bin)
+                    .map_err(|e| refuse(format!("{name} unavailable: {e:?}")))
+            })
+            .collect()
+    }
+    /// [`crate::toolchain::adapters::with_setup_tools`] over the plans of
+    /// `requests`.
+    fn with_setup_tools(
+        &self,
+        activation: crate::toolchain::adapters::ActivationReceipt,
+        requests: &[crate::toolchain::preparation::PreparationRequest],
+        receipts: &[Box<crate::toolchain::adapters::InstallationReceipt>],
+    ) -> Result<crate::toolchain::adapters::ActivationReceipt, ApiError> {
+        let plans = requests
+            .iter()
+            .map(|r| r.plan(&r.private_root).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tools: Vec<_> = plans
+            .iter()
+            .zip(receipts.iter().map(|r| r.as_ref()))
+            .collect();
+        crate::toolchain::adapters::with_setup_tools(activation, &tools).map_err(|e| {
+            ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                format!("setup tool activation refused: {e}"),
+            )
+        })
     }
     fn prepare_toolchains(
         &self,
@@ -2008,7 +2147,6 @@ impl Agent {
         use crate::toolchain::{
             adapters,
             contract::{observations, ExecutionBinding},
-            preparation::ToolPreparationPoll,
         };
         let Some(bundle) = &payload.toolchains else {
             return Ok(Some(None));
@@ -2037,34 +2175,9 @@ impl Agent {
         let begun = platform::monotonic_ms();
         let mut receipts = Vec::new();
         for request in &requests {
-            loop {
-                match self.host.toolchain_poll(&rec.attempt_id, request)? {
-                    ToolPreparationPoll::Installed(receipt) => {
-                        receipts.push(receipt);
-                        break;
-                    }
-                    ToolPreparationPoll::Failed(reason) => {
-                        return Err(ApiError::blocked(
-                            crate::error::BlockedReason::EnvironmentMismatch,
-                            format!("toolchain preparation failed: {reason:?}"),
-                        ))
-                    }
-                    ToolPreparationPoll::Pending => {
-                        if self.stopping() || self.stop_requested(&rec.attempt_id) {
-                            self.host.setup_release(&rec.attempt_id);
-                            return Ok(None);
-                        }
-                        if platform::monotonic_ms().saturating_sub(begun)
-                            >= self.cfg.prepare_timeout_ms
-                        {
-                            return Err(ApiError::blocked(
-                                crate::error::BlockedReason::EnvironmentMismatch,
-                                "toolchain preparation timed out",
-                            ));
-                        }
-                        self.pause(self.cfg.poll_ms);
-                    }
-                }
+            match self.poll_tool_install(rec, request, begun)? {
+                Some(receipt) => receipts.push(receipt),
+                None => return Ok(None),
             }
         }
         let plans = requests
@@ -2114,6 +2227,17 @@ impl Agent {
             &shell,
         )
         .map_err(|e| activation_refused(e, &native, &plans))?;
+        // The setup tools of the job belt installs with that rust (spec
+        // 22.1), after the toolchains: their roots are named by its cargo.
+        let setup = self.setup_tool_requests(bundle, &payload.requirements, &plans, &report)?;
+        let mut setup_receipts = Vec::with_capacity(setup.len());
+        for request in &setup {
+            match self.poll_tool_install(rec, request, begun)? {
+                Some(receipt) => setup_receipts.push(receipt),
+                None => return Ok(None),
+            }
+        }
+        let activation = self.with_setup_tools(activation, &setup, &setup_receipts)?;
         let binding = ExecutionBinding { activation };
         let path = self.execution_binding_path(&rec.attempt_id);
         if path.exists() {

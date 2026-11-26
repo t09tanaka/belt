@@ -33,6 +33,9 @@ pub enum AdapterKind {
     Mise,
     Fvm,
     Corepack,
+    /// A `cargo-*` tool a setup step of the job installs (spec 22.1):
+    /// `cargo install --locked` with the job's rust into a private root.
+    Cargo,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
@@ -316,6 +319,13 @@ impl InstallPlan {
     pub fn probes(&self) -> &[(String, CommandSpec)] {
         &self.probes
     }
+    pub fn tool(&self) -> &ToolId {
+        &self.tool
+    }
+    /// The directory the activation puts first on PATH.
+    pub fn activation_bin(&self) -> &Path {
+        &self.activation_bin
+    }
 }
 fn hash(value: &impl Serialize) -> Digest {
     Digest::of_bytes(&serde_json::to_vec(value).expect("serializable contract"))
@@ -357,6 +367,9 @@ pub fn plan(
     state: &Path,
     host: &HostTools,
 ) -> Result<InstallPlan> {
+    if kind == AdapterKind::Cargo {
+        return cargo_plan(frozen, tool, &evidence.concrete, state, host);
+    }
     plan_with_limit(
         kind,
         frozen,
@@ -435,6 +448,7 @@ pub(crate) fn plan_with_limit(
         AdapterKind::Mise => matches!(tool.as_str(), "node" | "python" | "go" | "ruby"),
         AdapterKind::Fvm => tool.as_str() == "flutter",
         AdapterKind::Corepack => matches!(tool.as_str(), "pnpm" | "yarn" | "npm"),
+        AdapterKind::Cargo => false,
     };
     if !supported {
         return Err("manual_required_unsupported_adapter_tool");
@@ -571,6 +585,7 @@ pub(crate) fn plan_with_limit(
             bin = payload.join("versions").join(&version).join("bin");
             programs.push(("flutter", bin.join("flutter")));
         }
+        AdapterKind::Cargo => return Err("manual_required_unsupported_adapter_tool"),
         AdapterKind::Corepack => {
             env.insert("COREPACK_HOME".into(), text(&payload)?);
             env.insert("COREPACK_ENABLE_AUTO_PIN".into(), "0".into());
@@ -703,6 +718,172 @@ pub(crate) fn plan_with_limit(
         activation_env: env,
         activation_bin: bin,
     })
+}
+/// Whether belt installs the setup tool `name` with cargo (spec 22.1): a
+/// `cargo-*` executable whose crate has the same name.
+pub fn cargo_installable(name: &str) -> bool {
+    name.strip_prefix("cargo-").is_some_and(|rest| {
+        !rest.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    })
+}
+/// The install of the setup tool `tool` (spec 22.1, 25.7 (b)):
+/// `cargo install --locked --root <root>/payload <tool>` with the job's rust.
+/// `host.manager` is that rust's `cargo`, its `rustc` the one dependency, and
+/// the toolchain's `bin` the first entry of `host.search_path`. The root is
+/// named by the crate and the identities of that `cargo` and `rustc`, so a
+/// different rust installs it again. CARGO_HOME and the target directory are
+/// inside the root; the user's `~/.cargo` is never written. `rust` is the
+/// version of that rust, the version the receipt records.
+pub fn cargo_plan(
+    frozen: &FrozenToolchains,
+    tool: &ToolId,
+    rust: &Version,
+    state: &Path,
+    host: &HostTools,
+) -> Result<InstallPlan> {
+    if !cargo_installable(tool.as_str()) {
+        return Err("manual_required_unsupported_adapter_tool");
+    }
+    if !clean_absolute(state)
+        || host.dependencies.len() != 1
+        || host.search_path.is_empty()
+        || host.search_path.len() > 32
+        || host.search_path.iter().any(|p| !clean_absolute(p))
+        || !host.manager.executable
+        || !host.dependencies[0].executable
+        || host.manager.path.file_name().is_none_or(|n| n != "cargo")
+        || host.dependencies[0]
+            .path
+            .file_name()
+            .is_none_or(|n| n != "rustc")
+    {
+        return Err("invalid_host_tools");
+    }
+    let identity = hash(&(
+        AdapterKind::Cargo,
+        tool,
+        rust,
+        &host.manager,
+        &host.dependencies,
+        &host.search_path,
+    ));
+    let root = state.join(&identity.as_str()[7..]);
+    let payload = root.join("payload");
+    let mut env = BTreeMap::new();
+    for (key, sub) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("TMPDIR", "tmp"),
+        ("CARGO_HOME", "cargo"),
+    ] {
+        env.insert(key.into(), text(&root.join(sub))?);
+    }
+    env.insert(
+        "CARGO_TARGET_DIR".into(),
+        text(&root.join("tmp").join("target"))?,
+    );
+    env.insert("RUSTC".into(), text(&host.dependencies[0].path)?);
+    env.insert(
+        "PATH".into(),
+        std::env::join_paths(&host.search_path)
+            .map_err(|_| "invalid_host_path")?
+            .into_string()
+            .map_err(|_| "non_utf8_host_path")?,
+    );
+    env.insert("CI".into(), "1".into());
+    let bin = payload.join("bin");
+    let commands = vec![CommandSpec {
+        program: host.manager.path.clone(),
+        argv: vec![
+            "install".into(),
+            "--locked".into(),
+            "--root".into(),
+            text(&payload)?,
+            tool.as_str().into(),
+        ],
+        env: env.clone(),
+        cwd: root.clone(),
+    }];
+    let probes = vec![(
+        tool.as_str().to_owned(),
+        CommandSpec {
+            program: bin.join(tool.as_str()),
+            argv: vec![],
+            env: env.clone(),
+            cwd: root.clone(),
+        },
+    )];
+    let mut external = vec![host.manager.clone()];
+    external.extend(host.dependencies.clone());
+    Ok(InstallPlan {
+        kind: AdapterKind::Cargo,
+        frozen: frozen.clone(),
+        tool: tool.clone(),
+        version: rust.clone(),
+        root,
+        payload,
+        commands,
+        probes,
+        external,
+        activation_env: BTreeMap::new(),
+        activation_bin: bin,
+    })
+}
+/// The activation with the setup tools belt installed (spec 22.1): each
+/// root's `bin` goes first on PATH, and the receipts are part of the
+/// installation identity and so of the execution fingerprint.
+pub fn with_setup_tools(
+    mut activation: ActivationReceipt,
+    tools: &[(&InstallPlan, &InstallationReceipt)],
+) -> Result<ActivationReceipt> {
+    if tools.is_empty() {
+        return Ok(activation);
+    }
+    let mut ordered = tools.to_vec();
+    ordered.sort_by(|a, b| a.0.tool.cmp(&b.0.tool));
+    let mut paths = Vec::new();
+    let mut receipts = Vec::new();
+    for (plan, receipt) in ordered {
+        if plan.kind != AdapterKind::Cargo {
+            return Err("activation_contract_mismatch");
+        }
+        receipt.validate(plan)?;
+        paths.push(plan.activation_bin.clone());
+        receipts.push((plan.tool.clone(), receipt.digest()));
+    }
+    if let Some(path) = activation.environment.get("PATH") {
+        paths.extend(std::env::split_paths(path));
+    }
+    let mut unique = BTreeSet::new();
+    paths.retain(|p| unique.insert(p.clone()));
+    activation.environment.insert(
+        "PATH".into(),
+        std::env::join_paths(paths)
+            .map_err(|_| "invalid_activation_path")?
+            .into_string()
+            .map_err(|_| "invalid_activation_path")?,
+    );
+    activation.installation = hash(&(&activation.installation, &receipts));
+    activation.binding_digest = hash(&(
+        &activation.base_profile,
+        &activation.frozen,
+        &activation.setup_policy,
+        &activation.installation,
+    ));
+    activation.execution_fingerprint = hash(&(
+        &activation.base_profile,
+        &activation.setup_policy,
+        &activation.installation,
+        &activation.environment,
+        &activation.shell,
+    ));
+    Ok(activation)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LinkIdentity {
@@ -1359,16 +1540,40 @@ fn install_holding(
         mkdir(&plan.root.join(sub))?;
     }
     for command in &plan.commands {
-        let out = executor.execute(command)?;
-        if !out.success {
-            return Err(COMMAND_FAILED);
-        }
+        let out = match executor.execute(command) {
+            Ok(out) if out.success => out,
+            failed => {
+                if plan.kind == AdapterKind::Cargo {
+                    // A failed build leaves no registry or target behind.
+                    for sub in ["cargo", "tmp"] {
+                        let _ = fs::remove_dir_all(plan.root.join(sub));
+                    }
+                }
+                failed?;
+                return Err(COMMAND_FAILED);
+            }
+        };
         if out.stdout.len() > 8192 {
             return Err("installer_output_limit");
         }
     }
+    if plan.kind == AdapterKind::Cargo {
+        // Only the installed executables stay: the registry, the sources
+        // and the build directory are not part of the root (spec 25.7 (b)).
+        for sub in ["cargo", "tmp"] {
+            let dir = plan.root.join(sub);
+            fs::remove_dir_all(&dir).map_err(|_| "cargo_build_cleanup")?;
+            mkdir(&dir)?;
+        }
+    }
     let mut probe_outputs = BTreeMap::new();
     for (name, command) in &plan.probes {
+        if plan.kind == AdapterKind::Cargo {
+            // A cargo subcommand has no common version flag: the receipt
+            // stands on the executable's identity in the tree.
+            probe_outputs.insert(name.clone(), Digest::of_bytes(b""));
+            continue;
+        }
         let out = executor.execute(command)?;
         if !out.success || output_version(name, &out.stdout)? != plan.version {
             return Err(VERSION_MISMATCH);

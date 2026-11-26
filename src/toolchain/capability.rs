@@ -12,7 +12,12 @@ pub const FEATURES: &[&str] = &[
     "log_resume",
     crate::forecast::COMMAND_FEATURE,
     SETUP_TOOLS_FEATURE,
+    SETUP_INSTALL_FEATURE,
 ];
+/// The feature of a worker that installs a missing `cargo-*` setup tool with
+/// the rust the job sets up (spec 22.1): a worker without it is a candidate
+/// only for the tools on its PATH.
+pub const SETUP_INSTALL_FEATURE: &str = "setup_cargo_install_v1";
 /// The feature of a report that carries [`WorkerCapabilities::path_tools`]
 /// and the components of each detected rustup toolchain (spec 22.1): only
 /// such a report can meet a [`Requirement::Setup`] or a
@@ -322,8 +327,11 @@ impl WorkerCapabilities {
 /// The line `missing` writes for an unmet requirement.
 pub fn unmet_line(requirement: &Requirement) -> String {
     match requirement {
+        Requirement::Setup(name) if crate::toolchain::adapters::cargo_installable(name) => format!(
+            "{name} unavailable: a setup step of the job installs it; belt installs it with cargo only for a job that sets up rust, on a worker that reports {SETUP_INSTALL_FEATURE}, or put it on the worker's PATH (`cargo install --locked {name}`)"
+        ),
         Requirement::Setup(name) => format!(
-            "{name} unavailable: a setup step of the job installs it; belt does not install it yet, so put it on the worker's PATH (for example `cargo install --locked {name}`)"
+            "{name} unavailable: a setup step of the job installs it, and belt installs only `cargo-*` tools; put it on the worker's PATH"
         ),
         Requirement::Component(name) => format!(
             "rust component {name} unavailable: a setup step of the job adds it; run `rustup component add {name}` on the worker"
@@ -357,7 +365,8 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
             }
             Requirement::Feature(v) => r.features.contains(v),
             Requirement::Setup(v) => {
-                r.features.contains(SETUP_TOOLS_FEATURE) && r.path_tools.contains(v)
+                r.features.contains(SETUP_TOOLS_FEATURE)
+                    && (r.path_tools.contains(v) || installs_setup(r, v))
             }
             Requirement::Component(v) => {
                 r.features.contains(SETUP_TOOLS_FEATURE)
@@ -371,6 +380,13 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
     missing
 }
 
+/// Whether the worker installs the setup tool `name` it does not have
+/// (spec 22.1). Only with a rust the job sets up: see
+/// [`missing_with_installable`].
+pub fn installs_setup(r: &WorkerCapabilities, name: &str) -> bool {
+    r.features.contains(SETUP_INSTALL_FEATURE)
+        && crate::toolchain::adapters::cargo_installable(name)
+}
 /// Eligibility is distinct from a native observation. Call only after validating
 /// the complete bundle against this worker's trusted registry.
 pub fn missing_with_installable(
@@ -394,6 +410,42 @@ pub fn missing_with_installable(
         });
     }
     let mut unmet = missing(&native, report);
+    // belt installs a setup tool with the rust the job sets up: without a
+    // rust selection only a worker with the tool on its PATH serves it.
+    let sets_up_rust = bundle.is_some_and(|b| {
+        b.frozen
+            .selections
+            .iter()
+            .any(|s| s.tool.as_str() == "rust")
+    });
+    // With rust, the install needs a real cargo (spec 22.1): the rust belt
+    // installs, or a rustup toolchain of the selected version. A native rust
+    // of another kind leaves the worker out, as the attempt would refuse.
+    let has_cargo = bundle.is_some_and(|b| {
+        let rust = b
+            .frozen
+            .selections
+            .iter()
+            .find(|s| s.tool.as_str() == "rust");
+        match (rust, report) {
+            (Some(rust), Some(report)) => {
+                crate::toolchain::contract::native_tool(&b.frozen, &rust.tool, report).is_none()
+                    || crate::toolchain::contract::setup_cargo_bin(&b.frozen, report, None)
+                        .is_some()
+            }
+            _ => false,
+        }
+    });
+    if let (false, Some(report)) = (sets_up_rust && has_cargo, report) {
+        for r in &native.requires {
+            if let Requirement::Setup(name) = r {
+                let line = unmet_line(r);
+                if !report.path_tools.contains(name) && !unmet.contains(&line) {
+                    unmet.push(line);
+                }
+            }
+        }
+    }
     // A component is one of the toolchain the job runs: with a frozen rust
     // version, only the detected toolchain of that version meets it (a
     // toolchain belt installs has the minimal profile).
@@ -895,6 +947,104 @@ mod tests {
         assert_eq!(missing(&req, Some(&old)).len(), 2);
     }
 
+    /// I-b: a worker that installs cargo tools serves a missing `cargo-*`
+    /// tool when the job sets up rust; one that cannot install it (no
+    /// feature, no rust in the job, not a cargo tool) is excluded.
+    #[test]
+    fn a_worker_that_installs_cargo_tools_serves_a_missing_one_only_with_rust() {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("1.92.0").unwrap(),
+                scope,
+                location: Location {
+                    path: "rust-toolchain".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let rust = FrozenBundle::seal_exact(frozen).unwrap();
+        let req = setup_req(vec![Requirement::Setup("cargo-llvm-cov".into())]);
+        let mut installer = setup_report(&[], vec![]);
+        installer.features.insert(SETUP_INSTALL_FEATURE.into());
+        assert!(installer.validate());
+        assert!(missing_with_installable(&req, Some(&installer), Some(&rust)).is_empty());
+        // No rust in the job: nothing to install it with.
+        assert_eq!(
+            missing_with_installable(&req, Some(&installer), None),
+            vec![unmet_line(&req.requires[0])]
+        );
+        // A worker without cargo installs: excluded.
+        let plain = setup_report(&[], vec![]);
+        assert_eq!(
+            missing_with_installable(&req, Some(&plain), Some(&rust)),
+            vec![unmet_line(&req.requires[0])]
+        );
+        // H2: a rust of the selected version only on the profile PATH has
+        // no cargo belt can prove real (a rustup proxy): excluded, as the
+        // attempt would refuse. A rustup toolchain of that version serves.
+        let mut on_path = installer.clone();
+        on_path.tools.insert(
+            "rustc".into(),
+            ToolObservation::Available {
+                version: "1.92.0".into(),
+                identity: Digest::of_bytes(b"rustc"),
+            },
+        );
+        assert_eq!(
+            missing_with_installable(&req, Some(&on_path), Some(&rust)),
+            vec![unmet_line(&req.requires[0])]
+        );
+        on_path.rustup = vec![rust_at("1.92.0", &["cargo", "rustc"])];
+        assert!(missing_with_installable(&req, Some(&on_path), Some(&rust)).is_empty());
+        // A tool on the PATH serves without rust.
+        let holder = setup_report(&["cargo-llvm-cov"], vec![]);
+        assert!(missing_with_installable(&req, Some(&holder), None).is_empty());
+        // The cargo: the installed rust's, else the rustup one of the version.
+        let bin = std::path::Path::new("/installed/bin");
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&rust.frozen, &installer, Some(bin)),
+            Some(bin.to_path_buf())
+        );
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&rust.frozen, &installer, None),
+            None
+        );
+        let none = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            Scope::project(""),
+            &[],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::toolchain::contract::setup_cargo_bin(&none, &on_path, None),
+            None
+        );
+        // The lines say what belt can install.
+        assert!(unmet_line(&req.requires[0]).contains(SETUP_INSTALL_FEATURE));
+        assert!(unmet_line(&Requirement::Setup("protoc".into()))
+            .contains("belt installs only `cargo-*` tools"));
+        // Not a cargo tool: only the PATH serves it.
+        let protoc = setup_req(vec![Requirement::Setup("protoc".into())]);
+        assert_eq!(
+            missing_with_installable(&protoc, Some(&installer), Some(&rust)).len(),
+            1
+        );
+    }
     /// With a frozen rust version, only that toolchain's components count.
     #[test]
     fn a_component_of_another_toolchain_does_not_meet_a_frozen_rust_version() {
