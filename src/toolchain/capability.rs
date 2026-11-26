@@ -418,7 +418,25 @@ pub fn missing_with_installable(
             .iter()
             .any(|s| s.tool.as_str() == "rust")
     });
-    if let (false, Some(report)) = (sets_up_rust, report) {
+    // With rust, the install needs a real cargo (spec 22.1): the rust belt
+    // installs, or a rustup toolchain of the selected version. A native rust
+    // of another kind leaves the worker out, as the attempt would refuse.
+    let has_cargo = bundle.is_some_and(|b| {
+        let rust = b
+            .frozen
+            .selections
+            .iter()
+            .find(|s| s.tool.as_str() == "rust");
+        match (rust, report) {
+            (Some(rust), Some(report)) => {
+                crate::toolchain::contract::native_tool(&b.frozen, &rust.tool, report).is_none()
+                    || crate::toolchain::contract::setup_cargo_bin(&b.frozen, report, None)
+                        .is_some()
+            }
+            _ => false,
+        }
+    });
+    if let (false, Some(report)) = (sets_up_rust && has_cargo, report) {
         for r in &native.requires {
             if let Requirement::Setup(name) = r {
                 let line = unmet_line(r);
@@ -972,6 +990,23 @@ mod tests {
             missing_with_installable(&req, Some(&plain), Some(&rust)),
             vec![unmet_line(&req.requires[0])]
         );
+        // H2: a rust of the selected version only on the profile PATH has
+        // no cargo belt can prove real (a rustup proxy): excluded, as the
+        // attempt would refuse. A rustup toolchain of that version serves.
+        let mut on_path = installer.clone();
+        on_path.tools.insert(
+            "rustc".into(),
+            ToolObservation::Available {
+                version: "1.92.0".into(),
+                identity: Digest::of_bytes(b"rustc"),
+            },
+        );
+        assert_eq!(
+            missing_with_installable(&req, Some(&on_path), Some(&rust)),
+            vec![unmet_line(&req.requires[0])]
+        );
+        on_path.rustup = vec![rust_at("1.92.0", &["cargo", "rustc"])];
+        assert!(missing_with_installable(&req, Some(&on_path), Some(&rust)).is_empty());
         // Not a cargo tool: only the PATH serves it.
         let protoc = setup_req(vec![Requirement::Setup("protoc".into())]);
         assert_eq!(

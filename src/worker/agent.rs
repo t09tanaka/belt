@@ -1992,8 +1992,7 @@ impl Agent {
             &shell,
         )
         .map_err(|e| activation_refused(e, &native, &plans))?;
-        let setup =
-            self.setup_tool_requests(&bundle, &payload.requirements, &plans, &native, &report)?;
+        let setup = self.setup_tool_requests(&bundle, &payload.requirements, &plans, &report)?;
         let mut setup_receipts = Vec::with_capacity(setup.len());
         for request in &setup {
             match self.toolchains.as_ref().map(|r| r.detect(request)) {
@@ -2061,7 +2060,6 @@ impl Agent {
         bundle: &crate::toolchain::contract::FrozenBundle,
         requirements: &crate::toolchain::capability::ExecutionRequirements,
         plans: &[crate::toolchain::adapters::InstallPlan],
-        native: &[crate::toolchain::contract::NativeTool],
         report: &crate::toolchain::capability::WorkerCapabilities,
     ) -> Result<Vec<crate::toolchain::preparation::PreparationRequest>, ApiError> {
         use crate::toolchain::capability::Requirement;
@@ -2090,22 +2088,20 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let rust_bin = plans
-            .iter()
-            .find(|p| p.tool().as_str() == "rust")
-            .map(|p| p.activation_bin().to_path_buf())
-            .or_else(|| {
-                native
-                    .iter()
-                    .find(|t| t.tool.as_str() == "rust")
-                    .and_then(|t| t.rustup.as_ref().map(|r| r.0.clone()).or(t.bin.clone()))
-            });
+        let rust_bin = crate::toolchain::contract::setup_cargo_bin(
+            &bundle.frozen,
+            report,
+            plans
+                .iter()
+                .find(|p| p.tool().as_str() == "rust")
+                .map(|p| p.activation_bin()),
+        );
         let evidence = bundle.evidence.iter().find(|e| e.tool.as_str() == "rust");
         let (Some(rust_bin), Some(evidence), Some(registry)) =
             (rust_bin, evidence, self.toolchains.as_ref())
         else {
             return Err(refuse(format!(
-                "{} unavailable: belt installs a setup tool with the rust toolchain the job sets up, and this attempt has none",
+                "{} unavailable: belt installs a setup tool with the cargo of the rust toolchain the job sets up (one belt installs or a rustup toolchain of that version), and this attempt has none",
                 names()
             )));
         };
@@ -2233,8 +2229,7 @@ impl Agent {
         .map_err(|e| activation_refused(e, &native, &plans))?;
         // The setup tools of the job belt installs with that rust (spec
         // 22.1), after the toolchains: their roots are named by its cargo.
-        let setup =
-            self.setup_tool_requests(bundle, &payload.requirements, &plans, &native, &report)?;
+        let setup = self.setup_tool_requests(bundle, &payload.requirements, &plans, &report)?;
         let mut setup_receipts = Vec::with_capacity(setup.len());
         for request in &setup {
             match self.poll_tool_install(rec, request, begun)? {

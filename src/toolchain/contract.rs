@@ -186,6 +186,32 @@ pub fn native_tool(
         bin: None,
     })
 }
+/// The `bin` with the real `cargo` that installs the job's `cargo-*` setup
+/// tools (spec 22.1), one rule for placement and the attempt: the toolchain
+/// belt installs for the attempt (`installed`), else the user's rustup
+/// toolchain of exactly the selected rust version. A rust found only on the
+/// profile PATH or through another manager serves no install: its `cargo`
+/// may be a rustup proxy, and the report cannot show that it is not.
+pub fn setup_cargo_bin(
+    frozen: &FrozenToolchains,
+    report: &super::capability::WorkerCapabilities,
+    installed: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(bin) = installed {
+        return Some(bin.to_path_buf());
+    }
+    let selection = frozen
+        .selections
+        .iter()
+        .find(|s| s.tool.as_str() == "rust")?;
+    report
+        .rustup
+        .iter()
+        .find(|r| {
+            node_semver::Version::parse(&r.version).ok().as_ref() == Some(&selection.concrete)
+        })
+        .map(|r| r.bin.clone())
+}
 /// The rustup toolchain of `report` that reports exactly `version`, as the
 /// native tool for `rust`. A channel's prerelease (nightly, beta) never
 /// equals a release.
