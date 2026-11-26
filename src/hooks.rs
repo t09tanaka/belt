@@ -89,6 +89,57 @@ impl Ignore {
     }
 }
 
+/// A project that a caller leaves out of one worktree's preparation (see
+/// `CreateOptions::skip` in the library): nothing of it runs, not its key
+/// commands, its install, its verify or its lifecycle scripts, and no cache
+/// entry is read or written for it. With `preset` alone it leaves out every
+/// project of that preset, with `dir` alone every project in that
+/// directory, with both the one project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Skip {
+    /// The preset, such as `npm` or `dart`; any preset without it.
+    pub preset: Option<String>,
+    /// The project directory, relative to the worktree root (`.` for the
+    /// root); any directory without it.
+    pub dir: Option<String>,
+}
+
+impl Skip {
+    /// Leave out every project of `preset` (`npm`, `dart`, `bundler`, ...).
+    pub fn preset(preset: impl Into<String>) -> Self {
+        Skip {
+            preset: Some(preset.into()),
+            dir: None,
+        }
+    }
+
+    /// Leave out every project in `dir`, relative to the worktree root.
+    pub fn dir(dir: impl Into<String>) -> Self {
+        Skip {
+            preset: None,
+            dir: Some(dir.into()),
+        }
+    }
+
+    /// Narrow to the project of `preset` in this directory, or of this
+    /// preset in `dir`.
+    pub fn and(mut self, other: Skip) -> Self {
+        self.preset = self.preset.or(other.preset);
+        self.dir = self.dir.or(other.dir);
+        self
+    }
+
+    /// Whether this leaves out the project of `preset` at `dir`.
+    pub fn covers(&self, preset: &str, dir: &str) -> bool {
+        self.preset.as_deref().is_none_or(|p| p == preset)
+            && self
+                .dir
+                .as_deref()
+                .is_none_or(|d| normalize_dir(d) == normalize_dir(dir))
+    }
+}
+
 /// One `[[clone]]` as written. Every field is optional here; what a preset
 /// fills in and what must be given is decided when it is resolved
 /// (`crate::ecosystem::target::resolve`).
