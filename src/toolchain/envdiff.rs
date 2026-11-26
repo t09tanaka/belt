@@ -621,6 +621,38 @@ mod tests {
     }
 
     #[test]
+    fn an_unmeasured_row_shows_each_side_as_measured() {
+        let unknown = fact(Observed::Unknown, None);
+        // The measured side keeps its value; an absent one is `absent`.
+        let row = tool(unknown.clone(), Some(avail("2.0.0"))).unwrap();
+        assert_eq!(row.parent.as_deref(), Some("unknown"));
+        assert_eq!(row.worker.as_deref(), Some("2.0.0"));
+        assert!(row.steps.unwrap().contains("on this machine"));
+        let row = tool(unknown.clone(), Some(fact(Observed::Unavailable, None))).unwrap();
+        assert_eq!(row.worker.as_deref(), Some("absent"));
+        let row = tool(unknown.clone(), Some(unknown)).unwrap();
+        assert!(row.steps.unwrap().contains("on either machine"));
+    }
+
+    #[test]
+    fn xcode_with_only_the_command_line_tools_says_what_is_missing() {
+        let mut parent = report();
+        parent.tools.insert("xcode".into(), avail("26.0"));
+        let mut worker = report();
+        worker
+            .tools
+            .insert("xcode".into(), fact(Observed::Unknown, None));
+        let items = diff(&parent, &worker);
+        let row = items.iter().find(|i| i.subject == "xcode").unwrap();
+        assert_eq!(row.class, Class::ManualRequired);
+        let steps = row.steps.as_deref().unwrap();
+        assert!(
+            steps.contains("only the Command Line Tools are installed, not Xcode"),
+            "{steps}"
+        );
+    }
+
+    #[test]
     fn equal_versions_are_same_and_other_versions_differ() {
         assert_eq!(class(avail("20.1.0"), Some(avail("20.1.0"))), Class::Same);
         assert_eq!(

@@ -189,13 +189,16 @@ fn the_policy_digest_is_the_one_task_traffic_controller_reports() {
     let state = h.state.join("traffic");
     let config = state.join("config.toml");
     fs::create_dir(&state).unwrap();
-    fs::write(&config, "budget = 3\n").unwrap();
+    // A budget equal to the logical CPU count is left out of our digest (it
+    // is the default), so pick one that is not the default here.
+    let budget = task_traffic_controller::config::logical_cpus() + 1;
+    fs::write(&config, format!("budget = {budget}\n")).unwrap();
     let ours = scope(&state, &config).policy_digest.unwrap();
     let context = task_traffic_controller::Context::new(Paths::new(&state, &config));
     let theirs = task_traffic_controller::inspect::inspect(&context).unwrap();
     assert_eq!(ours, theirs.policy_digest);
     // Another budget is another policy; a broken file has no digest.
-    fs::write(&config, "budget = 4\n").unwrap();
+    fs::write(&config, format!("budget = {}\n", budget + 1)).unwrap();
     assert_ne!(scope(&state, &config).policy_digest.unwrap(), ours);
     fs::write(&config, "budget = \"many\"\n").unwrap();
     assert_eq!(scope(&state, &config).policy_digest, None);
