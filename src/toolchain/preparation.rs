@@ -352,6 +352,37 @@ pub(crate) fn helper_main(path: &Path, binding: &str) -> i32 {
     }
 }
 
+/// The network settings `cargo install` needs to reach its registry behind
+/// a proxy or a private CA (#220 L3), taken from the helper's environment
+/// when set. They are passed at execution only, never part of the plan or
+/// its key, so a re-check of the plan does not depend on them.
+const NETWORK_ENV: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CARGO_HTTP_CAINFO",
+];
+fn network_env(command: &adapters::CommandSpec) -> Vec<(&'static str, std::ffi::OsString)> {
+    network_env_from(command, |k| std::env::var_os(k))
+}
+fn network_env_from(
+    command: &adapters::CommandSpec,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    if !cargo_install(command) {
+        return Vec::new();
+    }
+    NETWORK_ENV
+        .iter()
+        .filter(|k| !command.env.contains_key(**k))
+        .filter_map(|k| get(k).map(|v| (*k, v)))
+        .collect()
+}
 // No public production executor: creation is possible only after helper admission.
 struct HelperExecutor;
 impl adapters::AdmittedExecutor for HelperExecutor {
@@ -363,6 +394,7 @@ impl adapters::AdmittedExecutor for HelperExecutor {
             .args(&command.argv)
             .env_clear()
             .envs(&command.env)
+            .envs(network_env(command))
             .current_dir(&command.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -464,6 +496,25 @@ mod tests {
             HelperExecutor.execute(&spec("mise")).err(),
             Some("installer_output_limit")
         );
+    }
+    /// #220 L3: `cargo install` gets the proxy and CA settings that are
+    /// set, unless the plan sets them; another installer gets none.
+    #[test]
+    fn a_cargo_install_gets_the_proxy_and_ca_settings_that_are_set() {
+        let spec = |name: &str| adapters::CommandSpec {
+            program: format!("/x/{name}").into(),
+            argv: vec!["install".into()],
+            env: [("NO_PROXY".to_string(), "plan".to_string())].into(),
+            cwd: "/".into(),
+        };
+        let get =
+            |k: &str| matches!(k, "HTTPS_PROXY" | "SSL_CERT_FILE" | "NO_PROXY").then(|| k.into());
+        let got: Vec<_> = network_env_from(&spec("cargo"), get)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, ["HTTPS_PROXY", "SSL_CERT_FILE"]);
+        assert!(network_env_from(&spec("mise"), get).is_empty());
     }
     #[test]
     fn preparation_files_are_bounded_owned_private_regular_and_not_links() {

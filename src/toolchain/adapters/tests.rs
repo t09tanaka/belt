@@ -2342,3 +2342,36 @@ fn a_missing_cargo_tool_is_installed_into_a_private_root_and_put_on_path() {
         Err("manual_required_unsupported_adapter_tool")
     );
 }
+/// #220 L2: a failed `cargo install` leaves no registry or build behind.
+#[test]
+fn a_failed_cargo_install_leaves_no_registry_or_build() {
+    let f = fixture(AdapterKind::Rustup, "rust");
+    let (evidence, state, _) = &f.made;
+    let host = fake_rust(state);
+    executable(
+        &host.manager.path,
+        br#"#!/bin/sh
+mkdir -p "$CARGO_HOME/registry" "$CARGO_TARGET_DIR" || exit 4
+echo junk > "$CARGO_HOME/registry/index"
+echo junk > "$CARGO_TARGET_DIR/build"
+exit 101
+"#,
+    );
+    let host = HostTools {
+        manager: FileIdentity::capture(&host.manager.path).unwrap(),
+        ..host
+    };
+    let tool = ToolId::parse("cargo-fake").unwrap();
+    let plan = plan(
+        AdapterKind::Cargo,
+        &f.plan.frozen,
+        &tool,
+        evidence,
+        state,
+        &host,
+    )
+    .unwrap();
+    assert!(install_admitted(&plan, &mut Spawn).is_err());
+    assert!(!plan.root.join("cargo").exists());
+    assert!(!plan.root.join("tmp").exists());
+}
