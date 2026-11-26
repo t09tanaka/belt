@@ -60,15 +60,34 @@ const FILE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// taken before its last look ([`trim_collect`]), so an append either lands
 /// before that last look and is carried over, or finds the file replaced
 /// and goes to the new one. This holds with or without the history lock.
-/// Only an append that waits [`FILE_LOCK_WAIT`] on a trim stopped inside
-/// that window writes without the lock, and can then be lost.
+///
+/// An append never writes without that lock: written to a file a trim is
+/// about to replace, the record would be lost without a trace. When the
+/// lock cannot be had within [`FILE_LOCK_WAIT`] (a trim stopped inside its
+/// window, or a caller starved under load), the record is dropped instead,
+/// counted in [`dropped_appends`], warned about on stderr, and reported as
+/// an error, so the command that produced it is never held up.
 pub fn append(path: &Path, rec: &Record) -> Result<()> {
-    append_with(path, rec, &mut || {})
+    append_with(path, rec, FILE_LOCK_WAIT, &mut || {})
 }
 
-/// [`append`], calling `after_open` once the file is open and before it is
-/// locked (a seam for tests).
-fn append_with(path: &Path, rec: &Record, after_open: &mut dyn FnMut()) -> Result<()> {
+static DROPPED_APPENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many records [`append`] dropped in this process because the history
+/// file stayed locked.
+pub fn dropped_appends() -> u64 {
+    DROPPED_APPENDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`append`], waiting at most `wait` for the file lock, and calling
+/// `after_open` once the file is open and before it is locked (seams for
+/// tests).
+fn append_with(
+    path: &Path,
+    rec: &Record,
+    wait: std::time::Duration,
+    after_open: &mut dyn FnMut(),
+) -> Result<()> {
     use fs2::FileExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -82,28 +101,39 @@ fn append_with(path: &Path, rec: &Record, after_open: &mut dyn FnMut()) -> Resul
             .append(true)
             .open(path)?;
         after_open();
-        let locked = loop {
+        loop {
             match FileExt::try_lock_shared(&f) {
-                Ok(()) => break true,
+                Ok(()) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if start.elapsed() >= FILE_LOCK_WAIT {
-                        break false;
+                    if start.elapsed() >= wait {
+                        let n =
+                            DROPPED_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        eprintln!(
+                            "task-traffic-controller: warning: dropped a history record for `{}`: \
+                             {} stayed locked for {:?} ({n} dropped by this process)",
+                            rec.key,
+                            path.display(),
+                            wait
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "history file stayed locked; record dropped",
+                        )
+                        .into());
                     }
                     std::thread::sleep(FILE_LOCK_POLL);
                 }
                 Err(e) => return Err(e.into()),
             }
-        };
-        if locked && !crate::lock::names(&f, path) {
+        }
+        if !crate::lock::names(&f, path) {
             // Replaced (or removed) by a trim since it was opened.
             let _ = FileExt::unlock(&f);
             continue;
         }
         let out = f.write_all(line.as_bytes());
-        if locked {
-            // Explicitly: a child forked meanwhile holds a copy of the fd.
-            let _ = FileExt::unlock(&f);
-        }
+        // Explicitly: a child forked meanwhile holds a copy of the fd.
+        let _ = FileExt::unlock(&f);
         out?;
         return Ok(());
     }
@@ -533,7 +563,7 @@ mod tests {
             let (opened_tx, opened_rx) = std::sync::mpsc::channel();
             let path = p.clone();
             writer = Some(std::thread::spawn(move || {
-                append_with(&path, &rec("late", 9.0), &mut || {
+                append_with(&path, &rec("late", 9.0), FILE_LOCK_WAIT, &mut || {
                     let _ = opened_tx.send(());
                 })
                 .unwrap();
@@ -545,6 +575,45 @@ mod tests {
         assert_eq!(dropped, 2);
         let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
         assert_eq!(walls, vec![3.0, 9.0]);
+    }
+
+    /// An append that cannot get the file lock while a trim holds the old
+    /// file past its last look must not write to that file: the rename
+    /// would lose the record silently. It is dropped, counted and reported.
+    #[test]
+    fn an_append_that_times_out_inside_the_trim_window_is_dropped_visibly_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        for w in [1.0, 2.0, 3.0] {
+            append(&p, &rec("k", w)).unwrap();
+        }
+        let before = dropped_appends();
+        let mut result = None;
+        let (dropped, _) = trim_collect_with(&p, 1, None, &mut || {}, &mut || {
+            // The trim is stopped here, old file locked, longer than the
+            // writer waits: the writer gives up before the rename.
+            let path = p.clone();
+            result = Some(
+                std::thread::spawn(move || {
+                    append_with(
+                        &path,
+                        &rec("late", 9.0),
+                        std::time::Duration::from_millis(20),
+                        &mut || {},
+                    )
+                })
+                .join()
+                .unwrap(),
+            );
+        })
+        .unwrap();
+        assert_eq!(dropped, 2);
+        let walls: Vec<f64> = read_all(&p).unwrap().iter().map(|r| r.wall_secs).collect();
+        let r = result.unwrap();
+        // Either it is in the history, or the caller was told it is not.
+        assert!(r.is_err(), "append reported success, history: {walls:?}");
+        assert_eq!(walls, vec![3.0]);
+        assert!(dropped_appends() > before);
     }
 
     /// A half line nobody finishes (a writer that died, or one whose tail
