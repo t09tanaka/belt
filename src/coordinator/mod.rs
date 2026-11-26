@@ -2721,6 +2721,42 @@ impl Coordinator {
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,
             }));
+            // A worker that has the job's setup tools is preferred to one
+            // that would install them (spec 22.1): while one is a candidate,
+            // the others are not asked.
+            let setup_tools: Vec<&String> = spec
+                .requirements
+                .requires
+                .iter()
+                .filter_map(|r| match r {
+                    crate::toolchain::capability::Requirement::Setup(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            let has_setup_tools = |w: &Reached| {
+                w.capabilities
+                    .as_ref()
+                    .is_some_and(|c| setup_tools.iter().all(|t| c.path_tools.contains(*t)))
+            };
+            let compatible = if compatible.iter().any(|w| has_setup_tools(w)) {
+                let (has, installs): (Vec<&Reached>, Vec<&Reached>) =
+                    compatible.into_iter().partition(|w| has_setup_tools(w));
+                excluded.extend(installs.into_iter().map(|w| Excluded {
+                    unmet: vec![format!(
+                        "another worker has {} on its PATH; belt installs setup tools only where none has them",
+                        setup_tools
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )],
+                    worker_id: w.worker_id.clone(),
+                    why: Exclusion::CapabilityMismatch,
+                }));
+                has
+            } else {
+                compatible
+            };
             let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
                 .into_iter()
                 .partition(|w| !refused.contains(&w.worker_id));

@@ -268,3 +268,20 @@ all selections, then rebuild every request from the complete final frozen contra
 contain the same complete frozen contract. Evidence contract digests clear all selections,
 so this rebuild preserves the original authority. Do not begin installation with an
 intermediate request and later change that consumer's binding to a completed contract.
+
+**belt installs missing `cargo-*` tools (adapter `Cargo`).** A worker that
+reports `setup_cargo_install_v1` also meets a `cargo-*` requirement it lacks
+when the task's bundle selects rust. After the toolchains are prepared, the
+agent asks the registry for `cargo_request`: the plan runs the activated
+rust's real `cargo` (a rustup proxy is refused) as
+`cargo install --locked --root <root>/payload <crate>` with CARGO_HOME,
+CARGO_TARGET_DIR, HOME and TMPDIR inside the root. The root is
+`toolchains/<identity>/`, identity = crate + cargo/rustc file identities +
+rust version, and uses the same install lock, receipt, root binding, GC and
+size bound as every other managed root (spec 25.7 (b)). After a successful
+install `cargo/` and `tmp/` are removed. No version probe runs; the receipt
+stands on the tree identity of the installed executable.
+`adapters::with_setup_tools` puts each root's `bin` first on PATH and folds
+the receipts into the installation identity and execution fingerprint.
+Placement prefers workers that already have every setup tool on PATH.
+`~/.cargo/bin` is never written.

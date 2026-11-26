@@ -494,6 +494,66 @@ impl Registry {
             plan,
         ))
     }
+    /// The install of the setup tool `tool` with the rust the attempt runs
+    /// (spec 22.1): `rust_bin` is that toolchain's `bin`, which has the real
+    /// `cargo` and `rustc` (a rustup proxy is refused: it would read the
+    /// user's rustup home from the private one). `rust` is the selection's
+    /// evidence. Read-only: identities are hashed, nothing is run.
+    pub fn cargo_request(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        rust: &adapters::ResolutionEvidence,
+        rust_bin: &Path,
+    ) -> Result<PreparationRequest, Unavailable> {
+        let program = |name: &str| -> Result<adapters::FileIdentity, Unavailable> {
+            let path = std::fs::canonicalize(rust_bin.join(name))
+                .map_err(|_| Unavailable::Invalid("cargo_unavailable"))?;
+            if path.file_name().is_none_or(|n| n != name) {
+                return Err(Unavailable::Invalid("cargo_proxy_unsupported"));
+            }
+            adapters::FileIdentity::capture(&path).map_err(Unavailable::Invalid)
+        };
+        let cargo = program("cargo")?;
+        let rustc = program("rustc")?;
+        let mut search_path = vec![cargo
+            .path
+            .parent()
+            .ok_or(Unavailable::Invalid("cargo_unavailable"))?
+            .to_path_buf()];
+        // The linker cargo calls (`cc`).
+        for dir in ["/usr/bin", "/bin"] {
+            if !search_path.iter().any(|p| p == Path::new(dir)) {
+                search_path.push(dir.into());
+            }
+        }
+        let host = adapters::HostTools {
+            manager: cargo,
+            dependencies: vec![rustc],
+            search_path,
+            rust_host: String::new(),
+        };
+        let plan = adapters::plan(
+            adapters::AdapterKind::Cargo,
+            frozen,
+            tool,
+            rust,
+            &self.root,
+            &host,
+        )
+        .map_err(Unavailable::Invalid)?;
+        Ok(PreparationRequest {
+            kind: adapters::AdapterKind::Cargo,
+            frozen: frozen.clone(),
+            tool: tool.clone(),
+            evidence: rust.clone(),
+            private_root: self.root.clone(),
+            host,
+            expected_plan: plan.key(),
+            profile_definition: self.profile_definition.clone(),
+            base_profile: self.base_profile.clone(),
+        })
+    }
     /// The request for one operator-authorized exact version, as a warm-up
     /// asks for it: no project, no parent evidence. Its install plan (and so
     /// its singleflight key and private location) is the one an attempt that
@@ -564,6 +624,14 @@ impl Registry {
     /// Detect only the indexed exact artifact using its validated adapter receipt.
     pub fn detect(&self, request: &PreparationRequest) -> Result<Availability, Unavailable> {
         let expected = match self.request(&request.frozen, &request.tool, Some(&request.evidence)) {
+            _ if request.kind == adapters::AdapterKind::Cargo => {
+                let bin = request
+                    .host
+                    .search_path
+                    .first()
+                    .ok_or(Unavailable::Invalid("cargo_unavailable"))?;
+                self.cargo_request(&request.frozen, &request.tool, &request.evidence, bin)?
+            }
             Ok(expected) => expected,
             Err(refused) if refused.allows_native() => {
                 self.install_request(&request.frozen, &request.tool, &request.evidence)?
@@ -643,6 +711,7 @@ fn validate_recipe(r: &Recipe) -> Result<(), String> {
         AdapterKind::Mise => matches!(r.tool.as_str(), "node" | "python" | "go" | "ruby"),
         AdapterKind::Fvm => r.tool.as_str() == "flutter",
         AdapterKind::Corepack => matches!(r.tool.as_str(), "pnpm" | "yarn" | "npm"),
+        AdapterKind::Cargo => false,
     };
     if !supported
         || r.inventory.is_empty()

@@ -3935,3 +3935,115 @@ async fn a_silent_toolchain_answer_is_no_answer_and_is_asked_again() {
     c.tick().await.unwrap();
     assert_eq!(only(&c, &task).worker_id, worker.id);
 }
+
+/// I-b (spec 22.1): a job whose setup step installs `cargo-x` and that
+/// sets up rust goes to a worker with `cargo-x` on its PATH while one is a
+/// candidate; with none, a worker that installs cargo tools takes it.
+#[tokio::test]
+async fn a_worker_with_the_setup_tool_is_preferred_to_one_that_installs_it() {
+    use belt::toolchain::{capability::*, contract::FrozenBundle, versions::*};
+    let caps = |path_tools: &[&str], installs: bool| {
+        let mut features: std::collections::BTreeSet<String> =
+            [FEATURE.into(), SETUP_TOOLS_FEATURE.into()].into();
+        if installs {
+            features.insert(SETUP_INSTALL_FEATURE.into());
+        }
+        WorkerCapabilities {
+            schema_version: 1,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            profile: "default".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: BTreeMap::new(),
+            features,
+            rustup: Vec::new(),
+            installs: Vec::new(),
+            path_tools: path_tools.iter().map(|t| t.to_string()).collect(),
+            disk_free_bytes: None,
+            resource_budget: None,
+            cpu_cores: None,
+            memory_bytes: None,
+        }
+    };
+    let job = |manifest: &Digest| {
+        let mut task_spec = spec();
+        let scope = Scope::project("");
+        task_spec.requirements = ExecutionRequirements {
+            profile: None,
+            requires: vec![Requirement::Setup("cargo-x".into())],
+        };
+        task_spec.toolchains = Some(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    manifest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("rust").unwrap(),
+                        constraint: Constraint::parse("1.92.0").unwrap(),
+                        scope,
+                        location: Location {
+                            path: "rust-toolchain".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        task_spec
+    };
+    for with_holder in [true, false] {
+        let f = fx();
+        let installer = f.worker("a-installer", (1, 1));
+        installer.set(|s| s.capabilities = Some(caps(&[], true)));
+        let plain = f.worker("b-plain", (1, 1));
+        plain.set(|s| s.capabilities = Some(caps(&[], false)));
+        let holder = f.worker("c-holder", (1, 1));
+        holder.set(|s| s.capabilities = Some(caps(&["cargo-x"], false)));
+        let mut workers = vec![&installer, &plain];
+        if with_holder {
+            workers.push(&holder);
+        }
+        let c = f.open(&workers);
+        for w in workers {
+            c.attach(
+                w.id.clone(),
+                Arc::new(ToolchainAttestor {
+                    worker: w.clone(),
+                    stall_resolution: false,
+                }),
+            )
+            .await;
+        }
+        let task_spec = job(&spec().manifest_digest);
+        let task = TaskId::generate();
+        c.enqueue(
+            RunId::generate(),
+            source(&c),
+            vec![(task.clone(), task_spec)],
+        )
+        .await
+        .unwrap();
+        c.tick().await.unwrap();
+        let expected = if with_holder {
+            &holder.id
+        } else {
+            &installer.id
+        };
+        assert_eq!(&only(&c, &task).worker_id, expected, "{with_holder}");
+        // A worker without cargo installs is never asked.
+        assert_eq!(plain.received(Op::Forecast), 0, "{with_holder}");
+        if with_holder {
+            assert_eq!(installer.received(Op::Forecast), 0);
+        }
+    }
+}
