@@ -670,10 +670,9 @@ struct Made {
 /// its way to the lock. The marker records the filesystem this process sees
 /// the directory on.
 ///
-/// The returned descriptor holds `ephemeral.lock` shared and is inherited by
-/// every process this one starts (it is not close-on-exec), so the lock
-/// stays held until the last of them is gone. Call before any other thread
-/// exists.
+/// The returned descriptor holds `ephemeral.lock` shared. It is still
+/// close-on-exec: [`create_and_hold`] lets every process started from here
+/// inherit it.
 ///
 /// Until the lock is held, another start may take the directory for what a
 /// killed start left and remove it (`unfinished`). It makes or takes
@@ -751,7 +750,7 @@ fn create_state_with(
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         made.names.push(LOCK);
-        let lock = made.lock.insert(lock);
+        made.lock = Some(lock);
         at(Step::Locked);
         let mut marker = marker.clone();
         marker.filesystem = Some(plan::recorded(&filesystem_of(dir)));
@@ -770,7 +769,6 @@ fn create_state_with(
             std::fs::symlink_metadata(path).is_ok_and(|now| same_file(&now, &meta)),
             "worker state was replaced while it was created"
         );
-        inherit(lock)?;
         Ok(())
     })();
     match (filled, made.lock.take()) {
@@ -806,6 +804,22 @@ fn create_state_with(
                 .unwrap_or_else(|| anyhow::anyhow!("worker state was created without its lock")))
         }
     }
+}
+
+/// [`create_state`], whose lock every process this one starts from now on
+/// inherits (it is no longer close-on-exec), so the lock stays held until
+/// the last of them is gone (spec 25.4 (d)). Call before any other thread
+/// exists: a child another thread forks meanwhile would inherit it too (in
+/// a test process, one that has nothing to do with the worker).
+fn create_and_hold(
+    path: &Path,
+    marker: &MarkerFile,
+    filesystem_of: impl Fn(&File) -> plan::Filesystem,
+    at: &dyn Fn(Step),
+) -> anyhow::Result<(Created, File)> {
+    let (created, alive) = create_state(path, marker, filesystem_of, at)?;
+    inherit(&alive)?;
+    Ok((created, alive))
 }
 
 /// Let every process started from here inherit the descriptor: the
@@ -970,7 +984,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
         filesystem: None,
     };
     // Held until this process ends; its children hold their own copies.
-    let (created, alive) = create_state(&spec.state_dir, &marker, filesystem_of, &nowhere)?;
+    let (created, alive) = create_and_hold(&spec.state_dir, &marker, filesystem_of, &nowhere)?;
     let result = (|| {
         let config = spec.validate(&home)?;
         eprintln!(
