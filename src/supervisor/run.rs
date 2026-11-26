@@ -1027,10 +1027,13 @@ impl Control<'_> {
             since_ms: waiting_since,
         };
         let guard = match self.admit(&command, limits, stage)? {
-            Admission::AlreadyTerminal => {
-                // The id already ended: nothing may run for it again.
+            Admission::AlreadyTerminal(reason) => {
+                // The id already ended: nothing may run for it again, and
+                // it never waited here. A stop seen while `register` was in
+                // flight was already recorded, so it is the reason.
+                self.waiting_since_ms = None;
                 return Ok(NodeEnd {
-                    reason: None,
+                    reason,
                     exit: None,
                     unconfirmed: false,
                     identity_unknown: false,
@@ -1099,12 +1102,14 @@ impl Control<'_> {
                 s.spawn(move || admission_rounds(&ctx, &cfg, command, limits, poll, stop, &tx));
             let mut registered = false;
             let mut seen: Result<Option<StopReason>> = Ok(None);
-            let mut done = false;
-            while !done {
+            loop {
                 match rx.recv_timeout(poll) {
                     Ok(AdmitStep::Registered) => registered = true,
-                    Ok(AdmitStep::Done) | Err(_) if handle.is_finished() => done = true,
-                    _ => {}
+                    // The thread has its result (or is gone): stop looking.
+                    Ok(AdmitStep::Done) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 if registered {
                     // Shown once, as soon as it is known.
@@ -1136,22 +1141,29 @@ impl Control<'_> {
             let ended = handle
                 .join()
                 .map_err(|_| SupervisorError::State("the admission thread panicked".into()))?;
-            // A registration that ended before this thread saw its step.
+            // A registration that ended before this thread saw its step. A
+            // failure to mark it does not keep a stop from being released.
             if let Ok(AdmitEnd::Admitted(_) | AdmitEnd::Withdrawn(_)) = &ended {
                 while let Ok(step) = rx.try_recv() {
-                    if matches!(step, AdmitStep::Registered) {
-                        self.store.mark_receipt(
-                            &attempt,
-                            Receipt::CommandRegistered,
-                            platform::wall_ms(),
-                        )?;
+                    if !matches!(step, AdmitStep::Registered) {
+                        continue;
+                    }
+                    if let Err(e) = self.store.mark_receipt(
+                        &attempt,
+                        Receipt::CommandRegistered,
+                        platform::wall_ms(),
+                    ) {
+                        if matches!(seen, Ok(None)) {
+                            seen = Err(e.into());
+                        }
                     }
                 }
             }
             let ended = ended.map_err(SupervisorError::traffic)?;
             let reason = seen?;
             Ok(match (ended, reason) {
-                (AdmitEnd::AlreadyTerminal, _) => Admission::AlreadyTerminal,
+                // A stop already recorded is the node's reason too.
+                (AdmitEnd::AlreadyTerminal, r) => Admission::AlreadyTerminal(r),
                 (AdmitEnd::Admitted(g) | AdmitEnd::Withdrawn(g), Some(r)) => {
                     Admission::Stopped(g, r)
                 }
@@ -1640,7 +1652,8 @@ fn child_target(ctx: &Context, id: &str) -> Option<StopTarget> {
 /// [`super::recover::recover`].
 /// What [`Control::admit`] came to.
 enum Admission {
-    AlreadyTerminal,
+    /// With the stop reason recorded meanwhile, if one was.
+    AlreadyTerminal(Option<StopReason>),
     Admitted(managed::OwnerGuard),
     /// A stop reason was seen before the command was admitted (or in the
     /// same round): the registration is to be withdrawn.

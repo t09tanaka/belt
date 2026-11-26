@@ -151,17 +151,27 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
     }
     let wanted = want.version.as_deref();
     let have_version = have.and_then(|h| h.version.as_deref());
-    let unmeasured = |side: &str| {
-        item(
-            name,
-            Class::Differs,
-            wanted,
-            have_version,
-            Some(unmeasured_steps(name, side)),
-        )
+    // A side that could not be measured is shown as `unknown`, never as
+    // `-` (which is a tool that is not there): nothing was compared.
+    let shown = |fact: Option<&ToolFact>| match fact {
+        Some(f) if f.observed == Observed::Unavailable => Some("absent".to_string()),
+        Some(f) if f.observed == Observed::Available => f.version.clone(),
+        _ => Some("unknown".to_string()),
+    };
+    let unmeasured = |side: &str| Item {
+        subject: name.into(),
+        class: Class::NotMeasured,
+        parent: shown(Some(want)),
+        worker: shown(have),
+        steps: Some(unmeasured_steps(name, side)),
     };
     if want.observed == Observed::Unknown {
-        return Some(unmeasured("this machine"));
+        let side = if have.is_some_and(|h| h.observed == Observed::Unknown) {
+            "either machine"
+        } else {
+            "this machine"
+        };
+        return Some(unmeasured(side));
     }
     // A worker that did not report the tool at all was not measured either.
     let Some(have) = have else {
@@ -182,6 +192,18 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
         return Some(item(name, Class::Same, wanted, have_version, None));
     }
     if have.observed == Observed::Unknown {
+        if let Some(manual) = manual_steps(name) {
+            // Present but not answering: Xcode with only the Command Line
+            // Tools, docker with no engine running. Said as what is missing.
+            return Some(Item {
+                class: Class::ManualRequired,
+                steps: Some(format!(
+                    "{name} is on the worker's PATH but did not answer ({}); {manual}{RERUN}",
+                    unanswered(name)
+                )),
+                ..unmeasured("the worker")
+            });
+        }
         return Some(unmeasured("the worker"));
     }
     let present = have.observed == Observed::Available;
@@ -199,6 +221,15 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
         _ => install_steps(name, wanted, present),
     };
     Some(item(name, class, wanted, have_version, Some(steps)))
+}
+
+/// What a manual tool that is present but did not answer usually lacks.
+fn unanswered(tool: &str) -> &'static str {
+    match tool {
+        "xcode" => "only the Command Line Tools are installed, not Xcode",
+        // Only the manual tools reach here: xcode and docker.
+        _ => "no Docker engine is running",
+    }
 }
 
 fn steps_for_auto() -> String {
@@ -273,7 +304,7 @@ fn policy_item(want: &EnvReport, have: &EnvReport) -> Item {
             Some(w),
             Some(h),
             Some(format!(
-                "align the task-traffic-controller policy on the worker{RERUN}"
+                "the task-traffic-controller configuration differs (a budget equal to the machine's CPU count is not compared); make the worker's `task-traffic-controller/config.toml` under `$XDG_CONFIG_HOME` (else `~/.config`) of its retained service environment hold the same keys and values as the parent's{RERUN}"
             )),
         ),
         _ => item(
@@ -330,14 +361,22 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
     // The worker's own mise (spec 22.1). A report from before it was
     // measured has no row; nothing is compared then.
     if let Some(mise) = have.helpers.get("mise") {
+        // The parent's own mise is measured the same way; a report from
+        // before that has no row and is shown as `unknown`.
+        let parent = match want.helpers.get("mise") {
+            Some(Some(_)) => "present",
+            Some(None) => "absent",
+            None => "unknown",
+        };
         items.push(match mise {
-            Some(_) => item("mise", Class::Same, None, Some("present"), None),
-            // Shown with how to get it, never a failure: the worker still
-            // serves the versions it has, and sync cannot install mise.
+            Some(_) => item("mise", Class::Same, Some(parent), Some("present"), None),
+            // Shown with how to get it: the worker still serves the
+            // versions it has, and sync cannot install mise. doctor gives
+            // it as a notice.
             None => item(
                 "mise",
-                Class::Same,
-                None,
+                if parent == "present" { Class::Missing } else { Class::Same },
+                Some(parent),
                 Some("absent"),
                 Some(format!(
                     "{}; until then this worker serves only the node, python, go and ruby versions it already has{RERUN}",
@@ -372,10 +411,14 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
             ),
             Docker::Unknown => item(
                 "docker",
-                Class::Differs,
+                Class::ManualRequired,
                 Some("runnable"),
                 Some("unknown"),
-                Some(unmeasured_steps("docker", "the worker")),
+                Some(format!(
+                    "docker is on the worker's PATH but `docker info` did not answer ({}); {}{RERUN}",
+                    unanswered("docker"),
+                    manual_steps("docker").unwrap_or_default()
+                )),
             ),
         });
     }
@@ -546,14 +589,18 @@ mod tests {
     #[test]
     fn unknown_is_never_same() {
         let unknown = fact(Observed::Unknown, None);
+        // Never same: nothing was compared, which is said as such.
         assert_eq!(
             class(unknown.clone(), Some(unknown.clone())),
-            Class::Differs
+            Class::NotMeasured
         );
-        assert_eq!(class(unknown.clone(), None), Class::Differs);
-        assert_eq!(class(avail("1.0.0"), Some(unknown)), Class::Differs);
+        let both = tool(unknown.clone(), Some(unknown.clone())).unwrap();
+        assert_eq!(both.parent.as_deref(), Some("unknown"));
+        assert_eq!(both.worker.as_deref(), Some("unknown"));
+        assert_eq!(class(unknown.clone(), None), Class::NotMeasured);
+        assert_eq!(class(avail("1.0.0"), Some(unknown)), Class::NotMeasured);
         // A worker that did not report the tool was not measured either.
-        assert_eq!(class(avail("1.0.0"), None), Class::Differs);
+        assert_eq!(class(avail("1.0.0"), None), Class::NotMeasured);
         // Said as "could not be measured", never as an install instruction.
         for (want, have, side) in [
             (
@@ -571,6 +618,38 @@ mod tests {
             );
             assert!(!steps.contains("install"), "{steps}");
         }
+    }
+
+    #[test]
+    fn an_unmeasured_row_shows_each_side_as_measured() {
+        let unknown = fact(Observed::Unknown, None);
+        // The measured side keeps its value; an absent one is `absent`.
+        let row = tool(unknown.clone(), Some(avail("2.0.0"))).unwrap();
+        assert_eq!(row.parent.as_deref(), Some("unknown"));
+        assert_eq!(row.worker.as_deref(), Some("2.0.0"));
+        assert!(row.steps.unwrap().contains("on this machine"));
+        let row = tool(unknown.clone(), Some(fact(Observed::Unavailable, None))).unwrap();
+        assert_eq!(row.worker.as_deref(), Some("absent"));
+        let row = tool(unknown.clone(), Some(unknown)).unwrap();
+        assert!(row.steps.unwrap().contains("on either machine"));
+    }
+
+    #[test]
+    fn xcode_with_only_the_command_line_tools_says_what_is_missing() {
+        let mut parent = report();
+        parent.tools.insert("xcode".into(), avail("26.0"));
+        let mut worker = report();
+        worker
+            .tools
+            .insert("xcode".into(), fact(Observed::Unknown, None));
+        let items = diff(&parent, &worker);
+        let row = items.iter().find(|i| i.subject == "xcode").unwrap();
+        assert_eq!(row.class, Class::ManualRequired);
+        let steps = row.steps.as_deref().unwrap();
+        assert!(
+            steps.contains("only the Command Line Tools are installed, not Xcode"),
+            "{steps}"
+        );
     }
 
     #[test]
@@ -770,13 +849,10 @@ mod tests {
         worker.docker = Docker::Unknown;
         let items = diff(&report(), &worker);
         let item = items.iter().find(|i| i.subject == "docker").unwrap();
-        assert_eq!(item.class, Class::Differs);
+        assert_eq!(item.class, Class::ManualRequired);
         let steps = item.steps.as_deref().unwrap();
-        assert!(
-            steps.contains("docker could not be measured on the worker"),
-            "{steps}"
-        );
-        assert!(!steps.contains("install"), "{steps}");
+        assert!(steps.contains("no Docker engine is running"), "{steps}");
+        assert!(steps.contains("`docker info` succeeds"), "{steps}");
         // The parent does not run docker: nothing to compare.
         let mut parent = report();
         parent.docker = Docker::NotRunnable;
@@ -1077,11 +1153,28 @@ mod tests {
             .as_deref()
             .is_some_and(|s| s.contains("brew install mise")));
         assert!(all_same(&items));
+        // The parent has it and the worker does not: said, not hidden.
+        let mut with = report();
+        with.helpers.insert("mise".into(), Some("present".into()));
+        let row = diff(&with, &worker)
+            .into_iter()
+            .find(|i| i.subject == "mise")
+            .unwrap();
+        assert_eq!(row.class, Class::Missing);
+        assert_eq!(row.parent.as_deref(), Some("present"));
         worker.helpers.insert("mise".into(), Some("present".into()));
         let row = diff(&parent, &worker)
             .into_iter()
             .find(|i| i.subject == "mise")
             .unwrap();
         assert_eq!(row.class, Class::Same);
+        // A parent measured without mise is shown as `absent`.
+        let mut without = report();
+        without.helpers.insert("mise".into(), None);
+        let row = diff(&without, &worker)
+            .into_iter()
+            .find(|i| i.subject == "mise")
+            .unwrap();
+        assert_eq!(row.parent.as_deref(), Some("absent"));
     }
 }

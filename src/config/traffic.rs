@@ -71,9 +71,21 @@ pub fn apply_step_env(env: &mut BTreeMap<String, String>, scope: &BTreeMap<Strin
 
 /// The digest of an effective configuration (the policy of its scope).
 /// `None` only when the configuration cannot be serialized.
+///
+/// A `budget` equal to this machine's logical CPU count (the default) is
+/// left out: two machines with no configuration then have one policy
+/// whatever their core counts, so only a written difference tells them apart.
 pub fn policy_digest(config: &task_traffic_controller::config::Config) -> Option<String> {
+    policy_digest_on(config, task_traffic_controller::config::logical_cpus())
+}
+
+fn policy_digest_on(config: &task_traffic_controller::config::Config, cpus: u32) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(config).ok()?;
+    let mut value = serde_json::to_value(config).ok()?;
+    if config.budget == cpus {
+        value.as_object_mut()?.remove("budget");
+    }
+    let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
@@ -359,6 +371,42 @@ pub fn recorded_hold(state_dir: &Path, now_ms: u64) -> Option<HoldRecord> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_default_budget_is_left_out_of_the_policy_digest() {
+        use task_traffic_controller::config::Config;
+        let on = |budget: u32, cpus: u32| {
+            policy_digest_on(
+                &Config {
+                    budget,
+                    ..Config::default()
+                },
+                cpus,
+            )
+            .unwrap()
+        };
+        // No configuration on an 8-core and a 12-core machine: one policy.
+        assert_eq!(on(8, 8), on(12, 12));
+        // A budget written to differ from the cores is a real difference.
+        assert_ne!(on(4, 8), on(8, 8));
+        assert_ne!(on(4, 8), on(6, 8));
+        // Any other written key still tells the machines apart.
+        let reserve = Config {
+            memory_reserve_mib: 3072,
+            ..Config::default()
+        };
+        assert_ne!(
+            policy_digest_on(
+                &Config {
+                    budget: 12,
+                    ..reserve
+                },
+                12
+            )
+            .unwrap(),
+            on(8, 8)
+        );
+    }
     use super::*;
     use task_traffic_controller::lock;
 
