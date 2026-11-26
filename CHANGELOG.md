@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-11-26
+
 ### Fixed
 
 - An append that could not get the lock on the history file within a second still wrote, without the lock. Landing between a trim's last look and its rename, that record was lost without a trace; a caller under load could reach that second (one of 600 records missing in `appends_during_trims_are_not_lost`). An append now never writes without the file lock: when it cannot get it in time the record is dropped, counted (`history::dropped_appends`), warned about on stderr and returned as an error, so the command is never held up and no record is lost silently.
