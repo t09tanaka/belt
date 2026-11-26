@@ -65,6 +65,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
     store
         .submit(
             NewAcceptance {
+                lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
                 task_id: TaskId::generate(),
@@ -198,6 +199,7 @@ impl Fx {
         self.store
             .submit(
                 NewAcceptance {
+                    lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                     attempt_id: attempt.clone(),
                     run_id: first.run_id,
                     task_id: first.task_id,
@@ -995,7 +997,12 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     let renewer = std::thread::spawn(move || {
         let (mut seq, mut errors) = (1, Vec::new());
         while read_pid(&started).is_none() && !run_ended.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Err(e) = second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+            if let Err(e) = second.renew_lease(
+                &attempt,
+                key(seq),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 errors.push(format!("renewal {seq}: {e}"));
             }
             seq += 1;
@@ -1016,7 +1023,12 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     assert!(expired);
     let err = f
         .store
-        .renew_lease(f.attempt(), key(next), platform::wall_ms())
+        .renew_lease(
+            f.attempt(),
+            key(next),
+            platform::wall_ms(),
+            belt::storage::GrantStamp::now(),
+        )
         .unwrap_err();
     assert!(matches!(err, StorageError::LeaseNotRenewable(_)), "{err:?}");
 }
@@ -1043,7 +1055,12 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
         let (mut errors, mut longest) = (Vec::new(), Duration::ZERO);
         let mut last = Instant::now();
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-            match second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+            match second.renew_lease(
+                &attempt,
+                key(seq),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 Ok(_) => {
                     longest = longest.max(last.elapsed());
                     last = Instant::now();
@@ -1078,9 +1095,12 @@ fn a_replayed_renewal_does_not_extend_the_lease() {
         let mut extended = 0;
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             // The same request again and again.
-            if let Ok(LeaseOutcome::Extended) =
-                second.renew_lease(&attempt, key(1), platform::wall_ms())
-            {
+            if let Ok(LeaseOutcome::Extended) = second.renew_lease(
+                &attempt,
+                key(1),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 extended += 1;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1240,7 +1260,12 @@ fn a_seed_measured_before_a_renewal_does_not_shorten_that_renewal() {
     let mut f = fx(vec![node("n", "sleep 0.8; echo done")]);
     f.spec.lease_ms = 30_000;
     f.store
-        .renew_lease(f.attempt(), key(1), platform::wall_ms())
+        .renew_lease(
+            f.attempt(),
+            key(1),
+            platform::wall_ms(),
+            belt::storage::GrantStamp::now(),
+        )
         .unwrap();
     f.spec.lease_seed = Some(LeaseSeed {
         ends_mono_ms: platform::monotonic_ms(),

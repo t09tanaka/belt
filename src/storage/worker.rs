@@ -117,6 +117,48 @@ pub struct NewAcceptance {
     pub payload_hash: PayloadHash,
     pub coordinator_epoch: CoordinatorEpoch,
     pub spec: Value,
+    /// The lease granted with the acceptance (spec 12). `None` grants no
+    /// renewal: every renewal of the attempt is refused.
+    pub lease: Option<AcceptedLease>,
+}
+
+/// When a lease grant was made: the boot it belongs to and the worker's
+/// monotonic clock (suspend included) of that boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantStamp {
+    /// `None` when the boot cannot be told: such a grant proves nothing.
+    pub boot: Option<String>,
+    pub mono_ms: u64,
+}
+
+impl GrantStamp {
+    pub fn now() -> Self {
+        Self {
+            boot: crate::platform::boot_id(),
+            mono_ms: crate::platform::monotonic_ms(),
+        }
+    }
+}
+
+/// The lease terms persisted with an acceptance, and its grant time. The
+/// agent's renewal check and the supervisor count the same window
+/// (`lease_ms - poll_ms`) from these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedLease {
+    pub lease_ms: u64,
+    pub poll_ms: u64,
+    pub at: GrantStamp,
+}
+
+impl AcceptedLease {
+    /// Terms granted now.
+    pub fn now(lease_ms: u64, poll_ms: u64) -> Self {
+        Self {
+            lease_ms,
+            poll_ms,
+            at: GrantStamp::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -892,8 +934,9 @@ impl WorkerStore {
                         tx.execute(
                             "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation,
                             payload_hash, coordinator_epoch, spec_json, state, receipts_json,
-                            accepted_at_ms, coordinator_id, source_id)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9,?10,?11)",
+                            accepted_at_ms, coordinator_id, source_id, accepted_mono_ms,
+                            accepted_boot, lease_ms, lease_poll_ms)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9,?10,?11,?12,?13,?14,?15)",
                             params![
                                 aid,
                                 new.run_id.as_str(),
@@ -905,7 +948,14 @@ impl WorkerStore {
                                 json(&receipts),
                                 to_i64(at_ms)?,
                                 o,
-                                new.spec.get("source_id").and_then(|v| v.as_str())
+                                new.spec.get("source_id").and_then(|v| v.as_str()),
+                                new.lease
+                                    .as_ref()
+                                    .map(|l| to_i64(l.at.mono_ms))
+                                    .transpose()?,
+                                new.lease.as_ref().and_then(|l| l.at.boot.clone()),
+                                new.lease.as_ref().map(|l| to_i64(l.lease_ms)).transpose()?,
+                                new.lease.as_ref().map(|l| to_i64(l.poll_ms)).transpose()?,
                             ],
                         )?;
                         common::append_event_owned(
@@ -1465,11 +1515,20 @@ impl WorkerStore {
     /// lease_seq)` extends; a replay is `Stale`. A renewal of an expired,
     /// cancelling, finalizing, terminal or retired attempt is an error and
     /// never restores the right to run.
+    ///
+    /// Spec 12: a renewal that would extend is applied only in time after
+    /// the grant before it (the last applied renewal, else the acceptance),
+    /// as persisted here: same boot as `stamp`, not later than it, and less
+    /// than the persisted window (`lease_ms - poll_ms`) before it. Anything
+    /// missing refuses. The check and the new grant are one transaction, so
+    /// every stamped grant ends a chain that was never broken since the
+    /// acceptance. A refusal still records the epoch it carried.
     pub fn renew_lease(
         &self,
         attempt_id: &AttemptId,
         key: LeaseKey,
         at_ms: u64,
+        stamp: GrantStamp,
     ) -> Result<LeaseOutcome> {
         let a = attempt_id.clone();
         under_epoch(
@@ -1480,23 +1539,26 @@ impl WorkerStore {
             move |tx, o| {
                 let aid = a.to_string();
                 let rec = require(tx, o, &aid)?;
-                let row: Option<(i64, i64, Option<i64>)> = tx
+                type Row = (i64, i64, Option<i64>, Option<i64>, Option<String>);
+                let row: Option<Row> = tx
                     .query_row(
-                        "SELECT coordinator_epoch, lease_seq, expired_at_ms FROM lease
+                        "SELECT coordinator_epoch, lease_seq, expired_at_ms, renewed_mono_ms,
+                            renewed_boot FROM lease
                      WHERE coordinator_id = ?1 AND attempt_id = ?2",
                         [o, aid.as_str()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
                 let applied = row
-                    .map(|(e, s, _)| -> Result<LeaseKey> {
+                    .as_ref()
+                    .map(|&(e, s, ..)| -> Result<LeaseKey> {
                         Ok(LeaseKey {
                             coordinator_epoch: CoordinatorEpoch(to_u64(e)?),
                             lease_seq: to_u64(s)?,
                         })
                     })
                     .transpose()?;
-                let expired = row.is_some_and(|(_, _, x)| x.is_some());
+                let expired = row.as_ref().is_some_and(|r| r.2.is_some());
                 match decide_lease(
                     rec.state,
                     rec.retired,
@@ -1508,12 +1570,40 @@ impl WorkerStore {
                     LeaseDecision::Refuse => Err(StorageError::LeaseNotRenewable(a)),
                     LeaseDecision::Stale => Ok(LeaseOutcome::Stale),
                     LeaseDecision::Extend => {
+                        let (base_ms, base_boot, lease_ms, poll_ms): (
+                            Option<i64>,
+                            Option<String>,
+                            Option<i64>,
+                            Option<i64>,
+                        ) = tx.query_row(
+                            "SELECT accepted_mono_ms, accepted_boot, lease_ms, lease_poll_ms
+                             FROM worker_attempt WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                            [o, aid.as_str()],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )?;
+                        // The grant before this one: the last applied
+                        // renewal, else the acceptance.
+                        let (base_ms, base_boot) = match row {
+                            Some((_, _, _, m, b)) => (m, b),
+                            None => (base_ms, base_boot),
+                        };
+                        let u = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+                        let base = u(base_ms).map(|m| (m, base_boot.as_deref()));
+                        let window = u(lease_ms).zip(u(poll_ms));
+                        if !crate::supervisor::lease::renewal_in_time(
+                            base,
+                            window,
+                            stamp.mono_ms,
+                            stamp.boot.as_deref(),
+                        ) {
+                            return Err(StorageError::LeaseNotRenewable(a));
+                        }
                         tx.execute(
-                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, coordinator_id)
-                         VALUES (?1,?2,?3,?4,?5)
+                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, coordinator_id, renewed_mono_ms, renewed_boot)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)
                          ON CONFLICT (coordinator_id, attempt_id) DO UPDATE SET coordinator_epoch = ?2,
-                            lease_seq = ?3, renewed_at_ms = ?4",
-                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?, o],
+                            lease_seq = ?3, renewed_at_ms = ?4, renewed_mono_ms = ?6, renewed_boot = ?7",
+                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?, o, to_i64(stamp.mono_ms)?, stamp.boot],
                     )?;
                         Ok(LeaseOutcome::Extended)
                     }
@@ -1558,6 +1648,88 @@ impl WorkerStore {
                 at_ms,
             )?;
             Ok(true)
+        })
+    }
+
+    /// The highest applied key, when it was granted on the monotonic clock
+    /// of `boot` (`None` when the row has no stamp or one of another boot)
+    /// and whether the lease expired, read together.
+    pub fn lease_grant(
+        &self,
+        attempt_id: &AttemptId,
+        boot: Option<&str>,
+    ) -> Result<Option<(LeaseKey, Option<u64>, bool)>> {
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
+        let Some(boot) = boot.map(str::to_owned) else {
+            return Ok(self.lease(attempt_id)?.map(|(k, x)| (k, None, x)));
+        };
+        self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
+            c.query_row(
+                "SELECT coordinator_epoch, lease_seq,
+                    CASE WHEN renewed_boot = ?3 THEN renewed_mono_ms END, expired_at_ms FROM lease
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [&o, &a, &boot],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(e, s, m, x)| {
+                Ok((
+                    LeaseKey {
+                        coordinator_epoch: CoordinatorEpoch(to_u64(e)?),
+                        lease_seq: to_u64(s)?,
+                    },
+                    m.map(to_u64).transpose()?,
+                    x.is_some(),
+                ))
+            })
+            .transpose()
+        })
+    }
+
+    /// Move the acceptance's grant stamp to `stamp` while no renewal was
+    /// applied. Only for a supervisor that counts from its own start without
+    /// a seed (a setup builder's), called before it starts: the first window
+    /// then runs from no later than where that supervisor counts it.
+    pub fn restamp_unrenewed_grant(&self, attempt_id: &AttemptId, stamp: GrantStamp) -> Result<()> {
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db.write(move |tx| {
+            let o = owner_in(tx, &o, Some(&a))?;
+            tx.execute(
+                "UPDATE worker_attempt SET accepted_mono_ms = ?3, accepted_boot = ?4
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2 AND lease_ms IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM lease
+                                   WHERE coordinator_id = ?1 AND attempt_id = ?2)",
+                params![o, a, to_i64(stamp.mono_ms)?, stamp.boot],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The lease terms persisted at acceptance: `(lease_ms, poll_ms)`.
+    pub fn lease_terms(&self, attempt_id: &AttemptId) -> Result<Option<(u64, u64)>> {
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
+            let t: Option<(Option<i64>, Option<i64>)> = c
+                .query_row(
+                    "SELECT lease_ms, lease_poll_ms FROM worker_attempt
+                     WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                    [&o, &a],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            Ok(match t {
+                Some((Some(l), Some(p))) => Some((to_u64(l)?, to_u64(p)?)),
+                _ => None,
+            })
         })
     }
 

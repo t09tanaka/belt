@@ -14,6 +14,7 @@ fn hash(c: char) -> PayloadHash {
 
 fn acceptance(a: &AttemptId, h: char) -> NewAcceptance {
     NewAcceptance {
+        lease: None,
         attempt_id: a.clone(),
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
