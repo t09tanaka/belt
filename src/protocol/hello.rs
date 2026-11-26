@@ -43,6 +43,8 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     group::SHARED_ADMISSION_FEATURE,
     crate::wire::ATTEMPT_RELEASE_FEATURE,
     crate::wire::INPUT_MISSING_FEATURE,
+    crate::toolchain::capability::SETUP_TOOLS_FEATURE,
+    crate::toolchain::capability::SETUP_INSTALL_FEATURE,
 ];
 
 /// The features no connection of this build goes without, on either side
@@ -787,5 +789,19 @@ mod tests {
         assert!(!crate::protocol::session::required_features()
             .iter()
             .any(|f| f == crate::wire::CI_TASK_FEATURE));
+    }
+
+    #[test]
+    fn every_feature_a_capability_report_carries_is_negotiated() {
+        // A connection keeps only the negotiated features of a report
+        // (`WorkerIdentity::response` and the Inspect answer of
+        // `worker::serve`), so a report feature this build does not offer
+        // never reaches the parent and nothing that needs it is ever met.
+        for feature in crate::toolchain::capability::FEATURES {
+            assert!(
+                SUPPORTED_FEATURES.contains(feature),
+                "{feature} is reported but not offered"
+            );
+        }
     }
 }
