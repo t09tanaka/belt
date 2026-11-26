@@ -1098,17 +1098,25 @@ fn checked<L: Launcher>(spec: &Spec, launcher: &mut L) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    // The last refusal is kept: a timeout names the step that never held.
+    let mut last: Option<String> = None;
     runtime.block_on(async {
         tokio::time::timeout(READY, async {
             loop {
-                if managed_health(spec, launcher).await.is_ok() {
-                    break;
+                match managed_health(spec, launcher).await {
+                    Ok(()) => break,
+                    Err(e) => last = Some(format!("{e:#}")),
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("the new version did not answer as the registered service"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the new version did not answer as the registered service (last: {})",
+                last.as_deref().unwrap_or("no check finished")
+            )
+        })
     })?;
     let (j, paths) = managed_journal(spec)?;
     identity_checked(&paths, &j)?;
