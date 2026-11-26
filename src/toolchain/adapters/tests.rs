@@ -305,7 +305,9 @@ fn listing(root: &Path) -> Vec<String> {
     out.sort();
     out
 }
-fn held_lock(plan: &InstallPlan) -> File {
+/// (released by `LOCK_UN` on drop, not by the last close: a child that a
+/// parallel test forks meanwhile does not keep it held)
+fn held_lock(plan: &InstallPlan) -> crate::platform::flock::HeldLock {
     mkdir(&plan.root).unwrap();
     let lock = OpenOptions::new()
         .create(true)
@@ -314,8 +316,7 @@ fn held_lock(plan: &InstallPlan) -> File {
         .mode(0o600)
         .open(plan.root.join("install.lock"))
         .unwrap();
-    lock.lock().unwrap();
-    lock
+    crate::platform::flock::HeldLock::lock(lock).unwrap()
 }
 /// H1: an install that failed or was stopped leaves a root without a
 /// receipt. The next install of the same version clears it and succeeds.

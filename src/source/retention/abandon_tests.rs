@@ -1713,7 +1713,7 @@ fn the_removal_of_a_scratch_directory_follows_no_link_and_takes_none_in_use() {
     // The capture that made it does not ask for the lock: it held it, and
     // a copy of its descriptor may outlive the capture in a forked child.
     index.remove_own_scratch(&root).unwrap();
-    drop(held);
+    held.unlock().unwrap();
     assert!(scratch.symlink_metadata().is_err());
     assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"not ours");
     // Removing it again, or one that never was, is success.
@@ -1776,7 +1776,7 @@ fn a_kept_scratch_directory_is_counted_by_kind_until_it_goes() {
     // an error of another kind is not counted
     assert!(!counts.count(&anyhow::anyhow!("other")));
 
-    drop(held);
+    held.unlock().unwrap();
     index.remove_scratch_noted(&c, &root).unwrap();
     assert_eq!(
         inspect_scratch_kept(&parts.state).unwrap(),
