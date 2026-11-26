@@ -227,8 +227,8 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
 fn unanswered(tool: &str) -> &'static str {
     match tool {
         "xcode" => "only the Command Line Tools are installed, not Xcode",
-        "docker" => "no Docker engine is running",
-        _ => "it could not be measured",
+        // Only the manual tools reach here: xcode and docker.
+        _ => "no Docker engine is running",
     }
 }
 
@@ -1168,5 +1168,13 @@ mod tests {
             .find(|i| i.subject == "mise")
             .unwrap();
         assert_eq!(row.class, Class::Same);
+        // A parent measured without mise is shown as `absent`.
+        let mut without = report();
+        without.helpers.insert("mise".into(), None);
+        let row = diff(&without, &worker)
+            .into_iter()
+            .find(|i| i.subject == "mise")
+            .unwrap();
+        assert_eq!(row.parent.as_deref(), Some("absent"));
     }
 }
