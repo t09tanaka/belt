@@ -65,6 +65,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
     store
         .submit(
             NewAcceptance {
+                lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
                 task_id: TaskId::generate(),
@@ -198,6 +199,7 @@ impl Fx {
         self.store
             .submit(
                 NewAcceptance {
+                    lease: Some(belt::storage::AcceptedLease::now(3_600_000, 1)),
                     attempt_id: attempt.clone(),
                     run_id: first.run_id,
                     task_id: first.task_id,
@@ -897,7 +899,7 @@ fn cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone() {
     });
     let started = Instant::now();
     let r = run(&f.spec).unwrap();
-    canceller.join().unwrap();
+    crate::common::join_within(canceller, "the canceller");
     let t = settled(&r);
     assert_eq!(t.outcome(), Outcome::Cancelled);
     // TERM was ignored, so the group was killed after the grace.
@@ -933,7 +935,7 @@ fn a_cooperative_command_stops_on_term_within_the_grace() {
         started
     });
     let t = settled(&run(&f.spec).unwrap());
-    let started = canceller.join().unwrap();
+    let started = crate::common::join_within(canceller, "the canceller");
     assert_eq!(t.outcome(), Outcome::Cancelled);
     assert_eq!(t.exit(), Some(Exit::Signal(15)));
     assert!(started.elapsed() < Duration::from_secs(8));
@@ -985,26 +987,48 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     // on a busy machine, which would end the attempt before any command.
     let second = f.open_second();
     let attempt = f.attempt().clone();
+    // The renewals also end when the run has ended: a run that ends before
+    // its command started (its lease lapsed on the way there) never writes
+    // the pid, and a renewer waiting only for the pid once kept a whole
+    // `--test it` run waiting for hours on its join.
     let started = bg.clone();
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run_ended = ended.clone();
     let renewer = std::thread::spawn(move || {
-        let mut seq = 1;
-        while read_pid(&started).is_none() {
-            let _ = second.renew_lease(&attempt, key(seq), platform::wall_ms());
+        let (mut seq, mut errors) = (1, Vec::new());
+        while read_pid(&started).is_none() && !run_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Err(e) = second.renew_lease(
+                &attempt,
+                key(seq),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
+                errors.push(format!("renewal {seq}: {e}"));
+            }
             seq += 1;
             std::thread::sleep(Duration::from_millis(50));
         }
-        seq
+        (seq, errors)
     });
     let t = settled(&run(&f.spec).unwrap());
-    let next = renewer.join().unwrap();
+    ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (next, errors) = crate::common::join_within(renewer, "the renewer");
+    assert!(
+        t.exit().is_some(),
+        "the command did run and was stopped: {t:?}; failed renewals before its start: {errors:?}"
+    );
     assert_eq!(t.outcome(), Outcome::Interrupted);
-    assert!(t.exit().is_some(), "the command did run and was stopped");
     assert!(!alive(read_pid(&bg).unwrap()));
     let (_, expired) = f.store.lease(f.attempt()).unwrap().unwrap();
     assert!(expired);
     let err = f
         .store
-        .renew_lease(f.attempt(), key(next), platform::wall_ms())
+        .renew_lease(
+            f.attempt(),
+            key(next),
+            platform::wall_ms(),
+            belt::storage::GrantStamp::now(),
+        )
         .unwrap_err();
     assert!(matches!(err, StorageError::LeaseNotRenewable(_)), "{err:?}");
 }
@@ -1031,7 +1055,12 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
         let (mut errors, mut longest) = (Vec::new(), Duration::ZERO);
         let mut last = Instant::now();
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-            match second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+            match second.renew_lease(
+                &attempt,
+                key(seq),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 Ok(_) => {
                     longest = longest.max(last.elapsed());
                     last = Instant::now();
@@ -1045,7 +1074,7 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
     });
     let t = settled(&run(&f.spec).unwrap());
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let (errors, longest) = renewer.join().unwrap();
+    let (errors, longest) = crate::common::join_within(renewer, "the renewer");
     assert_eq!(
         t.outcome(),
         Outcome::Succeeded,
@@ -1066,9 +1095,12 @@ fn a_replayed_renewal_does_not_extend_the_lease() {
         let mut extended = 0;
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             // The same request again and again.
-            if let Ok(LeaseOutcome::Extended) =
-                second.renew_lease(&attempt, key(1), platform::wall_ms())
-            {
+            if let Ok(LeaseOutcome::Extended) = second.renew_lease(
+                &attempt,
+                key(1),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 extended += 1;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1078,7 +1110,7 @@ fn a_replayed_renewal_does_not_extend_the_lease() {
     let started = Instant::now();
     let t = settled(&run(&f.spec).unwrap());
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let extended = replayer.join().unwrap();
+    let extended = crate::common::join_within(replayer, "the replayer");
     assert_eq!(extended, 1, "only the first delivery extends");
     assert_eq!(t.outcome(), Outcome::Interrupted);
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -1228,7 +1260,12 @@ fn a_seed_measured_before_a_renewal_does_not_shorten_that_renewal() {
     let mut f = fx(vec![node("n", "sleep 0.8; echo done")]);
     f.spec.lease_ms = 30_000;
     f.store
-        .renew_lease(f.attempt(), key(1), platform::wall_ms())
+        .renew_lease(
+            f.attempt(),
+            key(1),
+            platform::wall_ms(),
+            belt::storage::GrantStamp::now(),
+        )
         .unwrap();
     f.spec.lease_seed = Some(LeaseSeed {
         ends_mono_ms: platform::monotonic_ms(),
@@ -1715,7 +1752,7 @@ fn after_a_supervisor_crash_the_same_process_is_stopped_and_never_respawned() {
     assert_eq!(t.outcome(), Outcome::Interrupted);
     assert_eq!(t.exit(), None);
     // The orphan was stopped: it ended on a signal.
-    let status = reaper.join().unwrap();
+    let status = crate::common::join_within(reaper, "the reaper");
     use std::os::unix::process::ExitStatusExt;
     assert!(status.signal().is_some(), "{status:?}");
     assert_eq!(f.state(), AttemptState::Terminal);
@@ -2296,7 +2333,9 @@ fn a_descendant_left_behind_by_an_early_exit_is_stopped_before_the_result_is_fix
     f.spec.term_grace_ms = 500;
     let spec = f.spec.clone();
     let runner = std::thread::spawn(move || run(&spec));
+    let deadline = Instant::now() + crate::common::JOIN_BOUND;
     while !runner.is_finished() {
+        assert!(Instant::now() < deadline, "the run did not end");
         // Read the state first: if it is terminal, the descendant must
         // already be gone when it is looked at afterwards.
         let terminal = f.state() == AttemptState::Terminal;
@@ -2304,7 +2343,7 @@ fn a_descendant_left_behind_by_an_early_exit_is_stopped_before_the_result_is_fix
         assert!(!(terminal && survivor), "settled while a descendant lived");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let t = settled(&runner.join().unwrap().unwrap());
+    let t = settled(&crate::common::join_within(runner, "the run").unwrap());
     assert_eq!(t.outcome(), Outcome::Succeeded);
     assert!(!alive(read_pid(&bg).unwrap()), "the descendant was stopped");
     // Either the identity was recorded, or the log says why it was not. (The

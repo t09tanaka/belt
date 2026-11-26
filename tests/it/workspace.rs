@@ -377,6 +377,16 @@ fn add_and_remove_a_commit_workspace() {
         let att = AttemptId::generate();
         let w = ws.create(&att, &store, &m, Some(&repo)).unwrap();
         assert!(w.root.ends_with(att.as_str()), "{}", b.name);
+        // Spotlight never indexes the workspaces on macOS (spec 25.10).
+        assert_eq!(
+            f.state
+                .join("workspaces")
+                .join(belt::workspace::SPOTLIGHT_MARKER)
+                .is_file(),
+            cfg!(target_os = "macos"),
+            "{}",
+            b.name
+        );
         assert_eq!(w.cwd, w.root);
         assert_eq!(
             std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
@@ -635,6 +645,8 @@ fn a_failed_unpack_leaves_nothing_behind() {
         assert_eq!(worktrees(&f, repo.dir()).len(), 1);
         let scratch: Vec<_> = std::fs::read_dir(f.state.join("workspaces"))
             .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != belt::workspace::SPOTLIGHT_MARKER)
             .collect();
         assert!(scratch.is_empty(), "scratch directories were left");
         // the same attempt can be tried again with the right store
@@ -2160,7 +2172,7 @@ fn a_publication_racing_step_4_never_keeps_a_row_without_its_refs() {
         )
         .unwrap();
     assert!(ok);
-    publisher.borrow_mut().take().unwrap().join().unwrap();
+    crate::common::join_within(publisher.borrow_mut().take().unwrap(), "the publisher");
     let refs_there = !f.git(repo.dir(), &["for-each-ref", &snapshot]).is_empty();
     let row = clone_ref.load(Ordering::SeqCst);
     assert!(

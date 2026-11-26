@@ -769,7 +769,7 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
     }
     if let Some(path) = &facts.service_path {
         let fix = if host == "parent" {
-            "this machine's service keeps the PATH `belt init` recorded, and belt has no command to recapture it yet".to_string()
+            "run `belt upgrade --refresh-env` to recapture this machine's service PATH from the login shell".to_string()
         } else {
             format!(
                 "run `belt workers refresh-env {host}` to recapture the PATH from the login shell"

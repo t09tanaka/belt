@@ -757,6 +757,16 @@ const ALPHA: &[u8] = b"0123456789";
 const BETA: &[u8] = b"abcdef";
 const LOG: &[u8] = b"hello log\n";
 
+/// Why the collection of `a` closed as `required_missing`, as `ci` reads it.
+fn missing_reason(c: &Coordinator, a: &AttemptId) -> Option<String> {
+    let events = c
+        .store()
+        .events_of(a, belt::ci::COLLECTION_MISSING_EVENT)
+        .unwrap();
+    assert!(events.len() <= 1, "{events:?}");
+    Some(events.last()?.payload["reason"].as_str()?.to_string())
+}
+
 fn two() -> Vec<ArtifactDecl> {
     vec![
         decl("alpha.txt", MissingPolicy::Required),
@@ -1278,6 +1288,15 @@ async fn a_required_artifact_that_is_missing_or_refused_fails_the_task_once_and_
         let row = c.store().collection(&a).unwrap().unwrap();
         assert_eq!(row.verdict, Some(Verdict::RequiredMissing));
         assert_eq!(row.strikes, 0, "{reason:?}");
+        // The job line can say which output is missing, and why.
+        let why = missing_reason(&c, &a).unwrap();
+        assert!(why.contains("reports/beta.bin"), "{why}");
+        assert!(!why.contains("alpha.txt"), "{why}");
+        let expected = match reason {
+            NotStoredReason::Missing => "the commands left nothing at its path",
+            NotStoredReason::Refused => "the worker did not keep what was there",
+        };
+        assert!(why.contains(expected), "{why}");
         // The command succeeded; the task did not.
         let rec = c.store().get_attempt(&a).unwrap().unwrap();
         assert!(!rec.receipts.reached(Receipt::Collected));
@@ -3142,6 +3161,22 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let report = ci_collect(&c, &files, &a).await;
         assert_eq!(report.required_missing, vec![a.clone()], "{unreadable}");
         assert!(report.collected.is_empty());
+        let why = missing_reason(&c, &a).unwrap();
+        let expected = if unreadable {
+            "names task another task"
+        } else {
+            "the result does not report it"
+        };
+        assert!(why.contains(expected), "{unreadable}: {why}");
+        // `ci` and `ci status` show it on the job's line.
+        let lines =
+            belt::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), &run).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.reason.as_deref() == Some(why.as_str())),
+            "{lines:?}"
+        );
         let rec = c.store().get_attempt(&a).unwrap().unwrap();
         assert!(rec.collection_failed_at_ms.is_some(), "{unreadable}");
         assert!(!rec.receipts.reached(Receipt::Collected));

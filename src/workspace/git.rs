@@ -375,7 +375,14 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         std::fs::create_dir(dir.path().join("repo")).unwrap();
         let git = bin.join("git");
-        std::fs::write(&git, format!("#!/bin/sh\n{script}\n")).unwrap();
+        // The fake git's pid leads its group: written first, so the test can
+        // look for anything left in that group (a pid alone can be reused).
+        let pgid = dir.path().join("pgid");
+        std::fs::write(
+            &git,
+            format!("#!/bin/sh\necho $$ > '{}'\n{script}\n", pgid.display()),
+        )
+        .unwrap();
         let mut perm = std::fs::metadata(&git).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
         std::fs::set_permissions(&git, perm).unwrap();
@@ -400,13 +407,26 @@ mod tests {
     }
 
     /// Whether `pid` is still a live process (not gone, not a zombie).
-    fn alive(pid: &str) -> bool {
+    /// What is left alive (not a zombie) in the fake git's process group,
+    /// one `ps` line each; empty when nothing is, or when the fake git never
+    /// ran its first line (then it started nothing).
+    fn group_left(dir: &Path) -> String {
+        let Ok(pgid) = std::fs::read_to_string(dir.join("pgid")) else {
+            return String::new();
+        };
+        let pgid = pgid.trim();
         let out = Command::new("ps")
-            .args(["-o", "stat=", "-p", pid.trim()])
+            .args(["-A", "-o", "pgid=,stat=,pid=,ppid=,command="])
             .output()
             .unwrap();
-        let stat = String::from_utf8_lossy(&out.stdout);
-        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| {
+                let mut f = l.split_whitespace();
+                f.next() == Some(pgid) && !f.next().unwrap_or("Z").starts_with('Z')
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Review round 2 (Env): no inherited `GIT_*` reaches step 4's git; its
@@ -457,10 +477,7 @@ wait"#,
             start.elapsed()
         );
         assert!(!lock.exists(), "git's lockfile was left");
-        assert!(
-            !alive(&std::fs::read_to_string(&pid).unwrap()),
-            "a child of git outlived it"
-        );
+        assert_eq!(group_left(dir.path()), "", "a child of git outlived it");
     }
 
     /// Review round 2 (M-b): past its deadline a git that ignores SIGTERM is
@@ -478,16 +495,7 @@ wait"#,
         let took = start.elapsed();
         assert!(took >= std::time::Duration::from_millis(300), "{took:?}");
         assert!(took < std::time::Duration::from_secs(5), "{took:?}");
-        let pid = dir.path().join("pid");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pid.exists() {
-            assert!(std::time::Instant::now() < deadline, "no pid written");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            !alive(&std::fs::read_to_string(&pid).unwrap()),
-            "a child of git outlived it"
-        );
+        assert_eq!(group_left(dir.path()), "", "a child of git outlived it");
     }
 
     /// Review round 4 (M-A): a git that ignores SIGTERM is killed and
@@ -654,10 +662,7 @@ wait"#,
         assert!(took >= std::time::Duration::from_millis(1500), "{took:?}");
         assert!(took < std::time::Duration::from_secs(8), "{took:?}");
         only_own_lock_removed(&repo);
-        assert!(
-            !alive(&std::fs::read_to_string(dir.path().join("pid")).unwrap()),
-            "a child of git outlived it"
-        );
+        assert_eq!(group_left(dir.path()), "", "a child of git outlived it");
     }
 
     /// Review round 2 (M-b): `stop` ends step 4's git through the cancel
@@ -676,10 +681,7 @@ wait"#,
             start.elapsed()
         );
         only_own_lock_removed(&repo);
-        assert!(
-            !alive(&std::fs::read_to_string(dir.path().join("pid")).unwrap()),
-            "a child of git outlived it"
-        );
+        assert_eq!(group_left(dir.path()), "", "a child of git outlived it");
     }
 
     #[test]

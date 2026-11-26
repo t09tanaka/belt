@@ -73,6 +73,8 @@ struct DirHost {
     pass_hook: Mutex<Option<PassHook>>,
     /// The reports `received_pass` gives, first to last (then a default one).
     pass_reports: Mutex<std::collections::VecDeque<belt::source::retention::ReceivedPassReport>>,
+    /// The toolchain each `prepare` was given, in order.
+    prepared_with: Mutex<Vec<Option<belt::worker::host::PrepareToolchain>>>,
 }
 
 type PassHook = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
@@ -141,8 +143,14 @@ impl Host for DirHost {
         self.log("workspaces");
         Ok(())
     }
-    fn prepare(&self, a: &AcceptedAttempt, _: &AttemptPayload) -> Result<Workspace, ApiError> {
+    fn prepare(
+        &self,
+        a: &AcceptedAttempt,
+        _: &AttemptPayload,
+        toolchain: Option<&belt::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
         self.log(format!("prepare {}", a.attempt_id));
+        self.prepared_with.lock().unwrap().push(toolchain.cloned());
         let now = self.preparing_now.fetch_add(1, Ordering::SeqCst) + 1;
         self.preparing_max.fetch_max(now, Ordering::SeqCst);
         while self.block_prepare.load(Ordering::SeqCst) {
@@ -331,6 +339,7 @@ pub(crate) fn fx_named(worker: &str) -> Fx {
         tool_poll_hold: AtomicBool::new(false),
         pass_hook: Mutex::default(),
         pass_reports: Mutex::default(),
+        prepared_with: Mutex::default(),
     });
     Fx {
         dir,
@@ -1199,6 +1208,7 @@ fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
         .for_member(&CoordinatorId::generate())
         .submit(
             belt::storage::NewAcceptance {
+                lease: None,
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
                 task_id: TaskId::generate(),
@@ -2513,26 +2523,34 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    // Never renewed: the supervisor starts 2 s into a 4 s lease and would
-    // count 4 s of its own (ending 6 s after the acceptance). It is given
-    // what is left and ends the lease when the grant ends.
+    // Never renewed: the supervisor starts after the acceptance, and is
+    // given what is left of the grant, not a full lease of its own. The
+    // seed it gets is checked, so how long the start takes on a loaded
+    // host does not matter.
     f.host.block_prepare.store(true, Ordering::SeqCst);
     let (script, marker, _) = stay(&f);
-    let mut p = payload(&script);
-    p.lease_ms = 4_000;
+    let p = payload(&script);
     let a = AttemptId::generate();
+    let before = belt::platform::monotonic_ms();
     submit(&c, &a, &p).await;
-    std::thread::sleep(Duration::from_millis(2_000));
+    let after = belt::platform::monotonic_ms();
+    wait_for("preparation to begin", || {
+        f.host.count(&format!("prepare {a}")) == 1
+    });
+    // A distinct tick: a lease counted from the start ends after the grant.
+    wait_for("a tick after acceptance", || {
+        belt::platform::monotonic_ms() > after
+    });
     f.host.block_prepare.store(false, Ordering::SeqCst);
-    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    assert_eq!(lines(&marker), 1, "the command did start");
-    // The supervisor saw it on its own clock, when the grant ended: the
-    // time of the expiry itself, however long the stop took after it.
-    let expired = f.store().events_of(&a, "lease_expired").unwrap();
-    assert_eq!(expired.len(), 1);
-    let after = expired[0].at_ms - f.rec(&a).accepted_at_ms;
-    assert!((3_500..5_500).contains(&after), "{after} ms");
+    wait_for("the command to start", || lines(&marker) == 1);
+    let end = seed_of(&f, &a)["ends_mono_ms"].as_u64().unwrap();
+    assert!(
+        (before + p.lease_ms..=after + p.lease_ms).contains(&end),
+        "seed {end}, acceptance bracket {before}..={after}"
+    );
     assert_eq!(events(&f, &a, "agent_lease_expired"), 0);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2641,8 +2659,11 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
         }
     }));
     submit(&c, &a, &p).await;
-    // The first grant runs out during the preparation.
-    std::thread::sleep(Duration::from_millis(4_300));
+    // Half of the first grant passes during the preparation; the renewal
+    // comes in time (a later one is refused: spec 12). A start that read
+    // the new key with the first grant's time would cut the renewed lease
+    // to what is left of the first one, which the end below tells apart.
+    std::thread::sleep(Duration::from_millis(2_000));
     let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 4_000)).await.unwrap() else {
         panic!()
     };
@@ -2658,6 +2679,141 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
     assert_eq!(expired.len(), 1);
     let after = expired[0].at_ms - renewed_at;
     assert!((3_500..6_500).contains(&after), "{after} ms");
+}
+
+/// Spec 12: a supervisor counts the lease from the last grant however late
+/// it looks, so a renewal after that grant ran out is refused and cannot
+/// revive the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_after_the_last_grant_ran_out_is_refused() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 1_000;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(1_300));
+    let e = call(&c, renew_req(&a, 1, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(lines(&marker), 0);
+}
+
+fn renew_at(a: &AttemptId, epoch: u64, seq: u64) -> Request {
+    let Request::RenewLease(mut r) = renew_req(a, seq, 1_000) else {
+        unreachable!()
+    };
+    r.coordinator_epoch = CoordinatorEpoch(epoch);
+    Request::RenewLease(r)
+}
+
+/// An attempt held in preparation with a lease of `lease_ms`, accepted by an
+/// agent polling every `poll_ms`.
+async fn held(f: &Fx, lease_ms: u64, poll_ms: u64) -> (Arc<Agent>, Client, AttemptId) {
+    let mut cfg = f.cfg("boot-a");
+    cfg.poll_ms = poll_ms;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, _, _) = stay(f);
+    let mut p = payload(&script);
+    p.lease_ms = lease_ms;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    (agent, c, a)
+}
+
+/// Spec 12: after the agent restarts it keeps nothing in memory; the base
+/// for the first renewal is the acceptance stamp in the database. A renewal
+/// later than a window after it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_a_first_renewal_past_the_acceptance_window_is_refused() {
+    let f = fx();
+    let (agent, _c, a) = held(&f, 1_000, 400).await;
+    let accepted = Instant::now();
+    agent.shutdown();
+    let mut cfg = f.cfg("boot-a");
+    cfg.poll_ms = 400;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    // The window is 1_000 - 400 = 600 ms.
+    std::thread::sleep(Duration::from_millis(800).saturating_sub(accepted.elapsed()));
+    let e = call(&c, renew_req(&a, 1, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// Spec 12: a lease row without a grant stamp (an older binary wrote it)
+/// proves nothing; the next renewal is refused, however soon it comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_after_an_unstamped_grant_is_refused() {
+    let f = fx();
+    let (agent, c, a) = held(&f, 30_000, 25).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 30_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    agent.shutdown();
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    assert_eq!(
+        db.execute("UPDATE lease SET renewed_mono_ms = NULL", [])
+            .unwrap(),
+        1
+    );
+    drop(db);
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let e = call(&c, renew_req(&a, 2, 30_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// Spec 12: the window is the one persisted at acceptance, not the poll of
+/// the agent that happens to run now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_renewal_window_is_the_one_persisted_at_acceptance() {
+    let f = fx();
+    let (agent, c, a) = held(&f, 1_000, 400).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 1_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    let granted = Instant::now();
+    agent.shutdown();
+    // The new agent polls every 25 ms: by its own poll the window would be
+    // 975 ms; the persisted one is 600 ms.
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    std::thread::sleep(Duration::from_millis(700).saturating_sub(granted.elapsed()));
+    let e = call(&c, renew_req(&a, 2, 1_000)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+}
+
+/// A refused late renewal still leaves the newer coordinator epoch it
+/// carried, and a replay of an applied renewal stays a no-op, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_renewal_keeps_its_epoch_and_a_late_replay_stays_a_replay() {
+    let f = fx();
+    let (_agent, c, a) = held(&f, 1_000, 25).await;
+    let Response::RenewLease(r) = call(&c, renew_at(&a, 1, 1)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    std::thread::sleep(Duration::from_millis(1_300));
+    let Response::RenewLease(r) = call(&c, renew_at(&a, 1, 1)).await.unwrap() else {
+        panic!()
+    };
+    assert!(!r.extended);
+    let e = call(&c, renew_at(&a, 5, 1)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LeaseNotRenewable, "{e:?}");
+    let e = call(&c, renew_at(&a, 4, 9)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::StaleEpoch, "{e:?}");
+    f.host.block_prepare.store(false, Ordering::SeqCst);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2890,7 +3046,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
         })
         .collect();
     for r in racers {
-        r.join().unwrap();
+        crate::common::join_within(r, "a racer");
     }
     assert!(!f.host.overlap.load(Ordering::SeqCst));
     assert!(!f.host.ws_dir(&a).exists());
@@ -2915,7 +3071,7 @@ async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
     let started = Instant::now();
     agent.tick();
     assert!(started.elapsed() < Duration::from_millis(300));
-    slow.join().unwrap();
+    crate::common::join_within(slow, "the slow tick");
     f.host.fail_cleanup.store(false, Ordering::SeqCst);
     f.host.slow_cleanup_ms.store(0, Ordering::SeqCst);
 }
@@ -3177,6 +3333,7 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
         store
             .submit(
                 belt::storage::NewAcceptance {
+                    lease: None,
                     attempt_id: a.clone(),
                     run_id: p.run_id.clone(),
                     task_id: p.task_id.clone(),
@@ -3259,8 +3416,20 @@ impl Host for RealButCore {
     fn sweep_workspaces(&self, h: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
         self.0.sweep_workspaces(h)
     }
-    fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
-        self.0.prepare(a, p)
+    fn prepare(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+        t: Option<&belt::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
+        self.0.prepare(a, p, t)
+    }
+    fn check_toolchain_source(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+    ) -> Result<(), ApiError> {
+        self.0.check_toolchain_source(a, p)
     }
     fn setup_poll(
         &self,
@@ -4232,7 +4401,10 @@ async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
         std::fs::read_dir(state.join("setup/builders")).map_or(true, |rd| rd.count() == 0)
     });
     wait_for("the workspaces to go", || {
-        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| rd.count() == 0)
+        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| {
+            rd.flatten()
+                .all(|e| e.file_name() == belt::workspace::SPOTLIGHT_MARKER)
+        })
     });
     assert!(f.supervisors_under(&state.join("setup")).is_empty());
 }
@@ -4392,6 +4564,90 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
     assert!(f.store().get(&b).unwrap().is_none());
 }
 
+/// The capability measurement of a preparation can take seconds (each tool
+/// probe has its own deadline). A stopping agent does not wait for it, and
+/// what it left unfinished does not end the attempt: the next agent looks
+/// again.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_the_capability_measurement_of_a_preparation() {
+    use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    let f = fx();
+    let bin = f.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (hang, probing) = (f.path("hang"), f.path("probing"));
+    let rustup = f.path("rustup");
+    std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+    let node = bin.join("node");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nif [ -f {hang:?} ]; then : > {probing:?}; exec /bin/sleep 30; fi\necho v22.0.0\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+            ("RUSTUP_HOME".into(), rustup.to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements =
+        ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    // Accepted and checked with the tool answering; the workspace is held
+    // until the tool hangs and the rustup toolchains change (a drift
+    // signal), so the next measurement (the supervisor spec's) probes and
+    // is the one the stop meets.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    submit(&client, &a, &p).await;
+    let end = Instant::now() + T;
+    while f.host.preparing_now.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < end, "the workspace was never prepared");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::write(&hang, b"").unwrap();
+    drift(&rustup);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    while !probing.exists() && f.rec(&a).state != AttemptState::Terminal {
+        assert!(Instant::now() < end, "the preparation never measured");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(probing.exists(), "the attempt ended before it was measured");
+    let at = Instant::now();
+    tokio::task::spawn_blocking(move || agent.shutdown())
+        .await
+        .unwrap();
+    // The probe's own deadline is 2 s, the measurement's 5 s.
+    let took = at.elapsed();
+    assert!(
+        took < Duration::from_millis(1_000),
+        "the stop took {took:?}"
+    );
+    assert_ne!(f.rec(&a).state, AttemptState::Terminal);
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 0);
+}
+
+/// Change the rustup toolchains directory (a drift signal) without
+/// changing what is in it.
+fn drift(rustup: &std::path::Path) {
+    let entry = rustup.join("toolchains").join("drift");
+    std::fs::create_dir(&entry).unwrap();
+    std::fs::remove_dir(&entry).unwrap();
+}
+
 #[tokio::test]
 async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
     use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
@@ -4400,6 +4656,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let bin = f.path("bin");
         std::fs::create_dir(&bin).unwrap();
         let marker = f.path("probe-fails");
+        // HOME, which a profile from profiles.toml keeps too, places the
+        // rustup toolchains.
+        let home = f.path("home");
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
         let node = bin.join("node");
         std::fs::write(
             &node,
@@ -4415,7 +4676,11 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         }
         let profile = Profile::load(
             &f.state(),
-            &[("PATH".into(), bin.to_str().unwrap().into())].into(),
+            &[
+                ("PATH".into(), bin.to_str().unwrap().into()),
+                ("HOME".into(), home.to_str().unwrap().into()),
+            ]
+            .into(),
         )
         .unwrap();
         let mut cfg = f.cfg("boot-1");
@@ -4425,6 +4690,9 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         let agent = f.start_with(cfg);
         let client = f.connect(&agent).await;
         std::fs::write(&marker, "fail").unwrap();
+        // Acceptance answers from the measured profile; a drift signal
+        // makes it measure again and see the failing tool.
+        drift(&rustup);
         let mut p = payload("exit 0");
         p.commands[0].env.clear();
         let a = AttemptId::generate();
@@ -6862,4 +7130,253 @@ fn a_forecast_counts_a_mise_install_only_where_the_version_is_missing() {
         );
         assert!(!f.dir.path().join("mise-ran").exists());
     }
+}
+
+/// The workspace's preparation runs with the task's activated toolchain
+/// (spec 22.1): a worker whose node 22.1.0 is only in its version manager,
+/// not on its bare PATH, prepares with that node first on the PATH, and the
+/// identity of the activated node goes with it. Two tasks with the same
+/// node share it; nothing is prepared before the toolchain is ready.
+#[test]
+fn the_workspace_is_prepared_with_the_activated_toolchain() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let node = |version: &str| {
+        let p = payload("exit 0");
+        let scope = Scope::project("");
+        let mut p = p;
+        p.commands[0].env.clear();
+        p.toolchains = Some(Box::new(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    p.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse(version).unwrap(),
+                        scope,
+                        location: Location {
+                            path: ".node-version".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ));
+        p
+    };
+    let f = fx();
+    let agent = mise_agent(&f, &["22.1.0"], false);
+    let base = std::fs::canonicalize(f.dir.path()).unwrap();
+    let managed = base.join("nodenv/versions/22.1.0/bin");
+    for _ in 0..2 {
+        let p = node("22.1.0");
+        agent
+            .handle(mise_session(), submit_req(&AttemptId::generate(), &p))
+            .unwrap();
+    }
+    wait_for("both preparations", || {
+        f.host.prepared_with.lock().unwrap().len() == 2
+    });
+    let seen = f.host.prepared_with.lock().unwrap().clone();
+    let first = seen[0]
+        .clone()
+        .expect("prepared with the activated toolchain");
+    let path = &first.env["PATH"];
+    assert!(std::env::split_paths(path).any(|d| d == managed), "{path}");
+    assert!(!first.identity.is_empty());
+    assert_eq!(
+        seen[1].as_ref(),
+        Some(&first),
+        "the same node, the same key"
+    );
+    // A toolchain that is not ready yet: the workspace is not prepared.
+    let g = fx();
+    *g.host.tool_poll.lock().unwrap() = Some(Some("no recipe".into()));
+    let agent = mise_agent(&g, &[], true);
+    let c = AttemptId::generate();
+    agent
+        .handle(mise_session(), submit_req(&c, &node("22.1.0")))
+        .unwrap();
+    wait_for("the toolchain to be asked for", || {
+        g.host.calls().iter().any(|c| c.starts_with("tool_poll"))
+    });
+    g.wait_terminal(&c);
+    assert!(
+        !g.host.calls().iter().any(|c| c.starts_with("prepare")),
+        "{:?}",
+        g.host.calls()
+    );
+}
+
+/// run5: a loaded host answers `node -v` after the live 300ms probe deadline.
+/// The worker measured node at startup, so resolving a task whose baseline is
+/// that node is answered from the measured profile, with no probe per
+/// question. Before, every question probed every tool, the late node became
+/// unknown, and the worker refused with `proposal baseline mismatch`, which
+/// the parent shows as `toolchain rust=stable unavailable`. A real version
+/// change is still drift: the changed file is measured again and refused.
+#[tokio::test]
+async fn a_slow_tool_probe_does_not_make_resolution_refuse_the_worker() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let f = fx();
+    let node = f.dir.path().join("node");
+    let count = f.dir.path().join("node-calls");
+    let write_node = |version: &str| {
+        std::fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\necho call >> '{}'\n/bin/sleep 0.6\necho {version}\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_node("v22.23.5");
+    let calls = || {
+        std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let client = rustup_worker(&f, &["stable=1.100.0"]).await;
+    let p = payload("exit 0");
+    let scope = Scope::project("");
+    let location = Location {
+        path: "rust-toolchain".into(),
+        first_line: 1,
+        last_line: 1,
+    };
+    let node_id = ToolId::parse("node").unwrap();
+    let bundle = FrozenBundle::seal_exact(
+        FrozenToolchains::freeze(
+            p.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("stable").unwrap(),
+                scope: scope.clone(),
+                location: location.clone(),
+            }],
+            &[(node_id.clone(), location)],
+            &[(
+                node_id.clone(),
+                VersionObservation::parse_for(&node_id, "v22.23.5"),
+            )]
+            .into(),
+            MatchPolicy::Exact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bundle.frozen.baseline.len(), 1);
+    let ask = || {
+        Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            bundle: bundle.clone(),
+            requirements: Default::default(),
+        })
+    };
+    let measured = calls();
+    assert!(measured > 0, "startup measured node");
+    for _ in 0..2 {
+        let Response::ResolveToolchains(resolved) = call(&client, ask())
+            .await
+            .unwrap_or_else(|e| panic!("refused: {e:?}"))
+        else {
+            panic!()
+        };
+        assert_eq!(resolved.bundle.evidence[0].concrete.to_string(), "1.100.0");
+    }
+    assert_eq!(calls(), measured, "a question probed node");
+    write_node("v23.0.0");
+    assert!(
+        call(&client, ask()).await.is_err(),
+        "a changed node version was not refused"
+    );
+}
+
+/// run5 (`activation_baseline_mismatch` under load): a task whose baseline
+/// is the worker's npm runs although `npm --version` answers after the live
+/// 300ms probe deadline. Admission and activation check the measured
+/// profile, so a late probe is never a mismatch. A real version change is
+/// still refused.
+#[test]
+fn a_slow_tool_probe_is_no_baseline_mismatch_at_activation() {
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
+    let task = |npm: &str| {
+        let mut p = payload("exit 0");
+        p.commands[0].env.clear();
+        let scope = Scope::project("");
+        let location = Location {
+            path: ".node-version".into(),
+            first_line: 1,
+            last_line: 1,
+        };
+        let npm_id = ToolId::parse("npm").unwrap();
+        p.toolchains = Some(Box::new(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    p.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse("22.1.0").unwrap(),
+                        scope,
+                        location: location.clone(),
+                    }],
+                    &[(npm_id.clone(), location)],
+                    &[(npm_id.clone(), VersionObservation::parse_for(&npm_id, npm))].into(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ));
+        p
+    };
+    let f = fx();
+    let base = std::fs::canonicalize(f.dir.path()).unwrap();
+    std::fs::create_dir_all(base.join("bin")).unwrap();
+    crate::common::write_executable(
+        &base.join("bin/npm"),
+        "#!/bin/sh\n/bin/sleep 0.6\necho 10.9.9\n",
+    );
+    let agent = mise_agent(&f, &["22.1.0"], false);
+    let p = task("10.9.9");
+    assert_eq!(p.toolchains.as_ref().unwrap().frozen.baseline.len(), 1);
+    let a = AttemptId::generate();
+    agent
+        .handle(mise_session(), submit_req(&a, &p))
+        .unwrap_or_else(|e| panic!("refused at admission: {e:?}"));
+    wait_for("the preparation", || {
+        f.host.prepared_with.lock().unwrap().len() == 1
+            || f.host.calls().iter().any(|c| c.starts_with("prepare"))
+    });
+    assert!(
+        f.host.prepared_with.lock().unwrap()[0].is_some(),
+        "prepared without the activated toolchain"
+    );
+    // npm now says another version: that is a mismatch.
+    let g = fx();
+    let base = std::fs::canonicalize(g.dir.path()).unwrap();
+    std::fs::create_dir_all(base.join("bin")).unwrap();
+    crate::common::write_executable(&base.join("bin/npm"), "#!/bin/sh\necho 10.9.9\n");
+    let agent = mise_agent(&g, &["22.1.0"], false);
+    crate::common::write_executable(&base.join("bin/npm"), "#!/bin/sh\necho 11.0.0\n");
+    assert!(agent
+        .handle(
+            mise_session(),
+            submit_req(&AttemptId::generate(), &task("10.9.9"))
+        )
+        .is_err());
 }

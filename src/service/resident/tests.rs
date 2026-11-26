@@ -412,13 +412,19 @@ async fn collection_shutdown_fixture(
     crate::service::bootstrap::ensure(spec.clone())
         .await
         .expect("spec reaches the live owner");
-    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    // The stop can never be confirmed here, so the wait ends through an
+    // interrupt sent once the acknowledgement has been read. A wall-clock
+    // budget would race the cancel request's round trip on a loaded host.
+    let (sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let target = crate::service::completion::Target::Run(run.clone());
-    let pending = crate::service::control::cancel_and_stop(
+    let pending = crate::service::control::cancel_and_stop_observed(
         &spec,
         target,
         &mut signals,
-        Duration::from_millis(500),
+        Duration::from_secs(30),
+        &mut || {
+            let _ = sender.send(());
+        },
     )
     .await;
     assert_eq!(pending.cli_exit_code, 77);
@@ -811,7 +817,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
         super::super::resident::secure_file(&captured.sources.root().join("transfer.lock"), true)
             .unwrap();
     transfer_file.try_lock().unwrap();
-    drop(transfer_file);
+    transfer_file.unlock().unwrap();
     drop(guard);
     let restart = tokio::time::timeout(Duration::from_secs(20), Resident::start(&config, inputs()))
         .await
@@ -2157,6 +2163,7 @@ fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     let ci = TaskSpec {
         ci: Some(crate::coordinator::CiSpec {
             history_keys: Vec::new(),
+            duration_key: None,
             dynamic_origin: false,
             core_outcome: None,
             matrix: None,

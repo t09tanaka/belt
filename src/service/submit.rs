@@ -409,10 +409,6 @@ async fn freeze_resolved_each(
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
-    // Every task of the run shares the tools its preparation runs: when no
-    // worker reports them, no task can be placed, and the submit is refused
-    // with the reason, as when no worker resolves the toolchain (spec 22.1).
-    check_preparation(owner, requirements).await?;
     let plan = std::sync::Arc::new(plan);
     let (prepared, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
@@ -448,6 +444,12 @@ async fn freeze_resolved_each(
     };
     let (resolved, notices) = resolve_each(tasks, freeze, ask).await?;
     drop(guard);
+    // Every task of the run shares the tools its preparation runs: when no
+    // worker has them, no task can be placed, and the submit is refused
+    // with the reason, as when no worker resolves the toolchain (spec 22.1).
+    // Preparation runs with the activated toolchains, so a tool whose
+    // toolchain every task's resolved bundle selects is served by it.
+    check_preparation(owner, &unserved_preparation(requirements, &resolved)).await?;
     Ok((resolved, crate::ci::toolchains::render(&notices)))
 }
 
@@ -636,6 +638,32 @@ fn unresolved_aliases(
     aliases.iter().filter(open).cloned().collect()
 }
 
+/// `requirements` without the preparation tools whose toolchain is
+/// selected in the resolved bundle of every task that resolved: those
+/// workers activate it for preparation, and resolving proved one can.
+fn unserved_preparation(
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    resolved: &[Selection],
+) -> crate::toolchain::capability::ExecutionRequirements {
+    use crate::toolchain::capability::{prepare_toolchain, Requirement};
+    let bundles: Vec<_> = resolved.iter().filter_map(|s| s.as_ref().ok()).collect();
+    let served = |name: &str| {
+        !bundles.is_empty()
+            && bundles.iter().all(|b| {
+                b.as_ref().is_some_and(|b| {
+                    b.frozen
+                        .selections
+                        .iter()
+                        .any(|s| s.tool.as_str() == prepare_toolchain(name))
+                })
+            })
+    };
+    let mut rest = requirements.clone();
+    rest.requires
+        .retain(|r| !matches!(r, Requirement::Prepare(name) if served(name)));
+    rest
+}
+
 /// Asks the owner whether some worker reports every tool the workspace's
 /// preparation runs. Requirements without such a tool ask nothing.
 async fn check_preparation(
@@ -659,6 +687,28 @@ async fn check_preparation(
 }
 
 /// Only the owner's answer that a worker can prepare lets the submit go on.
+/// Asks the owner whether some worker meets `requirements` (the setup tools
+/// of a task, spec 22.1): `None` when one does, the reason when none does.
+/// Only a failure to ask is an error.
+pub(crate) async fn ask_preparation(
+    owner: &super::resident::Client,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+) -> Result<Option<String>, ApiError> {
+    let reply = owner
+        .request(Operation::CheckPreparation {
+            requirements: requirements.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    match preparation_reply(reply) {
+        Ok(()) => Ok(None),
+        Err(e) if e.blocked_reason == Some(crate::error::BlockedReason::EnvironmentMismatch) => {
+            Ok(Some(e.message))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn preparation_reply(reply: Reply) -> Result<(), ApiError> {
     match reply {
         Reply::PreparationChecked => Ok(()),
@@ -824,8 +874,12 @@ fn prepare(
     )
     .map_err(blocked)?;
     let generic = requirements.requires.iter().filter_map(|r| match r {
-        crate::toolchain::capability::Requirement::Tool(name)
-        | crate::toolchain::capability::Requirement::Prepare(name) => Some(name.clone()),
+        crate::toolchain::capability::Requirement::Tool(name) => Some(name.clone()),
+        // npm comes with the node it is prepared with: a declared node
+        // covers it, and only an undeclared node is a native baseline.
+        crate::toolchain::capability::Requirement::Prepare(name) => {
+            Some(crate::toolchain::capability::prepare_toolchain(name).to_string())
+        }
         _ => None,
     });
     let required = profile
@@ -1037,6 +1091,49 @@ fn worker_inventory(
 #[cfg(test)]
 mod tests {
     use super::worker_inventory;
+
+    /// A worker without node on its bare PATH but with mise can prepare a
+    /// node project once every task resolved a node: the submit asks no
+    /// worker for a native node or npm then (spec 22.1).
+    #[test]
+    fn preparation_served_by_every_resolved_node_asks_for_no_native_tool() {
+        use super::unserved_preparation;
+        use crate::ids::Digest;
+        use crate::toolchain::capability::{ExecutionRequirements, Requirement};
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        use std::collections::BTreeMap;
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("20.0.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let node = FrozenBundle::seal_exact(frozen).unwrap();
+        let tools = ["node".to_string(), "npm".to_string(), "dart".to_string()];
+        let req = ExecutionRequirements::default()
+            .with_prepare(&tools)
+            .unwrap();
+        let rest = unserved_preparation(&req, &[Ok(Some(node.clone())), Ok(Some(node.clone()))]);
+        assert_eq!(rest.requires, [Requirement::Prepare("dart".into())]);
+        // A task without a node selection still needs a native one.
+        let rest = unserved_preparation(&req, &[Ok(Some(node)), Ok(None)]);
+        assert_eq!(rest, req);
+        assert_eq!(unserved_preparation(&req, &[]), req);
+    }
 
     /// A range is sealed to the observed version only after the refusal that
     /// says the requirements could not be resolved. An error that says

@@ -266,7 +266,7 @@ fn a_clearing_that_fails_midway_leaves_the_marker_for_the_next_start() {
 }
 
 #[test]
-fn a_new_state_starts_with_the_marker_and_holds_an_inheritable_shared_lock() {
+fn a_new_state_starts_with_the_marker_and_holds_a_shared_lock_no_child_inherits() {
     let fx = Fx::new();
     let state = fx.state();
     let (created, alive) = create_state(&state, &marker(), local, &nowhere).unwrap();
@@ -295,11 +295,8 @@ fn a_new_state_starts_with_the_marker_and_holds_an_inheritable_shared_lock() {
             .collect::<Vec<_>>(),
         [MARKER, LOCK]
     );
-    // Not close-on-exec: every process started from here keeps the lock held.
-    // SAFETY: a query on a descriptor this test owns.
-    let flags = unsafe { libc::fcntl(alive.as_raw_fd(), libc::F_GETFD) };
-    assert!(flags >= 0);
-    assert_eq!(flags & libc::FD_CLOEXEC, 0);
+    // Still close-on-exec: only `create_and_hold` (below) hands it down.
+    assert!(close_on_exec(&alive));
     // Shared: a second holder is fine, an exclusive taker is not.
     let second = File::open(state.join(LOCK)).unwrap();
     second.try_lock_shared().unwrap();
@@ -406,7 +403,7 @@ fn a_state_created_on_a_shared_filesystem_records_it_and_is_never_cleared() {
         })
     );
     // Its owner is gone and both locks are free: still kept.
-    drop(alive);
+    worker_ended(alive);
     let error = refused(&state, false, local);
     assert!(
         error.contains("did not see it on a local filesystem (it saw virtiofs"),
@@ -443,7 +440,7 @@ fn a_clearing_start_never_meets_a_marked_state_whose_owner_does_not_hold_the_loc
     assert!(!state.join(MARKER_PART).exists());
     let error = refused(&state, false, local);
     assert!(error.contains("ephemeral.lock is held"), "{error}");
-    drop(alive);
+    worker_ended(alive);
     assert_eq!(
         reclaim(&state, false, local, &nowhere).unwrap(),
         Cleared::Left
@@ -511,7 +508,7 @@ fn a_state_another_start_is_clearing_is_left_to_it() {
         error.contains("another ephemeral start is clearing it"),
         "{error}"
     );
-    drop(clearing);
+    clearing.unlock().unwrap();
     reclaim(&state, false, local, &nowhere).unwrap();
     assert!(!state.exists());
 }
@@ -756,11 +753,12 @@ fn a_child_that_inherited_the_lock_keeps_the_state_from_being_cleared() {
     let fx = Fx::new();
     let state = fx.state();
     let (_, alive) = create_state(&state, &marker(), local, &nowhere).unwrap();
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("600")
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("600").stdin(std::process::Stdio::null());
+    // As the worker's descriptor reaches a process it starts (only this
+    // child: the descriptor stays close-on-exec in this test process).
+    inherit_in(&mut command, alive.as_raw_fd());
+    let mut child = command.spawn().unwrap();
     // The worker is gone; only the child holds the lock now.
     drop(alive);
     // Nothing is asserted before the child is gone again.
@@ -780,6 +778,51 @@ fn a_child_that_inherited_the_lock_keeps_the_state_from_being_cleared() {
         Cleared::Left
     );
     assert!(!state.exists());
+}
+
+/// The worker's start hands the lock down to every process it starts.
+#[test]
+fn the_worker_s_start_lets_every_process_it_starts_inherit_the_lock() {
+    let fx = Fx::new();
+    let state = fx.state();
+    let (_, alive) = create_and_hold(&state, &marker(), local, &nowhere).unwrap();
+    let inherited = !close_on_exec(&alive);
+    // (released at once: a child another test thread starts meanwhile has a
+    // copy of it, which must not keep this test's state held)
+    worker_ended(alive);
+    assert!(inherited);
+}
+
+/// Whether `file` is closed by an `exec`.
+fn close_on_exec(file: &File) -> bool {
+    // SAFETY: a query on a descriptor this test owns.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    assert!(flags >= 0);
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// Let only the child `command` starts inherit `fd`.
+fn inherit_in(command: &mut std::process::Command, fd: std::os::fd::RawFd) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: only fcntl, async-signal-safe, between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The worker's process ends with no process of an attempt left: the lock
+/// is free. Released explicitly, as the exit of the last holder does: a
+/// plain close would leave it held while a child that another test thread
+/// forks at that moment still has a copy of the description, until its
+/// exec closes it.
+fn worker_ended(alive: File) {
+    alive.unlock().unwrap();
 }
 
 /// An empty private directory at the state's place.
@@ -846,7 +889,7 @@ fn an_unmarked_state_is_kept_unless_it_is_provably_an_unfinished_creation() {
         error.contains("another ephemeral start is clearing it"),
         "{error}"
     );
-    drop(clearing);
+    clearing.unlock().unwrap();
     // A start that is creating it holds the lock.
     private(&state.join(LOCK), b"");
     let creating = File::open(state.join(LOCK)).unwrap();
@@ -854,7 +897,7 @@ fn an_unmarked_state_is_kept_unless_it_is_provably_an_unfinished_creation() {
     let error = refused(&state, false, local);
     assert!(error.contains("ephemeral.lock is held"), "{error}");
     assert!(error.contains("creating it right now"), "{error}");
-    drop(creating);
+    creating.unlock().unwrap();
     // A lock file that others can touch proves nothing.
     std::fs::set_permissions(state.join(LOCK), std::fs::Permissions::from_mode(0o644)).unwrap();
     let error = refused(&state, false, local);
@@ -1205,7 +1248,7 @@ fn the_exit_keeps_everything_when_a_persistent_worker_appeared_or_the_state_is_i
         .to_string();
     assert!(error.contains("examining the worker state"), "{error}");
     assert_eq!(tree(&state), before);
-    drop(other);
+    other.unlock().unwrap();
     // The lock file under the name is not the one this worker holds.
     let error = clean_up(
         &created,
@@ -1243,7 +1286,7 @@ fn the_exit_does_not_enter_a_filesystem_mounted_inside_the_state() {
     assert!(state.join("attempts/a1/workspace/mount/file").exists());
     assert!(!state.join("attempts/a1/workspace/file").exists());
     assert_eq!(marker_kind(&state), plan::Marker::Ephemeral);
-    drop(alive);
+    worker_ended(alive);
     assert_eq!(clear_across(&state, &same_device).unwrap(), Cleared::Left);
     assert!(!state.exists());
 }

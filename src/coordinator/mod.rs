@@ -239,6 +239,11 @@ pub struct CiSpec {
     /// Planned SDK step identities, in demand order. Old tasks have no samples.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_keys: Vec<Option<crate::ids::Digest>>,
+    /// The job of the plan in its project (`ci::timing::task_scope`): the
+    /// key earlier runs of the same job are found by, to place the longest
+    /// first (spec 配置の手順 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_key: Option<crate::ids::Digest>,
     /// A dynamic origin waits on derived variants and never executes itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dynamic_origin: bool,
@@ -614,6 +619,9 @@ pub struct Coordinator {
     input_cursor: Mutex<Option<crate::storage::InputCursor>>,
     placement_fence: Arc<tokio::sync::Mutex<()>>,
     fenced: AtomicBool,
+    /// Set when the resident stops: a tick still running finishes the step
+    /// it is in, and starts no submit after it.
+    stopping: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
     unplaceable: Mutex<BTreeSet<TaskId>>,
@@ -684,6 +692,7 @@ impl Coordinator {
             input_cursor: Mutex::default(),
             placement_fence: Arc::default(),
             fenced: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             capacity_refused: Mutex::default(),
             input_missing: Mutex::default(),
@@ -770,6 +779,17 @@ impl Coordinator {
 
     pub fn epoch(&self) -> CoordinatorEpoch {
         self.store.epoch()
+    }
+
+    /// The resident stops: no submit starts after this, neither a new
+    /// placement nor a resend. What is not sent is sent by the next
+    /// coordinator, which follows the attempt again.
+    pub fn stop_submitting(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -871,7 +891,8 @@ impl Coordinator {
 
     /// Whether some attached worker reports every tool the workspace's
     /// preparation runs (the [`Requirement::Prepare`] of `requirements`,
-    /// spec 22.1). The refusal names what each asked worker lacks, as
+    /// spec 22.1) on its bare PATH. The submit leaves out the tools the
+    /// resolved toolchains of every task serve. The refusal names what each asked worker lacks, as
     /// placement would. Read-only: the same worker cap, deadline and fence
     /// checks as [`Self::resolve_toolchains`].
     ///
@@ -886,7 +907,12 @@ impl Coordinator {
             requires: requirements
                 .requires
                 .iter()
-                .filter(|r| matches!(r, Requirement::Prepare(_)))
+                .filter(|r| {
+                    matches!(
+                        r,
+                        Requirement::Prepare(_) | Requirement::Setup(_) | Requirement::Component(_)
+                    )
+                })
                 .cloned()
                 .collect(),
         };
@@ -934,18 +960,38 @@ impl Coordinator {
                 lacking.push(format!("{worker_id}: {}", unmet.join(", ")));
             }
         }
-        let tools: Vec<String> = prepare
-            .requires
-            .iter()
-            .filter_map(|r| match r {
-                Requirement::Prepare(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut why = format!(
-            "workspace preparation runs {}: no worker reports them",
-            tools.join(", ")
-        );
+        let named = |kind: fn(&Requirement) -> Option<&String>| -> Vec<String> {
+            prepare.requires.iter().filter_map(kind).cloned().collect()
+        };
+        let tools = named(|r| match r {
+            Requirement::Prepare(name) => Some(name),
+            _ => None,
+        });
+        let setup = named(|r| match r {
+            Requirement::Setup(name) => Some(name),
+            _ => None,
+        });
+        let components = named(|r| match r {
+            Requirement::Component(name) => Some(name),
+            _ => None,
+        });
+        let mut parts = Vec::new();
+        if !tools.is_empty() {
+            parts.push(format!("workspace preparation runs {}", tools.join(", ")));
+        }
+        if !setup.is_empty() {
+            parts.push(format!(
+                "the job's setup steps install {}",
+                setup.join(", ")
+            ));
+        }
+        if !components.is_empty() {
+            parts.push(format!(
+                "the job's setup steps add the rust components {}",
+                components.join(", ")
+            ));
+        }
+        let mut why = format!("{}: no worker reports them", parts.join("; "));
         if !lacking.is_empty() {
             why = format!("{why} ({})", lacking.join("; "));
         }
@@ -1104,6 +1150,13 @@ impl Coordinator {
             specs.push((task, value));
         }
         self.db(move |s| {
+            let mut specs = specs;
+            let keys = specs
+                .iter()
+                .filter_map(|(_, spec)| policy::duration_key(spec).map(str::to_string))
+                .collect();
+            let since = wall_ms().saturating_sub(crate::storage::DURATION_MAX_AGE_MS);
+            policy::longest_first(&mut specs, &s.ci_job_durations(keys, since)?);
             s.enqueue_guarded(
                 &run_id,
                 Some(&source_id),
@@ -1640,6 +1693,8 @@ impl Coordinator {
             // These ask the worker first, and apply what it says themselves.
             Step::Retire => return self.retire(link, &live, report, asked).await,
             Step::Cancel => return self.cancel(link, a, status, report, asked).await,
+            // Not sent while stopping: the next coordinator sends it.
+            Step::Submit if self.stopping() => return Ok(()),
             Step::Submit => return self.submit(link, &live, report, asked).await.map(|_| ()),
             _ => {}
         }
@@ -2272,7 +2327,7 @@ impl Coordinator {
         report: &mut TickReport,
         telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
-        if self.in_trial() {
+        if self.in_trial() || self.stopping() {
             return Ok(());
         }
         self.prune_missing().await?;
@@ -2326,6 +2381,9 @@ impl Coordinator {
         let page_len = queued.len();
         let mut processed = 0;
         for task in queued {
+            if self.stopping() {
+                break;
+            }
             self.join_newcomers(round, report, telemetry).await?;
             let evaluated: Vec<_> = round
                 .open
@@ -2504,6 +2562,8 @@ impl Coordinator {
             return Ok(());
         }
         let mut toolchain_eligible = BTreeSet::new();
+        // Asked and silent within the wait: no answer, not a refusal.
+        let mut toolchain_silent = BTreeSet::new();
         if let Some(bundle) = &spec.toolchains {
             // The same question of the same worker is asked once a tick: the
             // tasks of a run share one bundle.
@@ -2538,14 +2598,18 @@ impl Coordinator {
                     requirements: spec.requirements.clone(),
                 });
                 // Only an answer is kept; a silent worker is asked again.
-                if let Ok(Ok(Response::ResolveToolchains(response))) =
-                    tokio::time::timeout(wait, link.read_only_call(request)).await
-                {
-                    let eligible = response.bundle == *bundle;
-                    round.toolchain_eligible.insert(key, eligible);
-                    if eligible {
-                        toolchain_eligible.insert(worker_id);
+                match tokio::time::timeout(wait, link.read_only_call(request)).await {
+                    Ok(Ok(Response::ResolveToolchains(response))) => {
+                        let eligible = response.bundle == *bundle;
+                        round.toolchain_eligible.insert(key, eligible);
+                        if eligible {
+                            toolchain_eligible.insert(worker_id);
+                        }
                     }
+                    Err(_) => {
+                        toolchain_silent.insert(worker_id);
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -2640,13 +2704,16 @@ impl Coordinator {
                     // asks for.
                     if unmet.is_empty() && !toolchain_eligible.contains(&w.worker_id) {
                         if let Some(bundle) = &spec.toolchains {
-                            unmet.extend(
-                                bundle
-                                    .frozen
-                                    .requirements
-                                    .iter()
-                                    .map(|r| format!("toolchain {} unavailable", r.describe())),
-                            );
+                            unmet.extend(bundle.frozen.requirements.iter().map(|r| {
+                                match toolchain_silent.contains(&w.worker_id) {
+                                    true => {
+                                        format!("toolchain {} not answered in time", r.describe())
+                                    }
+                                    false => {
+                                        format!("toolchain {} unavailable", r.describe())
+                                    }
+                                }
+                            }));
                         }
                     }
                     unmet
@@ -3022,7 +3089,9 @@ impl Coordinator {
             cancel_requested: placed.record.cancel_requested_at_ms.is_some(),
             retire_requested: placed.retire_reason.is_some(),
         };
-        if !policy::may_send(facts) {
+        // A placement committed as the resident stops is sent by the next
+        // coordinator, like any placement that was never sent.
+        if !policy::may_send(facts) || self.stopping() {
             return Ok(Sent::Withheld);
         }
         self.submit(link, &placed, report, asked).await

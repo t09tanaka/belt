@@ -632,7 +632,7 @@ async fn failed_child_and_interrupted_startup_do_not_keep_startup_lock() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     waiting.abort();
     assert!(waiting.await.err().unwrap().is_cancelled());
-    drop(lock);
+    lock.unlock().unwrap();
     let client = ensure(spec).await.unwrap();
     shutdown(&client).await;
 }
@@ -1707,11 +1707,11 @@ async fn an_interrupt_after_the_capture_began_always_sends_the_cancel() {
     lock.lock().unwrap();
     let holder = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(3));
-        drop(lock);
+        lock.unlock().unwrap();
     });
     let report =
         control::stop_submission(&context, &run, &mut signals, Duration::from_secs(30)).await;
-    holder.join().unwrap();
+    crate::common::join_within(holder, "the lock holder");
     assert_eq!(report.state, "stop_confirmed", "{:?}", report.error);
     assert!(report.cancel_acknowledged);
     assert!(!report.snapshot.as_ref().unwrap().accepted);
@@ -5503,7 +5503,7 @@ async fn ci_output_with(
     more: &[&str],
 ) -> (Option<i32>, serde_json::Value) {
     let mut command = ci_command(spec, input);
-    command.args(more);
+    command.args(more).kill_on_drop(true);
     let waited = tokio::time::timeout(Duration::from_secs(240), command.output());
     let output = match waited.await {
         Ok(output) => output.unwrap(),

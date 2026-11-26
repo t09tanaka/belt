@@ -35,7 +35,7 @@ use crate::ids::{
 };
 use crate::platform;
 use crate::state::AttemptState;
-use crate::storage::{NewAcceptance, WorkerStore};
+use crate::storage::{AcceptedLease, GrantStamp, NewAcceptance, WorkerStore};
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::process::{code, spawn_detached, supervise};
 use crate::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
@@ -69,6 +69,16 @@ const MAX_UNKEPT: usize = 1024;
 /// How the builders get their workspaces: the same way the consumers do.
 pub trait BuilderWorkspaces: Send + Sync {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError>;
+    /// [`Self::create`] with the workspace's preparation run under the
+    /// setup's activated toolchains (spec 22.1).
+    fn create_with(
+        &self,
+        attempt: &AttemptId,
+        payload: &AttemptPayload,
+        _toolchain: Option<&crate::worker::host::PrepareToolchain>,
+    ) -> Result<Workspace, ApiError> {
+        self.create(attempt, payload)
+    }
     fn remove(&self, ws: &Workspace) -> Result<(), ApiError>;
 }
 
@@ -1454,7 +1464,14 @@ impl Setups {
         if self.wanted(id).0 == 0 {
             return BuildEnd::Cancelled;
         }
-        let ws = match self.ws.create(attempt, payload) {
+        let toolchain = match binding
+            .map(|b| crate::worker::host::PrepareToolchain::of(self.cfg.embedded_bin.as_deref(), b))
+            .transpose()
+        {
+            Ok(t) => t,
+            Err(why) => return crashed("builder workspace", &why),
+        };
+        let ws = match self.ws.create_with(attempt, payload, toolchain.as_ref()) {
             Ok(ws) => ws,
             Err(e) => return crashed("builder workspace", &e.message),
         };
@@ -1547,7 +1564,9 @@ impl Setups {
                     coordinator_epoch: CoordinatorEpoch(1),
                     lease_seq: lease.seq,
                 };
-                let _ = store.renew_lease(attempt, key, wall);
+                // Through the same in-time check as every renewal (spec 12);
+                // the grant is stamped on the real clock, not `now`.
+                let _ = store.renew_lease(attempt, key, wall, GrantStamp::now());
                 lease.last = now;
             }
         } else if !lease.cancelled {
@@ -1566,6 +1585,13 @@ impl Setups {
     ) -> BuildEnd {
         let crashed =
             |what: &str, e: &dyn std::fmt::Display| BuildEnd::Crashed(format!("{what}: {e}"));
+        // A builder's supervisor counts its lease from its own start, with
+        // no seed: the first window runs from just before it, not from the
+        // acceptance (the work between them can outlast a window). Earlier
+        // than the supervisor's start, so never longer than it counts.
+        if let Err(e) = store.restamp_unrenewed_grant(attempt, GrantStamp::now()) {
+            return crashed("the lease", &e);
+        }
         let mut child = match spawn_detached(&self.cfg.supervisor_exe, &dir.join("spec.json")) {
             Ok(c) => c,
             Err(e) => return crashed("supervisor", &e),
@@ -1635,6 +1661,11 @@ impl Setups {
                     payload_hash: Digest::of_bytes(attempt.as_str().as_bytes()),
                     coordinator_epoch: CoordinatorEpoch(1),
                     spec: serde_json::json!({ "setup_builder": true }),
+                    lease: Some(AcceptedLease {
+                        lease_ms: self.cfg.lease_ms,
+                        poll_ms: self.cfg.poll_ms,
+                        at: GrantStamp::now(),
+                    }),
                 },
                 now,
             )
@@ -1777,6 +1808,10 @@ impl Setups {
                 },
                 key: crate::ids::Digest::of_bytes(m.key.as_bytes()),
             });
+        // The terms persisted at acceptance, the ones renewals are checked by.
+        let terms = WorkerStore::open_read_only(dir)
+            .ok()
+            .and_then(|s| s.lease_terms(attempt).ok().flatten());
         let sup = SuperviseSpec {
             preparation,
             profile_fingerprint: fingerprint,
@@ -1786,10 +1821,10 @@ impl Setups {
             traffic_state_dir: self.cfg.traffic_state_dir.clone(),
             traffic_config: self.cfg.traffic_config.clone(),
             nodes,
-            lease_ms: self.cfg.lease_ms,
+            lease_ms: terms.map_or(self.cfg.lease_ms, |t| t.0),
             term_grace_ms: self.cfg.term_grace_ms,
             kill_wait_ms: self.cfg.kill_wait_ms,
-            poll_ms: self.cfg.poll_ms,
+            poll_ms: terms.map_or(self.cfg.poll_ms, |t| t.1),
             command_timeout_ms: None,
             resource_wait_timeout_ms: None,
             deadline_ms: Some(self.cfg.deadline_ms),
@@ -2203,6 +2238,35 @@ mod tool_validation_tests {
             })
         }
     }
+    /// Spec 12: the builder's renewals go through the same in-time check
+    /// as the agent's, from the stamp and terms persisted at acceptance.
+    #[test]
+    fn a_builder_renewal_after_its_window_is_refused() {
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let mut cfg = SetupConfig::new(
+            base.join("state"),
+            crate::ids::WorkerId::parse("w-validation").unwrap(),
+            "/bin/sh".into(),
+        );
+        cfg.lease_ms = 300;
+        cfg.poll_ms = 100;
+        let setups = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+        let consumer = AttemptId::generate();
+        let (id, attempt, store) = seed(&setups, &consumer, BuilderKind::ToolInstall);
+        assert_eq!(store.lease_terms(&attempt).unwrap(), Some((300, 100)));
+        // The window is 300 - 100 ms after the acceptance.
+        std::thread::sleep(Duration::from_millis(250));
+        let mut lease = BuilderLease {
+            last: 0,
+            seq: 0,
+            cancelled: false,
+        };
+        setups.lease_tick(&id, &attempt, &store, &mut lease, || (1_000, 1));
+        assert_eq!(lease.seq, 1, "a renewal was tried");
+        assert_eq!(store.lease(&attempt).unwrap(), None);
+    }
+
     fn seed(
         setups: &Setups,
         consumer: &AttemptId,

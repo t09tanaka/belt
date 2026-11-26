@@ -372,6 +372,26 @@ pub fn input_refusal(
         .map(|(_, why)| why)
 }
 
+/// The key a queued task's earlier durations are found by
+/// (`ci.duration_key` of its spec).
+pub fn duration_key(spec: &serde_json::Value) -> Option<&str> {
+    spec.pointer("/ci/duration_key").and_then(|v| v.as_str())
+}
+
+/// The order the tasks of one submission are queued in, which is the order
+/// they are placed in (spec 配置の手順 1): the tasks whose job has a measured
+/// duration first, longest first; then the others in the order given (the
+/// workflow's). The sort is stable, so equal durations keep their order.
+pub fn longest_first<T>(
+    tasks: &mut [(T, serde_json::Value)],
+    durations: &std::collections::BTreeMap<String, u64>,
+) {
+    tasks.sort_by_key(|(_, spec)| {
+        let known = duration_key(spec).and_then(|key| durations.get(key));
+        std::cmp::Reverse(known.map(|millis| millis.saturating_add(1)).unwrap_or(0))
+    });
+}
+
 /// The work a forecast is asked for: the commands of the task, or for a CI
 /// task the commands its plan says it starts (one node per step, in order).
 pub fn workload_of_spec(
@@ -421,6 +441,7 @@ mod tests {
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
                 history_keys: Vec::new(),
+                duration_key: None,
                 dynamic_origin: false,
                 core_outcome: None,
                 matrix: None,
@@ -915,5 +936,43 @@ mod tests {
             assert!(!may_send(facts(acked, false, true)));
             assert!(!may_send(facts(acked, true, true)));
         }
+    }
+
+    /// Spec 配置の手順 1: measured jobs go first, longest first; the others
+    /// keep the workflow's order after them; ties keep their order.
+    #[test]
+    fn a_submission_is_queued_longest_first() {
+        let job = |name: &str, key: Option<&str>| {
+            (
+                name.to_string(),
+                key.map_or_else(
+                    || serde_json::json!({"ci": {}}),
+                    |key| serde_json::json!({"ci": {"duration_key": key}}),
+                ),
+            )
+        };
+        let mut tasks = vec![
+            job("test", Some("t")),
+            job("msrv", None),
+            job("wire", Some("w")),
+            job("driver", Some("d")),
+            job("coverage", None),
+            job("shell", None),
+            job("tie", Some("w2")),
+        ];
+        let durations = [("t", 400), ("w", 600), ("d", 800), ("w2", 600)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
+        longest_first(&mut tasks, &durations);
+        let names: Vec<_> = tasks.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["driver", "wire", "tie", "test", "msrv", "coverage", "shell"]
+        );
+        // Without any measure the order is the workflow's.
+        let mut tasks = vec![job("b", Some("b")), job("a", None), job("c", Some("c"))];
+        longest_first(&mut tasks, &Default::default());
+        let names: Vec<_> = tasks.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["b", "a", "c"]);
     }
 }

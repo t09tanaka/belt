@@ -203,8 +203,27 @@ pub(crate) fn hidden_suspects_json(ctx: &Context, id: &str) -> Vec<serde_json::V
         .collect()
 }
 
+/// The most of a failing check's text kept in a `supervisor_unresolved`
+/// event (bytes, cut on a character boundary).
+pub(crate) const UNRESOLVED_DETAIL_MAX: usize = 1024;
+
+/// `text` cut to [`UNRESOLVED_DETAIL_MAX`] bytes, with "…" when it was cut.
+pub(crate) fn bounded_detail(text: &str) -> String {
+    if text.len() <= UNRESOLVED_DETAIL_MAX {
+        return text.to_string();
+    }
+    let mut end = UNRESOLVED_DETAIL_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// The report for an attempt that cannot be settled, after recording why
-/// (and for which nodes) in the worker database.
+/// (and for which nodes) in the worker database. `detail`: the text of the
+/// check that failed (task-traffic-controller's `finish` error), when one
+/// did; it is kept bounded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unresolved_report(
     store: &WorkerStore,
     attempt: &crate::ids::AttemptId,
@@ -213,6 +232,7 @@ pub(crate) fn unresolved_report(
     identity_unknown: bool,
     sleep_inhibit: String,
     hidden_suspects: Vec<serde_json::Value>,
+    detail: Option<&str>,
 ) -> Result<Report> {
     if let Some(a) = store.get(attempt)? {
         store.append_event(
@@ -224,6 +244,7 @@ pub(crate) fn unresolved_report(
                 "nodes": nodes,
                 "identity_unknown": identity_unknown,
                 "hidden_suspects": hidden_suspects,
+                "detail": detail.map(bounded_detail),
             }),
             platform::wall_ms(),
         )?;
@@ -789,6 +810,8 @@ pub(super) struct Control<'a> {
     store: &'a WorkerStore,
     traffic: Traffic,
     lease: LeaseClock,
+    /// This boot: only a grant stamped in it is counted from its time.
+    boot: Option<String>,
     started_ms: u64,
     spool: &'a AttemptSpool,
     masker: Masker,
@@ -804,6 +827,9 @@ pub(super) struct Control<'a> {
     /// A file that gets a copy of the masked output of the node being run
     /// (the step log of a CI task); `None` for a command of `exec`.
     pub(super) tee: Option<std::fs::File>,
+    /// Why task-traffic-controller's `finish` last refused to settle a node
+    /// (for the `supervisor_unresolved` event).
+    finish_error: Option<String>,
 }
 
 /// Notify only after a new grant was accepted by the clock. Diagnostics are
@@ -812,11 +838,12 @@ fn observe_lease(
     clock: &mut LeaseClock,
     now: u64,
     key: Option<crate::wire::LeaseKey>,
+    granted: Option<u64>,
     db_expired: bool,
     note: impl FnOnce(crate::wire::LeaseKey) -> bool,
 ) -> LeaseStatus {
     let before = clock.applied_key();
-    let status = clock.observe(now, key, db_expired);
+    let status = clock.observe_granted(now, key, granted, db_expired);
     if matches!(status, LeaseStatus::Valid { .. }) && clock.applied_key() != before {
         if let Some(applied) = clock.applied_key() {
             let _ = note(applied);
@@ -850,17 +877,20 @@ impl Control<'_> {
         stage: timeouts::Stage,
     ) -> Result<Option<StopReason>> {
         let attempt = &self.spec.attempt_id;
-        let now = platform::monotonic_ms();
         let Some(rec) = self.store.get(attempt)? else {
             return Err(SupervisorError::State(format!(
                 "attempt {attempt} vanished"
             )));
         };
-        let (key, db_expired) = match self.store.lease(attempt)? {
-            Some((k, e)) => (Some(k), e),
-            None => (None, false),
-        };
-        let status = observe_lease(&mut self.lease, now, key, db_expired, |applied| {
+        let (key, granted, db_expired) =
+            match self.store.lease_grant(attempt, self.boot.as_deref())? {
+                Some((k, g, e)) => (Some(k), g, e),
+                None => (None, None, false),
+            };
+        // Read after the database: the grant just read is not later than
+        // `now`, and a slow read is not counted against it.
+        let now = platform::monotonic_ms();
+        let status = observe_lease(&mut self.lease, now, key, granted, db_expired, |applied| {
             // Like the identity diagnostic, this is not an authoritative
             // receipt or a condition for keeping the command alive.
             self.store
@@ -1234,7 +1264,11 @@ impl Control<'_> {
             (_, Some(Exit::Signal(signal))) => TerminalKind::Signaled { signal },
             (_, None) => TerminalKind::SpawnFailed,
         };
-        let confirmed = managed::finish(&self.traffic.ctx, guard, kind).is_ok();
+        let finished = managed::finish(&self.traffic.ctx, guard, kind);
+        if let Err(e) = &finished {
+            self.finish_error = Some(e.to_string());
+        }
+        let confirmed = finished.is_ok();
         if confirmed && reason.is_none() && exit == Some(Exit::Code(0)) {
             if let Ok(ran) = &ran {
                 if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
@@ -1645,6 +1679,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
         store: &store,
         traffic: Traffic::open(spec)?,
         lease: LeaseClock::start_seeded(now, spec.lease_ms, spec.poll_ms, applied, spec.lease_seed),
+        boot: platform::boot_id(),
         started_ms: now,
         spool: &spool,
         masker: masker.clone(),
@@ -1654,6 +1689,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
         tee: None,
+        finish_error: None,
     };
     let mut end = NodeEnd {
         reason: None,
@@ -1693,6 +1729,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
             end.identity_unknown,
             sleep_inhibit,
             Vec::new(),
+            ctl.finish_error.as_deref(),
         );
     }
     // The heartbeat that would have recorded a reader error may not have got
@@ -1854,7 +1891,7 @@ mod tests {
         };
         let mut clock = LeaseClock::start(0, 100, 0, None);
         let mut noted = Vec::new();
-        let status = observe_lease(&mut clock, 10, Some(key), false, |applied| {
+        let status = observe_lease(&mut clock, 10, Some(key), None, false, |applied| {
             noted.push(applied);
             // A failed best-effort write has no result to feed back into
             // the clock or the caller's stop decision.
@@ -1863,7 +1900,7 @@ mod tests {
         assert_eq!(status, LeaseStatus::Valid { remaining_ms: 100 });
         assert_eq!(noted, vec![key]);
         assert_eq!(
-            observe_lease(&mut clock, 20, Some(key), false, |_| panic!("replay")),
+            observe_lease(&mut clock, 20, Some(key), None, false, |_| panic!("replay")),
             LeaseStatus::Valid { remaining_ms: 90 }
         );
         let newer = LeaseKey {
@@ -1871,12 +1908,14 @@ mod tests {
             ..key
         };
         assert_eq!(
-            observe_lease(&mut clock, 110, Some(newer), false, |_| panic!("late")),
+            observe_lease(&mut clock, 110, Some(newer), None, false, |_| panic!(
+                "late"
+            )),
             LeaseStatus::Expired
         );
         let mut clock = LeaseClock::start(0, 100, 0, None);
         assert_eq!(
-            observe_lease(&mut clock, 10, Some(key), true, |_| panic!(
+            observe_lease(&mut clock, 10, Some(key), None, true, |_| panic!(
                 "expired in database"
             )),
             LeaseStatus::Expired

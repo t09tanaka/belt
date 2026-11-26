@@ -1108,6 +1108,7 @@ fn run_of_task(task: &TaskId) -> RunId {
 
 fn acceptance(a: &AttemptId, task: &TaskId, h: char, epoch: u64) -> NewAcceptance {
     NewAcceptance {
+        lease: Some(crate::storage::AcceptedLease::now(3_600_000, 1)),
         attempt_id: a.clone(),
         run_id: run_of_task(task),
         task_id: task.clone(),
@@ -1121,6 +1122,7 @@ fn acceptance(a: &AttemptId, task: &TaskId, h: char, epoch: u64) -> NewAcceptanc
 /// The submit that produced `a`, byte for byte.
 fn resend_of(a: &AcceptedAttempt) -> NewAcceptance {
     NewAcceptance {
+        lease: Some(crate::storage::AcceptedLease::now(3_600_000, 1)),
         attempt_id: a.attempt_id.clone(),
         run_id: a.run_id.clone(),
         task_id: a.task_id.clone(),
@@ -1316,6 +1318,7 @@ fn cancelling_a_known_attempt_is_recorded_once_and_stops_new_spawns() {
         .store
         .submit(
             NewAcceptance {
+                lease: Some(crate::storage::AcceptedLease::now(3_600_000, 1)),
                 attempt_id: a.attempt_id.clone(),
                 run_id: a.run_id.clone(),
                 task_id: a.task_id.clone(),
@@ -1355,7 +1358,7 @@ fn a_retired_attempt_refuses_submit_launch_and_lease() {
     ));
     let e = w
         .store
-        .renew_lease(&a.attempt_id, key(1, 1), 33)
+        .renew_lease(&a.attempt_id, key(1, 1), 33, GrantStamp::now())
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LeaseNotRenewable(_)));
@@ -1456,7 +1459,8 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    let renew = |k| w.store.renew_lease(id, k, 50);
+    let st = GrantStamp::now();
+    let renew = |k| w.store.renew_lease(id, k, 50, st.clone());
     assert_eq!(renew(key(1, 1)).unwrap(), LeaseOutcome::Extended);
     assert_eq!(renew(key(1, 1)).unwrap(), LeaseOutcome::Stale);
     assert_eq!(renew(key(1, 3)).unwrap(), LeaseOutcome::Extended);
@@ -1464,11 +1468,21 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     // A new coordinator epoch restarts the sequence and still wins.
     assert_eq!(renew(key(2, 1)).unwrap(), LeaseOutcome::Extended);
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), false)));
+    // The grant time on the monotonic clock travels with the key.
+    assert_eq!(
+        w.store.lease_grant(id, st.boot.as_deref()).unwrap(),
+        Some((key(2, 1), st.boot.as_ref().map(|_| st.mono_ms), false))
+    );
     // The old coordinator is now rejected outright.
     let e = renew(key(1, 99)).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     assert_eq!(e.code(), ErrorCode::StaleEpoch);
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), false)));
+    // The grant time on the monotonic clock travels with the key.
+    assert_eq!(
+        w.store.lease_grant(id, st.boot.as_deref()).unwrap(),
+        Some((key(2, 1), st.boot.as_ref().map(|_| st.mono_ms), false))
+    );
     // An expiry is remembered and a late renewal does not undo it.
     assert!(w.store.events_of(id, "lease_expired").unwrap().is_empty());
     assert!(w.store.expire_lease(id, 60).unwrap());
@@ -1482,8 +1496,156 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     assert!(renew(key(2, 5)).is_err());
     assert!(w
         .store
-        .renew_lease(&AttemptId::generate(), key(2, 1), 1)
+        .renew_lease(&AttemptId::generate(), key(2, 1), 1, GrantStamp::now())
         .is_err());
+}
+
+fn at(boot: Option<&str>, mono_ms: u64) -> GrantStamp {
+    GrantStamp {
+        boot: boot.map(str::to_owned),
+        mono_ms,
+    }
+}
+
+/// An attempt accepted at monotonic 1_000 of boot "b", lease 1_000 ms with
+/// a poll of 100 ms: each grant runs 900 ms.
+fn accepted_at_1000(w: &Wx, lease: bool) -> AttemptId {
+    let mut new = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
+    new.lease = lease.then(|| AcceptedLease {
+        lease_ms: 1_000,
+        poll_ms: 100,
+        at: at(Some("b"), 1_000),
+    });
+    let id = new.attempt_id.clone();
+    w.store.submit(new, 10).unwrap();
+    drive(w, &id, &TO_READY);
+    id
+}
+
+/// Spec 12: a renewal extends only in time after the grant before it, as
+/// persisted; the first one is counted from the acceptance stamp.
+#[test]
+fn a_renewal_is_applied_only_within_the_window_of_the_grant_before_it() {
+    let w = wx();
+    let id = accepted_at_1000(&w, true);
+    let renew = |s, t| w.store.renew_lease(&id, key(1, s), 50, at(Some("b"), t));
+    let refused = |r: Result<LeaseOutcome>| matches!(r, Err(StorageError::LeaseNotRenewable(_)));
+    assert!(refused(renew(1, 1_900)));
+    assert_eq!(renew(1, 1_899).unwrap(), LeaseOutcome::Extended);
+    assert_eq!(
+        w.store.lease_grant(&id, Some("b")).unwrap(),
+        Some((key(1, 1), Some(1_899), false))
+    );
+    // Another boot's stamp is not counted by a supervisor of this one.
+    assert_eq!(
+        w.store.lease_grant(&id, Some("c")).unwrap(),
+        Some((key(1, 1), None, false))
+    );
+    assert_eq!(
+        w.store.lease_grant(&id, None).unwrap(),
+        Some((key(1, 1), None, false))
+    );
+    // The next window runs from that renewal, not from the acceptance.
+    assert_eq!(renew(2, 2_798).unwrap(), LeaseOutcome::Extended);
+    assert!(refused(renew(3, 2_798 + 900)));
+    // A replay of the applied key is still a replay, however late.
+    assert_eq!(renew(2, 9_000).unwrap(), LeaseOutcome::Stale);
+    // Another boot, no boot, a time before the last grant.
+    assert!(refused(w.store.renew_lease(
+        &id,
+        key(1, 3),
+        50,
+        at(Some("c"), 2_800)
+    )));
+    assert!(refused(w.store.renew_lease(
+        &id,
+        key(1, 3),
+        50,
+        at(None, 2_800)
+    )));
+    assert!(refused(renew(3, 2_797)));
+    assert_eq!(renew(3, 2_800).unwrap(), LeaseOutcome::Extended);
+}
+
+/// A builder's grant moves to its supervisor's start only while nothing
+/// was renewed: after a renewal the chain stays as it was.
+#[test]
+fn an_unrenewed_grant_is_restamped_and_a_renewed_one_is_not() {
+    let w = wx();
+    let id = accepted_at_1000(&w, true);
+    w.store
+        .restamp_unrenewed_grant(&id, at(Some("b"), 5_000))
+        .unwrap();
+    assert!(w
+        .store
+        .renew_lease(&id, key(1, 1), 50, at(Some("b"), 1_899))
+        .is_err());
+    assert_eq!(
+        w.store
+            .renew_lease(&id, key(1, 1), 50, at(Some("b"), 5_899))
+            .unwrap(),
+        LeaseOutcome::Extended
+    );
+    w.store
+        .restamp_unrenewed_grant(&id, at(Some("b"), 9_000))
+        .unwrap();
+    assert!(w
+        .store
+        .renew_lease(&id, key(1, 2), 50, at(Some("b"), 9_001))
+        .is_err());
+}
+
+/// A refused late renewal still leaves the newer epoch it carried.
+#[test]
+fn a_late_renewal_is_refused_and_still_remembers_its_epoch() {
+    let w = wx();
+    let id = accepted_at_1000(&w, true);
+    let e = w
+        .store
+        .renew_lease(&id, key(5, 1), 50, at(Some("b"), 5_000))
+        .unwrap_err();
+    assert!(matches!(e, StorageError::LeaseNotRenewable(_)), "{e:?}");
+    assert_eq!(w.store.lease(&id).unwrap(), None);
+    let e = w
+        .store
+        .renew_lease(&id, key(4, 1), 50, at(Some("b"), 1_001))
+        .unwrap_err();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+}
+
+/// What is needed to prove "in time" and is missing refuses: no persisted
+/// terms or stamp, or a lease row without a stamp (an older binary).
+#[test]
+fn a_renewal_without_a_persisted_base_is_refused() {
+    let w = wx();
+    let id = accepted_at_1000(&w, false);
+    assert_eq!(w.store.lease_terms(&id).unwrap(), None);
+    assert!(matches!(
+        w.store
+            .renew_lease(&id, key(1, 1), 50, at(Some("b"), 1_001)),
+        Err(StorageError::LeaseNotRenewable(_))
+    ));
+    let id = accepted_at_1000(&w, true);
+    assert_eq!(w.store.lease_terms(&id).unwrap(), Some((1_000, 100)));
+    w.store
+        .renew_lease(&id, key(1, 1), 50, at(Some("b"), 1_001))
+        .unwrap();
+    let c = rusqlite::Connection::open(w.dir.path().join("worker.db")).unwrap();
+    c.execute(
+        "UPDATE lease SET renewed_mono_ms = NULL WHERE attempt_id = ?1",
+        [id.as_str()],
+    )
+    .unwrap();
+    drop(c);
+    assert!(matches!(
+        w.store
+            .renew_lease(&id, key(1, 2), 50, at(Some("b"), 1_002)),
+        Err(StorageError::LeaseNotRenewable(_))
+    ));
+    assert_eq!(
+        w.store.lease_grant(&id, Some("b")).unwrap(),
+        Some((key(1, 1), None, false))
+    );
 }
 
 #[test]
@@ -1492,19 +1654,33 @@ fn a_lease_is_not_renewed_while_cancelling_or_after_the_end() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    w.store.renew_lease(id, key(1, 1), 1).unwrap();
+    w.store
+        .renew_lease(id, key(1, 1), 1, GrantStamp::now())
+        .unwrap();
     drive(&w, id, &[AttemptState::Cancelling]);
-    assert!(w.store.renew_lease(id, key(1, 2), 2).is_err());
+    assert!(w
+        .store
+        .renew_lease(id, key(1, 2), 2, GrantStamp::now())
+        .is_err());
     drive(&w, id, &[AttemptState::Finalizing]);
-    assert!(w.store.renew_lease(id, key(1, 3), 3).is_err());
+    assert!(w
+        .store
+        .renew_lease(id, key(1, 3), 3, GrantStamp::now())
+        .is_err());
     w.store.finalize(id, done(Outcome::Cancelled), 4).unwrap();
-    assert!(w.store.renew_lease(id, key(1, 4), 5).is_err());
+    assert!(w
+        .store
+        .renew_lease(id, key(1, 4), 5, GrantStamp::now())
+        .is_err());
     // A never-started cancel request alone also blocks renewal.
     let b = accepted(&w);
     w.store
         .cancel(&b.attempt_id, CoordinatorEpoch(1), 6)
         .unwrap();
-    assert!(w.store.renew_lease(&b.attempt_id, key(1, 1), 7).is_err());
+    assert!(w
+        .store
+        .renew_lease(&b.attempt_id, key(1, 1), 7, GrantStamp::now())
+        .is_err());
 }
 
 #[test]
@@ -1972,7 +2148,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
     }
 }
 
@@ -2193,7 +2369,11 @@ fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     // renew_lease on a retired attempt fails at epoch 9 and still raises it.
     w.store.retire(&a, CoordinatorEpoch(7), 6).unwrap();
-    let e = w.store.renew_lease(&a, key(9, 1), 7).err().unwrap();
+    let e = w
+        .store
+        .renew_lease(&a, key(9, 1), 7, GrantStamp::now())
+        .err()
+        .unwrap();
     assert!(matches!(e, StorageError::LeaseNotRenewable(_)));
     let e = w.store.retire(&a, CoordinatorEpoch(8), 8).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
@@ -2216,7 +2396,9 @@ fn an_expired_lease_refuses_a_new_launch_claim_but_not_a_replay() {
     let a = accepted(&w);
     let id = &a.attempt_id;
     drive(&w, id, &TO_READY);
-    w.store.renew_lease(id, key(1, 1), 25).unwrap();
+    w.store
+        .renew_lease(id, key(1, 1), 25, GrantStamp::now())
+        .unwrap();
     assert_eq!(
         w.store.claim_launch(id, &node("build"), 30).unwrap(),
         LaunchClaim::Granted
@@ -6920,5 +7102,64 @@ fn the_rows_of_a_cancel_before_the_enqueue_exist_only_for_a_capture_and_are_forg
             .completion(Target::Run(f.run.clone()))
             .unwrap()
             .accepted
+    );
+}
+
+/// Spec 配置の手順 1: the duration of a CI job is its last succeeded
+/// attempt in a recent run; a failure, a discovery probe and an old run
+/// do not count.
+#[test]
+fn a_ci_job_duration_is_its_last_success_in_a_recent_run() {
+    let f = fx();
+    let finish = |run_at: u64, spec: serde_json::Value, outcome: Outcome, start: u64, end: u64| {
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        f.store
+            .create_run(&run, None, None, &json!({}), run_at)
+            .unwrap();
+        f.store.create_task(&task, &run, &spec, run_at).unwrap();
+        let a = f
+            .store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task,
+                    worker_id: f.worker.clone(),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                start,
+            )
+            .unwrap();
+        for s in [
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ] {
+            f.store.transition_attempt(&a.attempt_id, s, start).unwrap();
+        }
+        f.store
+            .finalize_attempt(&a.attempt_id, done(outcome), end)
+            .unwrap();
+    };
+    let job = |key: &str| json!({"ci": {"duration_key": key}});
+    finish(100, job("long"), Outcome::Succeeded, 100, 900);
+    finish(200, job("long"), Outcome::Succeeded, 1_000, 1_500);
+    finish(300, job("long"), Outcome::Failed, 300, 5_000);
+    finish(100, job("short"), Outcome::Succeeded, 100, 200);
+    let probe = json!({"ci": {"duration_key": "short",
+        "task": {"inputs": {"belt_discovery": {}}}}});
+    finish(400, probe, Outcome::Succeeded, 400, 9_000);
+    finish(10, job("old"), Outcome::Succeeded, 10, 20);
+    let keys = ["long", "short", "old", "none"]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    let found = f.store.ci_job_durations(keys, 50).unwrap();
+    assert_eq!(
+        found,
+        [("long".to_string(), 500), ("short".to_string(), 100)].into()
     );
 }
