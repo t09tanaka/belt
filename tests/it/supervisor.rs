@@ -1111,7 +1111,12 @@ fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_wa
         let mut errors = Vec::new();
         let until = Instant::now() + Duration::from_secs(20);
         while !runner.is_finished() {
-            if let Err(e) = second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+            if let Err(e) = second.renew_lease(
+                &attempt,
+                key(seq),
+                platform::wall_ms(),
+                belt::storage::GrantStamp::now(),
+            ) {
                 errors.push(format!("renewal {seq}: {e}"));
             }
             if observed.is_none() {
