@@ -1123,3 +1123,45 @@ fn a_workspace_binds_with_declared_overlays_and_everything_else_is_compared() {
         .unverified_paths()
         .is_empty());
 }
+
+/// A forked child keeps every open description of the parent, the receipt
+/// lock included, until it reaches exec, so another thread spawning a process
+/// can hold `receipt.lock` for a moment. A writer then waits for the lock
+/// instead of failing with EAGAIN.
+#[test]
+fn receipt_write_waits_for_a_transient_holder_of_the_writer_lock() {
+    use local_ci::source_execute::{AttemptBinding, PrivateReceiptDirectory};
+    let f = Fixture::new(WORKFLOW);
+    std::fs::write(f.root.join("payload"), "captured").unwrap();
+    let m = f.capture();
+    let p = build(&f.store, &m, &options()).unwrap();
+    let input = PinnedExecution::new(&p, &m, &f.store).unwrap();
+    let workspace = input.materialize_workspace(ws(&f, "attempt")).unwrap();
+    let (state, root) = private_state(&f);
+    let directory = PrivateReceiptDirectory::open(&state, Path::new("attempts/a")).unwrap();
+    let binding = AttemptBinding {
+        attempt: "a".into(),
+        generation: 1,
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    let holder = std::fs::OpenOptions::new()
+        .mode(0o600)
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("attempts/a/.local-ci-captured/receipt.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&holder).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(holder);
+    });
+    workspace
+        .write_receipt(&input, &directory, &binding)
+        .unwrap();
+    release.join().unwrap();
+    workspace
+        .write_receipt(&input, &directory, &binding)
+        .unwrap();
+}

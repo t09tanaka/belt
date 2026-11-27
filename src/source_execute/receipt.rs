@@ -169,13 +169,17 @@ impl PinnedWorkspace {
         }
         // An immutable receipt is published once. The cooperating writer lock
         // makes rename atomic without replacing an existing different binding.
+        // Wait for the lock rather than try it: holders are brief, and a
+        // process this one forks on another thread shares the lock's open
+        // description until it reaches exec (O_CLOEXEC only closes it there),
+        // so a try would fail with EAGAIN while nothing is wrong.
         let writer = open_at(
             &directory.directory,
             b"receipt.lock",
             libc::O_RDWR | libc::O_CREAT,
         )?;
         validate_file(&writer)?;
-        fs2::FileExt::try_lock_exclusive(&writer)?;
+        fs2::FileExt::lock_exclusive(&writer)?;
         match directory.read() {
             Ok(existing) if existing == receipt => return Ok(()),
             Ok(_) => bail!("cannot replace another captured workspace receipt"),
