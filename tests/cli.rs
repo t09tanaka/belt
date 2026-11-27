@@ -119,8 +119,13 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 fn marker_script(dir: &Path, name: &str, secs: &str) -> String {
     let p = dir.join(name);
     let now = "perl -MTime::HiRes=time -e 'printf \"%.0f\\n\", time*1e9'";
+    // Each mark appears only once it holds its time: the shell creates a
+    // redirect's file before the command runs, so a script waiting for
+    // `<name>.start` to exist would otherwise go on before perl (slow to
+    // start on a loaded machine) has read the clock.
     format!(
-        "{now} > {p}.start; sleep {secs}; {now} > {p}.end",
+        "{now} > {p}.start.tmp && mv {p}.start.tmp {p}.start; sleep {secs}; \
+         {now} > {p}.end.tmp && mv {p}.end.tmp {p}.end",
         p = p.display()
     )
 }
@@ -685,7 +690,9 @@ fn a_nested_exec_that_does_not_fit_starts_after_the_sibling_limit() {
     assert!(parent.wait().unwrap().success());
     assert!(
         read_ns(&dir.join("client.start")) - read_ns(&dir.join("server.start")) >= 2_000_000_000,
-        "started before the limit"
+        "started before the limit: server {} client {}",
+        read_ns(&dir.join("server.start")),
+        read_ns(&dir.join("client.start"))
     );
 }
 
