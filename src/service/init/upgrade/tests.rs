@@ -1108,3 +1108,36 @@ async fn refresh_env_runs_the_same_build_with_the_login_path_and_a_rollback_rest
     );
     assert!(!control::held(&h.paths.worker));
 }
+
+/// A new version that never answered is reported with its own startup
+/// error, which the managed daemon leaves beside its input.
+#[test]
+fn a_new_version_that_never_answers_is_reported_with_its_own_startup_error() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let config = root.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let spec = Spec {
+        state_dir: root.path().join("state"),
+        worker_state_dir: root.path().join("worker"),
+        worker_id: crate::ids::WorkerId::parse("mac").unwrap(),
+        cluster_key_path: config.join("cluster.key"),
+        executable: root.path().join("belt"),
+        env: BTreeMap::new(),
+        repo_root: None,
+        expected_cluster: None,
+        managed_service: Some(config.join("init.json")),
+    };
+    let quiet = format!("{:#}", not_answered(&spec, Some("Connection refused")));
+    assert!(quiet.contains("last: Connection refused"), "{quiet}");
+    assert!(!quiet.contains("its own start failed"), "{quiet}");
+    fs::write(
+        config.join(bootstrap::STARTUP_ERROR),
+        "unsafe resident directory\n",
+    )
+    .unwrap();
+    let told = format!("{:#}", not_answered(&spec, Some("Connection refused")));
+    assert!(
+        told.ends_with("; its own start failed: unsafe resident directory"),
+        "{told}"
+    );
+}

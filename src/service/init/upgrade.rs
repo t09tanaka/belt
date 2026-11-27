@@ -1111,12 +1111,7 @@ fn checked<L: Launcher>(spec: &Spec, launcher: &mut L) -> anyhow::Result<()> {
             }
         })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "the new version did not answer as the registered service (last: {})",
-                last.as_deref().unwrap_or("no check finished")
-            )
-        })
+        .map_err(|_| not_answered(spec, last.as_deref()))
     })?;
     let (j, paths) = managed_journal(spec)?;
     identity_checked(&paths, &j)?;
@@ -1138,6 +1133,21 @@ fn checked<L: Launcher>(spec: &Spec, launcher: &mut L) -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The health check never held: the last refusal, and the new version's own
+/// startup error when it left one (launchd keeps no output of it).
+fn not_answered(spec: &Spec, last: Option<&str>) -> anyhow::Error {
+    let own = spec
+        .managed_service
+        .as_deref()
+        .and_then(|journal| bootstrap::startup_error(&journal.with_file_name("coordinator.json")))
+        .map(|e| format!("; its own start failed: {}", e.trim_end()))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "the new version did not answer as the registered service (last: {}){own}",
+        last.unwrap_or("no check finished")
+    )
 }
 
 /// `belt upgrade [--binary <path>]`. A binary other than this one runs the
