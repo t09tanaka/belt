@@ -423,7 +423,10 @@ mod tests {
             .lines()
             .filter(|l| {
                 let mut f = l.split_whitespace();
-                f.next() == Some(pgid) && !f.next().unwrap_or("Z").starts_with('Z')
+                // (a zombie `Z` is dead, and so is one that is exiting, `E`
+                // on macOS: SIGKILL reached it, but a grandchild orphaned to
+                // launchd may still be tearing down when `ps` runs)
+                f.next() == Some(pgid) && !f.next().unwrap_or("Z").contains(['Z', 'E'])
             })
             .collect::<Vec<_>>()
             .join("\n")
