@@ -2605,12 +2605,14 @@ fn a_skipped_npm_preset_runs_no_node_or_npm() {
     );
     let rev = f.commit(
         "web/package-lock.json",
-        "{\"name\":\"web\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"web\",\"version\":\"1.0.0\"}}}\n",
+        "{\"name\":\"web\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"web\",\"version\":\"1.0.0\"},\"node_modules/dep\":{\"version\":\"1.0.0\"}}}\n",
     );
     let store = f.store();
     let manifest = f.capture_commit(&store, &rev);
-    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(embedded_env));
-    let ws = f.workspaces(&fw);
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(embedded_env.clone()));
+    // The preparation runs with the workspaces' environment: it must find
+    // the recording node and npm, or neither half proves anything.
+    let ws = Workspaces::new(f.state.clone(), embedded_env, fw);
     let repo = f.clone_of(&ws);
     f.deliver(&store, &repo, &manifest);
     let log = || std::fs::read_to_string(&calls).unwrap_or_default();
