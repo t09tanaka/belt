@@ -11,6 +11,20 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System,
 /// Start time of `pid` in seconds since the epoch, or `None` if there is no
 /// such live (non-zombie) process.
 pub fn start_time(pid: u32) -> Option<u64> {
+    start_time_of(pid, false)
+}
+
+/// Like [`start_time`], but also for a zombie leader whose group still runs
+/// (see [`runs`]): that process can still fork and still takes signals,
+/// and its pid cannot be reused while the zombie exists. The time is
+/// sysinfo's, the one [`rows`] lists it with. For the checks that ask
+/// whether a process seen before is still that one (to signal it, or to
+/// tell whether it is gone); a plain zombie is still `None`.
+pub fn running_start_time(pid: u32) -> Option<u64> {
+    start_time_of(pid, true)
+}
+
+fn start_time_of(pid: u32, group: bool) -> Option<u64> {
     let mut sys = System::new();
     let p = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
@@ -22,7 +36,7 @@ pub fn start_time(pid: u32) -> Option<u64> {
         // sysinfo may not list a process that exists: ask the kernel.
         return kernel_start_time(pid);
     };
-    if matches!(proc.status(), ProcessStatus::Zombie) {
+    if matches!(proc.status(), ProcessStatus::Zombie) && !(group && runs(proc)) {
         return None;
     }
     Some(proc.start_time())
@@ -42,31 +56,50 @@ fn runs(p: &sysinfo::Process) -> bool {
     // Read now, not from sysinfo: a reused `System` keeps the thread list
     // of a process from when it first saw it (before an `exec`, say).
     let pid = p.pid().as_u32();
-    still_runs(true, pid, task_ids(pid).as_deref())
+    still_runs(true, pid, tasks(pid).as_deref())
 }
 
-/// The thread ids of `pid` (`/proc/<pid>/task`), `None` when they cannot be
-/// read (the process is gone).
+/// The threads of `pid` (`/proc/<pid>/task`), each with its state (`None`
+/// when its `stat` cannot be read), or `None` when the list cannot be read
+/// (the process is gone).
 #[cfg(target_os = "linux")]
-fn task_ids(pid: u32) -> Option<Vec<u32>> {
+fn tasks(pid: u32) -> Option<Vec<(u32, Option<char>)>> {
     let dir = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
     Some(
         dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .map(|tid: u32| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"));
+                (tid, stat.ok().as_deref().and_then(stat_state))
+            })
             .collect(),
     )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn task_ids(_pid: u32) -> Option<Vec<u32>> {
+fn tasks(_pid: u32) -> Option<Vec<(u32, Option<char>)>> {
     None
 }
 
-/// [`runs`] on plain readings: `tasks` is the list of thread ids under
-/// `/proc/<pid>/task` (`None` where the OS has no such list). A zombie whose
-/// list names a thread other than its leader is a live group whose leader
-/// exited first; a dead group lists its leader alone, or nothing.
-fn still_runs(zombie: bool, pid: u32, tasks: Option<&[u32]>) -> bool {
-    !zombie || tasks.is_some_and(|t| t.iter().any(|&tid| tid != pid))
+/// The state letter of a `/proc` `stat` line, `"<pid> (<comm>) <state> ..."`.
+/// The comm may contain anything, so the state is what follows the last `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_state(stat: &str) -> Option<char> {
+    stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+}
+
+/// [`runs`] on plain readings: `tasks` is the threads under
+/// `/proc/<pid>/task` with their states (`None` where the OS has no such
+/// list). A zombie with a thread other than its leader that is neither a
+/// zombie nor dead (`Z`, `X`) is a live group whose leader exited first; a
+/// dead group lists its leader alone, nothing, or threads that are exiting
+/// too. A thread whose state cannot be read counts as not running.
+fn still_runs(zombie: bool, pid: u32, tasks: Option<&[(u32, Option<char>)]>) -> bool {
+    !zombie
+        || tasks.is_some_and(|t| {
+            t.iter().any(|&(tid, state)| {
+                tid != pid && state.is_some_and(|s| !matches!(s, 'Z' | 'X' | 'x'))
+            })
+        })
 }
 
 /// The start time of a live, non-zombie `pid` from the kernel (macOS:
@@ -334,7 +367,7 @@ fn leader_start_time(sid: u32) -> Option<u64> {
 /// Is the recorded child itself still running? A pid that now has a
 /// different start time is a different process.
 pub fn probe_child(c: &ChildIdentity) -> Probe {
-    match (start_time(c.pid), c.start_time) {
+    match (running_start_time(c.pid), c.start_time) {
         (None, _) => Probe::Gone,
         (Some(now), Some(then)) => {
             if now == then {
@@ -374,7 +407,7 @@ pub fn signal_if_same(p: &ProcRef, sig: libc::c_int) -> bool {
     let Some(then) = p.start_time else {
         return false;
     };
-    if p.pid <= 1 || i32::try_from(p.pid).is_err() || start_time(p.pid) != Some(then) {
+    if p.pid <= 1 || i32::try_from(p.pid).is_err() || running_start_time(p.pid) != Some(then) {
         return false;
     }
     unsafe { libc::kill(p.pid as libc::pid_t, sig) == 0 }
@@ -416,7 +449,7 @@ impl TableReader {
 fn rows(sys: &System) -> Vec<Row> {
     sys.processes()
         .iter()
-        .filter(|(_, p)| runs(p) && !is_thread(p))
+        .filter(|(_, p)| !is_thread(p) && runs(p))
         .map(|(pid, p)| Row {
             proc: ProcRef {
                 pid: pid.as_u32(),
@@ -533,7 +566,7 @@ fn observe_all() -> Vec<Seen> {
 fn vanished(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     (rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
-        || start_time(pid).is_none()
+        || running_start_time(pid).is_none()
 }
 
 /// `None` when the process is gone.
@@ -653,14 +686,47 @@ mod tests {
     fn a_zombie_leader_whose_threads_still_run_is_still_running() {
         // A live process, with or without a thread list.
         assert!(still_runs(false, 40, None));
-        assert!(still_runs(false, 40, Some(&[40, 41])));
+        assert!(still_runs(
+            false,
+            40,
+            Some(&[(40, Some('R')), (41, Some('S'))])
+        ));
         // Its leader thread exited first: the group still runs and can fork.
-        assert!(still_runs(true, 40, Some(&[40, 41])));
-        assert!(still_runs(true, 40, Some(&[41])));
+        assert!(still_runs(
+            true,
+            40,
+            Some(&[(40, Some('Z')), (41, Some('S'))])
+        ));
+        assert!(still_runs(true, 40, Some(&[(41, Some('R'))])));
+        assert!(still_runs(
+            true,
+            40,
+            Some(&[(40, Some('Z')), (41, Some('D'))])
+        ));
         // A dead group: the leader alone, an empty list, or no list at all.
-        assert!(!still_runs(true, 40, Some(&[40])));
+        assert!(!still_runs(true, 40, Some(&[(40, Some('Z'))])));
         assert!(!still_runs(true, 40, Some(&[])));
         assert!(!still_runs(true, 40, None));
+        // The other threads are exiting too, or cannot be read.
+        assert!(!still_runs(
+            true,
+            40,
+            Some(&[(40, Some('Z')), (41, Some('Z'))])
+        ));
+        assert!(!still_runs(
+            true,
+            40,
+            Some(&[(41, Some('X')), (42, Some('x'))])
+        ));
+        assert!(!still_runs(true, 40, Some(&[(40, Some('Z')), (41, None)])));
+    }
+
+    #[test]
+    fn the_state_is_read_after_the_last_parenthesis() {
+        assert_eq!(stat_state("41 (cargo) S 1 41"), Some('S'));
+        assert_eq!(stat_state("41 (a) Z (b)) R 1 41"), Some('R'));
+        assert_eq!(stat_state("41 (x"), None);
+        assert_eq!(stat_state("41 (x)"), None);
     }
 
     #[cfg(target_os = "macos")]

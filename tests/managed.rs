@@ -1269,11 +1269,17 @@ fn helper_entry() {
     };
     let pidfile = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_PIDFILE");
     if role == "leader-exits" {
-        leader_exits_first();
+        leader_exits_first(Duration::from_millis(2000), None);
+    } else if role == "leader-exits-runs-on" {
+        leader_exits_first(Duration::from_secs(30), pidfile);
     } else if role == "escape" {
+        let child = std::env::var("TASK_TRAFFIC_CONTROLLER_TEST_CHILD_ROLE");
         let mut c = Command::new(std::env::current_exe().unwrap());
         c.args(["--exact", "helper_entry", "--nocapture"])
-            .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
+            .env(
+                "TASK_TRAFFIC_CONTROLLER_TEST_ROLE",
+                child.as_deref().unwrap_or("sleep"),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1306,20 +1312,29 @@ fn helper_entry() {
     }
 }
 
-/// The `leader-exits` role: the main thread of this process exits on its
-/// own while this (libtest's test) thread runs on for a while, then the
-/// whole process exits. Meanwhile Linux shows the process as a zombie
-/// leader of a group that still runs.
+/// The `leader-exits` roles: the main thread of this process exits on its
+/// own while another thread runs on for `lasts`, then the whole process
+/// exits. Meanwhile Linux shows the process as a zombie leader of a group
+/// that still runs. With `pidfile`, the pid is written there once the
+/// leader has exited.
 #[cfg(target_os = "linux")]
-fn leader_exits_first() {
+fn leader_exits_first(lasts: Duration, pidfile: Option<std::ffi::OsString>) {
     extern "C" fn exit_this_thread(_: libc::c_int) {
         // `exit`, not `exit_group`: only the thread the signal landed on.
         unsafe { libc::syscall(libc::SYS_exit, 0) };
     }
     // The thread that outlives the leader: longer than `GAP_LIMIT` + 1 looks
     // of the tracker.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(2000));
+    std::thread::spawn(move || {
+        if let Some(f) = pidfile {
+            let me = std::process::id() as i32;
+            let end = Instant::now() + Duration::from_secs(10);
+            while !is_zombie(me) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(f, me.to_string()).unwrap();
+        }
+        std::thread::sleep(lasts);
         std::process::exit(0);
     });
     // Only once the recorder has taken its first looks: it reads the
@@ -1344,7 +1359,7 @@ fn leader_exits_first() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn leader_exits_first() {}
+fn leader_exits_first(_: Duration, _: Option<std::ffi::OsString>) {}
 
 /// On Linux a process whose leader thread exited before its other threads
 /// is listed as a zombie although it still runs (and can still fork). Every
@@ -1474,6 +1489,69 @@ fn a_descendant_that_left_the_process_group_is_stopped_before_release() {
 #[test]
 fn a_descendant_that_ignores_sigterm_is_killed() {
     escaped_case("escaped-kill", true);
+}
+
+/// A left-behind descendant whose leader thread has exited while its other
+/// threads run on is still that process: it is signalled and stopped
+/// before the budget is released, not waited for until the grace ends and
+/// then reported as left behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_whose_leader_thread_exited_is_still_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let pidfile = dir.path().join("pid");
+    let mut argv = helper_command("escape", &pidfile, false);
+    argv.insert(
+        1,
+        "TASK_TRAFFIC_CONTROLLER_TEST_CHILD_ROLE=leader-exits-runs-on".into(),
+    );
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let s = spec(dir.path(), "le-left", "d", &argv);
+    let began = Instant::now();
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    assert_eq!(ran.outcome.exit.code(), 0);
+    assert!(
+        !ran.outcome.descendants_left && !ran.outcome.tracker_unknown,
+        "{:?}",
+        ran.outcome
+    );
+    assert!(
+        until(5, || !group_runs(pid)),
+        "the descendant whose leader exited was left running"
+    );
+    // SIGTERM ended it: neither grace was waited out.
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        began.elapsed()
+    );
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("le-left").is_none());
+}
+
+/// Does any thread of `pid` other than a zombie or dead one remain?
+#[cfg(target_os = "linux")]
+fn group_runs(pid: i32) -> bool {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .any(|tid| {
+            std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    let rest = s.get(s.rfind(')')? + 1..)?;
+                    rest.trim_start().chars().next()
+                })
+                .is_some_and(|c| c != 'Z' && c != 'X')
+        })
 }
 
 #[test]

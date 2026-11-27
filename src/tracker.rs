@@ -56,7 +56,7 @@ impl Tracker {
     pub fn start(root: u32, record: Record) -> Tracker {
         let (tx, rx) = mpsc::channel::<bool>();
         let Some(start_time) = root_start_with(
-            || process::start_time(root),
+            || process::running_start_time(root),
             || process::has_ended(root),
             ROOT_READ_TRIES,
             || std::thread::sleep(Duration::from_millis(10)),
