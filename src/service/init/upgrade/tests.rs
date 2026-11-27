@@ -1141,3 +1141,48 @@ fn a_new_version_that_never_answers_is_reported_with_its_own_startup_error() {
         "{told}"
     );
 }
+
+#[tokio::test]
+async fn a_resident_installed_without_process_type_is_upgraded_and_gets_it() {
+    use sha2::Digest as _;
+    use std::io::Write as _;
+    let h = Host::new().await;
+    // An earlier version wrote the plist without ProcessType.
+    let mut journal = read_journal(&h.paths.journal).unwrap();
+    let path = journal.plist.as_ref().unwrap().path().to_owned();
+    let current = fs::read_to_string(&path).unwrap();
+    let key = "<key>ProcessType</key><string>Interactive</string>";
+    assert!(current.contains(key), "{current}");
+    let earlier = current.replace(key, "");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(earlier.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    journal.plist = Some(macos::Receipt::system(
+        path.clone(),
+        &metadata,
+        sha2::Sha256::digest(earlier.as_bytes()).into(),
+    ));
+    // The journal also proves the file it names.
+    refresh(&mut journal, &[&h.paths.input, &path]).unwrap();
+    replace_journal(&h.paths, &journal).unwrap();
+    let mut fake = h.fake.clone();
+    let upgraded = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(upgraded.to, h.new);
+    h.assert_finished();
+    let after = read_journal(&h.paths.journal).unwrap();
+    let written = fs::read_to_string(after.plist.unwrap().path()).unwrap();
+    assert!(written.contains(key), "{written}");
+}
