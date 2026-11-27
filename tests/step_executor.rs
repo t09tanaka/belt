@@ -746,7 +746,15 @@ fn the_legs_of_a_matrix_call_the_executor_at_once() {
             use std::sync::atomic::Ordering::SeqCst;
             let n = self.now.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(n, SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Stay in the executor until another leg has entered it too. A
+            // fixed sleep let a loaded machine start the next leg only after
+            // this one had left, so the legs looked serial when they were not.
+            // Legs that really run one after another never meet: the first
+            // one gives up at the deadline and the peak stays 1.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while self.peak.load(SeqCst) < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             self.now.fetch_sub(1, SeqCst);
             Ok(StepExit {
                 exit: Exit::Code(0),
