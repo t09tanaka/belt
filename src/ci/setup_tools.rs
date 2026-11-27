@@ -14,14 +14,18 @@ pub struct SetupTools {
     pub notices: Vec<String>,
 }
 
+/// The string value of `key` in `task`'s matrix; a number or a list is no
+/// literal of a step input.
+fn matrix_value(task: &ExecutionTask, key: &str) -> Option<String> {
+    match task.variant.as_ref()?.values.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// The setup tools of `task`: the steps of its own jobs in `plan`.
 pub fn of_task(plan: &FrozenPlan, task: &ExecutionTask) -> SetupTools {
-    let matrix = |key: &str| -> Option<String> {
-        match task.variant.as_ref()?.values.get(key)? {
-            serde_json::Value::String(s) => Some(s.clone()),
-            _ => None,
-        }
-    };
+    let matrix = |key: &str| matrix_value(task, key);
     let mut out = SetupTools::default();
     let jobs = plan
         .workflows
@@ -44,12 +48,7 @@ pub fn of_task(plan: &FrozenPlan, task: &ExecutionTask) -> SetupTools {
 /// cannot read the version it asks for. These decide which presets the
 /// task's workspace preparation runs (spec 22.1).
 pub fn set_up_tools(plan: &FrozenPlan, task: &ExecutionTask) -> std::collections::BTreeSet<String> {
-    let matrix = |key: &str| -> Option<String> {
-        match task.variant.as_ref()?.values.get(key)? {
-            serde_json::Value::String(s) => Some(s.clone()),
-            _ => None,
-        }
-    };
+    let matrix = |key: &str| matrix_value(task, key);
     plan.workflows
         .iter()
         .filter(|w| w.file == task.workflow)
@@ -530,5 +529,52 @@ mod tests {
         ]);
         assert_eq!(got.requires, vec![Requirement::Component("miri".into())]);
         assert!(got.notices.is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_expression_is_kept_as_written() {
+        let matrix = |_: &str| Some("npm".to_string());
+        let script = expand_matrix("${{ matrix.a }} x ${{ matrix.b", &matrix);
+        assert_eq!(script, "npm x ${{ matrix.b");
+    }
+
+    #[test]
+    fn a_run_command_from_the_matrix_prepares_its_preset() {
+        const WORKFLOW: &str = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        cmd: [npm test]\n    steps:\n      - uses: actions/checkout@v4\n      - run: ${{ matrix.cmd }}\n";
+        let f = crate::ci::execute::tests::fixture(WORKFLOW);
+        let task = &f.plan.tasks[0];
+        let set_up = set_up_tools(&f.plan, task);
+        assert_eq!(
+            set_up,
+            ["npm".to_string()].into_iter().collect(),
+            "{task:?}"
+        );
+        let prepare = crate::workspace::prepare_tools::PrepareTools {
+            presets: [
+                ("npm".to_string(), ["npm".to_string()].into_iter().collect()),
+                (
+                    "dart".to_string(),
+                    ["dart".to_string()].into_iter().collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // a configured requirement that is no tool adds no setup
+        let configured = crate::toolchain::capability::ExecutionRequirements {
+            profile: None,
+            requires: vec![Requirement::Os("linux".into())],
+        };
+        let got = task_preparation(&prepare, &f.plan, task, &configured);
+        assert_eq!(got.tools, ["npm".to_string()].into_iter().collect());
+        assert_eq!(got.skip, vec!["dart".to_string()]);
+        // a `--requires` tool prepares its preset too
+        let configured = crate::toolchain::capability::ExecutionRequirements {
+            profile: None,
+            requires: vec![Requirement::Tool("dart".into())],
+        };
+        let got = task_preparation(&prepare, &f.plan, task, &configured);
+        assert!(got.skip.is_empty(), "{got:?}");
     }
 }
