@@ -1556,6 +1556,15 @@ pub fn command(name: Option<&str>) -> Result<ResultReceipt, ApiError> {
         executable: std::env::current_exe()
             .map_err(|_| ApiError::new(ErrorCode::InvalidInput, "cannot locate executable"))?,
     };
+    // The resident runs with this PATH (spec 22.1): say before it starts
+    // when macOS privacy protection may block it.
+    let protected = crate::service::doctor::env_gaps::protected_in(&context.env);
+    if !protected.is_empty() {
+        eprintln!(
+            "warning: {}",
+            crate::service::doctor::env_gaps::protected_warning(&protected)
+        );
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

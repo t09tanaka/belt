@@ -383,6 +383,7 @@ fn healthy() -> HostFacts {
             name: Some("default".into()),
             fingerprint: Some("sha256:f".into()),
             error: None,
+            unreadable_path: Vec::new(),
         },
         cli_jobs: Some(CliJobs::default()),
         cli_jobs_error: None,
@@ -558,6 +559,7 @@ fn a_profile_error_fails_the_service_profile_check() {
         name: None,
         fingerprint: None,
         error: Some("profiles.toml: bad".into()),
+        unreadable_path: Vec::new(),
     };
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "service_profile"), Level::Fail);
@@ -2338,6 +2340,29 @@ fn a_source_lock_that_cannot_be_taken_fails_the_worker() {
 }
 
 #[test]
+fn unreadable_and_protected_path_directories_are_named() {
+    let mut facts = healthy();
+    assert!(!evaluate("mini", &facts)
+        .iter()
+        .any(|c| c.id == "unreadable_path" || c.id == "protected_path"));
+    facts.profile.unreadable_path = vec!["/h/me/Documents/flutter/bin".into()];
+    facts.service_path = Some(env_gaps::PathFacts {
+        login: None,
+        gaps: Vec::new(),
+        protected: vec!["/h/me/Documents/flutter/bin".into()],
+    });
+    let checks = evaluate("mini", &facts);
+    assert_eq!(level(&checks, "unreadable_path"), Level::Notice);
+    assert!(detail(&checks, "unreadable_path").contains("/h/me/Documents/flutter/bin"));
+    assert_eq!(level(&checks, "protected_path"), Level::Notice);
+    let text = detail(&checks, "protected_path");
+    assert!(
+        text.contains("/h/me/Documents/flutter/bin") && text.contains("Full Disk Access"),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_path_gap_names_the_command_that_recaptures_it_for_the_parent_and_a_worker() {
     let mut facts = healthy();
     facts.service_path = Some(env_gaps::PathFacts {
@@ -2346,6 +2371,7 @@ fn a_path_gap_names_the_command_that_recaptures_it_for_the_parent_and_a_worker()
             dir: "/opt/homebrew/bin".into(),
             tools: vec!["node".into()],
         }],
+        protected: Vec::new(),
     });
     let parent = evaluate("parent", &facts);
     assert!(
