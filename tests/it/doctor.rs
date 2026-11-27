@@ -305,6 +305,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
                 name: Some("default".into()),
                 fingerprint: Some("sha256:f".into()),
                 error: None,
+                unreadable_path: Vec::new(),
             },
             cli_jobs: None,
             cli_jobs_error: None,

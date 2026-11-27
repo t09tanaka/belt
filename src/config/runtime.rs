@@ -246,6 +246,23 @@ impl ResolvedConfig {
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         agent.profile = profile.name().into();
         agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
+        // Named in the resident's log: a directory that did not answer
+        // (spec 22.1), and why it may be blocked on macOS.
+        let unreadable = profile.unreadable_path_dirs();
+        if !unreadable.is_empty() {
+            let dirs: Vec<String> = unreadable.iter().map(|d| d.display().to_string()).collect();
+            eprintln!(
+                "warning: {} did not answer a listing in time; the tools in it are not offered",
+                dirs.join(", ")
+            );
+            let protected = crate::service::doctor::env_gaps::protected_in(&inputs.env);
+            if !protected.is_empty() {
+                eprintln!(
+                    "warning: {}",
+                    crate::service::doctor::env_gaps::protected_warning(&protected)
+                );
+            }
+        }
         let profile_definition = profile.definition_digest().clone();
         let env = profile.environment().clone();
         let scope_env = profile.scope_environment().clone();

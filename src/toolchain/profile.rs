@@ -146,6 +146,9 @@ pub struct Profile {
     /// The required tools as `load` measured them: the first startup
     /// measurement takes these instead of calling the same tools again.
     loaded: Arc<Mutex<BTreeMap<String, ToolObservation>>>,
+    /// The PATH directories (and CARGO_HOME/bin) the last measurement could
+    /// not list in time: their tools are not offered.
+    unreadable_path: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 /// A determinate measurement: startup probes, and a tool that gave no answer
@@ -391,6 +394,7 @@ impl Profile {
             resolution: Arc::new(Mutex::new(None)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             loaded: Arc::new(Mutex::new(BTreeMap::new())),
+            unreadable_path: Arc::new(Mutex::new(Vec::new())),
         };
         // Loading is part of startup: a cold required tool gets the startup
         // deadline and repeats, and is refused only once it stays undetermined.
@@ -550,6 +554,15 @@ impl Profile {
     /// answers after this baseline, that is drift.
     pub fn startup_report(&self) -> WorkerCapabilities {
         self.remeasure().0
+    }
+    /// The directories the last measurement could not list in time (spec
+    /// 22.1): a macOS privacy prompt, or a hung file system. Their tools are
+    /// not offered.
+    pub fn unreadable_path_dirs(&self) -> Vec<PathBuf> {
+        self.unreadable_path
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
     /// The measured profile toolchain questions are answered from, and the
     /// tools in it that kept an earlier answer because the last measurement
@@ -799,7 +812,11 @@ impl Profile {
             rustup,
             installs,
             path_tools: {
-                let mut names = path_tools(&self.definition.path);
+                let listed = path_tools(&self.definition.path);
+                if let Ok(mut slot) = self.unreadable_path.lock() {
+                    slot.extend(listed.unreadable);
+                }
+                let mut names = listed.names;
                 names.extend(cargo_home.iter().map(|(name, _)| name.clone()));
                 names.sort();
                 names.dedup();
@@ -979,13 +996,21 @@ impl Profile {
     /// directory is not on the profile PATH, with their file identity. Read
     /// only: a listing and metadata, nothing runs or is written.
     fn cargo_home_tools(&self) -> Vec<(String, CargoHomeStamp)> {
+        if let Ok(mut slot) = self.unreadable_path.lock() {
+            slot.clear();
+        }
         let Some(bin) = self.cargo_home_bin() else {
             return Vec::new();
         };
         if self.definition.path.iter().any(|p| p == &bin) {
             return Vec::new();
         }
-        path_tools(std::slice::from_ref(&bin))
+        let listed = path_tools(std::slice::from_ref(&bin));
+        if let Ok(mut slot) = self.unreadable_path.lock() {
+            slot.extend(listed.unreadable);
+        }
+        listed
+            .names
             .into_iter()
             .filter(|name| name.starts_with("cargo-"))
             .filter_map(|name| {
@@ -1485,38 +1510,131 @@ pub(crate) fn rustup_components(bin: &Path, host: Option<&str>) -> Vec<String> {
     names.truncate(64);
     names
 }
+/// A file's canonical path, device, inode, size and mtime.
+type CargoHomeStamp = (PathBuf, u64, u64, u64, i64, i64);
+/// What [`path_tools`] found: the tool names, and the directories that did
+/// not answer within the deadline (they are left out, as if empty).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PathTools {
+    pub(crate) names: Vec<String>,
+    pub(crate) unreadable: Vec<PathBuf>,
+}
 /// The `cargo-*` and [`super::capability::PATH_TOOL_NAMES`] executables in
 /// the directories of `path`, sorted, at most
 /// [`super::capability::MAX_PATH_TOOLS`] (spec 22.1). Only directory
-/// listings and metadata: nothing runs.
-/// A file's canonical path, device, inode, size and mtime.
-type CargoHomeStamp = (PathBuf, u64, u64, u64, i64, i64);
-pub(crate) fn path_tools(path: &[PathBuf]) -> Vec<String> {
+/// listings and metadata: nothing runs. Listing a directory can block
+/// without end (a macOS privacy prompt for ~/Documents opened by a
+/// LaunchAgent), so the whole listing is bounded by [`STARTUP_PROBES`]'s
+/// call deadline; a directory that has not answered by then is unreadable.
+pub(crate) fn path_tools(path: &[PathBuf]) -> PathTools {
+    path_tools_with(path, STARTUP_PROBES.call, list_path_dir)
+}
+/// The path tool names in `dir`, or `None` when it cannot be listed.
+fn list_path_dir(dir: &Path) -> Option<Vec<String>> {
     use std::os::unix::fs::PermissionsExt;
-    let mut found = std::collections::BTreeSet::new();
-    for dir in path.iter().take(64) {
-        let Ok(entries) = fs::read_dir(dir) else {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut names = Vec::new();
+    for entry in entries.flatten().take(4096) {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        for entry in entries.flatten().take(4096) {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !super::capability::path_tool_name(&name) || found.contains(&name) {
-                continue;
-            }
-            // A link is followed: `~/.cargo/bin` entries may be links.
-            let executable = fs::metadata(entry.path())
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-            if executable {
-                found.insert(name);
-            }
+        if !super::capability::path_tool_name(&name) {
+            continue;
+        }
+        // A link is followed: `~/.cargo/bin` entries may be links.
+        let executable = fs::metadata(entry.path())
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        if executable {
+            names.push(name);
         }
     }
-    found
+    Some(names)
+}
+/// [`path_tools`] with the directory reader `read` and the whole wait
+/// `limit`. Every directory is read on its own thread, all at once, and
+/// waited for against one shared deadline. A read that has not returned
+/// cannot be cancelled: its thread stays, and a later call for the same
+/// directory waits for that thread instead of starting another (at most one
+/// reader per directory, as [`read_magic`]).
+fn path_tools_with<R>(path: &[PathBuf], limit: Duration, read: R) -> PathTools
+where
+    R: Fn(&Path) -> Option<Vec<String>> + Send + Sync + Clone + 'static,
+{
+    type Answer = Option<Option<Vec<String>>>;
+    type Slot = std::sync::Arc<(std::sync::Mutex<Answer>, std::sync::Condvar)>;
+    static IN_FLIGHT: std::sync::Mutex<BTreeMap<PathBuf, Slot>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    fn in_flight() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Slot>> {
+        IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    let started = Instant::now();
+    let mut dirs: Vec<&PathBuf> = Vec::new();
+    for dir in path.iter().take(64) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    let slots: Vec<(&PathBuf, Option<Slot>)> = dirs
         .into_iter()
-        .take(super::capability::MAX_PATH_TOOLS)
-        .collect()
+        .map(|dir| {
+            let (slot, start) = {
+                let mut readers = in_flight();
+                match readers.get(dir) {
+                    Some(slot) => (slot.clone(), false),
+                    None => {
+                        let slot = Slot::default();
+                        readers.insert(dir.clone(), slot.clone());
+                        (slot, true)
+                    }
+                }
+            };
+            if start {
+                #[cfg(test)]
+                tests::note_reader_spawned(dir);
+                let reader = dir.clone();
+                let answer = slot.clone();
+                let read = read.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("belt-path-read".into())
+                    .spawn(move || {
+                        let names = read(&reader);
+                        in_flight().remove(&reader);
+                        let (value, ready) = &*answer;
+                        *value.lock().unwrap_or_else(|e| e.into_inner()) = Some(names);
+                        ready.notify_all();
+                    });
+                if spawned.is_err() {
+                    in_flight().remove(dir);
+                    return (dir, None);
+                }
+            }
+            (dir, Some(slot))
+        })
+        .collect();
+    let mut found = std::collections::BTreeSet::new();
+    let mut unreadable = Vec::new();
+    for (dir, slot) in slots {
+        let answer = slot.and_then(|slot| {
+            let (value, ready) = &*slot;
+            let value = value.lock().unwrap_or_else(|e| e.into_inner());
+            let wait = limit.saturating_sub(started.elapsed());
+            let (value, _) = ready
+                .wait_timeout_while(value, wait, |v| v.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            value.clone()
+        });
+        match answer {
+            Some(names) => found.extend(names.into_iter().flatten()),
+            None => unreadable.push(dir.clone()),
+        }
+    }
+    PathTools {
+        names: found
+            .into_iter()
+            .take(super::capability::MAX_PATH_TOOLS)
+            .collect(),
+        unreadable,
+    }
 }
 fn measured_version(tool: &str, output: &str) -> Option<String> {
     let text = output.trim();
@@ -3224,8 +3342,45 @@ mod rustup_tests {
         symlink(a.join("cargo-llvm-cov"), b.join("cargo-linked")).unwrap();
         let missing = dir.path().join("missing");
         let got = path_tools(&[a, missing, b]);
-        assert_eq!(got, vec!["cargo-linked", "cargo-llvm-cov", "just"]);
+        assert_eq!(got.names, vec!["cargo-linked", "cargo-llvm-cov", "just"]);
+        assert!(got.unreadable.is_empty(), "{:?}", got.unreadable);
         assert!(!dir.path().join("ran").exists());
+    }
+
+    /// A PATH directory whose listing never returns (a macOS privacy prompt
+    /// for ~/Documents) does not hold the measurement past its deadline: it
+    /// is reported unreadable, its tools are not offered, the other
+    /// directories still count, and a repeat starts no second reader.
+    #[test]
+    fn a_path_directory_that_never_answers_is_skipped_at_the_deadline() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let (stuck, fine) = (dir.path().join("protected"), dir.path().join("fine"));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Arc::new(Mutex::new(wait));
+        let blocked = stuck.clone();
+        let read = move |d: &Path| {
+            if d == blocked {
+                // Released when the test ends, so a reverted fix fails the
+                // elapsed assert instead of hanging the suite.
+                let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                return Some(vec!["cargo-hidden".to_string()]);
+            }
+            Some(vec!["just".to_string()])
+        };
+        let limit = Duration::from_millis(200);
+        let path = [stuck.clone(), fine];
+        for _ in 0..2 {
+            let at = Instant::now();
+            let got = path_tools_with(&path, limit, read.clone());
+            assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+            assert_eq!(got.names, vec!["just"]);
+            assert_eq!(got.unreadable, vec![stuck.clone()]);
+        }
+        assert_eq!(
+            super::tests::READERS_SPAWNED.lock().unwrap().get(&stuck),
+            Some(&1)
+        );
+        drop(release);
     }
 
     #[test]

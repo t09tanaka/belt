@@ -128,6 +128,58 @@ pub struct PathFacts {
     /// `None`: the login shell's `PATH` could not be read.
     pub login: Option<String>,
     pub gaps: Vec<PathGap>,
+    /// The service's `PATH` directories macOS privacy protection guards
+    /// ([`protected_dirs`]). Empty off macOS, or from a host that predates
+    /// the check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<String>,
+}
+
+/// The folders under HOME that macOS privacy protection (TCC) guards: a
+/// program the user has not allowed blocks when it opens anything there.
+const PROTECTED: &[&str] = &[
+    "Documents",
+    "Desktop",
+    "Downloads",
+    "Library/Mobile Documents",
+];
+
+/// The directories of `path` (a `PATH` value) inside a folder of
+/// [`PROTECTED`] under `home`, compared by whole path components.
+pub fn protected_dirs(path: &str, home: &str) -> Vec<String> {
+    if home.is_empty() || !Path::new(home).is_absolute() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let inside = PROTECTED
+            .iter()
+            .any(|p| Path::new(dir).starts_with(Path::new(home).join(p)));
+        if inside && !out.iter().any(|d| d == dir) {
+            out.push(dir.to_string());
+        }
+    }
+    out
+}
+
+/// [`protected_dirs`] of `env`'s `PATH` and `HOME`, on macOS only.
+pub fn protected_in(env: &BTreeMap<String, String>) -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    protected_dirs(
+        env.get("PATH").map(String::as_str).unwrap_or(""),
+        env.get("HOME").map(String::as_str).unwrap_or(""),
+    )
+}
+
+/// What to say about the protected directories `dirs` of the resident's
+/// `PATH`.
+pub fn protected_warning(dirs: &[String]) -> String {
+    format!(
+        "the resident's PATH has {}, inside a folder macOS privacy protection guards, so the resident may block reading it; every belt upgrade is a new program to macOS, so a permission granted before does not carry over; move the tool out of that folder and update PATH, or grant Full Disk Access to the resident",
+        dirs.join(", ")
+    )
 }
 
 fn executable(path: &Path) -> bool {
@@ -145,6 +197,7 @@ pub fn path_facts(
         return PathFacts {
             login: None,
             gaps: Vec::new(),
+            protected: protected_in(service),
         };
     };
     let service_path = service.get("PATH").map(String::as_str).unwrap_or("");
@@ -162,6 +215,7 @@ pub fn path_facts(
     PathFacts {
         login: Some(login),
         gaps,
+        protected: protected_in(service),
     }
 }
 
@@ -169,6 +223,24 @@ pub fn path_facts(
 /// the service's `PATH` is recaptured.
 pub fn path_checks(host: &str, facts: &PathFacts, fix: &str) -> Vec<Check> {
     let check = |level, detail: String| Check::new(host, "service_path", level, detail);
+    let mut out = Vec::new();
+    if !facts.protected.is_empty() {
+        out.push(Check::new(
+            host,
+            "protected_path",
+            Level::Notice,
+            protected_warning(&facts.protected),
+        ));
+    }
+    out.extend(path_gap_checks(facts, fix, check));
+    out
+}
+
+fn path_gap_checks(
+    facts: &PathFacts,
+    fix: &str,
+    check: impl Fn(Level, String) -> Check,
+) -> Vec<Check> {
     if facts.login.is_none() {
         return vec![check(
             Level::Notice,
@@ -356,6 +428,26 @@ pub fn toolchain_checks(host: &str, facts: &ToolchainFacts) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_dirs_are_the_path_entries_inside_the_guarded_home_folders() {
+        let path = "/h/me/Documents/flutter/bin:/opt/homebrew/bin:/h/me/DocumentsOld/bin:/h/me/Desktop/x:/h/me/Downloads:/h/me/Library/Mobile Documents/com~apple~CloudDocs/bin:/h/me/Library/bin:/h/other/Documents/bin:/h/me/Documents/flutter/bin";
+        assert_eq!(
+            protected_dirs(path, "/h/me"),
+            [
+                "/h/me/Documents/flutter/bin",
+                "/h/me/Desktop/x",
+                "/h/me/Downloads",
+                "/h/me/Library/Mobile Documents/com~apple~CloudDocs/bin",
+            ]
+        );
+        assert!(protected_dirs(path, "").is_empty());
+        assert!(protected_dirs(path, "relative").is_empty());
+        assert!(protected_dirs("/opt/homebrew/bin:/usr/bin", "/h/me").is_empty());
+        let warning = protected_warning(&["/h/me/Documents/flutter/bin".into()]);
+        assert!(warning.contains("/h/me/Documents/flutter/bin"));
+        assert!(warning.contains("Full Disk Access") && warning.contains("upgrade"));
+    }
 
     struct Fake(
         Vec<(PathBuf, Vec<String>, BTreeMap<String, String>)>,

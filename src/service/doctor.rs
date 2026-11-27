@@ -120,6 +120,10 @@ pub struct ProfileFacts {
     pub name: Option<String>,
     pub fingerprint: Option<String>,
     pub error: Option<String>,
+    /// PATH directories the measurement could not list in time; their tools
+    /// are not offered. Empty from a host that predates the check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_path: Vec<String>,
 }
 
 /// What one host found. Facts only; the parent decides what they mean.
@@ -431,11 +435,17 @@ fn profile(worker_state: &Path, env: &BTreeMap<String, String>) -> ProfileFacts 
             name: Some(profile.name().to_string()),
             fingerprint: Some(profile.startup_report().profile_fingerprint.to_string()),
             error: None,
+            unreadable_path: profile
+                .unreadable_path_dirs()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect(),
         },
         Err(error) => ProfileFacts {
             name: None,
             fingerprint: None,
             error: Some(error),
+            unreadable_path: Vec::new(),
         },
     }
 }
@@ -718,6 +728,16 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             ),
         ),
     });
+    if !facts.profile.unreadable_path.is_empty() {
+        out.push(check(
+            "unreadable_path",
+            Level::Notice,
+            format!(
+                "{} on the service's PATH did not answer a listing in time, so the tools in it are not offered here",
+                facts.profile.unreadable_path.join(", ")
+            ),
+        ));
+    }
     if let Some(linger) = &facts.linger {
         out.push(linger::check(host, linger));
     }

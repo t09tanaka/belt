@@ -542,6 +542,18 @@ pub fn begin_with<L: Launcher>(
     if let Some(note) = recovered {
         let _ = writeln!(std::io::stderr(), "note: {note}");
     }
+    // Before anything starts: the new version is a new program to macOS.
+    let mut resident = from.spec.env.clone();
+    if let Some(p) = new_path {
+        resident.insert("PATH".into(), p.to_string());
+    }
+    let protected = crate::service::doctor::env_gaps::protected_in(&resident);
+    if !protected.is_empty() {
+        eprintln!(
+            "warning: {}",
+            crate::service::doctor::env_gaps::protected_warning(&protected)
+        );
+    }
     control::hold(&paths.worker)?;
     // From the hold to the record an interrupt is only noted, so that the
     // hold is lifted on the way out rather than left behind.
