@@ -143,6 +143,9 @@ pub struct Profile {
     /// The measured profile toolchain questions are answered from.
     resolution: Arc<Mutex<Option<Resolution>>>,
     refreshing: Arc<std::sync::atomic::AtomicBool>,
+    /// The required tools as `load` measured them: the first startup
+    /// measurement takes these instead of calling the same tools again.
+    loaded: Arc<Mutex<BTreeMap<String, ToolObservation>>>,
 }
 
 /// A determinate measurement: startup probes, and a tool that gave no answer
@@ -387,17 +390,30 @@ impl Profile {
             probe_timeout: PROBE_TIMEOUT,
             resolution: Arc::new(Mutex::new(None)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            loaded: Arc::new(Mutex::new(BTreeMap::new())),
         };
         // Loading is part of startup: a cold required tool gets the startup
         // deadline and repeats, and is refused only once it stays undetermined.
-        let required = profile.startup_probes(
+        let mut stuck = Vec::new();
+        let required = profile.startup_probes_noting(
             profile.definition.required_tools.iter().map(String::as_str),
             STARTUP_PROBES,
+            &mut stuck,
         );
         for (tool, observed) in &required {
             if !matches!(observed, ToolObservation::Available { .. }) {
-                return Err(format!("required worker profile tool {tool} unavailable"));
+                // A call that never returned names the file it was stuck on.
+                let path = match (stuck.contains(tool), profile.tool_path(tool)) {
+                    (true, Some(path)) => format!(" ({} did not answer in time)", path.display()),
+                    _ => String::new(),
+                };
+                return Err(format!(
+                    "required worker profile tool {tool} unavailable{path}"
+                ));
             }
+        }
+        if let Ok(mut loaded) = profile.loaded.lock() {
+            *loaded = required;
         }
         Ok(profile)
     }
@@ -525,8 +541,10 @@ impl Profile {
     /// resident baseline, so a cold native launcher is not recorded as unknown
     /// and then taken for drift when it later answers. One call may take 2s;
     /// only a call that timed out is repeated, after every tool had its first
-    /// call, at most 3 times per tool within one shared 5s. The wait is at
-    /// most 5s + 14 fixed calls x 300ms = 9.2s.
+    /// call, at most 3 times per tool within one shared 5s. The rustup (8s)
+    /// and install (8s) detections run beside the tool calls, and the
+    /// required tools `load` measured are not called again: the wait is the
+    /// longest of the three, not their sum.
     /// A tool that is absent, fails, or still times out stays
     /// unavailable/unknown and does not prevent unconstrained shell work; if it
     /// answers after this baseline, that is drift.
@@ -630,19 +648,40 @@ impl Profile {
         timed_out: &mut Vec<String>,
     ) -> WorkerCapabilities {
         let files_before = self.executable_identity();
-        let tools: BTreeMap<_, _> = match startup {
-            Some(limits) => self.startup_probes_noting(TOOLS.iter().copied(), limits, timed_out),
-            None => TOOLS
-                .iter()
-                .map(|t| (t.to_string(), self.probe(t)))
-                .collect(),
-        };
         let call = match startup {
             Some(limits) => limits.call,
             None => self.probe_timeout,
         };
-        let rustup = self.detect_rustup(call);
-        let installs = self.detect_installs(call);
+        // The three stages have their own deadlines and share nothing but
+        // locks taken briefly: they run side by side, so the wait is the
+        // longest stage, not their sum.
+        let (tools, rustup, installs) = std::thread::scope(|scope| {
+            let rustup = scope.spawn(|| self.detect_rustup(call));
+            let installs = scope.spawn(|| self.detect_installs(call));
+            let tools: BTreeMap<_, _> = match startup {
+                Some(limits) => {
+                    let mut known = self
+                        .loaded
+                        .lock()
+                        .map(|mut loaded| std::mem::take(&mut *loaded))
+                        .unwrap_or_default();
+                    let rest = TOOLS.iter().copied().filter(|t| !known.contains_key(*t));
+                    let probed = self.startup_probes_noting(rest, limits, timed_out);
+                    known.retain(|tool, _| TOOLS.contains(&tool.as_str()));
+                    known.extend(probed);
+                    known
+                }
+                None => TOOLS
+                    .iter()
+                    .map(|t| (t.to_string(), self.probe(t)))
+                    .collect(),
+            };
+            (
+                tools,
+                rustup.join().unwrap_or_default(),
+                installs.join().unwrap_or_default(),
+            )
+        });
         let os = match std::env::consts::OS {
             "macos" => "macos",
             other => other,
@@ -1130,13 +1169,6 @@ impl Profile {
     /// Every tool is called once, then only the ones that timed out are
     /// called again, pass by pass: a tool that never answers cannot use up
     /// the repeats of the others. Every other answer is final at once.
-    fn startup_probes<'a>(
-        &self,
-        tools: impl Iterator<Item = &'a str>,
-        limits: StartupProbes,
-    ) -> BTreeMap<String, ToolObservation> {
-        self.startup_probes_noting(tools, limits, &mut Vec::new())
-    }
     fn startup_probes_noting<'a>(
         &self,
         tools: impl Iterator<Item = &'a str>,
@@ -1184,6 +1216,15 @@ impl Profile {
             Err(ProbeMiss::TimedOut) => return None,
         })
     }
+    /// The file a probe of `tool` calls: the first executable on the profile PATH.
+    fn tool_path(&self, tool: &str) -> Option<PathBuf> {
+        let binary = if tool == "xcode" { "xcodebuild" } else { tool };
+        self.definition
+            .path
+            .iter()
+            .map(|p| p.join(binary))
+            .find(|p| executable(p))
+    }
     fn probe_once(
         &self,
         tool: &str,
@@ -1195,14 +1236,7 @@ impl Profile {
                 identity: Digest::of_bytes(format!("{tool}/{version}").as_bytes()),
             });
         }
-        let binary = if tool == "xcode" { "xcodebuild" } else { tool };
-        let Some(path) = self
-            .definition
-            .path
-            .iter()
-            .map(|p| p.join(binary))
-            .find(|p| executable(p))
-        else {
+        let Some(path) = self.tool_path(tool) else {
             return Ok(ToolObservation::Unavailable);
         };
         // The standard Flutter launcher bootstraps SDK/cache even for
@@ -2386,6 +2420,72 @@ mod tests {
         assert_eq!(
             Profile::load(root.path(), &env(root.path())).unwrap_err(),
             "required worker profile tool node unavailable"
+        );
+    }
+
+    /// The startup measurement's stages run side by side: a tool on PATH and
+    /// the installs of a version manager that both never answer cost the
+    /// longest stage (installs, 8s), not the sum (5s + 8s).
+    #[test]
+    fn the_startup_measurement_waits_for_its_longest_stage_not_the_sum() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        fake(root.path(), "node", "/bin/sleep 30", 0o700);
+        for minor in 0..5 {
+            let bin = root
+                .path()
+                .join(format!(".nodenv/versions/20.{minor}.0/bin"));
+            fs::create_dir_all(&bin).unwrap();
+            fake(&bin, "node", "/bin/sleep 30", 0o700);
+        }
+        write_profile(root.path(), "node22", "");
+        let mut env = env(root.path());
+        env.insert("HOMEBREW_PREFIX".into(), "/nonexistent".into());
+        let profile = Profile::load(root.path(), &env).unwrap();
+        let started = Instant::now();
+        let report = profile.startup_report();
+        let spent = started.elapsed();
+        assert_eq!(report.tools["node"], ToolObservation::Unknown);
+        assert!(spent < Duration::from_millis(11_500), "took {spent:?}");
+    }
+
+    /// The first startup measurement takes the required tools as `load`
+    /// measured them: a required tool is called once, not twice.
+    #[test]
+    fn the_startup_report_reuses_the_required_tools_load_measured() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let node_calls = root.path().join("node-calls");
+        fake(
+            root.path(),
+            "node",
+            &format!("echo call >> {node_calls:?}\necho v22.0.0"),
+            0o700,
+        );
+        write_profile(root.path(), "node22", "required_tools = [\"node\"]\n");
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        assert_eq!(calls(&node_calls), 1);
+        let report = profile.startup_report();
+        assert!(matches!(
+            report.tools["node"],
+            ToolObservation::Available { .. }
+        ));
+        assert_eq!(calls(&node_calls), 1);
+    }
+
+    /// A required tool whose calls never return is refused with the file it
+    /// was stuck on, so a hang is attributable.
+    #[test]
+    fn a_stuck_required_tool_is_refused_with_its_path() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        fake(root.path(), "node", "/bin/sleep 30", 0o700);
+        write_profile(root.path(), "node22", "required_tools = [\"node\"]\n");
+        let error = Profile::load(root.path(), &env(root.path())).unwrap_err();
+        let path = root.path().join("node");
+        assert_eq!(
+            error,
+            format!(
+                "required worker profile tool node unavailable ({} did not answer in time)",
+                path.display()
+            )
         );
     }
 
