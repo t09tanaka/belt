@@ -129,18 +129,23 @@ pub fn read_exit(ctx: &Context, id: &str) -> Option<i32> {
 
 /// Persist the outcome. Written once; later writers lose (the first
 /// outcome is the real one, e.g. the runner's over a late `cancel`).
+///
+/// The descriptor gets its `finished_at` before the exit file appears.
+/// The exit file is what `wait` returns on, so once it is there nothing of
+/// the job's is still being written: no descriptor without `finished_at`
+/// and no temporary file in `jobs/` for a reader to trip over.
 pub fn write_exit(ctx: &Context, id: &str, code: i32) {
     let path = ctx.paths.job_exit(id);
     if path.exists() {
         return;
     }
-    if let Ok(mut tmp) = jobs_tempfile(ctx) {
-        let _ = writeln!(tmp, "{code}");
-        let _ = tmp.persist(&path);
-    }
     if let Ok(mut job) = load(ctx, id) {
         job.finished_at = Some(ctx.clock.now());
         let _ = save(ctx, &job);
+    }
+    if let Ok(mut tmp) = jobs_tempfile(ctx) {
+        let _ = writeln!(tmp, "{code}");
+        let _ = tmp.persist(&path);
     }
 }
 
