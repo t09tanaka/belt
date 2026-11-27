@@ -7106,8 +7106,8 @@ fn the_rows_of_a_cancel_before_the_enqueue_exist_only_for_a_capture_and_are_forg
 }
 
 /// Spec 配置の手順 1: the duration of a CI job is its last succeeded
-/// attempt in a recent run; a failure, a discovery probe and an old run
-/// do not count.
+/// attempt in a recent run, else its last failure; an attempt something
+/// else stopped, a discovery probe and an old run do not count.
 #[test]
 fn a_ci_job_duration_is_its_last_success_in_a_recent_run() {
     let f = fx();
@@ -7153,13 +7153,35 @@ fn a_ci_job_duration_is_its_last_success_in_a_recent_run() {
         "task": {"inputs": {"belt_discovery": {}}}}});
     finish(400, probe, Outcome::Succeeded, 400, 9_000);
     finish(10, job("old"), Outcome::Succeeded, 10, 20);
-    let keys = ["long", "short", "old", "none"]
+    // Never succeeded: the newest failure ran until the job stopped.
+    finish(100, job("failing"), Outcome::Failed, 100, 700);
+    finish(200, job("failing"), Outcome::Failed, 1_000, 1_300);
+    // Stopped from outside: when it ended says nothing of its length.
+    for outcome in [Outcome::Interrupted, Outcome::Cancelled] {
+        finish(300, job("cut"), outcome, 300, 8_000);
+    }
+    // More newer runs than are looked at, none with these jobs: other
+    // projects and plain commands do not push the history out.
+    finish(60, job("crowded"), Outcome::Succeeded, 60, 160);
+    for at in 0..25 {
+        finish(1_000 + at, job("other"), Outcome::Succeeded, 1_000, 1_001);
+        f.store
+            .create_run(&RunId::generate(), None, None, &json!({}), 1_000 + at)
+            .unwrap();
+    }
+    let keys = ["long", "short", "old", "none", "failing", "cut", "crowded"]
         .map(str::to_string)
         .into_iter()
         .collect();
     let found = f.store.ci_job_durations(keys, 50).unwrap();
     assert_eq!(
         found,
-        [("long".to_string(), 500), ("short".to_string(), 100)].into()
+        [
+            ("long".to_string(), 500),
+            ("short".to_string(), 100),
+            ("failing".to_string(), 300),
+            ("crowded".to_string(), 100),
+        ]
+        .into()
     );
 }
