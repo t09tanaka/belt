@@ -13,7 +13,13 @@ pub const FEATURES: &[&str] = &[
     crate::forecast::COMMAND_FEATURE,
     SETUP_TOOLS_FEATURE,
     SETUP_INSTALL_FEATURE,
+    PREPARE_SKIP_FEATURE,
 ];
+/// The feature of a worker that leaves out of a task's workspace
+/// preparation the presets the task does not set up (spec 22.1,
+/// `fast-worktree add --skip-preset`): a task that skips one is placed only
+/// on such a worker, since another would prepare them all.
+pub const PREPARE_SKIP_FEATURE: &str = "prepare_skip_presets_v1";
 /// The feature of a worker that installs a missing `cargo-*` setup tool with
 /// the rust the job sets up (spec 22.1): a worker without it is a candidate
 /// only for the tools on its PATH.
@@ -99,6 +105,11 @@ pub enum Requirement {
     /// `dtolnay/rust-toolchain`), without the `-preview` suffix: met by a
     /// worker whose rustup toolchain has it.
     Component(String),
+    /// A `fast-worktree` preset the task's workspace preparation leaves out,
+    /// because the task does not set up its tool (spec 22.1): met by a worker
+    /// that reports [`PREPARE_SKIP_FEATURE`], which passes it to
+    /// `fast-worktree add --skip-preset`.
+    SkipPreset(String),
 }
 fn os(v: &str) -> Option<&str> {
     match v {
@@ -137,6 +148,7 @@ impl Requirement {
             Self::Feature(v) => FEATURES.contains(&v.as_str()),
             Self::Setup(v) => path_tool_name(v),
             Self::Component(v) => valid_name(v) && component_name(v, None) == *v,
+            Self::SkipPreset(v) => crate::workspace::prepare_tools::is_preset(v),
         }
     }
 }
@@ -162,6 +174,21 @@ impl ExecutionRequirements {
     }
     pub fn is_empty(&self) -> bool {
         self.profile.is_none() && self.requires.is_empty()
+    }
+    /// The presets the workspace's preparation leaves out
+    /// ([`Requirement::SkipPreset`]), sorted.
+    pub fn skipped_presets(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .requires
+            .iter()
+            .filter_map(|r| match r {
+                Requirement::SkipPreset(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
     /// These requirements with a [`Requirement::Prepare`] for each of
     /// `tools`: the tools the workspace's preparation runs (spec 22.1).
@@ -336,6 +363,9 @@ pub fn unmet_line(requirement: &Requirement) -> String {
         Requirement::Component(name) => format!(
             "rust component {name} unavailable: a setup step of the job adds it; run `rustup component add {name}` on the worker"
         ),
+        Requirement::SkipPreset(name) => format!(
+            "{PREPARE_SKIP_FEATURE} unavailable: the task does not set up {name}, and only a worker that reports it leaves the {name} projects out of the workspace preparation; upgrade the worker"
+        ),
         _ => format!("{requirement:?} unavailable"),
     }
 }
@@ -372,6 +402,7 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
                 r.features.contains(SETUP_TOOLS_FEATURE)
                     && r.rustup.iter().any(|t| t.components.contains(v))
             }
+            Requirement::SkipPreset(_) => r.features.contains(PREPARE_SKIP_FEATURE),
         };
         if !available {
             missing.push(unmet_line(v));
@@ -405,7 +436,7 @@ pub fn missing_with_installable(
         };
         native.requires.retain(|r| match r {
             Requirement::Tool(name) => !selected(crate::toolchain::contract::canonical_tool(name)),
-            Requirement::Prepare(name) => !selected(prepare_toolchain(name)),
+            Requirement::Prepare(name) => !prepare_served(name, Some(bundle)),
             _ => true,
         });
     }
@@ -474,6 +505,21 @@ pub fn missing_with_installable(
     unmet
 }
 
+/// Whether `bundle` serves the preparation tool `name`: it selects that
+/// tool's toolchain, which the worker activates before preparing. The one
+/// rule of the submit's check, the owner's and placement (spec 22.1).
+pub fn prepare_served(
+    name: &str,
+    bundle: Option<&crate::toolchain::contract::FrozenBundle>,
+) -> bool {
+    bundle.is_some_and(|b| {
+        b.frozen
+            .selections
+            .iter()
+            .any(|s| s.tool.as_str() == prepare_toolchain(name))
+    })
+}
+
 /// The toolchain whose activation serves a tool preparation runs: npm ships
 /// with node.
 pub fn prepare_toolchain(name: &str) -> &str {
@@ -536,6 +582,19 @@ mod tests {
         assert!(ExecutionRequirements::default()
             .with_prepare(&unknown)
             .is_err());
+        // A task that skips a preset requires nothing of its tools, only a
+        // worker that skips; the requirement is never written by a user.
+        let skips = ExecutionRequirements {
+            profile: None,
+            requires: vec![Requirement::SkipPreset("npm".into())],
+        };
+        assert_eq!(skips.skipped_presets(), ["npm"]);
+        let mut skipper = report();
+        assert!(missing(&skips, Some(&skipper))[0].contains(PREPARE_SKIP_FEATURE));
+        skipper.features.insert(PREPARE_SKIP_FEATURE.into());
+        assert!(missing(&skips, Some(&skipper)).is_empty());
+        assert!(!Requirement::SkipPreset("yarn".into()).validate());
+        assert!(Requirement::parse("skip_preset:npm").is_err());
     }
     /// A report's detected rustup toolchains are bounded and well formed
     /// (spec 22.1); each rule refuses alone.
@@ -1093,6 +1152,37 @@ mod tests {
             missing_with_installable(&req, Some(&none), Some(&bundle)).len(),
             1
         );
+    }
+
+    /// A preparation is served only by a bundle selecting its toolchain.
+    #[test]
+    fn prepare_is_served_only_by_a_bundle_selecting_its_toolchain() {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("1.92.0").unwrap(),
+                scope,
+                location: Location {
+                    path: "rust-toolchain".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let rust = FrozenBundle::seal_exact(frozen).unwrap();
+        assert!(prepare_served("rust", Some(&rust)));
+        assert!(!prepare_served("npm", Some(&rust)));
+        assert!(!prepare_served("rust", None));
+        assert_eq!(prepare_toolchain("npm"), "node");
     }
 
     #[test]

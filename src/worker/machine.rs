@@ -342,15 +342,17 @@ impl BuilderWorkspaces for BuilderWs {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
         };
+        let skip = payload.requirements.skipped_presets();
         match toolchain {
             None => self
                 .workspaces
-                .create(attempt, &self.store, &m, repo.as_ref()),
-            Some(t) => prepared_with(&self.state_dir, &self.env, t).create(
+                .create_skipping(attempt, &self.store, &m, repo.as_ref(), &skip),
+            Some(t) => prepared_with(&self.state_dir, &self.env, t).create_skipping(
                 attempt,
                 &self.store,
                 &m,
                 repo.as_ref(),
+                &skip,
             ),
         }
     }
@@ -539,15 +541,23 @@ impl Host for Machine {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
         };
+        // The presets the task does not set up are left out (spec 22.1),
+        // as the parent required of this worker.
+        let skip = payload.requirements.skipped_presets();
         match toolchain {
-            None => self
-                .workspaces
-                .create(&attempt.attempt_id, &self.store, &m, repo.as_ref()),
-            Some(t) => prepared_with(&self.state_dir, &self.env, t).create(
+            None => self.workspaces.create_skipping(
                 &attempt.attempt_id,
                 &self.store,
                 &m,
                 repo.as_ref(),
+                &skip,
+            ),
+            Some(t) => prepared_with(&self.state_dir, &self.env, t).create_skipping(
+                &attempt.attempt_id,
+                &self.store,
+                &m,
+                repo.as_ref(),
+                &skip,
             ),
         }
     }

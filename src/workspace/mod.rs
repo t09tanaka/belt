@@ -562,6 +562,19 @@ impl Workspaces {
         m: &CiManifest,
         repo: Option<&ObjectsRepo>,
     ) -> Result<Workspace, ApiError> {
+        self.create_skipping(attempt, store, m, repo, &[])
+    }
+
+    /// [`Self::create`], with a Git workspace's preparation leaving out the
+    /// presets in `skip` (spec 22.1). A directory workspace is not prepared.
+    pub fn create_skipping(
+        &self,
+        attempt: &AttemptId,
+        store: &SourceStore,
+        m: &CiManifest,
+        repo: Option<&ObjectsRepo>,
+        skip: &[String],
+    ) -> Result<Workspace, ApiError> {
         let flavor = plan::flavor_of(m.execution_commit.as_deref(), m.repository_id.as_deref())?;
         let cwd_rel = m.cwd_relative.to_path();
         plan::check_cwd_relative(&cwd_rel)?;
@@ -597,11 +610,12 @@ impl Workspaces {
                         "a Git source needs the repository's canonical clone",
                     )
                 })?;
-                self.create_git(attempt, store, m, repo, &commit, &dest)
+                self.create_git(attempt, store, m, repo, &commit, &dest, skip)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_git(
         &self,
         attempt: &AttemptId,
@@ -610,6 +624,7 @@ impl Workspaces {
         repo: &ObjectsRepo,
         commit: &str,
         dest: &Path,
+        skip: &[String],
     ) -> Result<Workspace, ApiError> {
         if !repo.has_commit(commit) {
             return Err(ApiError::new(
@@ -627,7 +642,7 @@ impl Workspaces {
             // of the clone's main checkout, which must stay at `commit` until
             // that is done.
             let _held = self.hold_clone_at(clone, commit)?;
-            self.fw.add(clone, dest, &branch, commit)
+            self.fw.add(clone, dest, &branch, commit, skip)
         };
         let made = added
             .map_err(|f| plan::fw_error("add", &f))

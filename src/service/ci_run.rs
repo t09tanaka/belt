@@ -241,8 +241,42 @@ pub fn task_specs(
         .collect()
 }
 
-/// The requirements of every task of a run: the configured ones, with the
-/// tools the workspace's preparation runs (spec 22.1).
+/// Each task of `specs` (in the order of `plan`'s tasks) with its own
+/// workspace preparation (spec 22.1): a [`Requirement::Prepare`] for each
+/// tool it runs and a [`Requirement::SkipPreset`] for each preset it leaves
+/// out, from [`crate::ci::setup_tools::task_preparation`].
+///
+/// [`Requirement::Prepare`]: crate::toolchain::capability::Requirement::Prepare
+/// [`Requirement::SkipPreset`]: crate::toolchain::capability::Requirement::SkipPreset
+pub(crate) fn with_preparation(
+    specs: &mut [(String, TaskSpec)],
+    plan: &local_ci::FrozenPlan,
+    prepare: &crate::workspace::prepare_tools::PrepareTools,
+    configured: &crate::toolchain::capability::ExecutionRequirements,
+) -> Result<(), ApiError> {
+    use crate::toolchain::capability::Requirement;
+    for ((id, spec), task) in specs.iter_mut().zip(&plan.tasks) {
+        let prepared = crate::ci::setup_tools::task_preparation(prepare, plan, task, configured);
+        let mut requirements = spec
+            .requirements
+            .clone()
+            .with_prepare(&prepared.tools)
+            .map_err(|e| invalid(format!("task `{id}`: {e}")))?;
+        requirements
+            .requires
+            .extend(prepared.skip.into_iter().map(Requirement::SkipPreset));
+        requirements.requires.sort();
+        requirements.requires.dedup();
+        requirements
+            .validate()
+            .map_err(|e| invalid(format!("task `{id}`: {e}")))?;
+        spec.requirements = requirements;
+    }
+    Ok(())
+}
+
+/// The requirements of a plain command: the configured ones, with every
+/// tool the workspace's preparation runs (spec 22.1).
 pub(crate) fn run_requirements(
     configured: crate::toolchain::capability::ExecutionRequirements,
     prepare: &crate::workspace::prepare_tools::PrepareTools,
@@ -280,8 +314,34 @@ pub(crate) fn setup_requirements(
     }
 }
 
-/// Asks the owner, once for each set of setup tools, whether some worker
-/// has them; a task no worker serves is marked unplaceable with the reason.
+/// What the owner is asked of one task before it is queued: its setup tools,
+/// the presets its preparation skips, and the tools its preparation runs that
+/// its own resolved bundle does not serve (the same rule as the submit of a
+/// plain command, `submit::unserved_preparation`, and as placement).
+pub(crate) fn placement_requirements(
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+    bundle: Option<&crate::toolchain::contract::FrozenBundle>,
+) -> crate::toolchain::capability::ExecutionRequirements {
+    use crate::toolchain::capability::{prepare_served, Requirement};
+    let mut out = setup_requirements(requirements);
+    out.requires.extend(
+        requirements
+            .requires
+            .iter()
+            .filter(|r| match r {
+                Requirement::SkipPreset(_) => true,
+                Requirement::Prepare(name) => !prepare_served(name, bundle),
+                _ => false,
+            })
+            .cloned(),
+    );
+    out.requires.sort();
+    out
+}
+
+/// Asks the owner, once for each set of setup tools and preparation tools
+/// (spec 22.1), whether some worker has them; a task no worker serves is
+/// marked unplaceable with the reason.
 async fn check_setup_tools(
     owner: &super::resident::Client,
     specs: &mut [(String, TaskSpec)],
@@ -291,7 +351,7 @@ async fn check_setup_tools(
         Option<String>,
     )> = Vec::new();
     for (_, spec) in specs.iter_mut() {
-        let setup = setup_requirements(&spec.requirements);
+        let setup = placement_requirements(&spec.requirements, spec.toolchains.as_ref());
         if setup.is_empty() {
             continue;
         }
@@ -352,7 +412,7 @@ async fn submit_run(
     revision: Option<String>,
     run_id: RunId,
 ) -> Result<Receipt, ApiError> {
-    let mut requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+    let requirements = crate::toolchain::capability::ExecutionRequirements::parse(
         context.config.profile.value.clone(),
         &context.config.requires.value,
     )
@@ -401,9 +461,6 @@ async fn submit_run(
     .await
     .map_err(|e| invalid(e.to_string()))?;
     let (captured, plan, plan_digest, policies, guard, prepare) = frozen?;
-    // Every task's workspace is prepared alike: the tools it runs are
-    // required of the worker of every task (spec 22.1).
-    requirements = run_requirements(requirements, &prepare)?;
     let source_id = captured.manifest.source_id.clone();
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
@@ -415,6 +472,10 @@ async fn submit_run(
         &requirements,
         timeout,
     )?;
+    // Each task prepares the presets it sets up, and the tools those run are
+    // required of its worker (spec 22.1).
+    with_preparation(&mut specs, &plan, &prepare, &requirements)?;
+    let task_requirements: Vec<_> = specs.iter().map(|(_, s)| s.requirements.clone()).collect();
     // Frozen once for the run: the declarations a plain command of this
     // source would freeze, and for each task the `setup-*` inputs of its own
     // jobs. Every task carries its bundle, and the worker activates it
@@ -425,6 +486,7 @@ async fn submit_run(
         &captured.manifest,
         &manifest_digest,
         &requirements,
+        &task_requirements,
         &plan,
         guard,
     )
@@ -1022,21 +1084,79 @@ mod tests {
         assert!(missing_with_installable(&of("test"), Some(&mini), None).is_empty());
     }
 
-    /// A Rust-only job of a source whose tracked npm example the workspace
-    /// preparation installs runs `node -v`: without a node selection a
-    /// worker without node is no candidate (run4 of the acceptance), and
-    /// with one the activated node serves preparation too (spec 22.1).
+    /// A job whose only step is `run: npm run lint` uses npm without a setup
+    /// step (the runner image has it): its preparation runs the npm preset
+    /// and requires node and npm, while a job that names no preset program
+    /// skips it (spec 22.1).
     #[test]
-    fn a_worker_without_node_is_a_candidate_only_when_the_task_selects_node() {
-        use crate::toolchain::capability::{missing_with_installable, ToolObservation};
+    fn a_run_step_that_names_npm_prepares_the_npm_preset() {
+        use crate::toolchain::capability::Requirement;
+        let f = fixture(
+            "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo build\n",
+        );
+        let paths = ["Cargo.lock", "package-lock.json"];
+        let prepare = crate::workspace::prepare_tools::prepare_tools(paths, None).unwrap();
+        let requirements = Default::default();
+        let digest = Digest::of_bytes(b"plan bytes");
+        let mut specs = task_specs(&f.plan, &digest, &digest, &requirements, None).unwrap();
+        with_preparation(&mut specs, &f.plan, &prepare, &requirements).unwrap();
+        let of = |job: &str| {
+            let id = task_of(&f.plan, job).to_string();
+            let spec = &specs.iter().find(|(t, _)| t == &id).unwrap().1;
+            spec.requirements.requires.clone()
+        };
+        assert_eq!(
+            of("lint"),
+            [
+                Requirement::Prepare("node".into()),
+                Requirement::Prepare("npm".into())
+            ]
+        );
+        assert_eq!(of("build"), [Requirement::SkipPreset("npm".into())]);
+    }
+
+    /// A Rust-only job of a source with a tracked npm example prepares no
+    /// npm project, as on GitHub Actions: it requires neither node nor npm,
+    /// only a worker that skips the preset, so a worker without node (mini
+    /// of the acceptance run7) is a candidate. A job that sets up node
+    /// prepares it: a worker without node is a candidate only when the
+    /// task's bundle selects node, whose activation then prepares (spec 22.1).
+    #[test]
+    fn only_a_job_that_sets_up_node_requires_node_for_its_preparation() {
+        use crate::toolchain::capability::{
+            missing_with_installable, Requirement, ToolObservation, PREPARE_SKIP_FEATURE,
+        };
         use crate::toolchain::versions::*;
-        let f = fixture(WORKFLOW);
+        let f = fixture(
+            "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - run: cargo clippy\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: ${{ github.sha }}\n      - run: npm test\n",
+        );
         let paths = ["Cargo.lock", "examples/sharding/node/package-lock.json"];
         let prepare = crate::workspace::prepare_tools::prepare_tools(paths, None).unwrap();
         let requirements = Default::default();
-        let requirements = run_requirements(requirements, &prepare).unwrap();
         let digest = Digest::of_bytes(b"plan bytes");
-        let specs = task_specs(&f.plan, &digest, &digest, &requirements, None).unwrap();
+        let mut specs = task_specs(&f.plan, &digest, &digest, &requirements, None).unwrap();
+        with_preparation(&mut specs, &f.plan, &prepare, &requirements).unwrap();
+        let of = |job: &str| {
+            let id = task_of(&f.plan, job).to_string();
+            specs
+                .iter()
+                .find(|(t, _)| t == &id)
+                .unwrap()
+                .1
+                .requirements
+                .clone()
+        };
+        let (lint, test) = (of("lint"), of("test"));
+        assert_eq!(lint.requires, [Requirement::SkipPreset("npm".into())]);
+        assert!(lint.skipped_presets() == ["npm"]);
+        assert_eq!(
+            test.requires,
+            [
+                Requirement::Prepare("node".into()),
+                Requirement::Prepare("npm".into())
+            ]
+        );
+        assert!(test.skipped_presets().is_empty());
         let scope = Scope::project("");
         let mut node = crate::toolchain::contract::FrozenBundle::seal_exact(
             FrozenToolchains::freeze(
@@ -1067,51 +1187,58 @@ mod tests {
             requirement_digest: Digest::of_bytes(b"requirement"),
             authority: Digest::of_bytes(b"authority"),
         });
-        let worker = |tools: &[&str]| crate::toolchain::capability::WorkerCapabilities {
-            disk_free_bytes: None,
-            cpu_cores: None,
-            memory_bytes: None,
-            resource_budget: None,
-            schema_version: 1,
-            os: "macos".into(),
-            arch: "aarch64".into(),
-            profile: "default".into(),
-            profile_digest: Digest::of_bytes(b"definition"),
-            execution_uid: 1,
-            protocol_versions: vec![1],
-            profile_fingerprint: Digest::of_bytes(b"p"),
-            tools: tools
-                .iter()
-                .map(|t| {
-                    let seen = ToolObservation::Available {
-                        version: "1.0.0".into(),
-                        identity: Digest::of_bytes(t.as_bytes()),
-                    };
-                    (t.to_string(), seen)
-                })
-                .collect(),
-            features: [crate::toolchain::capability::FEATURE.into()].into(),
-            rustup: Vec::new(),
-            installs: Vec::new(),
-            path_tools: Vec::new(),
-        };
+        let worker =
+            |tools: &[&str], skips: bool| crate::toolchain::capability::WorkerCapabilities {
+                disk_free_bytes: None,
+                cpu_cores: None,
+                memory_bytes: None,
+                resource_budget: None,
+                schema_version: 1,
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                profile: "default".into(),
+                profile_digest: Digest::of_bytes(b"definition"),
+                execution_uid: 1,
+                protocol_versions: vec![1],
+                profile_fingerprint: Digest::of_bytes(b"p"),
+                tools: tools
+                    .iter()
+                    .map(|t| {
+                        let seen = ToolObservation::Available {
+                            version: "1.0.0".into(),
+                            identity: Digest::of_bytes(t.as_bytes()),
+                        };
+                        (t.to_string(), seen)
+                    })
+                    .collect(),
+                features: std::iter::once(crate::toolchain::capability::FEATURE)
+                    .chain(skips.then_some(PREPARE_SKIP_FEATURE))
+                    .map(str::to_string)
+                    .collect(),
+                rustup: Vec::new(),
+                installs: Vec::new(),
+                path_tools: Vec::new(),
+            };
         let (mini, studio) = (
-            worker(&["cargo", "rustc"]),
-            worker(&["cargo", "node", "npm"]),
+            worker(&["cargo", "rustc"], true),
+            worker(&["cargo", "node", "npm"], true),
         );
-        for (_, spec) in &specs {
-            let unmet = missing_with_installable(&spec.requirements, Some(&mini), Some(&node));
-            assert!(unmet.is_empty(), "the selected node prepares: {unmet:?}");
-            for bundle in [None, Some(&node)] {
-                if bundle.is_none() {
-                    let unmet = missing_with_installable(&spec.requirements, Some(&mini), None);
-                    let node = unmet.iter().any(|u| u.contains("\"node\""));
-                    assert!(node, "mini cannot run `node -v`: {unmet:?}");
-                }
-                assert!(
-                    missing_with_installable(&spec.requirements, Some(&studio), bundle).is_empty()
-                );
-            }
+        // The Rust-only job: mini is a candidate, with a bundle or without.
+        for bundle in [None, Some(&node)] {
+            let unmet = missing_with_installable(&lint, Some(&mini), bundle);
+            assert!(unmet.is_empty(), "mini prepares no npm project: {unmet:?}");
+        }
+        // Only a worker that skips presets: an older one would run `npm ci`.
+        let old = worker(&["cargo", "rustc"], false);
+        let unmet = missing_with_installable(&lint, Some(&old), None);
+        assert!(unmet[0].contains(PREPARE_SKIP_FEATURE), "{unmet:?}");
+        // The job that sets up node: mini only with node selected.
+        let unmet = missing_with_installable(&test, Some(&mini), None);
+        assert!(unmet.iter().any(|u| u.contains("\"node\"")), "{unmet:?}");
+        let unmet = missing_with_installable(&test, Some(&mini), Some(&node));
+        assert!(unmet.is_empty(), "the selected node prepares: {unmet:?}");
+        for bundle in [None, Some(&node)] {
+            assert!(missing_with_installable(&test, Some(&studio), bundle).is_empty());
         }
     }
 

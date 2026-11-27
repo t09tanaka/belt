@@ -15,8 +15,17 @@ use std::time::{Duration, Instant};
 pub trait FastWorktree: Send + Sync {
     /// A worktree at `dest` on the new branch `branch`, starting at the commit
     /// `start`, with the project's dependencies prepared (its
-    /// `.fast-worktree.toml`, `post_add` hooks included).
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure>;
+    /// `.fast-worktree.toml`, `post_add` hooks included), less the projects
+    /// of the presets in `skip` (`--skip-preset`, spec 22.1): nothing of
+    /// those runs.
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        skip: &[String],
+    ) -> Result<(), FwFailure>;
     /// Remove the clean worktree at `path` (`pre_remove` hooks run).
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure>;
     /// Release this attempt's port reservation even after a previous cleanup
@@ -24,6 +33,25 @@ pub trait FastWorktree: Send + Sync {
     fn release_ports(&self, _repo: &Path, _path: &Path) -> Result<(), FwFailure> {
         Ok(())
     }
+}
+
+/// The variable fast-worktree adds to every key of its preparation caches
+/// (the pool's and the clones').
+const KEY_IDENTITY: &str = "FAST_WORKTREE_KEY_IDENTITY";
+
+/// The cache identity of a preparation that skips `skip` (sorted, spec
+/// 22.1): the activated toolchains' `identity`, if any, with the skip set,
+/// so that what one skip set prepared is never reused for another. `None`
+/// (the identity unchanged) when nothing is skipped.
+pub fn key_identity(identity: Option<&str>, skip: &[String]) -> Option<String> {
+    if skip.is_empty() {
+        return None;
+    }
+    let skipped = format!("skip-preset:{}", skip.join(","));
+    Some(match identity.filter(|id| !id.is_empty()) {
+        Some(id) => format!("{id}+{skipped}"),
+        None => skipped,
+    })
 }
 
 /// How long one call may run unless the caller says otherwise: a `post_add`
@@ -67,6 +95,15 @@ impl CliFastWorktree {
     }
 
     fn run(&self, repo: &Path, args: &[&std::ffi::OsStr]) -> Result<(), FwFailure> {
+        self.run_with(repo, args, None)
+    }
+
+    fn run_with(
+        &self,
+        repo: &Path,
+        args: &[&std::ffi::OsStr],
+        identity: Option<String>,
+    ) -> Result<(), FwFailure> {
         let missing: Vec<String> = ["HOME", "PATH"]
             .into_iter()
             .filter(|k| !self.env.contains_key(*k))
@@ -80,6 +117,7 @@ impl CliFastWorktree {
             .current_dir(repo)
             .env_clear()
             .envs(&self.env)
+            .envs(identity.map(|id| (KEY_IDENTITY, id)))
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -183,18 +221,28 @@ impl Drain {
 }
 
 impl FastWorktree for CliFastWorktree {
-    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+    fn add(
+        &self,
+        repo: &Path,
+        dest: &Path,
+        branch: &str,
+        start: &str,
+        skip: &[String],
+    ) -> Result<(), FwFailure> {
         use std::ffi::OsStr;
-        self.run(
-            repo,
-            &[
-                OsStr::new("add"),
-                dest.as_os_str(),
-                OsStr::new("-b"),
-                OsStr::new(branch),
-                OsStr::new(start),
-            ],
-        )
+        let mut args = vec![
+            OsStr::new("add"),
+            dest.as_os_str(),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            OsStr::new(start),
+        ];
+        for preset in skip {
+            args.push(OsStr::new("--skip-preset"));
+            args.push(OsStr::new(preset));
+        }
+        let identity = key_identity(self.env.get(KEY_IDENTITY).map(String::as_str), skip);
+        self.run_with(repo, &args, identity)
     }
 
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
@@ -215,5 +263,27 @@ impl FastWorktree for CliFastWorktree {
                     stderr: err.to_string(),
                 },
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_identity;
+
+    /// The skip set is part of the preparation cache identity (spec 22.1):
+    /// what a preparation that skipped a preset made is never reused for one
+    /// that skipped another, and nothing skipped keeps the identity as it was.
+    #[test]
+    fn the_skip_set_changes_the_cache_identity() {
+        let npm = ["npm".to_string()];
+        let both = ["dart".to_string(), "npm".to_string()];
+        assert_eq!(key_identity(Some("sha256:a"), &[]), None);
+        assert_eq!(key_identity(None, &[]), None);
+        let a = key_identity(Some("sha256:a"), &npm).unwrap();
+        assert_ne!(a, "sha256:a");
+        assert!(a.starts_with("sha256:a"), "{a}");
+        assert_ne!(Some(a), key_identity(Some("sha256:a"), &both));
+        assert_ne!(key_identity(None, &npm), key_identity(None, &both));
+        assert_eq!(key_identity(Some(""), &npm), key_identity(None, &npm));
     }
 }

@@ -310,6 +310,9 @@ pub(super) fn advance(
                 .map(String::as_str)
                 .collect()
         };
+        // Each shard prepares what its own job needs (spec 22.1), not what
+        // the first probe's job needed.
+        let own: TaskSpec = serde_json::from_value(row.spec.clone()).map_err(unrunnable)?;
         let mut parts = Vec::with_capacity(names.len());
         for (i, name) in names.into_iter().enumerate() {
             let spec = by_id
@@ -321,6 +324,7 @@ pub(super) fn advance(
                 TaskId::generate()
             };
             let mut spec = spec.clone();
+            spec.requirements = with_own_preparation(&spec.requirements, &own.requirements);
             if let Some(shard) = split.task(name).and_then(|t| t.shard.as_ref()) {
                 let runner = shard.runner.runner.as_str();
                 let allowed = policies
@@ -352,4 +356,68 @@ pub(super) fn advance(
         .apply_ci_discovery(run, &current, &digest, ids, replacements, now_ms)
         .map_err(transient)?;
     Ok(true)
+}
+
+/// `shard`'s requirements with the workspace preparation
+/// ([`Requirement::Prepare`] and [`Requirement::SkipPreset`]) of `own`, the
+/// spec of the job the shard was split from (spec 22.1). Preparation is per
+/// task, so a shard must not inherit another job's.
+///
+/// [`Requirement::Prepare`]: crate::toolchain::capability::Requirement::Prepare
+/// [`Requirement::SkipPreset`]: crate::toolchain::capability::Requirement::SkipPreset
+fn with_own_preparation(
+    shard: &crate::toolchain::capability::ExecutionRequirements,
+    own: &crate::toolchain::capability::ExecutionRequirements,
+) -> crate::toolchain::capability::ExecutionRequirements {
+    use crate::toolchain::capability::Requirement;
+    let preparation =
+        |r: &Requirement| matches!(r, Requirement::Prepare(_) | Requirement::SkipPreset(_));
+    let mut out = shard.clone();
+    out.requires.retain(|r| !preparation(r));
+    out.requires
+        .extend(own.requires.iter().filter(|r| preparation(r)).cloned());
+    out.requires.sort();
+    out.requires.dedup();
+    out
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::toolchain::capability::{ExecutionRequirements, Requirement};
+
+    fn reqs(requires: Vec<Requirement>) -> ExecutionRequirements {
+        ExecutionRequirements {
+            profile: None,
+            requires,
+        }
+    }
+
+    #[test]
+    fn each_split_job_keeps_its_own_preparation() {
+        // The first probe is a Rust job: it skips the npm preset. A jest job
+        // split in the same pass prepares node; a Rust shard must not.
+        let rust = reqs(vec![
+            Requirement::Tool("cargo".into()),
+            Requirement::SkipPreset("npm".into()),
+        ]);
+        let jest = reqs(vec![
+            Requirement::Tool("cargo".into()),
+            Requirement::Prepare("node".into()),
+        ]);
+        // task_specs built every shard from the first probe's requirements.
+        let jest_shard = with_own_preparation(&rust, &jest);
+        assert!(jest_shard
+            .requires
+            .contains(&Requirement::Prepare("node".into())));
+        assert!(jest_shard.skipped_presets().is_empty());
+        assert!(jest_shard
+            .requires
+            .contains(&Requirement::Tool("cargo".into())));
+        let rust_shard = with_own_preparation(&jest, &rust);
+        assert!(!rust_shard
+            .requires
+            .contains(&Requirement::Prepare("node".into())));
+        assert_eq!(rust_shard.skipped_presets(), ["npm"]);
+    }
 }

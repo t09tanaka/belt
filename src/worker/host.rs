@@ -40,7 +40,7 @@ impl PrepareToolchain {
 
     /// What `fast-worktree add` runs with: the worker's own variables
     /// `own`, overlaid by the activation's (its `PATH` among them), and the
-    /// identity, which fast-worktree 0.8 adds to every preparation cache
+    /// identity, which fast-worktree 0.9 adds to every preparation cache
     /// key: a `node_modules` prepared with one node is never reused for
     /// another.
     pub fn environment(

@@ -2491,3 +2491,30 @@ fn a_direct_version_precedes_the_version_file_of_every_setup_action() {
         }
     }
 }
+
+#[test]
+fn setup_action_tool_maps_each_recognized_setup_action_to_its_tool() {
+    let cases = [
+        ("actions/setup-node", "node"),
+        ("actions/setup-python", "python"),
+        ("actions/setup-go", "go"),
+        ("actions/setup-java", "java"),
+        ("ruby/setup-ruby", "ruby"),
+        ("subosito/flutter-action", "flutter"),
+        ("dart-lang/setup-dart", "dart"),
+        ("maxim-lobanov/setup-xcode", "xcode"),
+        ("actions-rust-lang/setup-rust-toolchain", "rust"),
+        ("dtolnay/rust-toolchain", "rust"),
+        ("pnpm/action-setup", "pnpm"),
+    ];
+    for (action, tool) in cases {
+        assert_eq!(setup_action_tool(action), Some(tool), "{action}");
+    }
+}
+
+#[test]
+fn setup_action_tool_returns_none_for_other_actions() {
+    assert_eq!(setup_action_tool("actions/checkout"), None);
+    assert_eq!(setup_action_tool("actions/cache"), None);
+    assert_eq!(setup_action_tool(""), None);
+}
