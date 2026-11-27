@@ -26,14 +26,14 @@ Workspace hooks and commands can call `fast-worktree` and `portool` directly. `b
 
 ## Install
 
-Build the CLI from a checkout with the stable Rust toolchain. From the repository root, run:
+Install the package `belt-ci` from crates.io with the stable Rust toolchain:
 
 ```sh
-cargo install --locked --path .
+cargo install --locked belt-ci
 belt --version
 ```
 
-Cargo installs the executable as `belt` (normally in `~/.cargo/bin`). The package name in this repository is `belt-cli`.
+To build from a checkout instead, run `cargo install --locked --path .` from the repository root. Cargo installs the executable as `belt` (normally in `~/.cargo/bin`).
 
 ## First run on one machine
 
@@ -78,7 +78,7 @@ Run `belt top` in a terminal to see worker connections, active attempts, waiting
 
 The CLI surface is defined, but public orchestration commands remain under development. Unimplemented commands return `NOT_IMPLEMENTED` (exit code 70; with `--json`, an envelope with `schema_version` on stdout).
 
-Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workers include fast-worktree and portool. Workspace hooks and commands use the versions shown by `belt workers diff`. The coexistence tests also exercise standalone installations. Resource admission uses task-traffic-controller 0.10.x (0.10.2 or newer in that minor: the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.10 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
+Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workers include fast-worktree and portool. Workspace hooks and commands use the versions shown by `belt workers diff`. The coexistence tests also exercise standalone installations. Resource admission uses task-traffic-controller 0.12.x (the worker shares the ledger of the same user's CLI, and another minor may change its format). The worker also reads that CLI's configuration file, so a key or value the 0.12 library rejects there fails every command the worker starts until the file is corrected. Initialize and check the worktree's portool allocation before starting services or integration tests.
 
 Run the configured CI against committed HEAD:
 

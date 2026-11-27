@@ -1,11 +1,11 @@
 [package]
-name = "belt-cli"
-version = "0.0.0"
+name = "belt-ci"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Distribute CI and heavy commands across your own machines"
 license = "MIT"
-repository = "https://github.com/t09tanaka/belt"
+repository = "https://github.com/t09tanaka/belt-ci"
 readme = "README.md"
 
 [lib]
