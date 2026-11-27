@@ -2,6 +2,9 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+/// The launchd class of every belt service (launchd.plist(5) `ProcessType`).
+pub const PROCESS_TYPE: &str = "Interactive";
+
 /// Which service manager a plan is for. The worker-host helper is generic over
 /// the manager; only the rendering and the manager's own commands differ.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,6 +35,11 @@ pub struct Plan {
     domain: String,
     /// The managed file's text: a launchd plist or a systemd unit.
     plist: String,
+    /// The bytes an earlier version wrote for the same service: the plist
+    /// without `ProcessType`. A service installed by that version is still
+    /// recognized as this plan, so it can be stopped and upgraded; every new
+    /// write uses `plist`.
+    legacy_plist: Option<String>,
     domain_identity: Mode,
     executable: PathBuf,
     arguments: Vec<String>,
@@ -47,6 +55,7 @@ impl Plan {
             label: def.label.clone(),
             domain: domain.into(),
             plist: unit,
+            legacy_plist: None,
             domain_identity: def.mode.clone(),
             executable: def.executable.clone(),
             arguments: std::iter::once(def.executable.to_string_lossy().into_owned())
@@ -83,6 +92,25 @@ impl Plan {
     }
     pub fn plist(&self) -> &str {
         &self.plist
+    }
+    /// Whether an installed managed file holds this plan: the bytes this
+    /// version writes, or the ones an earlier version wrote.
+    pub fn installed_as(&self, bytes: &[u8]) -> bool {
+        bytes == self.plist.as_bytes()
+            || self
+                .legacy_plist
+                .as_ref()
+                .is_some_and(|l| bytes == l.as_bytes())
+    }
+    /// `installed_as`, for a file known only by its SHA-256.
+    pub fn installed_digest(&self, digest: &[u8; 32]) -> bool {
+        use sha2::Digest as _;
+        let of = |text: &str| <[u8; 32]>::from(sha2::Sha256::digest(text.as_bytes()));
+        *digest == of(&self.plist)
+            || self
+                .legacy_plist
+                .as_deref()
+                .is_some_and(|l| *digest == of(l))
     }
     pub fn filename(&self) -> String {
         match self.backend {
@@ -207,12 +235,20 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
         checked_observable(value)?;
         env.push_str(&format!("<key>{}</key>{}", xml(key)?, string(value)?));
     }
-    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key>{}<key>ProgramArguments</key><array>{argv}</array><key>WorkingDirectory</key>{}<key>EnvironmentVariables</key><dict>{env}</dict>{user}<key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n", string(&def.label)?, string(absolute(&def.working_directory)?)?);
+    let render = |process_type: &str| -> Result<String, String> {
+        Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key>{}<key>ProgramArguments</key><array>{argv}</array><key>WorkingDirectory</key>{}<key>EnvironmentVariables</key><dict>{env}</dict>{user}<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>{process_type}</dict></plist>\n", string(&def.label)?, string(absolute(&def.working_directory)?)?))
+    };
+    // Without ProcessType launchd throttles the job's CPU and I/O, and the
+    // CI work the resident runs inherits it. Interactive gives the job the
+    // limits of an app, that is none (launchd.plist(5); spec 24).
+    let plist = render(&format!("<key>ProcessType</key>{}", string(PROCESS_TYPE)?))?;
+    let legacy_plist = Some(render("")?);
     Ok(Plan {
         backend: Backend::Launchd,
         label: def.label.clone(),
         domain,
         plist,
+        legacy_plist,
         domain_identity: def.mode.clone(),
         executable: def.executable.clone(),
         arguments: std::iter::once(absolute(&def.executable)?.to_owned())
@@ -236,6 +272,24 @@ mod tests {
             working_directory: "/var/example".into(),
         }
     }
+    /// A service an earlier version installed (no ProcessType) is still this
+    /// plan, so it can be stopped and upgraded; anything else is not.
+    #[test]
+    fn earlier_plist_is_recognized() {
+        use sha2::Digest as _;
+        let p = render(&definition()).unwrap();
+        let earlier = p
+            .plist()
+            .replace("<key>ProcessType</key><string>Interactive</string>", "");
+        assert_ne!(earlier, p.plist());
+        for text in [p.plist(), earlier.as_str()] {
+            assert!(p.installed_as(text.as_bytes()));
+            assert!(p.installed_digest(&sha2::Sha256::digest(text.as_bytes()).into()));
+        }
+        let other = earlier.replace("runner", "other");
+        assert!(!p.installed_as(other.as_bytes()));
+        assert!(!p.installed_digest(&sha2::Sha256::digest(other.as_bytes()).into()));
+    }
     #[test]
     fn rendering() {
         let d = definition();
@@ -250,7 +304,7 @@ mod tests {
             p.stop_arguments(Path::new("/tmp/example.plist")).unwrap(),
             ["bootout", "gui/501", "/tmp/example.plist"]
         );
-        assert_eq!(p.plist(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>org.example.worker</string><key>ProgramArguments</key><array><string>/opt/example/bin/runner</string><string>a&lt;&amp;&gt;&quot;&apos;</string></array><key>WorkingDirectory</key><string>/var/example</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n");
+        assert_eq!(p.plist(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>org.example.worker</string><key>ProgramArguments</key><array><string>/opt/example/bin/runner</string><string>a&lt;&amp;&gt;&quot;&apos;</string></array><key>WorkingDirectory</key><string>/var/example</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Interactive</string></dict></plist>\n");
         assert!(p.start_arguments(Path::new("relative")).is_err());
         let mut d = d;
         d.mode = Mode::SystemUser {

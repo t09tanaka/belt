@@ -101,7 +101,7 @@ fn read_definition(path: &Path, owner: u32, plan: &policy::Plan) -> anyhow::Resu
     let mut bytes = Vec::new();
     (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
     ensure!(
-        bytes == plan.plist().as_bytes(),
+        plan.installed_as(&bytes),
         "administrator-managed system service differs from the requested worker plan"
     );
     Ok(Receipt::system(
