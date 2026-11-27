@@ -1154,6 +1154,37 @@ mod tests {
         );
     }
 
+    /// A preparation is served only by a bundle selecting its toolchain.
+    #[test]
+    fn prepare_is_served_only_by_a_bundle_selecting_its_toolchain() {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("1.92.0").unwrap(),
+                scope,
+                location: Location {
+                    path: "rust-toolchain".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let rust = FrozenBundle::seal_exact(frozen).unwrap();
+        assert!(prepare_served("rust", Some(&rust)));
+        assert!(!prepare_served("npm", Some(&rust)));
+        assert!(!prepare_served("rust", None));
+        assert_eq!(prepare_toolchain("npm"), "node");
+    }
+
     #[test]
     fn setup_names_components_and_reports_are_bounded() {
         assert!(path_tool_name("cargo-llvm-cov"));
