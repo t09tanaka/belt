@@ -1088,8 +1088,16 @@ fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_wa
     // the command waits for it. The supervisor must go on looking meanwhile:
     // a renewal made while registration waits is observed
     // (lease_renewal_observed), not only after registration returns.
+    //
+    // The lease is 2 s against a renewal every 50 ms. With 700 ms a single
+    // stall of this thread past ~675 ms (lease less poll) on a loaded or
+    // coverage-instrumented runner let the lease lapse correctly, refusing
+    // every later renewal; that is the product rule, not a fault. Two leases
+    // (4 s) stay well under task-traffic-controller's 10 s ledger-lock
+    // timeout, so a supervisor that did not look while waiting still fails.
     let mut f = fx(vec![node("n", &crate::fixture_process::script("true"))]);
-    f.spec.lease_ms = 700;
+    f.spec.lease_ms = 2000;
+    let late_after = Duration::from_millis(2 * f.spec.lease_ms);
     std::fs::create_dir_all(&f.spec.traffic_state_dir).unwrap();
     let ledger_lock = std::fs::OpenOptions::new()
         .create(true)
@@ -1109,18 +1117,23 @@ fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_wa
         // taken, or when the bound runs out.
         let (mut seq, mut late, mut observed) = (1, None, None);
         let mut errors = Vec::new();
+        let (mut longest, mut last) = (Duration::ZERO, Instant::now());
         let until = Instant::now() + Duration::from_secs(20);
         while !runner.is_finished() {
-            if let Err(e) = second.renew_lease(
+            match second.renew_lease(
                 &attempt,
                 key(seq),
                 platform::wall_ms(),
                 belt::storage::GrantStamp::now(),
             ) {
-                errors.push(format!("renewal {seq}: {e}"));
+                Ok(_) => {
+                    longest = longest.max(last.elapsed());
+                    last = Instant::now();
+                }
+                Err(e) => errors.push(format!("renewal {seq} at {:?}: {e}", last.elapsed())),
             }
             if observed.is_none() {
-                if late.is_none() && held.elapsed() > Duration::from_millis(2 * 700) {
+                if late.is_none() && held.elapsed() > late_after {
                     late = Some(seq);
                 }
                 let newest = f
@@ -1144,7 +1157,7 @@ fn renewals_are_observed_while_task_traffic_controller_keeps_the_registration_wa
         assert_eq!(
             observed,
             Some(true),
-            "no renewal observed while registration waited; errors: {errors:?}"
+            "no renewal observed while registration waited; longest gap between renewals {longest:?}; errors: {errors:?}"
         );
         report
     });
