@@ -1268,7 +1268,9 @@ fn helper_entry() {
         return;
     };
     let pidfile = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_PIDFILE");
-    if role == "escape" {
+    if role == "leader-exits" {
+        leader_exits_first();
+    } else if role == "escape" {
         let mut c = Command::new(std::env::current_exe().unwrap());
         c.args(["--exact", "helper_entry", "--nocapture"])
             .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
@@ -1302,6 +1304,83 @@ fn helper_entry() {
         }
         std::thread::sleep(Duration::from_secs(30));
     }
+}
+
+/// The `leader-exits` role: the main thread of this process exits on its
+/// own while this (libtest's test) thread runs on for a while, then the
+/// whole process exits. Meanwhile Linux shows the process as a zombie
+/// leader of a group that still runs.
+#[cfg(target_os = "linux")]
+fn leader_exits_first() {
+    extern "C" fn exit_this_thread(_: libc::c_int) {
+        // `exit`, not `exit_group`: only the thread the signal landed on.
+        unsafe { libc::syscall(libc::SYS_exit, 0) };
+    }
+    // The thread that outlives the leader: longer than `GAP_LIMIT` + 1 looks
+    // of the tracker.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(2000));
+        std::process::exit(0);
+    });
+    // Only once the recorder has taken its first looks: it reads the
+    // command's start time when it starts.
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = std::process::id() as libc::pid_t;
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+    assert!(pid > 1);
+    if tid == pid {
+        // libtest runs the test on the main thread: leave from here.
+        exit_this_thread(0);
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            exit_this_thread as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        // Our own main thread, whose id is the pid.
+        libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR1);
+    }
+    std::thread::sleep(Duration::from_secs(10));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leader_exits_first() {}
+
+/// On Linux a process whose leader thread exited before its other threads
+/// is listed as a zombie although it still runs (and can still fork). Every
+/// multithreaded command that exits or is killed looks like this for a
+/// moment; on a loaded machine a look of the tracker landed there, could not
+/// find the command, and the run ended with its descendants "not recorded",
+/// keeping the budget. Here the moment is made long.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_whose_leader_thread_exits_first_is_still_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let exe = std::env::current_exe().unwrap().display().to_string();
+    let argv = [
+        "env",
+        "TASK_TRAFFIC_CONTROLLER_TEST_ROLE=leader-exits",
+        &exe,
+        "--exact",
+        "helper_entry",
+        "--nocapture",
+    ];
+    let s = spec(dir.path(), "le", "d", &argv);
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "le");
+    let ran = managed::run_command_with_tracker(&ctx, &guard, &s.opts, cfg.limits(), None).unwrap();
+    assert_eq!(
+        ran.outcome.exit,
+        task_traffic_controller::runner::Exit::Code(0),
+        "{:?}",
+        ran.outcome
+    );
+    assert!(!ran.outcome.tracker_unknown, "{:?}", sidecar(&ctx, "le"));
+    let sc = sidecar(&ctx, "le");
+    assert!(!sc.descendants_truncated && sc.tracked_to_exit, "{sc:?}");
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("le").is_none());
 }
 
 fn helper_command(role: &str, pidfile: &Path, ignore_term: bool) -> Vec<String> {

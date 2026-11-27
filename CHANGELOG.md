@@ -7,6 +7,10 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- On Linux a managed command that is multithreaded could end with "the descendants of the command could not be recorded", keeping its budget, although it exited normally or was stopped. When the leader thread of such a process exits before the others (as it may while the process exits or is killed, and for as long as it runs after its main thread called `pthread_exit`), the kernel shows the process as a zombie while it still runs. The process table left it out, so a look of the recorder landing in that moment could not find the command; the gap it opened could never close once the command was gone, and the record became truncated. The process table now lists a zombie whose `/proc/<pid>/task` still names a thread other than its leader as running, so such a look finds the command (and still walks what it starts). A real survivor still keeps the budget.
+
 ## [0.12.3] - 2026-11-26
 
 ### Fixed
