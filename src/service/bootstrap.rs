@@ -299,6 +299,13 @@ pub fn read_input(path: &Path) -> anyhow::Result<Spec> {
 
 /// Hidden process entry. Stdin is one bounded, private bootstrap specification.
 pub fn daemon_main(input: Option<&Path>) -> i32 {
+    // Only the error of the latest start is kept: launchd keeps no output.
+    let error_file = input
+        .and_then(Path::parent)
+        .map(|dir| dir.join(STARTUP_ERROR));
+    if let Some(file) = &error_file {
+        let _ = std::fs::remove_file(file);
+    }
     let result = (|| -> anyhow::Result<()> {
         let mut bytes = Vec::new();
         match input {
@@ -368,9 +375,44 @@ pub fn daemon_main(input: Option<&Path>) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "error: {e}");
+            if let Some(file) = &error_file {
+                let _ = write_startup_error(file, &format!("{e:#}"));
+            }
             1
         }
     }
+}
+
+/// The file beside a managed daemon's input that holds why its latest start
+/// failed (`belt upgrade` reports it). Gone while the latest start goes on.
+pub(crate) const STARTUP_ERROR: &str = "resident-error";
+const STARTUP_ERROR_LIMIT: usize = 4096;
+
+fn write_startup_error(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut end = text.len().min(STARTUP_ERROR_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)?
+        .write_all(&text.as_bytes()[..end])
+}
+
+/// Why the latest start of the managed daemon whose input is `input` failed,
+/// if it did.
+pub(crate) fn startup_error(input: &Path) -> Option<String> {
+    let file = input.parent()?.join(STARTUP_ERROR);
+    let meta = std::fs::symlink_metadata(&file).ok()?;
+    if !meta.is_file() || meta.len() > STARTUP_ERROR_LIMIT as u64 {
+        return None;
+    }
+    std::fs::read_to_string(file).ok()
 }
 
 /// Connect only: service health must never spawn a detached fallback owner.
@@ -392,6 +434,29 @@ pub async fn health(spec: &Spec) -> anyhow::Result<Reply> {
 #[cfg(test)]
 mod state_dir_tests {
     use super::distinct_state_dirs;
+
+    /// A managed daemon that cannot start leaves why beside its input, and
+    /// a start that gets further removes what an earlier one left.
+    #[test]
+    fn a_failed_start_leaves_its_error_beside_the_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_tmp::tempdir().unwrap();
+        let dir = root.path().join("config");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = dir.join("coordinator.json");
+        std::fs::write(&input, "{}").unwrap();
+        assert_eq!(super::daemon_main(Some(&input)), 1);
+        assert_eq!(
+            super::startup_error(&input).as_deref(),
+            Some("unsafe resident directory")
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(super::daemon_main(Some(&input)), 1);
+        let second = super::startup_error(&input).unwrap();
+        assert_ne!(second, "unsafe resident directory", "{second}");
+    }
 
     /// Review round 1, L4: a worker state directory that resolves to the
     /// parent's (the same path, or another path to it) is refused.
