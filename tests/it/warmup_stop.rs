@@ -157,7 +157,12 @@ async fn the_idle_release_stops_the_install_and_a_later_sync_installs_once() {
     loop {
         match warm(&client, &spec, &second).await {
             SyncOutcome::Pending => {
-                assert!(Instant::now() < end, "the second install did not end");
+                assert!(
+                    Instant::now() < end,
+                    "the second install did not end; calls {}, pids {:?}",
+                    calls(&host),
+                    recorded(&host)
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             outcome => {
