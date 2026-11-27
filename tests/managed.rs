@@ -1427,15 +1427,10 @@ fn pid_alive(pid: i32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_zombie(pid: i32) -> bool {
-    // "<pid> (<comm>) <state> ...": the comm may contain anything, so the
-    // state is what follows the last ')'.
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    std::fs::read(format!("/proc/{pid}/stat"))
         .ok()
-        .and_then(|s| {
-            let rest = s.get(s.rfind(')')? + 1..)?;
-            rest.trim_start().chars().next()
-        })
-        .is_some_and(|c| c == 'Z' || c == 'X')
+        .and_then(|s| stat_state(&s))
+        .is_some_and(|c| c == b'Z' || c == b'X')
 }
 
 #[cfg(target_os = "macos")]
@@ -1536,6 +1531,18 @@ fn a_descendant_whose_leader_thread_exited_is_still_stopped() {
     assert!(ledger(&ctx).find("le-left").is_none());
 }
 
+/// The state byte of a `/proc` `stat` line, `"<pid> (<comm>) <state> ..."`.
+/// The comm may contain anything, including bytes that are not UTF-8, so the
+/// line is read as bytes and the state follows the last `)` and its space.
+#[cfg(target_os = "linux")]
+fn stat_state(stat: &[u8]) -> Option<u8> {
+    let end = stat.iter().rposition(|&b| b == b')')?;
+    stat[end + 1..]
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+}
+
 /// Does any thread of `pid` other than a zombie or dead one remain?
 #[cfg(target_os = "linux")]
 fn group_runs(pid: i32) -> bool {
@@ -1544,13 +1551,10 @@ fn group_runs(pid: i32) -> bool {
     };
     dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .any(|tid| {
-            std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))
+            std::fs::read(format!("/proc/{pid}/task/{tid}/stat"))
                 .ok()
-                .and_then(|s| {
-                    let rest = s.get(s.rfind(')')? + 1..)?;
-                    rest.trim_start().chars().next()
-                })
-                .is_some_and(|c| c != 'Z' && c != 'X')
+                .and_then(|s| stat_state(&s))
+                .is_some_and(|c| c != b'Z' && c != b'X')
         })
 }
 

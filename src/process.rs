@@ -68,7 +68,7 @@ fn tasks(pid: u32) -> Option<Vec<(u32, Option<char>)>> {
     Some(
         dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
             .map(|tid: u32| {
-                let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"));
+                let stat = std::fs::read(format!("/proc/{pid}/task/{tid}/stat"));
                 (tid, stat.ok().as_deref().and_then(stat_state))
             })
             .collect(),
@@ -81,10 +81,14 @@ fn tasks(_pid: u32) -> Option<Vec<(u32, Option<char>)>> {
 }
 
 /// The state letter of a `/proc` `stat` line, `"<pid> (<comm>) <state> ..."`.
-/// The comm may contain anything, so the state is what follows the last `)`.
+/// The comm may contain anything, including bytes that are not UTF-8 (the
+/// kernel cuts it at 15 bytes, even inside a character), so the line is read
+/// as bytes and the state is the byte after the last `)` and its space.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn stat_state(stat: &str) -> Option<char> {
-    stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+fn stat_state(stat: &[u8]) -> Option<char> {
+    let end = stat.iter().rposition(|&b| b == b')')?;
+    let state = *stat[end + 1..].iter().find(|b| !b.is_ascii_whitespace())?;
+    Some(state as char)
 }
 
 /// [`runs`] on plain readings: `tasks` is the threads under
@@ -723,10 +727,18 @@ mod tests {
 
     #[test]
     fn the_state_is_read_after_the_last_parenthesis() {
-        assert_eq!(stat_state("41 (cargo) S 1 41"), Some('S'));
-        assert_eq!(stat_state("41 (a) Z (b)) R 1 41"), Some('R'));
-        assert_eq!(stat_state("41 (x"), None);
-        assert_eq!(stat_state("41 (x)"), None);
+        assert_eq!(stat_state(b"41 (cargo) S 1 41"), Some('S'));
+        assert_eq!(stat_state(b"41 (a) Z (b)) R 1 41"), Some('R'));
+        assert_eq!(stat_state(b"41 (x"), None);
+        assert_eq!(stat_state(b"41 (x)"), None);
+    }
+
+    #[test]
+    fn a_comm_cut_inside_a_multibyte_character_still_gives_the_state() {
+        // The kernel cuts the comm at 15 bytes, here inside the third byte of
+        // "あ" (e3 81 82), so the line is not UTF-8.
+        let stat = b"41 (abcdefgh)\xe3\x81\x82\xe3\x81) S 1 41";
+        assert_eq!(stat_state(stat), Some('S'));
     }
 
     #[cfg(target_os = "macos")]
