@@ -510,7 +510,7 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
         self.files.verify(receipt)?;
         anyhow::ensure!(
             receipt.path.file_name().and_then(|n| n.to_str()) == Some(plan.filename().as_str())
-                && receipt.digest == <[u8; 32]>::from(Sha256::digest(plan.plist().as_bytes())),
+                && plan.installed_digest(&receipt.digest),
             "installed plan differs"
         );
         Ok(())

@@ -972,6 +972,8 @@ SSHで到達できる、起動中のMacへworkerを導入・起動できる。Re
 
 既定はユーザーのLaunchAgentとする。ログインsessionが存在する開発用Mac向けで、logout中・login前の常駐を保証しない。無人の専用Macには、明示選択の `service_mode = "system-user"` を提供し、LaunchDaemonの `UserName` で非rootの実行userを指定する。service登録に管理権限が必要でも、CI自体をrootで実行しない。
 
+beltが書くplist（residentとworkerのLaunchAgent、LaunchDaemon、更新の番人）には `ProcessType` を `Interactive` で入れる。launchd.plist(5) によれば、`ProcessType` を書かない（`Standard` と同じ）jobにはlaunchdが軽い資源制限をかけ、CPUの使用とI/Oの帯域を絞る。`Background` はさらに強く絞り、`Interactive` はappと同じ制限、つまり制限なしで動かす。residentの子として動くのは利用者が投入したbuildとtestなので、絞られると利用者が結果を待つ時間がそのまま延びる。manは `Interactive` を応答性がそれに依存するjobに限るよう勧めるが、CIの完了を待つ利用者にとってはresidentの処理速度が応答性そのものであり、`Adaptive` はXPCの通信を前提とするので使えない。`Nice`・`LowPriorityIO`・`LowPriorityBackgroundIO` は書かない（既定のまま絞らない）。beltとtask-traffic-controllerは、起動するcommandにnice値やQoSを設定しない。前の版が `ProcessType` なしで書いたplistも、同じserviceの定義として認め（止めて更新できる）、`upgrade` と `init` が書き直すときに `ProcessType` を加える。
+
 launchd配下のagentはforegroundで動作する。attempt supervisorをagentの一時的なSSH process groupへ従属させず、agent再起動が所有commandへどのように伝わるかを検証する。supervisor自体の自動再起動によってuser commandを再実行してはならない。
 
 system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用できるとは限らない。doctorが実際のservice user・service環境でprofileを検査し、必要能力を持つworkerだけを選ぶ。専用Macのreboot後の自動agent復帰はこのmodeで受入検証する。
@@ -1357,7 +1359,7 @@ Macのservice運用、SSH、Git転送の根拠は次の一次資料とする。�
 - [Apple Remote Login](https://support.apple.com/ja-jp/guide/mac-help/mchlp1066/27/mac/27)：SSH／SFTPと利用userの設定。
 - [Apple Designing Daemons and Services](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/DesigningDaemons.html)：daemonとagentの実行文脈。
 - [Apple Creating Launch Daemons and Agents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)：loginとservice lifecycle。
-- [Apple launchd.plist manual](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)：UserName、KeepAlive、process group等のservice設定。
+- [Apple launchd.plist manual](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)：UserName、KeepAlive、ProcessType、process group等のservice設定。
 - [OpenSSH ssh manual](https://man.openbsd.org/ssh.1)：リモートcommandとSSH transport。
 - [Git bundle documentation](https://git-scm.com/docs/git-bundle)：Git objectsとrefsの転送・検証。
 
