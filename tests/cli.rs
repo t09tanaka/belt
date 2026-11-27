@@ -800,7 +800,9 @@ fn nested_inherit_runs_at_once_under_the_outer_entry() {
 
 #[test]
 fn front_jumps_the_queue() {
-    let env = TestEnv::new().with_config("budget = 1\n");
+    // About queue order, not the overload guard: with the default factor a
+    // load average of 2 (budget 1) would hold `--front` on a busy host.
+    let env = TestEnv::new().with_config("budget = 1\nfront_overload_factor = 0.0\n");
     let dir = env.marker_dir();
     let first_gate = Gate::new(&dir, "first");
     let front_gate = Gate::new(&dir, "front");
@@ -828,42 +830,9 @@ fn front_jumps_the_queue() {
     assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("normal.start")));
 }
 
-#[test]
-fn front_waits_briefly_on_an_overloaded_machine() {
-    // A factor this small makes any non-zero load average "overloaded".
-    let env = TestEnv::new().with_config(
-        "budget = 2\nmemory_reserve_mib = 0\nfront_overload_factor = 0.0001\nfront_overload_max_wait_secs = 2\n",
-    );
-    let dir = env.marker_dir();
-    let first_gate = Gate::new(&dir, "first");
-    let mut first = env.spawn_exec(&["--weight", "1"], &marked_gate(&dir, "first"));
-    assert!(wait_until(Duration::from_secs(5), || {
-        env.entries().iter().any(|e| e["state"] == "running")
-    }));
-    let queued = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let front = env.spawn_exec(
-        &["--front", "--weight", "1"],
-        &marker_script(&dir, "front", "0"),
-    );
-    let out = front.wait_with_output().unwrap();
-    assert!(out.status.success());
-    let waited = Duration::from_nanos(
-        (read_ns(&dir.join("front.start")) - queued)
-            .try_into()
-            .unwrap(),
-    );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("overloaded: load"), "{err}");
-    assert!(waited >= Duration::from_millis(1900), "{waited:?}");
-    assert!(!dir.join("first.released.start").exists());
-    first_gate.release();
-    assert!(first.wait().unwrap().success());
-    // It gave up on the guard rather than waiting for `first` to finish.
-    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.released.start")));
-}
+// The overload guard for `--front` is driven by injected machine readings
+// in `exec::tests::with_context::front_waits_briefly_on_an_overloaded_machine`:
+// through the binary it could only read the real load average.
 
 #[test]
 fn killed_waiting_head_is_reaped_and_queue_moves_on() {

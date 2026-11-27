@@ -1063,6 +1063,101 @@ mod tests {
             );
         }
 
+        /// A `--front` run on a machine whose load average is over the
+        /// limit, with one weight of the budget held by a running entry:
+        /// the lines it printed while waiting and how long it waited.
+        fn front_beside_a_holder(load_avg: f64) -> (Gated, Vec<String>, Duration) {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+            let ctx = Context::new(Paths::new(dir.path().join("state"), dir.path().join("c")))
+                .with_clock(clock.clone())
+                .with_live(Arc::new(FixedLive(Some(admit::LiveSnapshot {
+                    available_memory: 64 << 30,
+                    cpu_busy: 0.0,
+                    load_avg,
+                }))));
+            // Overloaded from a load average of 4; held for at most 2 s.
+            let cfg = Config::parse(
+                "budget = 2\nfront_overload_factor = 2.0\nfront_overload_max_wait_secs = 2\n",
+            )
+            .unwrap();
+            let _held = lock::take_lease(&ctx, "holder").unwrap();
+            let mut ledger = Ledger::load(&ctx.paths.ledger_file()).unwrap();
+            let seq = ledger.take_seq();
+            ledger.entries.push(Entry {
+                id: "holder".into(),
+                pid: 1,
+                state: State::Running,
+                front: false,
+                weight: 1,
+                predicted_rss: 0,
+                expected_secs: None,
+                repo: String::new(),
+                subdir: String::new(),
+                argv: "sleep".into(),
+                key: "k".into(),
+                seq,
+                enqueued_at: clock.now(),
+                started_at: Some(clock.now()),
+                using: None,
+                backfilled: false,
+                label: None,
+                worktree: None,
+                branch: None,
+                parent: None,
+                nested_cpu_secs: 0.0,
+                extra: Default::default(),
+            });
+            ledger.save(&ctx.paths.ledger_file()).unwrap();
+            let polls = Cell::new(0);
+            let cancelled = bounded(1000, &polls);
+            let lines = std::cell::RefCell::new(Vec::new());
+            let o = Opts {
+                front: true,
+                weight: Some(1),
+                ..opts(dir.path(), &["true"])
+            };
+            let start = clock.monotonic();
+            let got = run_gated(
+                &ctx,
+                &cfg,
+                &o,
+                "front",
+                &Hooks {
+                    cancelled: &cancelled,
+                    progress: &|l| lines.borrow_mut().push(l.to_string()),
+                    progress_tty: true,
+                },
+            )
+            .unwrap();
+            let waited = clock.monotonic() - start;
+            (got, lines.into_inner(), waited)
+        }
+
+        #[test]
+        fn front_waits_briefly_on_an_overloaded_machine() {
+            let (got, lines, waited) = front_beside_a_holder(99.0);
+            assert_eq!(got, Gated::Finished(Exit::Code(0)));
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("overloaded: load 99, limit 4")),
+                "{lines:?}"
+            );
+            // It gave up on the guard after its max wait, with the holder
+            // still running, rather than waiting for the holder to finish.
+            assert!(waited >= Duration::from_secs(2), "{waited:?}");
+            assert!(waited < Duration::from_secs(3), "{waited:?}");
+        }
+
+        #[test]
+        fn front_does_not_wait_below_the_overload_limit() {
+            let (got, lines, waited) = front_beside_a_holder(3.9);
+            assert_eq!(got, Gated::Finished(Exit::Code(0)));
+            assert!(!lines.iter().any(|l| l.contains("overloaded")), "{lines:?}");
+            assert!(waited < Duration::from_secs(1), "{waited:?}");
+        }
+
         #[test]
         fn concurrent_runs_in_one_process_do_not_share_state() {
             let a = tempfile::tempdir().unwrap();

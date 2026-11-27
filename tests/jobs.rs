@@ -139,13 +139,21 @@ fn wait_reports_in_given_order_and_first_failure_wins() {
 #[test]
 fn jobs_are_gated_by_the_budget() {
     let env = TestEnv::new("budget = 1\n");
-    let (a, _) = env.submit(&[], "sleep 1");
+    // `a` runs until the test opens its gate: however slow the machine,
+    // it cannot finish between two looks and let `b` through.
+    let gate = env.dir.path().join("a.gate");
+    let (a, _) = env.submit(
+        &[],
+        &format!("until [ -e {} ]; do sleep 0.05; done", gate.display()),
+    );
     let (b, _) = env.submit(&[], "true");
     assert!(wait_until(Duration::from_secs(5), || env.state_of(&a) == "running"));
     assert_eq!(env.state_of(&b), "queued");
     assert!(wait_until(Duration::from_secs(5), || {
         String::from_utf8_lossy(&env.run(&["status"]).stdout).contains("waiting (1)")
     }));
+    assert_eq!(env.state_of(&b), "queued");
+    fs::write(&gate, "").unwrap();
     assert!(env.run(&["wait", &a, &b]).status.success());
     assert_eq!(env.state_of(&b), "done 0");
 }
@@ -386,13 +394,38 @@ fn the_runner_records_the_exit_before_it_leaves_the_queue() {
 #[test]
 fn a_job_log_over_the_limit_is_cut_before_wait_can_see_it() {
     let env = TestEnv::new("budget = 4\njobs_log_max_mib = 1\n");
-    let (id, _) = env.submit(&[], "yes 0123456789abcdef | head -c 3000000; echo the-end");
+    // A cut of a running log loses what the job writes during it (see
+    // `jobs::cap_log`), so the last line is written only once the runner
+    // has cut the log under the limit and stops cutting.
+    let written = env.dir.path().join("written");
+    let gate = env.dir.path().join("end.gate");
+    let (id, _) = env.submit(
+        &[],
+        &format!(
+            "yes 0123456789abcdef | head -c 3000000; touch {}; \
+             until [ -e {} ]; do sleep 0.05; done; echo the-end",
+            written.display(),
+            gate.display()
+        ),
+    );
+    let log = env.state().join(format!("jobs/{id}.log"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        written.exists()
+            && fs::read(&log).is_ok_and(|b| {
+                b.len() < 1 << 20 && String::from_utf8_lossy(&b).contains("were cut")
+            })
+    }));
+    fs::write(&gate, "").unwrap();
     let out = env.run(&["wait", &id]);
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.len() < (1 << 20) + 1000, "{}", text.len());
     assert!(text.contains("were cut"), "{}", &text[..300]);
-    assert!(text.trim_end().ends_with("the-end"));
+    assert!(
+        text.trim_end().ends_with("the-end"),
+        "{}",
+        &text[text.len().saturating_sub(300)..]
+    );
 }
 
 #[test]
@@ -566,7 +599,19 @@ fn job_without_a_waiter_is_cancelled_after_grace() {
         &[],
         &format!("echo $$ > {}; exec sleep 30", pidfile.display()),
     );
+    // Be its waiter until the command runs, so the grace (counted from
+    // submit) cannot run out while a slow machine is still starting it;
+    // from the drop on, nobody waits.
+    let waiter = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.state().join(format!("jobs/{id}.waiter")))
+        .unwrap();
+    waiter.lock_shared().unwrap();
     assert!(wait_until(Duration::from_secs(5), || pidfile.exists()));
+    drop(waiter);
     assert!(
         wait_until(Duration::from_secs(6), || {
             env.state_of(&id).starts_with("orphaned")
