@@ -50,12 +50,28 @@ pub fn set_up_tools(plan: &FrozenPlan, task: &ExecutionTask) -> std::collections
         .flat_map(|w| &w.jobs)
         .filter(|j| task.jobs.contains(&j.id))
         .flat_map(|j| &j.steps)
-        .filter_map(|s| {
-            let uses = s.uses.as_deref()?;
-            let action = uses.split_once('@').map_or(uses, |(a, _)| a);
-            crate::toolchain::declarations::setup_action_tool(action)
+        .flat_map(|s| {
+            let action = s
+                .uses
+                .as_deref()
+                .map(|uses| uses.split_once('@').map_or(uses, |(a, _)| a))
+                .and_then(crate::toolchain::declarations::setup_action_tool);
+            let run = s.run.as_deref().map(run_programs).unwrap_or_default();
+            action.into_iter().chain(run)
         })
         .map(str::to_string)
+        .collect()
+}
+
+/// The preset programs (`npm`, `node`, `dart`, `flutter`, `ruby`, `bundle`)
+/// a `run:` script names as the first word of a command: a job whose only
+/// step is `run: npm run lint` uses npm, so its preparation runs the npm
+/// preset (spec 22.1). Other words are not tools a preset prepares.
+fn run_programs(script: &str) -> Vec<&'static str> {
+    script
+        .split(['\n', ';', '|', '&', '(', ')'])
+        .filter_map(crate::workspace::prepare_tools::program_of)
+        .filter_map(crate::workspace::prepare_tools::preset_program)
         .collect()
 }
 
@@ -211,6 +227,16 @@ fn short(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_script_names_the_preset_programs_its_commands_start_with() {
+        assert_eq!(run_programs("npm run lint"), ["npm"]);
+        assert_eq!(
+            run_programs("cd web && CI=1 npx tsc\nflutter test | tee log; echo npm"),
+            ["flutter"]
+        );
+        assert!(run_programs("cargo test").is_empty());
+    }
 
     fn step(uses: &str, with: &[(&str, &str)]) -> StepSpec {
         StepSpec {

@@ -1084,6 +1084,37 @@ mod tests {
         assert!(missing_with_installable(&of("test"), Some(&mini), None).is_empty());
     }
 
+    /// A job whose only step is `run: npm run lint` uses npm without a setup
+    /// step (the runner image has it): its preparation runs the npm preset
+    /// and requires node and npm, while a job that names no preset program
+    /// skips it (spec 22.1).
+    #[test]
+    fn a_run_step_that_names_npm_prepares_the_npm_preset() {
+        use crate::toolchain::capability::Requirement;
+        let f = fixture(
+            "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo build\n",
+        );
+        let paths = ["Cargo.lock", "package-lock.json"];
+        let prepare = crate::workspace::prepare_tools::prepare_tools(paths, None).unwrap();
+        let requirements = Default::default();
+        let digest = Digest::of_bytes(b"plan bytes");
+        let mut specs = task_specs(&f.plan, &digest, &digest, &requirements, None).unwrap();
+        with_preparation(&mut specs, &f.plan, &prepare, &requirements).unwrap();
+        let of = |job: &str| {
+            let id = task_of(&f.plan, job).to_string();
+            let spec = &specs.iter().find(|(t, _)| t == &id).unwrap().1;
+            spec.requirements.requires.clone()
+        };
+        assert_eq!(
+            of("lint"),
+            [
+                Requirement::Prepare("node".into()),
+                Requirement::Prepare("npm".into())
+            ]
+        );
+        assert_eq!(of("build"), [Requirement::SkipPreset("npm".into())]);
+    }
+
     /// A Rust-only job of a source with a tracked npm example prepares no
     /// npm project, as on GitHub Actions: it requires neither node nor npm,
     /// only a worker that skips the preset, so a worker without node (mini

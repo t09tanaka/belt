@@ -111,6 +111,15 @@ pub fn is_preset(name: &str) -> bool {
     PRESETS.iter().any(|p| p.0 == name)
 }
 
+/// `program` as the preset tool it names (`npm`, `dart`, ...), if it is one.
+pub(crate) fn preset_program(program: &str) -> Option<&'static str> {
+    PRESET_SETUP
+        .iter()
+        .flat_map(|(_, tools)| tools.iter())
+        .find(|t| **t == program)
+        .copied()
+}
+
 /// Whether setting up `set_up` makes a task prepare the projects of `preset`.
 fn needs_preset(preset: &str, set_up: &BTreeSet<String>) -> bool {
     PRESET_SETUP
@@ -122,7 +131,7 @@ fn needs_preset(preset: &str, set_up: &BTreeSet<String>) -> bool {
 /// The program a shell command runs first: the first word after any
 /// `NAME=value` assignments. `None` for a command that starts with anything
 /// a plain word is not (a quote, a subshell, a variable).
-fn program_of(command: &str) -> Option<&str> {
+pub(crate) fn program_of(command: &str) -> Option<&str> {
     let word = command
         .split_whitespace()
         .find(|w| !w.split_once('=').is_some_and(|(n, _)| is_name(n)))?;
