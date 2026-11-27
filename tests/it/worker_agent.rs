@@ -6007,6 +6007,34 @@ fn a_stopping_or_crowded_worker_starts_no_new_warm_up() {
 }
 
 #[test]
+fn the_idle_time_of_a_warm_up_starts_when_its_look_ends() {
+    // The parent asks again only once it has the answer: a look that took
+    // longer than the idle time must not leave the warm-up already idle, or
+    // a loaded host lets go of (and stops) every install before it is asked
+    // about again.
+    let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 3_000);
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    f.host.tool_poll_hold.store(true, Ordering::SeqCst);
+    let sync = RequestId::generate();
+    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    std::thread::sleep(Duration::from_millis(3_200));
+    f.host.tool_poll_hold.store(false, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    agent.tick();
+    let consumer = f.host.tool_polls()[0].clone();
+    assert!(
+        !f.host.releases().contains(&consumer),
+        "released at the end of its look"
+    );
+    // Nobody asks after the answer: released once the idle time is over.
+    wait_for("the idle release", || {
+        agent.tick();
+        f.host.releases().contains(&consumer)
+    });
+    assert_eq!(f.host.releases(), vec![consumer]);
+}
+
+#[test]
 fn a_slow_look_is_answered_pending_and_asking_meanwhile_starts_no_second_look() {
     let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 3_000);
     *f.host.tool_poll.lock().unwrap() = Some(Some("the manager exited 19".into()));

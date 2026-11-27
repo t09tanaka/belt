@@ -76,7 +76,10 @@ fn kept(looking: bool, asked_ms: u64, now: u64, idle: u64) -> bool {
     looking || now.saturating_sub(asked_ms) < idle
 }
 
-/// Ends the look when its thread ends, however it ends.
+/// Ends the look when its thread ends, however it ends. The idle time starts
+/// again then: the coordinator can only ask again once it has the answer, and
+/// a look that took longer than the idle time (a loaded host) must not leave
+/// the warm-up already idle, released before the next ask arrives.
 struct Looking {
     agent: Arc<Agent>,
     id: String,
@@ -85,6 +88,7 @@ impl Drop for Looking {
     fn drop(&mut self) {
         if let Some(warmup) = lock(&self.agent.warmups).get_mut(&self.id) {
             warmup.looking = false;
+            warmup.asked_ms = warmup.asked_ms.max(platform::monotonic_ms());
         }
     }
 }
