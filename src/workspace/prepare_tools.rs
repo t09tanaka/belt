@@ -44,6 +44,10 @@ pub struct PrepareTools {
     pub presets: BTreeMap<String, BTreeSet<String>>,
     pub always: BTreeSet<String>,
     pub unobservable: BTreeSet<String>,
+    /// The source declares a `[[post_add]]` hook. `fast-worktree` 0.9 runs
+    /// hooks with `--skip-preset` too, and a hook may need what a preset
+    /// installs, so such a source skips no preset (spec 22.1).
+    pub post_add: bool,
 }
 
 /// The preparation of one task: the tools it runs, each a requirement of the
@@ -82,6 +86,9 @@ impl PrepareTools {
     /// every other preset with a project. The one rule both the parent's
     /// requirements and the worker's `fast-worktree add` follow (spec 22.1).
     pub fn for_task(&self, set_up: &BTreeSet<String>) -> TaskPreparation {
+        if self.post_add {
+            return self.whole();
+        }
         let mut out = TaskPreparation {
             tools: self.always.clone(),
             skip: Vec::new(),
@@ -113,6 +120,8 @@ pub fn is_preset(name: &str) -> bool {
 
 /// `program` as the preset tool it names (`npm`, `dart`, ...), if it is one.
 pub(crate) fn preset_program(program: &str) -> Option<&'static str> {
+    // `npx` runs the packages `npm ci` installs.
+    let program = if program == "npx" { "npm" } else { program };
     PRESET_SETUP
         .iter()
         .flat_map(|(_, tools)| tools.iter())
@@ -193,6 +202,7 @@ pub fn prepare_tools<'a>(
             }
         }
     }
+    out.post_add = !config.post_add.is_empty();
     // A hook with `requires` is skipped by fast-worktree when that tool is
     // missing: it never fails preparation. A hook runs whatever is skipped.
     for hook in config.post_add.iter().filter(|h| h.requires.is_none()) {
@@ -252,8 +262,7 @@ mod tests {
     }
 
     /// A `[[clone]]` entry of a preset is skipped with it, commands
-    /// included; an entry without a preset and a `post_add` hook run for
-    /// every task.
+    /// included; an entry without a preset runs for every task.
     #[test]
     fn a_skipped_preset_leaves_out_its_clone_entries_but_not_the_rest() {
         let config = r#"
@@ -266,20 +275,26 @@ key_commands = ["flutter --version"]
 path = "vendor"
 key = ["vendor.lock"]
 install = "cargo vendor"
-
-[[post_add]]
-run = "portool sync"
 "#;
         let found = prepare_tools([], Some(config)).unwrap();
         let rust = found.for_task(&set(&["rust"]));
-        assert_eq!(rust.tools, set(&["cargo", "portool"]));
+        assert_eq!(rust.tools, set(&["cargo"]));
         assert_eq!(rust.skip, ["npm"]);
         let node = found.for_task(&set(&["node"]));
-        assert_eq!(
-            node.tools,
-            set(&["cargo", "flutter", "node", "npm", "portool"])
-        );
+        assert_eq!(node.tools, set(&["cargo", "flutter", "node", "npm"]));
         assert!(node.skip.is_empty());
+    }
+
+    /// fast-worktree 0.9 runs `[[post_add]]` hooks with `--skip-preset` as
+    /// well, and a hook may use what a preset installs: a source with any
+    /// hook skips no preset, even one whose hook has `requires`.
+    #[test]
+    fn a_post_add_hook_makes_every_task_prepare_every_preset() {
+        let config = "[[post_add]]\nrun = \"npm run codegen\"\nrequires = \"npm\"\n";
+        let found = prepare_tools(["web/package-lock.json"], Some(config)).unwrap();
+        let rust = found.for_task(&set(&["rust"]));
+        assert!(rust.skip.is_empty());
+        assert_eq!(rust.tools, set(&["node", "npm"]));
     }
 
     /// `[[ignore]]` leaves a project out, as fast-worktree does.

@@ -44,6 +44,12 @@ pub fn of_task(plan: &FrozenPlan, task: &ExecutionTask) -> SetupTools {
 /// cannot read the version it asks for. These decide which presets the
 /// task's workspace preparation runs (spec 22.1).
 pub fn set_up_tools(plan: &FrozenPlan, task: &ExecutionTask) -> std::collections::BTreeSet<String> {
+    let matrix = |key: &str| -> Option<String> {
+        match task.variant.as_ref()?.values.get(key)? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    };
     plan.workflows
         .iter()
         .filter(|w| w.file == task.workflow)
@@ -56,23 +62,91 @@ pub fn set_up_tools(plan: &FrozenPlan, task: &ExecutionTask) -> std::collections
                 .as_deref()
                 .map(|uses| uses.split_once('@').map_or(uses, |(a, _)| a))
                 .and_then(crate::toolchain::declarations::setup_action_tool);
-            let run = s.run.as_deref().map(run_programs).unwrap_or_default();
+            let run = s
+                .run
+                .as_deref()
+                .map(|script| run_programs(&expand_matrix(script, &matrix)))
+                .unwrap_or_default();
             action.into_iter().chain(run)
         })
         .map(str::to_string)
         .collect()
 }
 
-/// The preset programs (`npm`, `node`, `dart`, `flutter`, `ruby`, `bundle`)
-/// a `run:` script names as the first word of a command: a job whose only
-/// step is `run: npm run lint` uses npm, so its preparation runs the npm
-/// preset (spec 22.1). Other words are not tools a preset prepares.
+/// `script` with each `${{ matrix.<key> }}` replaced by the task's matrix
+/// value, as [`of_task`] reads step inputs; any other expression stays.
+fn expand_matrix(script: &str, matrix: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut rest = script;
+    while let Some(start) = rest.find("${{") {
+        let Some(len) = rest[start..].find("}}") else {
+            break;
+        };
+        let expression = &rest[start..start + len + 2];
+        out.push_str(&rest[..start]);
+        match literal(expression, matrix) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(expression),
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The preset programs (`npm`, `npx`, `node`, `dart`, `flutter`, `ruby`,
+/// `bundle`) a `run:` script runs as a command: a job whose only step is
+/// `run: npm run lint` uses npm, so its preparation runs the npm preset
+/// (spec 22.1). A simple tokenizer, not a shell parser: a command starts the
+/// script and follows each `;`, `|`, `&`, `(`, `)` and line break, after
+/// reserved words (`if`, `then`, `do`, `!`, `{`, ...), `NAME=value`
+/// assignments and the prefix commands `time`, `env`, `exec`, `command`
+/// (and their `-` options). Programs a script, a `make` target or a
+/// composite action runs are not seen.
 fn run_programs(script: &str) -> Vec<&'static str> {
-    script
-        .split(['\n', ';', '|', '&', '(', ')'])
-        .filter_map(crate::workspace::prepare_tools::program_of)
-        .filter_map(crate::workspace::prepare_tools::preset_program)
-        .collect()
+    const RESERVED: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time",
+        "env", "exec", "command", "nohup",
+    ];
+    let spaced: String = script
+        .chars()
+        .flat_map(|c| match c {
+            '\n' | ';' | '|' | '&' | '(' | ')' => [' ', ';', ' '],
+            c => [c, '\0', '\0'],
+        })
+        .filter(|c| *c != '\0')
+        .collect();
+    let mut out = Vec::new();
+    let mut start = true;
+    let mut prefixed = false;
+    for word in spaced.split_whitespace() {
+        if word == ";" {
+            start = true;
+            prefixed = false;
+            continue;
+        }
+        if !start {
+            continue;
+        }
+        if RESERVED.contains(&word) {
+            prefixed = true;
+            continue;
+        }
+        if (prefixed && word.starts_with('-'))
+            || word.split_once('=').is_some_and(|(n, _)| {
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        {
+            continue;
+        }
+        start = false;
+        if let Some(tool) = crate::workspace::prepare_tools::program_of(word)
+            .and_then(crate::workspace::prepare_tools::preset_program)
+        {
+            out.push(tool);
+        }
+    }
+    out
 }
 
 /// The workspace preparation of `task` (spec 22.1): the presets its setup
@@ -233,9 +307,36 @@ mod tests {
         assert_eq!(run_programs("npm run lint"), ["npm"]);
         assert_eq!(
             run_programs("cd web && CI=1 npx tsc\nflutter test | tee log; echo npm"),
-            ["flutter"]
+            ["npm", "flutter"]
         );
         assert!(run_programs("cargo test").is_empty());
+        assert!(run_programs("echo npm; cargo test --features node").is_empty());
+        for script in [
+            "if true; then npm ci; fi",
+            "for d in a b; do npm test; done",
+            "while false; do :; done; until npm test; do :; done",
+            "! npm test",
+            "{ npm test; }",
+            "(cd web && npm test)",
+            "time npm test",
+            "env -i CI=1 NODE_ENV=test npm test",
+            "exec npm test",
+            "command -v npm && npm test",
+            "CI=1 npm test",
+            "cd web\nnpm test",
+            "make lint || npx eslint .",
+        ] {
+            assert!(run_programs(script).contains(&"npm"), "{script}");
+        }
+        assert!(run_programs("make lint && ./scripts/test.sh").is_empty());
+    }
+
+    #[test]
+    fn a_run_script_is_read_with_its_matrix_values() {
+        let matrix = |key: &str| (key == "tool").then(|| "npm".to_string());
+        let script = expand_matrix("${{ matrix.tool }} test ${{ github.sha }}", &matrix);
+        assert_eq!(script, "npm test ${{ github.sha }}");
+        assert_eq!(run_programs(&script), ["npm"]);
     }
 
     fn step(uses: &str, with: &[(&str, &str)]) -> StepSpec {
