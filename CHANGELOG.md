@@ -7,6 +7,12 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-11-28
+
+### Fixed
+
+- A finished job wrote its exit file before it saved `finished_at` in its descriptor. `wait` returns as soon as the exit file appears, so a caller could read the descriptor without `finished_at`, or see a `.ttc-tmp.*` file in `jobs/` while the descriptor was being replaced. The descriptor is now saved first and the exit file is written last.
+
 ## [0.12.4] - 2026-11-27
 
 ### Fixed
