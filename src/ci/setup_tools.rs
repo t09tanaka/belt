@@ -331,6 +331,17 @@ mod tests {
     }
 
     #[test]
+    fn a_word_is_an_assignment_or_an_option_only_where_the_shell_reads_one() {
+        // A name before `=` must be a shell name: otherwise the word is the
+        // command, and the program after it is its argument.
+        assert_eq!(run_programs("FOO_BAR=1 npm test"), ["npm"]);
+        assert!(run_programs("FOO-BAR=1 npm test").is_empty());
+        assert!(run_programs("=1 npm test").is_empty());
+        // A `-` word is skipped only after a prefix command.
+        assert!(run_programs("-v npm test").is_empty());
+    }
+
+    #[test]
     fn a_run_script_is_read_with_its_matrix_values() {
         let matrix = |key: &str| (key == "tool").then(|| "npm".to_string());
         let script = expand_matrix("${{ matrix.tool }} test ${{ github.sha }}", &matrix);
@@ -519,6 +530,9 @@ mod tests {
         assert!(!names_no_tool("v"));
         assert!(!names_no_tool("cargo-llvm-cov"));
         assert!(!names_no_tool("0123456789abcdef0123456789abcdef0123456"));
+        assert!(!names_no_tool(&"g".repeat(40)));
+        assert!(names_no_tool("v2.1"));
+        assert!(names_no_tool(&"a".repeat(40)));
         let got = read(&[
             step("actions/setup-node@v4", &[("tool", "cargo-x")]),
             step("dtolnay/rust-toolchain@stable", &[]),
