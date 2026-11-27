@@ -1268,10 +1268,18 @@ fn helper_entry() {
         return;
     };
     let pidfile = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_PIDFILE");
-    if role == "escape" {
+    if role == "leader-exits" {
+        leader_exits_first(Duration::from_millis(2000), None);
+    } else if role == "leader-exits-runs-on" {
+        leader_exits_first(Duration::from_secs(30), pidfile);
+    } else if role == "escape" {
+        let child = std::env::var("TASK_TRAFFIC_CONTROLLER_TEST_CHILD_ROLE");
         let mut c = Command::new(std::env::current_exe().unwrap());
         c.args(["--exact", "helper_entry", "--nocapture"])
-            .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
+            .env(
+                "TASK_TRAFFIC_CONTROLLER_TEST_ROLE",
+                child.as_deref().unwrap_or("sleep"),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1304,6 +1312,92 @@ fn helper_entry() {
     }
 }
 
+/// The `leader-exits` roles: the main thread of this process exits on its
+/// own while another thread runs on for `lasts`, then the whole process
+/// exits. Meanwhile Linux shows the process as a zombie leader of a group
+/// that still runs. With `pidfile`, the pid is written there once the
+/// leader has exited.
+#[cfg(target_os = "linux")]
+fn leader_exits_first(lasts: Duration, pidfile: Option<std::ffi::OsString>) {
+    extern "C" fn exit_this_thread(_: libc::c_int) {
+        // `exit`, not `exit_group`: only the thread the signal landed on.
+        unsafe { libc::syscall(libc::SYS_exit, 0) };
+    }
+    // The thread that outlives the leader: longer than `GAP_LIMIT` + 1 looks
+    // of the tracker.
+    std::thread::spawn(move || {
+        if let Some(f) = pidfile {
+            let me = std::process::id() as i32;
+            let end = Instant::now() + Duration::from_secs(10);
+            while !is_zombie(me) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(f, me.to_string()).unwrap();
+        }
+        std::thread::sleep(lasts);
+        std::process::exit(0);
+    });
+    // Only once the recorder has taken its first looks: it reads the
+    // command's start time when it starts.
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = std::process::id() as libc::pid_t;
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+    assert!(pid > 1);
+    if tid == pid {
+        // libtest runs the test on the main thread: leave from here.
+        exit_this_thread(0);
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            exit_this_thread as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        // Our own main thread, whose id is the pid.
+        libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR1);
+    }
+    std::thread::sleep(Duration::from_secs(10));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leader_exits_first(_: Duration, _: Option<std::ffi::OsString>) {}
+
+/// On Linux a process whose leader thread exited before its other threads
+/// is listed as a zombie although it still runs (and can still fork). Every
+/// multithreaded command that exits or is killed looks like this for a
+/// moment; on a loaded machine a look of the tracker landed there, could not
+/// find the command, and the run ended with its descendants "not recorded",
+/// keeping the budget. Here the moment is made long.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_whose_leader_thread_exits_first_is_still_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let exe = std::env::current_exe().unwrap().display().to_string();
+    let argv = [
+        "env",
+        "TASK_TRAFFIC_CONTROLLER_TEST_ROLE=leader-exits",
+        &exe,
+        "--exact",
+        "helper_entry",
+        "--nocapture",
+    ];
+    let s = spec(dir.path(), "le", "d", &argv);
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "le");
+    let ran = managed::run_command_with_tracker(&ctx, &guard, &s.opts, cfg.limits(), None).unwrap();
+    assert_eq!(
+        ran.outcome.exit,
+        task_traffic_controller::runner::Exit::Code(0),
+        "{:?}",
+        ran.outcome
+    );
+    assert!(!ran.outcome.tracker_unknown, "{:?}", sidecar(&ctx, "le"));
+    let sc = sidecar(&ctx, "le");
+    assert!(!sc.descendants_truncated && sc.tracked_to_exit, "{sc:?}");
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("le").is_none());
+}
+
 fn helper_command(role: &str, pidfile: &Path, ignore_term: bool) -> Vec<String> {
     let mut v = vec![
         "env".to_string(),
@@ -1333,15 +1427,10 @@ fn pid_alive(pid: i32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_zombie(pid: i32) -> bool {
-    // "<pid> (<comm>) <state> ...": the comm may contain anything, so the
-    // state is what follows the last ')'.
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    std::fs::read(format!("/proc/{pid}/stat"))
         .ok()
-        .and_then(|s| {
-            let rest = s.get(s.rfind(')')? + 1..)?;
-            rest.trim_start().chars().next()
-        })
-        .is_some_and(|c| c == 'Z' || c == 'X')
+        .and_then(|s| stat_state(&s))
+        .is_some_and(|c| c == b'Z' || c == b'X')
 }
 
 #[cfg(target_os = "macos")]
@@ -1395,6 +1484,78 @@ fn a_descendant_that_left_the_process_group_is_stopped_before_release() {
 #[test]
 fn a_descendant_that_ignores_sigterm_is_killed() {
     escaped_case("escaped-kill", true);
+}
+
+/// A left-behind descendant whose leader thread has exited while its other
+/// threads run on is still that process: it is signalled and stopped
+/// before the budget is released, not waited for until the grace ends and
+/// then reported as left behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_whose_leader_thread_exited_is_still_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let pidfile = dir.path().join("pid");
+    let mut argv = helper_command("escape", &pidfile, false);
+    argv.insert(
+        1,
+        "TASK_TRAFFIC_CONTROLLER_TEST_CHILD_ROLE=leader-exits-runs-on".into(),
+    );
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let s = spec(dir.path(), "le-left", "d", &argv);
+    let began = Instant::now();
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    assert_eq!(ran.outcome.exit.code(), 0);
+    assert!(
+        !ran.outcome.descendants_left && !ran.outcome.tracker_unknown,
+        "{:?}",
+        ran.outcome
+    );
+    assert!(
+        until(5, || !group_runs(pid)),
+        "the descendant whose leader exited was left running"
+    );
+    // SIGTERM ended it: neither grace was waited out.
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        began.elapsed()
+    );
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("le-left").is_none());
+}
+
+/// The state byte of a `/proc` `stat` line, `"<pid> (<comm>) <state> ..."`.
+/// The comm may contain anything, including bytes that are not UTF-8, so the
+/// line is read as bytes and the state follows the last `)` and its space.
+#[cfg(target_os = "linux")]
+fn stat_state(stat: &[u8]) -> Option<u8> {
+    let end = stat.iter().rposition(|&b| b == b')')?;
+    stat[end + 1..]
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+}
+
+/// Does any thread of `pid` other than a zombie or dead one remain?
+#[cfg(target_os = "linux")]
+fn group_runs(pid: i32) -> bool {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .any(|tid| {
+            std::fs::read(format!("/proc/{pid}/task/{tid}/stat"))
+                .ok()
+                .and_then(|s| stat_state(&s))
+                .is_some_and(|c| c != b'Z' && c != b'X')
+        })
 }
 
 #[test]
