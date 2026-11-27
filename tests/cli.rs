@@ -142,6 +142,17 @@ fn gated_script(dir: &Path, name: &str) -> String {
     )
 }
 
+/// `n` workers that keep a core each busy until the test creates
+/// `<dir>/<name>.release` (giving up after 60 s), so a busy host cannot end
+/// them before the test has seen what it needs.
+fn gated_burners(dir: &Path, name: &str, n: u32) -> String {
+    let p = dir.join(format!("{name}.release"));
+    format!(
+        "for i in $(seq {n}); do perl -e '$e = time + 60; 1 until -e $ARGV[0] || time > $e' {p} & done; wait",
+        p = p.display()
+    )
+}
+
 /// Releases only this test's marker when unwinding, including before a child
 /// has started. The bounded gated script then exits without a lingering job.
 struct Gate(PathBuf);
@@ -358,20 +369,29 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     let env = TestEnv::new()
         .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
-    // Declared weight 1, but six workers each burning 4 s of their own
-    // CPU time. Bounded by CPU time, so load only stretches the wall time.
+    // Declared weight 1, but sixteen workers that spin until released: on
+    // a busy host they still win far more than the 1.5 cores needed below,
+    // and they cannot finish before the test has looked.
+    let gate = Gate::new(&dir, "hog");
     let now = "perl -MTime::HiRes=time -e 'printf \"%.0f\\n\", time*1e9'";
     let burn = format!(
-        "for i in 1 2 3 4 5 6; do perl -e '1 while (times)[0] < 4' & done; wait; {now} > {}",
+        "{}; {now} > {}",
+        gated_burners(&dir, "hog", 16),
         dir.join("hog.end").display()
     );
     let mut hog = env.spawn_exec(&["--weight", "1"], &burn);
+    // Admission rounds what it measured, so 1.5 cores is charged as 2 and
+    // with the next command's 1 goes over the budget. That, not a share of
+    // an idle host, is what the hold needs.
+    let hog_use = || {
+        env.entries()
+            .iter()
+            .find(|e| e["state"] == "running")
+            .and_then(|e| e["using"].as_f64())
+            .unwrap_or(0.0)
+    };
     assert!(
-        wait_until(Duration::from_secs(20), || {
-            env.entries()
-                .iter()
-                .any(|e| e["using"].as_f64().unwrap_or(0.0) >= 2.5)
-        }),
+        wait_until(Duration::from_secs(20), || hog_use() >= 1.5),
         "the running tree was never measured: {:?}",
         env.entries()
     );
@@ -379,8 +399,16 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     assert!(status.contains("w1  (using "), "{status}");
     // By declared weight (1 + 1 <= 2) this would start at once.
     let mut next = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "next", "0"));
+    let started = wait_until(Duration::from_secs(3), || dir.join("next.start").exists());
+    let still = hog_use();
+    assert!(still >= 1.5, "the hog no longer filled the budget: {still}");
+    gate.release();
     assert!(hog.wait().unwrap().success());
     assert!(next.wait().unwrap().success());
+    assert!(
+        !started,
+        "started while the measured tree filled the budget"
+    );
     assert!(
         read_ns(&dir.join("next.start")) >= read_ns(&dir.join("hog.end")),
         "started while the measured tree filled the budget"
@@ -512,31 +540,55 @@ fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
     let env = TestEnv::new()
         .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
-    // One worker burning 6 s of its own CPU time: bounded by CPU time, so
-    // load only stretches the wall time.
-    let burn = "perl -e '1 while (times)[0] < 6'\n";
+    // Four workers that spin until released, nested one level down.
+    let gate = Gate::new(&dir, "burn");
     let outer = format!(
         "{BIN} exec --weight 1 -- {}\n",
-        script_file(&dir, "burn", burn)
+        script_file(
+            &dir,
+            "burn",
+            &format!("{}\n", gated_burners(&dir, "burn", 4))
+        )
     );
     let mut parent = env.spawn_exec(&["--weight", "1"], &script_file(&dir, "outer", &outer));
-    let using = |e: &serde_json::Value| e["using"].as_f64().unwrap_or(0.0);
+    let using = |e: &serde_json::Value| e["using"].as_f64();
+    // What the nested tree gets depends on what else the host runs, so the
+    // parent is compared with what the nested tree was measured using in
+    // the same ledger: charged twice, the parent would show all of it.
+    let snapshot = || {
+        let entries = env.entries();
+        let nested = entries
+            .iter()
+            .filter(|e| e["parent"].is_string())
+            .find_map(using);
+        let own = entries
+            .iter()
+            .filter(|e| e["parent"].is_null())
+            .find_map(using);
+        (nested, own, entries)
+    };
     assert!(
         wait_until(Duration::from_secs(30), || {
-            nested_entries(&env).iter().any(|e| using(e) >= 0.5)
+            matches!(snapshot(), (Some(n), Some(_), _) if n >= 0.5)
         }),
-        "the nested tree was never measured: {:?}",
+        "the nested tree and its parent were never both measured: {:?}",
         env.entries()
     );
     // The outer's own sampler has had time to see the same processes.
-    let on_parent = wait_until(Duration::from_millis(2500), || {
-        env.entries()
-            .iter()
-            .any(|e| e["parent"].is_null() && using(e) >= 0.3)
+    let mut charged = None;
+    wait_until(Duration::from_millis(2500), || {
+        let (nested, own, entries) = snapshot();
+        if let (Some(n), Some(o)) = (nested, own) {
+            if o >= n / 2.0 {
+                charged = Some(entries);
+                return true;
+            }
+        }
+        false
     });
-    let entries = env.entries();
+    gate.release();
     assert!(parent.wait().unwrap().success());
-    assert!(!on_parent, "charged twice: {entries:?}");
+    assert!(charged.is_none(), "charged twice: {charged:?}");
 }
 
 /// A command that only starts its steps and waits for them does not learn
@@ -1192,7 +1244,9 @@ fn fixed_weight_pattern_overrides_history() {
 
 #[test]
 fn weight_flag_is_recorded() {
-    let env = TestEnv::new();
+    // The budget defaults to the host's cores and caps every weight, so on
+    // a two-core host 3 would be recorded as 2.
+    let env = TestEnv::new().with_config("budget = 4\n");
     env.run(&["exec", "--weight", "3", "--", "true"]);
     let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
     let rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
