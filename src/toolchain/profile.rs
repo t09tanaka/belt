@@ -1233,6 +1233,11 @@ impl Profile {
         };
         let version = bounded_probe(&path, args, &self.host_environment(), deadline())?;
         let Some(version) = measured_version(tool, &version) else {
+            #[cfg(test)]
+            tests::note_miss(format!(
+                "no version in {}",
+                outputs(version.as_bytes(), b"")
+            ));
             return Ok(ToolObservation::Unknown);
         };
         let sdk_identity = if tool == "xcode" {
@@ -1598,7 +1603,8 @@ fn bounded_probe_in(
     deadline: Duration,
 ) -> Result<String, ProbeMiss> {
     let cwd = crate::platform::owned_temp::OwnedTemp::new_in(parent, PROBE_DIR_PREFIX)
-        .map_err(|_| ProbeMiss::Failed)?;
+        .map_err(|e| miss(ProbeMiss::Failed, || format!("probe directory: {e}")))?;
+    let started = Instant::now();
     let mut child = Command::new(path)
         .args(args)
         .current_dir(cwd.path())
@@ -1609,7 +1615,7 @@ fn bounded_probe_in(
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .map_err(|_| ProbeMiss::Failed)?;
+        .map_err(|e| miss(ProbeMiss::Failed, || format!("spawn: {e}")))?;
     let pid = child.id();
     // Every failure after spawn still passes through owned group cleanup/reap.
     let output = probe_output(&mut child, deadline);
@@ -1617,32 +1623,74 @@ fn bounded_probe_in(
     if let Ok(group) = i32::try_from(pid) {
         crate::platform::signal_process_group(group, libc::SIGKILL);
     }
-    let status = child.wait().map_err(|_| ProbeMiss::Failed)?;
+    let status = child
+        .wait()
+        .map_err(|e| miss(ProbeMiss::Failed, || format!("wait: {e}")))?;
     // The timeout was decided before the kill above; its status is no answer.
-    let output = output?;
+    let (stdout, stderr) = output?;
     if !status.success() {
-        return Err(ProbeMiss::Failed);
+        return Err(miss(ProbeMiss::Failed, || {
+            let at = started.elapsed();
+            format!("{status:?} after {at:?}, {}", outputs(&stdout, &stderr))
+        }));
     }
-    String::from_utf8(output).map_err(|_| ProbeMiss::Failed)
+    let output = if stdout.is_empty() { stderr } else { stdout };
+    String::from_utf8(output).map_err(|e| {
+        miss(ProbeMiss::Failed, || {
+            format!("not UTF-8: {}", outputs(e.as_bytes(), b""))
+        })
+    })
+}
+/// Test builds record why a probe missed, so a rare failure of a probe test
+/// names its cause; other builds drop the reason unbuilt. A diagnostic aid only.
+fn miss(kind: ProbeMiss, why: impl FnOnce() -> String) -> ProbeMiss {
+    #[cfg(test)]
+    tests::note_miss(format!("{kind:?}: {}", why()));
+    #[cfg(not(test))]
+    drop(why);
+    kind
+}
+#[cfg(test)]
+fn outputs(stdout: &[u8], stderr: &[u8]) -> String {
+    let cut = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(200)]).into_owned();
+    format!("stdout {:?}, stderr {:?}", cut(stdout), cut(stderr))
+}
+#[cfg(not(test))]
+fn outputs(_: &[u8], _: &[u8]) -> String {
+    String::new()
 }
 /// Observe exit before the deadline: the parent may resume late after the
 /// child has already finished. The caller retains group cleanup and reaping.
-fn probe_output(child: &mut std::process::Child, deadline: Duration) -> Result<Vec<u8>, ProbeMiss> {
+/// Returns stdout and stderr.
+fn probe_output(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), ProbeMiss> {
     let pid = child.id();
     let mut out = child.stdout.take().ok_or(ProbeMiss::Failed)?;
     let mut err = child.stderr.take().ok_or(ProbeMiss::Failed)?;
     for fd in [out.as_raw_fd(), err.as_raw_fd()] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(ProbeMiss::Failed);
+            let errno = std::io::Error::last_os_error();
+            return Err(miss(ProbeMiss::Failed, || format!("fcntl: {errno}")));
         }
     }
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let started = Instant::now();
+    let read_miss = |e: Option<std::io::Error>, stdout: &[u8], stderr: &[u8]| {
+        miss(ProbeMiss::Failed, || {
+            let e = e.map_or("more output than allowed".into(), |e| e.to_string());
+            let at = started.elapsed();
+            format!("read: {e} after {at:?}, {}", outputs(stdout, stderr))
+        })
+    };
     loop {
-        if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
-            return Err(ProbeMiss::Failed);
+        if let Err(e) = read_available(&mut out, &mut stdout)
+            .and_then(|()| read_available(&mut err, &mut stderr))
+        {
+            return Err(read_miss(e, &stdout, &stderr));
         }
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let observed = unsafe {
@@ -1654,39 +1702,52 @@ fn probe_output(child: &mut std::process::Child, deadline: Duration) -> Result<V
             )
         };
         if observed != 0 {
-            return Err(ProbeMiss::Failed);
+            let errno = std::io::Error::last_os_error();
+            return Err(miss(ProbeMiss::Failed, || {
+                let at = started.elapsed();
+                format!("waitid: {errno} after {at:?}")
+            }));
         }
         if unsafe { info.si_pid() } == pid as i32 {
-            if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
-                return Err(ProbeMiss::Failed);
+            if let Err(e) = read_available(&mut out, &mut stdout)
+                .and_then(|()| read_available(&mut err, &mut stderr))
+            {
+                return Err(read_miss(e, &stdout, &stderr));
             }
-            return Ok(if stdout.is_empty() { stderr } else { stdout });
+            return Ok((stdout, stderr));
         }
         if started.elapsed() >= deadline {
-            return Err(ProbeMiss::TimedOut);
+            return Err(miss(ProbeMiss::TimedOut, || {
+                let at = started.elapsed();
+                format!("after {at:?}, {}", outputs(&stdout, &stderr))
+            }));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
-fn read_available(input: &mut impl Read, output: &mut Vec<u8>) -> bool {
+/// `Err(None)`: more output than allowed.
+fn read_available(
+    input: &mut impl Read,
+    output: &mut Vec<u8>,
+) -> Result<(), Option<std::io::Error>> {
     loop {
         let mut chunk = [0u8; 1024];
         let left = (MAX_PROBE_BYTES + 1).saturating_sub(output.len() as u64) as usize;
         if left == 0 {
-            return false;
+            return Err(None);
         }
         let length = chunk.len().min(left);
         match input.read(&mut chunk[..length]) {
-            Ok(0) => return true,
+            Ok(0) => return Ok(()),
             Ok(n) => {
                 output.extend_from_slice(&chunk[..n]);
                 if output.len() as u64 > MAX_PROBE_BYTES {
-                    return false;
+                    return Err(None);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            Err(e) => return Err(Some(e)),
         }
     }
 }
@@ -1754,6 +1815,24 @@ mod tests {
     /// How many readers [`read_magic`] started for each path.
     pub(super) static READERS_SPAWNED: std::sync::Mutex<BTreeMap<PathBuf, usize>> =
         std::sync::Mutex::new(BTreeMap::new());
+    thread_local! {
+        /// Why each probe on this thread missed, oldest first.
+        static MISSES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    pub(super) fn note_miss(why: String) {
+        MISSES.with(|m| m.borrow_mut().push(why));
+    }
+    /// Asserts `tool` is available; a miss names its recorded reasons.
+    #[track_caller]
+    fn assert_available(p: &Profile, tool: &str) {
+        MISSES.with(|m| m.borrow_mut().clear());
+        let observed = p.probe(tool);
+        let misses = MISSES.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        assert!(
+            matches!(observed, ToolObservation::Available { .. }),
+            "{tool}: {observed:?}, misses: {misses:?}"
+        );
+    }
     pub(super) fn note_reader_spawned(path: &Path) {
         *READERS_SPAWNED
             .lock()
@@ -1828,7 +1907,7 @@ mod tests {
         let status = child.wait().unwrap();
         assert_eq!(observed, 0);
         assert!(status.success());
-        assert_eq!(output, Ok(b"probe answer\n".to_vec()));
+        assert_eq!(output, Ok((b"probe answer\n".to_vec(), Vec::new())));
     }
 
     /// Every way a probe ends removes its directory: an answer, a failing
@@ -2387,10 +2466,7 @@ mod tests {
             "test \"$1\" = info || exit 1; echo 28.0.0",
             0o700,
         );
-        assert!(matches!(
-            answers.probe("docker"),
-            ToolObservation::Available { .. }
-        ));
+        assert_available(&answers, "docker");
         fake(root.path(), "xcodebuild", "echo 'Xcode 16.2'", 0o700);
         fake(root.path(), "xcrun", "exit 1", 0o700);
         assert_eq!(p.probe("xcode"), ToolObservation::Unknown);
@@ -2402,15 +2478,9 @@ mod tests {
             &format!("printf '%s' {:?}", sdk),
             0o700,
         );
-        assert!(matches!(
-            answers.probe("xcode"),
-            ToolObservation::Available { .. }
-        ));
+        assert_available(&answers, "xcode");
         fake(root.path(), "node", "echo v22.0.0 >&2", 0o700);
-        assert!(matches!(
-            answers.probe("node"),
-            ToolObservation::Available { .. }
-        ));
+        assert_available(&answers, "node");
         fake(
             root.path(),
             "node",
@@ -2420,10 +2490,7 @@ mod tests {
         // The answer is taken when the leader exits, not when its busy
         // descendant would: well inside even the patient deadline.
         let at = Instant::now();
-        assert!(matches!(
-            answers.probe("node"),
-            ToolObservation::Available { .. }
-        ));
+        assert_available(&answers, "node");
         assert!(at.elapsed() < Duration::from_secs(2));
     }
     /// A nested task-traffic-controller finds its ledger through `HOME` and
