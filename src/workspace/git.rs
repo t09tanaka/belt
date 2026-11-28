@@ -140,6 +140,52 @@ pub(super) fn run_bounded(
     deadline: std::time::Instant,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<i32>> {
+    run_bounded_inner(env, git_dir, ceiling, args, deadline, stop, None)
+}
+
+/// [`run_bounded`], with what the git wrote to its standard error: the
+/// exit code and the last [`STDERR_TAIL`] bytes of it (lossy UTF-8), for a
+/// caller that reports a failure with git's own reason. It goes to an
+/// unnamed temporary file, so a git that writes much never blocks on it.
+pub(super) fn run_bounded_stderr(
+    env: &Env,
+    git_dir: &Path,
+    ceiling: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<(i32, String)>> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = tempfile::tempfile().context("cannot make a file for git's stderr")?;
+    let sink = file
+        .try_clone()
+        .context("cannot make a file for git's stderr")?;
+    let Some(code) = run_bounded_inner(env, git_dir, ceiling, args, deadline, stop, Some(sink))?
+    else {
+        return Ok(None);
+    };
+    let len = file.metadata()?.len();
+    file.seek(std::io::SeekFrom::Start(len.saturating_sub(STDERR_TAIL)))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    Ok(Some((
+        code,
+        String::from_utf8_lossy(&tail).trim().to_string(),
+    )))
+}
+
+/// How much of a git's standard error [`run_bounded_stderr`] keeps.
+pub(super) const STDERR_TAIL: u64 = 4096;
+
+fn run_bounded_inner(
+    env: &Env,
+    git_dir: &Path,
+    ceiling: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+    stop: &dyn Fn() -> bool,
+    stderr: Option<std::fs::File>,
+) -> Result<Option<i32>> {
     use std::os::unix::process::CommandExt as _;
     let mut cmd = Command::new("git");
     cmd.args(args)
@@ -157,7 +203,7 @@ pub(super) fn run_bounded(
         .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     let spawned = cmd.spawn().context("cannot run git")?;
     // (decided now, while the leader is alive and unreaped: its group id
     // is its pid only if it is still the leader of the group it made)
