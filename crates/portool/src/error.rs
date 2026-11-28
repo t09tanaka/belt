@@ -1,0 +1,157 @@
+//! Crate-wide error type and exit code mapping.
+
+use std::fmt;
+
+/// The crate-wide error type. Every fallible operation in this crate
+/// resolves to one of these variants, which map directly to process exit
+/// codes via [`Error::exit_code`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// A general, unstructured error (exit code 1).
+    General(String),
+    /// The on-disk ledger uses a schema version this build does not
+    /// understand (exit code 1), typically because a *newer* portool wrote
+    /// it. Kept distinct from generic corruption so callers never treat
+    /// such a ledger as something to repair or reset; upgrade portool
+    /// instead. Every operation that reads the ledger before using it
+    /// (allocating, releasing, `exec_env`, ...) fails with this variant.
+    UnsupportedRegistryVersion {
+        /// The schema version in the file.
+        found: u32,
+        /// The newest schema version this build understands.
+        supported: u32,
+        /// The ledger file, when known.
+        path: Option<std::path::PathBuf>,
+    },
+    /// The configured pool has no room left for a block anywhere in the
+    /// range (exit code 3). Exit code 2 is retired along with the old
+    /// per-project subrange model (hardening batch C).
+    PoolExhausted,
+    /// Acquiring the registry lock timed out (exit code 4).
+    LockTimeout,
+    /// `portool exec` could not find the requested command (exit code
+    /// 127, spec v0.4 §9).
+    CommandNotFound(String),
+    /// `portool exec` found the requested command but could not execute
+    /// it, e.g. missing execute permission (exit code 126, spec v0.4 §9).
+    CommandNotExecutable(String),
+}
+
+impl Error {
+    /// Maps this error to the process exit code defined by the spec.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Error::General(_) => 1,
+            Error::UnsupportedRegistryVersion { .. } => 1,
+            Error::PoolExhausted => 3,
+            Error::LockTimeout => 4,
+            Error::CommandNotExecutable(_) => 126,
+            Error::CommandNotFound(_) => 127,
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::General(msg) => write!(f, "{msg}"),
+            Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: None,
+            } => write!(
+                f,
+                "unsupported registry version {found} (this build understands version {supported})"
+            ),
+            Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: Some(path),
+            } => write!(
+                f,
+                "{} uses registry schema version {found}, but this build understands version \
+                 {supported}; upgrade portool instead of modifying the ledger",
+                path.display()
+            ),
+            Error::PoolExhausted => write!(f, "pool exhausted"),
+            Error::LockTimeout => write!(f, "lock timeout"),
+            Error::CommandNotFound(cmd) => write!(f, "command not found: {cmd}"),
+            Error::CommandNotExecutable(cmd) => write!(f, "cannot execute: {cmd}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::General(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Error::General(err.to_string())
+    }
+}
+
+impl From<toml::de::Error> for Error {
+    fn from(err: toml::de::Error) -> Self {
+        Error::General(err.to_string())
+    }
+}
+
+/// Convenience alias for `Result<T, Error>`.
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_mapping() {
+        assert_eq!(Error::General("x".into()).exit_code(), 1);
+        assert_eq!(Error::PoolExhausted.exit_code(), 3);
+        assert_eq!(Error::LockTimeout.exit_code(), 4);
+        assert_eq!(Error::CommandNotExecutable("x".into()).exit_code(), 126);
+        assert_eq!(Error::CommandNotFound("x".into()).exit_code(), 127);
+    }
+
+    #[test]
+    fn display_messages() {
+        assert_eq!(Error::General("boom".into()).to_string(), "boom");
+        assert_eq!(Error::PoolExhausted.to_string(), "pool exhausted");
+        assert_eq!(Error::LockTimeout.to_string(), "lock timeout");
+        assert_eq!(
+            Error::CommandNotFound("nope".into()).to_string(),
+            "command not found: nope"
+        );
+        assert_eq!(
+            Error::CommandNotExecutable("nope".into()).to_string(),
+            "cannot execute: nope"
+        );
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let err: Error = io_err.into();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn from_serde_json_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+        let err: Error = json_err.into();
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn from_toml_error() {
+        let toml_err = "not = [valid".parse::<toml::Value>().unwrap_err();
+        let err: Error = toml_err.into();
+        assert_eq!(err.exit_code(), 1);
+    }
+}
