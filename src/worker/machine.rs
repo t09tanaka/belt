@@ -674,9 +674,7 @@ impl Host for Machine {
         let Some(id) = ci_id_of(&payload.source_id) else {
             return Ok(true);
         };
-        self.store
-            .received(held, &id)
-            .map_err(source_read_error)
+        self.store.received(held, &id).map_err(source_read_error)
     }
 
     fn secret_paths(

@@ -1702,7 +1702,7 @@ impl Index {
         Self::publication_on(&self.connect_foreground()?, object)
     }
     fn publication_on(c: &Connection, object: &str) -> Result<PublicationIncarnation> {
-        Self::check_publication(&c, object)?;
+        Self::check_publication(c, object)?;
         let n: Option<i64> = c
             .query_row(
                 "SELECT incarnation FROM publication WHERE object=?1",
