@@ -87,7 +87,7 @@ impl Index {
         root: &str,
     ) -> Result<ImportReleaseReport> {
         let mut report = ImportReleaseReport::default();
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let mut after = String::new();
         loop {
             let (finished, last, _) = shared_page(&mut c, root, &after, &mut report)?;
@@ -107,7 +107,7 @@ impl Index {
         &self,
     ) -> Result<ImportReleaseReport> {
         let mut report = ImportReleaseReport::default();
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let get = |c: &Connection, key: &str| -> Result<Option<String>> {
             Ok(
                 c.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))

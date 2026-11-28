@@ -387,7 +387,7 @@ impl Index {
     /// The import placed `object`'s file with `bytes` bytes: the size row
     /// and the total are written in one transaction.
     pub(crate) fn placed(&self, object: &str, bytes: u64) -> Result<()> {
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::record_bytes(&tx, object, bytes)?;
         tx.commit()?;
@@ -754,14 +754,14 @@ impl Index {
     /// Whether the legacy registration left `receive:<id>` abandoned (its
     /// manifest invalid, or a blob it names missing: review round 4, L-B).
     pub(crate) fn legacy_abandoned(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        Ok(self.connect_foreground()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND kind='abandoned')",
             [id],
             |r| r.get(0),
         )?)
     }
     pub(crate) fn legacy_queued(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        Ok(self.connect_foreground()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM legacy_queue WHERE name=?1)",
             [id],
             |r| r.get(0),
@@ -1119,7 +1119,7 @@ impl Index {
     /// An empty receive root whose manifest cannot be proven: abandoned (its
     /// members go by the later passes), and its graph rows removed.
     pub(crate) fn abandon_empty_receive_root(&self, root: &str) -> Result<bool> {
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE root SET kind='abandoned' WHERE id=?1 AND kind='pending' AND source IS NULL",
@@ -1151,7 +1151,14 @@ impl Index {
         Ok(gone)
     }
     pub(crate) fn received_row(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        Self::received_row_on(&self.connect()?, id)
+    }
+    /// [`Self::received_row`] for acceptance, on the foreground budget.
+    pub(crate) fn received_row_foreground(&self, id: &str) -> Result<bool> {
+        Self::received_row_on(&self.connect_foreground()?, id)
+    }
+    fn received_row_on(c: &Connection, id: &str) -> Result<bool> {
+        Ok(c.query_row(
             "SELECT EXISTS(SELECT 1 FROM root WHERE id='receive:'||?1 AND source=?1)",
             [id],
             |r| r.get(0),
@@ -1161,21 +1168,29 @@ impl Index {
     /// 5b (c), an acceptance). Only that root: a carried submodule is kept
     /// by its parent's graph row.
     pub(crate) fn touch_received(&self, id: &str, at_ms: u64) -> Result<()> {
-        self.connect()?.execute(
+        self.connect_foreground()?.execute(
             "UPDATE root SET used_ms=MAX(COALESCE(used_ms,0),?2) WHERE id='receive:'||?1 AND source=?1 AND kind='received'",
             params![id, i64::try_from(at_ms)?],
         )?;
         Ok(())
     }
     pub(crate) fn legacy_registration_pending(&self) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        Self::legacy_registration_pending_on(&self.connect()?)
+    }
+    /// [`Self::legacy_registration_pending`] for acceptance, on the
+    /// foreground budget.
+    pub(crate) fn legacy_registration_pending_foreground(&self) -> Result<bool> {
+        Self::legacy_registration_pending_on(&self.connect_foreground()?)
+    }
+    fn legacy_registration_pending_on(c: &Connection) -> Result<bool> {
+        Ok(c.query_row(
             "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_registration' AND value<>'done')",
             [],
             |r| r.get(0),
         )?)
     }
     pub(crate) fn has_object(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        Ok(self.connect_foreground()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM object WHERE id=?1)",
             [id],
             |r| r.get(0),
@@ -1186,10 +1201,11 @@ impl Index {
     }
 
     // Transfers from independent connections and processes publish short
-    // transactions to the same index. Give foreground writes the five-second
-    // busy budget used by the coordinator database. Maintenance keeps its
-    // shorter budget so it can yield between pages.
-    fn connect_for_import(&self) -> Result<Connection> {
+    // transactions to the same index. Give foreground work, writes and the
+    // reads of acceptance and of an accepted attempt (the `Guard` checks),
+    // the five-second busy budget used by the coordinator database.
+    // Maintenance keeps its shorter budget so it can yield between pages.
+    fn connect_foreground(&self) -> Result<Connection> {
         self.connect_with_timeout(std::time::Duration::from_secs(5))
     }
 
@@ -1638,7 +1654,7 @@ impl Index {
     }
     pub(crate) fn import_blob(&self, token: &ImportToken, hash: &str) -> Result<()> {
         self.check_token_store(token)?;
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         // Reserve the writer before reading. Competing Deferred readers cannot
         // both upgrade to a writer, even with SQLite's busy timeout installed.
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1678,8 +1694,15 @@ impl Index {
         Ok(())
     }
     pub(crate) fn publication(&self, object: &str) -> Result<PublicationIncarnation> {
-        let c = self.connect()?;
-        Self::check_publication(&c, object)?;
+        Self::publication_on(&self.connect()?, object)
+    }
+    /// [`Self::publication`] for a foreground reader (acceptance, an
+    /// accepted attempt, a delivery): on the foreground busy budget.
+    fn publication_foreground(&self, object: &str) -> Result<PublicationIncarnation> {
+        Self::publication_on(&self.connect_foreground()?, object)
+    }
+    fn publication_on(c: &Connection, object: &str) -> Result<PublicationIncarnation> {
+        Self::check_publication(c, object)?;
         let n: Option<i64> = c
             .query_row(
                 "SELECT incarnation FROM publication WHERE object=?1",
@@ -1690,7 +1713,7 @@ impl Index {
         Ok(PublicationIncarnation(u64::try_from(n.unwrap_or(1))?))
     }
     pub(crate) fn ensure_run(&self, run: &crate::ids::RunId) -> Result<()> {
-        let expired: bool = self.connect()?.query_row(
+        let expired: bool = self.connect_foreground()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM run_expiry WHERE run_id=?1)",
             [run.as_str()],
             |r| r.get(0),
@@ -1789,7 +1812,7 @@ impl Guard {
     /// The SDK discovers content IDs while writing. Pending claims therefore
     /// fence the whole raw SDK operation until B completes their incarnations.
     pub(crate) fn ensure_sdk_available(&self) -> Result<()> {
-        Self::check_sdk_available(&self.index.connect()?)
+        Self::check_sdk_available(&self.index.connect_foreground()?)
     }
     fn check_sdk_available(c: &Connection) -> Result<()> {
         let claimed: bool = c.query_row(
@@ -1808,11 +1831,11 @@ impl Guard {
             super::classify::source_id_of_ci(id).is_some(),
             "invalid source identity"
         );
-        self.index.publication(&format!("m:{id}"))
+        self.index.publication_foreground(&format!("m:{id}"))
     }
     pub fn ensure_blob_available(&self, hash: &str) -> Result<PublicationIncarnation> {
         ensure!(super::diff::is_blob_hash(hash), "invalid source digest");
-        self.index.publication(&format!("b:{hash}"))
+        self.index.publication_foreground(&format!("b:{hash}"))
     }
 }
 impl SourceStore {
@@ -1852,7 +1875,7 @@ impl SourceStore {
             id: ulid::Ulid::new().to_string(),
             store: (metadata.dev(), metadata.ino()),
         };
-        let mut c = self.retention.connect_for_import()?;
+        let mut c = self.retention.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Check the outstanding claim and register this root atomically.
         Guard::check_sdk_available(&tx)?;

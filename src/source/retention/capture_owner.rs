@@ -126,7 +126,7 @@ impl Index {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains(run.as_str())
         });
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(run) = run {
             let named: bool = tx.query_row(
@@ -310,7 +310,7 @@ impl SourceStore {
     /// made once and reused) keeps its row. A run that another process owns,
     /// or that its owner gave up, is not taken over.
     pub(crate) fn own_capture_as(&self, run: &RunId, owner: &OwnerRecord) -> Result<()> {
-        let mut c = self.retention.connect_for_import()?;
+        let mut c = self.retention.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO capture_owner(run_id,state,root,place,pid,start) VALUES(?1,'capturing',NULL,?2,?3,?4)",
@@ -337,7 +337,7 @@ impl SourceStore {
     /// enqueue was refused, or it was interrupted). The row stays: only the
     /// resident, which owns deletion, removes it and what it names.
     pub fn give_up_capture(&self, run: &RunId) -> Result<()> {
-        self.retention.connect_for_import()?.execute(
+        self.retention.connect_foreground()?.execute(
             "UPDATE capture_owner SET state='given_up' WHERE run_id=?1 AND state='capturing'",
             [run.as_str()],
         )?;

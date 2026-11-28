@@ -122,7 +122,7 @@ impl SourceStore {
         let root = format!("import:{id}");
         let shared = {
             let _guard = self.mutation_guard()?;
-            let mut c = self.retention.connect_for_import()?;
+            let mut c = self.retention.connect_foreground()?;
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             self.retention.abandon_import(&tx, id)?;
             tx.commit()?;
@@ -148,7 +148,7 @@ impl SourceStore {
         ensure!(is_import_token_id(id), "not an import token id");
         let root = format!("import:{id}");
         let _guard = self.mutation_guard()?;
-        let mut c = self.retention.connect_for_import()?;
+        let mut c = self.retention.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.retention.abandon_import(&tx, id)?;
         tx.commit()?;
@@ -200,7 +200,7 @@ impl SourceStore {
             let _guard = self.mutation_guard()?;
             let mut after = String::new();
             loop {
-                let mut c = self.retention.connect_for_import()?;
+                let mut c = self.retention.connect_foreground()?;
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let tokens: Vec<String> = {
                     let mut s = tx.prepare(
