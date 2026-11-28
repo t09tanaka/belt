@@ -1,0 +1,115 @@
+name: task-traffic-controller
+
+# The gates of crates/task-traffic-controller, ported from its own repository's
+# ci.yml. Every run step starts in crates/task-traffic-controller, so cargo acts
+# on the member only and its scripts run unchanged. cargo-schemata names files
+# relative to the workspace root even from a member and reads .cargo/mutants.toml
+# from the workspace root, so the mutation gate's file arguments carry the
+# crates/task-traffic-controller/ prefix and --config points at the crate's own
+# .cargo/mutants.toml; every other argument is the old one. belt's ci.yml keeps
+# belt's gates.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/task-traffic-controller/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/task-traffic-controller.yml"
+  pull_request:
+    paths:
+      - "crates/task-traffic-controller/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/task-traffic-controller.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: crates/task-traffic-controller
+
+jobs:
+  test:
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: task-traffic-controller-test
+
+      - name: cargo fmt --check
+        run: cargo fmt -p task-traffic-controller --check
+
+      - name: cargo clippy
+        run: cargo clippy -p task-traffic-controller --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p task-traffic-controller
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - run: cargo check -p task-traffic-controller --all-targets
+
+  coverage:
+    name: coverage gate (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: task-traffic-controller-coverage
+      # The workspace builds into the root target/, so the crate's target/,
+      # where the script writes llvm-cov.json, does not exist yet.
+      - name: create the crate's target directory
+        run: mkdir -p target
+      - name: 100% line coverage on admit / weight / key / eta / forecast / reap / receipt
+        run: ./scripts/coverage-gate.sh
+
+  mutants:
+    name: mutation gate (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: task-traffic-controller-mutants
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: zero survivors in admit / weight / key / eta / forecast / reap / receipt / marker / lineage
+        run: cargo schemata --config .cargo/mutants.toml --file crates/task-traffic-controller/src/admit.rs --file crates/task-traffic-controller/src/weight.rs --file crates/task-traffic-controller/src/key.rs --file crates/task-traffic-controller/src/eta.rs --file crates/task-traffic-controller/src/forecast.rs --file crates/task-traffic-controller/src/reap.rs --file crates/task-traffic-controller/src/receipt.rs --file crates/task-traffic-controller/src/marker.rs --file crates/task-traffic-controller/src/lineage.rs -- --lib
