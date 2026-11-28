@@ -1,12 +1,12 @@
-name: Release
+name: task-traffic-controller release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["task-traffic-controller-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach binaries to (e.g. v0.10.1)"
+        description: "Existing tag to build and attach binaries to (e.g. task-traffic-controller-v0.12.6)"
         required: true
 
 env:
@@ -43,15 +43,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: task-traffic-controller-release
           key: ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p task-traffic-controller --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
           set -euo pipefail
-          archive="task-traffic-controller-${TAG}-${{ matrix.target }}.tar.gz"
+          # The archive keeps the old name, task-traffic-controller-vX.Y.Z-<target>, so
+          # install scripts that read it keep working.
+          archive="task-traffic-controller-v${TAG#task-traffic-controller-v}-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" task-traffic-controller
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
