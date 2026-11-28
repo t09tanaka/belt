@@ -2,9 +2,10 @@ name: local-ci
 
 # The gates of crates/local-ci, ported from its own repository's ci.yml. Every
 # run step starts in crates/local-ci, so cargo acts on the member only and its
-# scripts run unchanged. cargo-schemata 0.4.0 names files relative to the
-# workspace root even from a member, so the mutation gates' file arguments
-# carry the crates/local-ci/ prefix; every other argument is the old one.
+# scripts run unchanged. cargo-schemata prints and records files relative to
+# the workspace root, and scripts/mutation-targets-check.sh matches those
+# names, so the mutation gates' file arguments keep the crates/local-ci/
+# prefix; every other argument is the old one.
 # belt's ci.yml keeps belt's gates.
 on:
   push:
@@ -191,10 +192,10 @@ jobs:
           shared-key: local-ci-mutants-pure
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/matrix.rs crates/local-ci/src/filter.rs crates/local-ci/src/source/gate.rs
       - name: zero survivors in matrix / filter / source gate
@@ -213,10 +214,10 @@ jobs:
           shared-key: local-ci-mutants-artifact
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/artifact.rs
       - name: zero survivors in artifact
@@ -233,10 +234,10 @@ jobs:
           shared-key: local-ci-mutants-frozen
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/frozen.rs
       - name: zero survivors in frozen
@@ -253,10 +254,10 @@ jobs:
           shared-key: local-ci-mutants-shard
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/shard.rs
       - name: zero survivors in shard
@@ -273,10 +274,10 @@ jobs:
           shared-key: local-ci-mutants-demand
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/demand.rs
       - name: zero survivors in demand
@@ -293,10 +294,10 @@ jobs:
           shared-key: local-ci-mutants-wire
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/wire.rs crates/local-ci/src/result_wire.rs crates/local-ci/src/digest.rs
       - name: zero survivors in wire, result_wire and digest
@@ -324,10 +325,10 @@ jobs:
           shared-key: local-ci-mutants-driver
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
-            cargo install cargo-schemata --locked --version 0.4.0 --force
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
+            cargo install cargo-schemata --locked --version 0.7.0 --force
           fi
-          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh crates/local-ci/src/driver.rs crates/local-ci/src/driver/atomic.rs crates/local-ci/src/driver/dispatch.rs crates/local-ci/src/driver/shards.rs crates/local-ci/src/job_evaluate.rs
       - name: zero survivors in transactional driver and shared evaluation
