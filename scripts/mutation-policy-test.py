@@ -34,7 +34,7 @@ def workflow_policy(text):
     expected = 'python3 scripts/mutation-run.py --shard "${{ matrix.shard }}/4"'
     assert runs.count(expected) == 1, "mutation must use the checked runner"
     assert len(runs) == 2, "only install and checked runner belong in mutation shard"
-    assert "cargo install cargo-schemata --locked --version 0.6.0 --force" in runs[0]
+    assert "cargo install cargo-schemata --locked --version 0.7.0 --force" in runs[0]
     assert runs[0].count("cargo schemata") == 1 and "cargo schemata --version" in runs[0], "installation must not bypass the runner"
     assert "cargo schemata " not in runs[1].replace(expected, "")
     assert "run: python3 scripts/mutation-policy-test.py" in text, "ordinary CI must check policy"
@@ -72,7 +72,7 @@ class Policy(unittest.TestCase):
 import json, os, pathlib, sys
 a=sys.argv[1:]
 with open(os.environ['CAPTURE'], 'a') as f: f.write(json.dumps(a)+'\\n')
-if a==['schemata','--version']: print('cargo-schemata 0.6.0')
+if a==['schemata','--version']: print('cargo-schemata 0.7.0')
 elif a[0]=='test':
     if os.environ.get('EMPTY')!='1':
         if '--lib' in a:

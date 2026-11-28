@@ -62,8 +62,8 @@ def main():
     if args.tests_only:
         return subprocess.run(["cargo", "test", *test_args]).returncode
     version = subprocess.check_output(["cargo", "schemata", "--version"], text=True).strip()
-    if version != "cargo-schemata 0.6.0":
-        raise ValueError(f"expected cargo-schemata 0.6.0, got {version}")
+    if version != "cargo-schemata 0.7.0":
+        raise ValueError(f"expected cargo-schemata 0.7.0, got {version}")
     started = time.monotonic()
     # Keep Unix socket paths short. A mutation of PID classification must
     # never sweep another test process's live fixture. The unmodified driver
