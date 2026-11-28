@@ -8,6 +8,11 @@ license = "MIT"
 repository = "https://github.com/t09tanaka/belt-ci"
 readme = "README.md"
 
+# fast-worktree lives in this repository as a workspace member; belt-ci stays
+# the root package, so cargo commands without -p/--workspace act on belt only.
+[workspace]
+members = ["crates/fast-worktree"]
+
 [lib]
 name = "belt"
 path = "src/lib.rs"
@@ -20,7 +25,7 @@ path = "src/main.rs"
 toml = "0.8"
 
 [dependencies]
-fast-worktree = { version = "=0.9.0", features = ["cli"] }
+fast-worktree = { path = "crates/fast-worktree", version = "=0.9.0", features = ["cli"] }
 portool = "=0.14.0"
 anyhow = "1"
 base64 = "0.22"

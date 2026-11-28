@@ -603,8 +603,6 @@ dependencies = [
 [[package]]
 name = "fast-worktree"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278631313ab8d8864b1651694f4b91cf55884191fb200c2c1535053e46a2c16d"
 dependencies = [
  "clap",
  "globset",
@@ -613,6 +611,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml 0.8.23",
  "toml_edit",
 ]

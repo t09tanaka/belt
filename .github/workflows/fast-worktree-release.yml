@@ -1,12 +1,12 @@
-name: Release
+name: fast-worktree release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["fast-worktree-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach binaries to (e.g. v0.10.1)"
+        description: "Existing tag to build and attach binaries to (e.g. fast-worktree-v0.10.1)"
         required: true
 
 env:
@@ -46,12 +46,14 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p fast-worktree --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
           set -euo pipefail
-          archive="fast-worktree-${TAG}-${{ matrix.target }}.tar.gz"
+          # The archive keeps the old name, fast-worktree-vX.Y.Z-<target>, so
+          # install scripts that read it keep working.
+          archive="fast-worktree-v${TAG#fast-worktree-v}-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" fast-worktree
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"

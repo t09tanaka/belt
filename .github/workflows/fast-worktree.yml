@@ -1,0 +1,71 @@
+name: fast-worktree
+
+# The gates of crates/fast-worktree, ported from its own repository's ci.yml
+# and scoped with -p fast-worktree. belt's ci.yml keeps belt's gates.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/fast-worktree/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/fast-worktree.yml"
+  pull_request:
+    paths:
+      - "crates/fast-worktree/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/fast-worktree.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt -p fast-worktree --check
+
+      - name: cargo clippy
+        run: cargo clippy -p fast-worktree --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p fast-worktree
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - run: cargo check -p fast-worktree --all-targets
+
