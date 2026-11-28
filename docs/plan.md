@@ -2,7 +2,7 @@
 
 `docs/spec.md`（仕様版 1.5）の実装を、PR 単位に分けた計画である。仕様 1.5 で追加した A50 と A55 を含め、A01〜A58 の担当は下の対応表に示す。
 
-初回公開前に製品名を再考する。現行の CLI 名は `belt`、Cargo のパッケージ名は `belt-cli`。
+CLI 名は `belt`、Cargo のパッケージ名は `belt-ci`。
 
 ## 前提
 
@@ -59,7 +59,7 @@
 | R68 | belt | resident が自分を更新する（メンバーの更新） | `belt upgrade [--binary <path>]`: 更新のための保留（drain とは別の永続状態で、`resume` では解けない）→受理済みの仕事の完了待ち→親 DB と worker DB を同じ時点で退避 → 版別 directory へ配置 → 互換検査 → service 切替 → 実行した CLI が health を確かめて commit → 保留を解く。commit までは coordinator の役割を adopt と lease 更新だけに制限し（配置・generation の作成・投入の受理・retire と cancel の送信・回収の確定をしない）、worker は他のメンバーからの状態を変える要求のすべてに、何も保存せず理由なしの `OVERLOADED` を返す。commit の期限は service の入口（更新されない側）が見張り、過ぎたら新しい版が応答していなくても元へ戻す。rollback は 2 つの DB を一緒に戻す。`workers upgrade` が相手のマシンで同じ手順を起こす。process lock で同時に 1 つ | 仕様 §24.8 と A57 のテスト（run を抱えたメンバーの更新で attempt を失わない、失敗時に 2 つの DB が一緒に元の版へ戻る、rollback の後に user command を再び開始しない＝二重実行が無い、試用中に別のメンバーが出した retire が rollback の後に届いて二重実行にならない、新しい版が応答しないときに入口が期限で戻す、N と N+1 のメンバーが両方向で動く） | release の成果物の自動取得 | WP24b・WP24d |
 | R96 | belt | 遅い・応答しないメンバーが CLI と他のメンバーを止めない | coordinator の tick が worker との通信を待つ間 actor を持ち続けない構造へ直す（worker ごとの独立した処理、actor へは結果だけ）。自分の DB だけで答えられる CLI 要求を他のメンバーの状態から切り離す。照会が要る CLI は答えた分だけ返す。受ける側で、あるメンバーの接続が他のメンバーへの応答を塞がないこと | 仕様 §24.7 と A56 のテスト。worker への呼び出しが永久に答えないままの状態で CLI 要求が完了することを構造として確かめ、加えて仮想の時計で 2 秒以内に返ることを測る、決定的なテスト（sleep に頼らない） | `worker_budget_ms` の既定値の変更 | なし（WP24b と並行可） |
 
-正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-cli`、バイナリは `belt`、lib は `belt` とする。旧名 remote-task-runner（略称 rtr）からの改名は WP22 で実施した。以降の記述は新名に揃えてある。
+正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-ci`、バイナリは `belt`、lib は `belt` とする。crate は当初 `belt-cli` とし、0.1.0 の公開前（2026-11-28）に、GitHub のリポジトリ名とともに `belt-ci` へ改めた。旧名 remote-task-runner（略称 rtr）からの改名は WP22 で実施した。以降の記述は新名に揃えてある。
 
 ## 現在の進捗と追加作業（2026-11-14）
 
@@ -1921,7 +1921,7 @@ version 0.1.0 への変更、`cargo publish`、tag、Release は、実機試験�
 ### 前提（M00）
 
 - 利用者の操作: miniで「リモートログイン」を有効にする。親の公開鍵を `agent` の `~/.ssh/authorized_keys` に入れる。`agent` は管理者でない一般のアカウントにする（A35で使う）。
-- 親で、試験する版を作る: `cargo build --release -p belt-cli --bin belt` と `./target/release/belt --version`。
+- 親で、試験する版を作る: `cargo build --release -p belt-ci --bin belt` と `./target/release/belt --version`。
 - 確かめる: `ssh agent@macmini-1.local 'uname -sm; sw_vers -productVersion'`。期待: `Darwin arm64` と、親と同じ世代のmacOS。違うときは、`workers add` に `--binary <miniで動く build>` を付ける。
 - 親で、`belt init` と `belt doctor`。期待: `doctor` が合格する。
 - 試験の前後に、親とminiで `pgrep -fl belt` と `launchctl list | grep -i belt` を残す。終わったら、親から `belt workers stop mini --cancel-running` で止め、利用者が登録を外す。

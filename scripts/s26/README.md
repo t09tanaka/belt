@@ -28,7 +28,7 @@ From the repository root, with Rust **1.93.0** already installed:
 ```bash
 # Build the native parent (or supply an existing native build of this checkout).
 task-traffic-controller exec -- env CARGO_TARGET_DIR="$PWD/target/s26/native" \
-  cargo +1.93.0 build --locked --release -p belt-cli --bin belt
+  cargo +1.93.0 build --locked --release -p belt-ci --bin belt
 scripts/s26/build-linux.sh
 scripts/s26/up.sh
 S26_BELT="$PWD/target/s26/native/release/belt" scripts/s26/run.sh
@@ -147,7 +147,7 @@ REF=feature/r68-upgrade   # any ref with `belt upgrade`
 export S26_BASE="$HOME/Library/Caches/belt-s26"
 git worktree add --detach "$S26_BASE/src-native" "$REF"
 task-traffic-controller exec -- env CARGO_TARGET_DIR="$S26_BASE/native" \
-  cargo +1.93.0 build --locked --release -p belt-cli --bin belt \
+  cargo +1.93.0 build --locked --release -p belt-ci --bin belt \
   --manifest-path "$S26_BASE/src-native/Cargo.toml"
 scripts/s26/build-linux.sh --upgrade "$REF"
 scripts/s26/up.sh

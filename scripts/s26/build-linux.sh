@@ -20,7 +20,7 @@ build() {
         -e S26_TARGET="$S26_MACHINE-unknown-linux-gnu" \
         -e S26_OUTPUT="$2" \
         -w "/src/$2" rust:1.93.0-bookworm bash -euo pipefail -c '
-            cargo build --locked --release --target "$S26_TARGET" -p belt-cli --bin belt
+            cargo build --locked --release --target "$S26_TARGET" -p belt-ci --bin belt
             cp "/cache/linux-cache/target/$S26_TARGET/release/belt" "/cache/$S26_OUTPUT.tmp"
             chmod 755 "/cache/$S26_OUTPUT.tmp"
             mv "/cache/$S26_OUTPUT.tmp" "/cache/$S26_OUTPUT"

@@ -971,8 +971,8 @@ def variants():
     next_version = f"{major}.{minor}.{int(micro) + 1}"
     for name in ("n1", "n1-broken"):
         patch(out / name / "Cargo.toml", f'version = "{version}"', f'version = "{next_version}"')
-        patch(out / name / "Cargo.lock", f'name = "belt-cli"\nversion = "{version}"',
-              f'name = "belt-cli"\nversion = "{next_version}"')
+        patch(out / name / "Cargo.lock", f'name = "belt-ci"\nversion = "{version}"',
+              f'name = "belt-ci"\nversion = "{next_version}"')
     # The resident (`belt daemon`) of the broken build starts and then never
     # answers: the upgrade's health check fails while the process runs.
     patch(out / "n1-broken/src/cli.rs",
