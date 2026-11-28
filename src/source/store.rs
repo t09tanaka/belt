@@ -836,10 +836,10 @@ impl SourceStore {
     /// the registration abandoned its root). Call under
     /// a shared mutation lock (`_held`).
     pub fn received(&self, _held: &super::retention::Guard, id: &str) -> Result<bool> {
-        if self.retention.received_row(id)? {
+        if self.retention.received_row_foreground(id)? {
             return Ok(true);
         }
-        if !self.retention.legacy_registration_pending()? {
+        if !self.retention.legacy_registration_pending_foreground()? {
             return Ok(false);
         }
         // (a manifest the legacy registration has not finished may have its

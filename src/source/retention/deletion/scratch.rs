@@ -309,7 +309,7 @@ impl Index {
             );
             rows.push((intent.destination.clone(), key, path));
         }
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND kind='pending' AND source IS NULL)",
@@ -340,7 +340,7 @@ impl Index {
     /// stopped part-way did not create those files, so the capture holds
     /// nothing of them.
     pub(in crate::source) fn unreserve_capture(&self, root: &str, keys: &[&str]) -> Result<()> {
-        let mut c = self.connect_for_import()?;
+        let mut c = self.connect_foreground()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND kind='pending' AND source IS NULL)",
