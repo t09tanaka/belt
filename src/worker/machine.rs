@@ -74,6 +74,28 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, format!("{what}: {e}"))
 }
 
+/// A read of the source store that failed. The index still busy after the
+/// foreground budget is `OVERLOADED` (`source_store`), which the caller may
+/// send again (spec: `OVERLOADED` covers a busy database); any
+/// other failure is internal.
+fn source_read_error(e: anyhow::Error) -> ApiError {
+    let busy = e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _))
+                if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    });
+    if busy {
+        ApiError::overloaded(
+            crate::error::OverloadedReason::SourceStore,
+            format!("source store: {e:#}"),
+        )
+    } else {
+        internal("source store", format!("{e:#}"))
+    }
+}
+
 impl Machine {
     /// `env` is what Git, fast-worktree and the project's hooks run with
     /// (`HOME` and `PATH` at least); `key_path` is the cluster key file.
@@ -293,7 +315,7 @@ fn manifest_in(
         Some(g) => store.manifest_under(g, &source),
         None => store.manifest(&source),
     }
-    .map_err(|e| internal("source store", format!("{e:#}")))?
+    .map_err(source_read_error)?
     .ok_or_else(missing)?;
     let want = payload.manifest_digest.as_str();
     if m.manifest_digest != want && format!("sha256:{}", m.manifest_digest) != want {
@@ -654,7 +676,7 @@ impl Host for Machine {
         };
         self.store
             .received(held, &id)
-            .map_err(|e| internal("source store", format!("{e:#}")))
+            .map_err(source_read_error)
     }
 
     fn secret_paths(
@@ -908,6 +930,62 @@ mod tests {
         let started = Instant::now();
         check_toolchain_waiting(&f.store, f.area.as_path(), &f.manifest, &p).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(250));
+        holder.join().unwrap();
+    }
+
+    /// The source index held by a writer on another connection for `ms`:
+    /// `EXCLUSIVE`, as a writer holds it while it commits, which is when
+    /// a reader of a rollback-journal database is refused. Returns once
+    /// the lock is held.
+    fn hold_index(f: &crate::ci::execute::tests::Fixture, ms: u64) -> std::thread::JoinHandle<()> {
+        let path = f.area.join("state").join("sources").join("retention.db");
+        let (held, taken) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let c = rusqlite::Connection::open(path).unwrap();
+            c.execute_batch(
+                "BEGIN EXCLUSIVE; UPDATE meta SET value=value WHERE key='store_bytes';",
+            )
+            .unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(ms));
+            c.execute_batch("COMMIT").unwrap();
+        });
+        taken.recv().unwrap();
+        holder
+    }
+
+    /// Acceptance's reads are foreground work: a writer that holds the
+    /// index for longer than the maintenance budget (1 s) but within the
+    /// foreground one (5 s) delays acceptance and does not fail it.
+    #[test]
+    fn acceptance_reads_wait_for_a_writer_within_the_foreground_budget() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let (machine, p) = machine_with_source(&f, None);
+        let held = machine.store.mutation_guard().unwrap();
+        let holder = hold_index(&f, 2000);
+        let started = Instant::now();
+        let m = manifest_in(&machine.store, &p, Wait::No, Some(&held)).unwrap();
+        assert_eq!(m.source_id, f.manifest.source_id);
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+        holder.join().unwrap();
+    }
+
+    /// An index still busy after the foreground budget is `OVERLOADED`
+    /// (`source_store`), which the caller sends again, not `INTERNAL`.
+    #[test]
+    fn acceptance_answers_overloaded_when_the_index_stays_busy() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let (machine, p) = machine_with_source(&f, None);
+        let held = machine.store.mutation_guard().unwrap();
+        let holder = hold_index(&f, 6500);
+        let e = manifest_in(&machine.store, &p, Wait::No, Some(&held)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Overloaded, "{e:?}");
+        assert_eq!(
+            e.overloaded_reason,
+            Some(crate::error::OverloadedReason::SourceStore),
+            "{e:?}"
+        );
+        assert!(e.message.starts_with("source store: "), "{e:?}");
         holder.join().unwrap();
     }
 
