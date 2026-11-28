@@ -1,0 +1,447 @@
+//! `fast-worktree remove`: unregister a worktree at once and delete its
+//! files in the background.
+//!
+//! Deleting a worktree with `node_modules` takes seconds per project;
+//! renaming it into the trash takes milliseconds. Like `git worktree
+//! remove`, it refuses a worktree with uncommitted or untracked changes
+//! (ignored files are fine) and a locked one, and also one that has another
+//! registered worktree inside it. Only this worktree's entry is removed
+//! from git; `git worktree prune` would also drop worktrees that are merely
+//! out of sight, such as one on a volume that is not mounted.
+//!
+//! A `.fast-worktree.toml` that cannot be read does not stop it: it says so,
+//! runs no `pre_remove` hook, keeps nothing in the cache and removes the
+//! worktree all the same (`hook remove` does the same). The checks above
+//! are not in that file and still refuse.
+
+use crate::ecosystem::{generic, target};
+use crate::error::{bail, Error, Kind, Result};
+use crate::hooks::{self, Config, Stage};
+use crate::util::{errln, outln};
+use crate::{git, paths, pending, pool, trash, util};
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+pub struct Opts {
+    pub path: PathBuf,
+    pub delete_branch: bool,
+}
+
+/// What `remove` looks at before deciding.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    pub is_worktree_root: bool,
+    pub is_main_checkout: bool,
+    pub locked: bool,
+    /// Another registered worktree lives below this one (in an ignored
+    /// directory, so `status` does not show it).
+    pub contains_worktree: bool,
+    /// `git status` printed something, or failed: see [`is_dirty`].
+    pub dirty: bool,
+    pub has_submodules: bool,
+}
+
+/// Why a worktree is not removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The path is inside a worktree, not its root.
+    NotWorktreeRoot,
+    /// The embedding process has its current directory inside the worktree.
+    ProcessCwdInside,
+    /// The path is the repository's main checkout.
+    MainCheckout,
+    /// The worktree is locked.
+    Locked,
+    /// Another registered worktree is inside it.
+    ContainsWorktree,
+    /// It has uncommitted or untracked changes.
+    Dirty,
+    /// It has submodules.
+    Submodules,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Refusal::ProcessCwdInside => {
+                "process cwd is inside the worktree; refusing to remove it"
+            }
+            Refusal::NotWorktreeRoot => "not a worktree root",
+            Refusal::MainCheckout => "refusing to remove the main checkout",
+            Refusal::Locked => "worktree is locked",
+            Refusal::ContainsWorktree => "another worktree is inside it; remove that one first",
+            Refusal::Dirty => "uncommitted or untracked changes",
+            Refusal::Submodules => "worktree has submodules; use git worktree remove",
+        })
+    }
+}
+
+/// The arguments of the `git status` that decides [`Facts::dirty`]: every
+/// untracked file counts whatever `status.showUntrackedFiles` says, and so
+/// does every change in a submodule whatever `diff.ignoreSubmodules` says.
+pub const STATUS_ARGS: [&str; 4] = [
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+];
+
+/// Dirty when `git status` printed anything, and when it could not run:
+/// what cannot be checked is not deleted.
+pub fn is_dirty(status: &Result<String>) -> bool {
+    status.as_ref().map_or(true, |s| !s.is_empty())
+}
+
+/// The first reason not to remove, in the order they are checked.
+pub fn refusal(f: &Facts) -> Option<Refusal> {
+    if !f.is_worktree_root {
+        Some(Refusal::NotWorktreeRoot)
+    } else if f.is_main_checkout {
+        Some(Refusal::MainCheckout)
+    } else if f.locked {
+        Some(Refusal::Locked)
+    } else if f.contains_worktree {
+        Some(Refusal::ContainsWorktree)
+    } else if f.dirty {
+        Some(Refusal::Dirty)
+    } else if f.has_submodules {
+        Some(Refusal::Submodules)
+    } else {
+        None
+    }
+}
+
+/// What [`execute`] did.
+pub struct Done {
+    /// The exit code `remove` gives: 0, or 1 when something after the move
+    /// failed (git still lists the entry, the branch was kept).
+    pub code: i32,
+    /// Where the files are, being deleted.
+    pub trash: PathBuf,
+    /// `--delete-branch` was given and the branch is gone.
+    pub branch_deleted: bool,
+}
+
+pub fn run(opts: Opts) -> Result<i32> {
+    execute(opts).map(|d| d.code)
+}
+
+/// Refuse before hooks or other removal side effects in an embedding process.
+pub(crate) fn refuse_embedded_cwd(path: &Path) -> Result<()> {
+    if crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(path)) {
+        let reason = Refusal::ProcessCwdInside;
+        return Err(Error::of(
+            Kind::Refused(reason),
+            format!("{}: {reason}; nothing was removed", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub fn execute(opts: Opts) -> Result<Done> {
+    let path = opts
+        .path
+        .canonicalize()
+        .map_err(|e| Error::msg(format!("{}: {e}", opts.path.display())))?;
+    refuse_embedded_cwd(&path)?;
+    let toplevel = git::toplevel(&path)?;
+    let toplevel = toplevel.canonicalize().unwrap_or(toplevel);
+    let worktrees = git::worktrees(&path)?;
+    let Some(main) = worktrees.first() else {
+        bail!("no worktrees registered");
+    };
+    let main = main
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| main.path.clone());
+    let real = |w: &git::Worktree| w.path.canonicalize().unwrap_or_else(|_| w.path.clone());
+    let me = worktrees.iter().find(|w| real(w) == path);
+    let inner = worktrees
+        .iter()
+        .map(real)
+        .find(|p| p != &path && p.starts_with(&path));
+    let facts = Facts {
+        is_worktree_root: toplevel == path,
+        is_main_checkout: path == main,
+        locked: me.is_some_and(|w| w.locked),
+        contains_worktree: inner.is_some(),
+        dirty: is_dirty(&git::output(&path, &STATUS_ARGS)),
+        has_submodules: git::output(&path, &["submodule", "status"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+    };
+    if let Some(r) = refusal(&facts) {
+        if r == Refusal::Locked && pool::is_pool_path(&path) {
+            bail!(
+                "{r}: {} is a spare of the pool; `fast-worktree pool clear` removes the spares",
+                path.display()
+            );
+        }
+        let msg = match (r, &inner) {
+            (Refusal::ContainsWorktree, Some(i)) => {
+                format!("{r}: {} is inside {}", i.display(), path.display())
+            }
+            _ => format!("{r}: {}", path.display()),
+        };
+        return Err(Error::of(Kind::Refused(r), msg));
+    }
+    let branch = me.and_then(|w| w.branch.clone());
+    // Decide about the branch before anything is removed: `git branch -d`
+    // failing afterwards would leave the worktree gone and the branch kept.
+    let merged = match (&branch, opts.delete_branch) {
+        (Some(b), true) => git::merged(&main, b),
+        _ => git::Merged::Unknown,
+    };
+    if let (Some(b), git::Merged::No(refs)) = (&branch, &merged) {
+        return Err(Error::of(
+            Kind::BranchNotMerged,
+            format!(
+                "branch {b} is not merged into {}; nothing was removed. \
+                 Merge it first, or run remove without --delete-branch",
+                if refs.is_empty() {
+                    "anything that stays".to_string()
+                } else {
+                    refs.join(" or ")
+                }
+            ),
+        ));
+    }
+    // Taken while the worktree is in place: after the move, git can no
+    // longer tell which entry was this worktree's.
+    let admin = git::admin_dir(&path)?;
+    if let Err(why) = trash::can_move(&path) {
+        bail!(
+            "cannot move {} away: {why}; nothing was removed",
+            path.display()
+        );
+    }
+
+    let cfg = config_or_warn(&path);
+    // A background install that `hook create` left still writing into it
+    // would bring it back after the move.
+    pending::report_stop(&pending::stop(&path, pending::STOP_GRACE));
+    if let Some(cfg) = &cfg {
+        let failed = hooks::run(cfg, Stage::PreRemove, &path, &main);
+        if failed > 0 {
+            errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
+        }
+    }
+
+    if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
+        std::env::set_current_dir(&main)?;
+    }
+    crate::retention::run(Some(&main));
+    let dest = match trash::move_aside(&path) {
+        Ok(d) => d,
+        Err(e) => bail!(
+            "the pre_remove hooks ran, but {} could not be moved away ({e}): \
+             the worktree is still there and still registered",
+            path.display()
+        ),
+    };
+    // Only once the worktree is surely going.
+    if let Some(cfg) = &cfg {
+        reclaim(&dest, &path, &main, cfg);
+    }
+    trash::spawn_rm(&dest);
+    let registered = git::unregister(&admin);
+    outln!(
+        "removed {} (moved to {}, deleting in background)",
+        util::tilde(&path),
+        util::tilde(&dest)
+    );
+    if let Err(e) = registered {
+        errln!(
+            "fast-worktree: the worktree is gone but git still lists it ({e}); \
+             `git worktree prune` removes the entry"
+        );
+        return Ok(Done {
+            code: 1,
+            trash: dest,
+            branch_deleted: false,
+        });
+    }
+
+    if opts.delete_branch {
+        let code = delete_branch(&main, branch.as_deref(), &merged);
+        return Ok(Done {
+            code,
+            trash: dest,
+            branch_deleted: code == 0 && branch.is_some(),
+        });
+    }
+    Ok(Done {
+        code: 0,
+        trash: dest,
+        branch_deleted: false,
+    })
+}
+
+/// The worktree's `.fast-worktree.toml`, or `None`, said on stderr, when it
+/// cannot be read: then no `pre_remove` hook runs and nothing is kept in
+/// the cache, and the worktree is removed all the same. Which hooks it
+/// would have run cannot be told, so the warning says that none ran, and
+/// which file could not be read.
+pub fn config_or_warn(path: &Path) -> Option<Config> {
+    match Config::load(path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            errln!(
+                "fast-worktree: NO pre_remove hook was run: cannot read {}, so \
+                 which ones it lists is unknown; removing the worktree without \
+                 them, and keeping nothing of it in the cache. The error: {e}",
+                util::tilde(&path.join(crate::hooks::FILE))
+            );
+            None
+        }
+    }
+}
+
+/// The worktree that was at `was` is in the trash at `at` now, about to
+/// be deleted: move the directories of its `[[clone]]` entries without a
+/// preset into the cache, where the next worktree with the same key clones
+/// them ([`generic::reclaim`]). Prints what it did; a failure only means
+/// they are deleted with the worktree.
+pub fn reclaim(at: &Path, was: &Path, main: &Path, cfg: &Config) {
+    if cfg.clone.is_empty() {
+        return;
+    }
+    let targets = match target::targets(at, cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            outln!("note   nothing kept in the cache: {e}");
+            return;
+        }
+    };
+    let cache_repo = paths::cache_root().join(paths::repo_key(main));
+    for line in generic::reclaim(at, was, main, &cache_repo, &targets) {
+        outln!("{line}");
+    }
+}
+
+/// Delete the branch. One found merged ([`git::merged`]) is deleted with
+/// `git branch -D` if it is still at the commit that was checked (`-d`
+/// compares with `HEAD` or the upstream only, and would keep a branch that
+/// is merged into origin's default branch); otherwise `git branch -d`
+/// decides.
+fn delete_branch(main: &Path, branch: Option<&str>, merged: &git::Merged) -> i32 {
+    let Some(b) = branch else {
+        errln!("fast-worktree: the worktree had a detached HEAD; no branch to delete");
+        return 0;
+    };
+    let flag = match merged {
+        git::Merged::Yes(sha)
+            if git::output(
+                main,
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+            )
+            .is_ok_and(|now| now.trim() == sha) =>
+        {
+            "-D"
+        }
+        _ => "-d",
+    };
+    match git::output(main, &["branch", flag, b]) {
+        Ok(_) => {
+            outln!("deleted branch {b}");
+            0
+        }
+        Err(e) => {
+            errln!("fast-worktree: kept branch {b}: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok() -> Facts {
+        Facts {
+            is_worktree_root: true,
+            ..Facts::default()
+        }
+    }
+
+    #[test]
+    fn a_clean_linked_worktree_may_be_removed() {
+        assert_eq!(refusal(&ok()), None);
+    }
+
+    #[test]
+    fn each_condition_refuses() {
+        let cases = [
+            (
+                Facts {
+                    is_worktree_root: false,
+                    ..ok()
+                },
+                Refusal::NotWorktreeRoot,
+            ),
+            (
+                Facts {
+                    is_main_checkout: true,
+                    ..ok()
+                },
+                Refusal::MainCheckout,
+            ),
+            (
+                Facts {
+                    locked: true,
+                    ..ok()
+                },
+                Refusal::Locked,
+            ),
+            (
+                Facts {
+                    contains_worktree: true,
+                    ..ok()
+                },
+                Refusal::ContainsWorktree,
+            ),
+            (
+                Facts {
+                    dirty: true,
+                    ..ok()
+                },
+                Refusal::Dirty,
+            ),
+            (
+                Facts {
+                    has_submodules: true,
+                    ..ok()
+                },
+                Refusal::Submodules,
+            ),
+        ];
+        for (f, want) in cases {
+            assert_eq!(refusal(&f), Some(want), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_status_that_fails_counts_as_dirty() {
+        assert!(!is_dirty(&Ok(String::new())));
+        assert!(is_dirty(&Ok("?? notes.txt\n".into())));
+        assert!(is_dirty(&Err(Error::msg("git status: fatal"))));
+    }
+
+    #[test]
+    fn the_main_checkout_is_refused_before_anything_else_about_it() {
+        let f = Facts {
+            is_main_checkout: true,
+            dirty: true,
+            locked: true,
+            ..ok()
+        };
+        assert_eq!(refusal(&f), Some(Refusal::MainCheckout));
+        let f = Facts {
+            is_worktree_root: false,
+            is_main_checkout: true,
+            ..ok()
+        };
+        assert_eq!(refusal(&f), Some(Refusal::NotWorktreeRoot));
+    }
+}
