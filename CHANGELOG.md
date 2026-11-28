@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.20.1] - 2026-11-28
+
+- Writing a private worker receipt waits for the receipt writer lock instead of failing at once with `Resource temporarily unavailable` (EAGAIN). A process forked on another thread shares the lock's open file description until it execs, so a second write could fail while nothing was wrong. Holders are brief, so the write now blocks.
+
 ## [0.20.0] - 2026-11-24
 
 - Add `source::GitOptions` and `source::import_objects_with`, `import_objects_for_with` and `remove_imported_refs_with`, for a caller that holds a lock of its own around these calls. `GitOptions::new().hermetic()` runs Git without the context's `GIT_*` variables (an inherited `GIT_DIR` no longer points Git at another repository), without system or global configuration (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`), without hooks (`core.hooksPath=/dev/null`), and with `GIT_CEILING_DIRECTORIES` at the clone's parent. `.deadline(at)` bounds each Git process. Under these functions each Git process runs in a process group of its own and is ended on the deadline or when the context's `cancel` handle is cancelled: SIGTERM to that group, SIGKILL after two seconds, then it is reaped, and the call fails. No other process or group is signalled. The existing functions are unchanged.
