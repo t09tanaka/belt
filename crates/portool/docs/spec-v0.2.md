@@ -181,7 +181,7 @@ dotenvとしてsourceする利用者には後方互換。ただし「コメン�
 ## 13. 利用例
 ### Docker Compose
 ```yaml
-name: esim-commerce-${PORTOOL_WORKTREE_ID:-default}
+name: myapp-${PORTOOL_WORKTREE_ID:-default}
 ```
 起動:
 ```sh
@@ -190,11 +190,11 @@ docker compose --env-file .env.portool up
 ### 開発DBとテストDBを別projectにする場合
 開発用:
 ```yaml
-name: esim-commerce-dev-${PORTOOL_WORKTREE_ID:-default}
+name: myapp-dev-${PORTOOL_WORKTREE_ID:-default}
 ```
 テスト用:
 ```yaml
-name: esim-commerce-test-${PORTOOL_WORKTREE_ID:-default}
+name: myapp-test-${PORTOOL_WORKTREE_ID:-default}
 ```
 portool未導入時は `default` へフォールバックできる。
 ## 14. エッジケース
