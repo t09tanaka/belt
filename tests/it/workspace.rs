@@ -2327,7 +2327,13 @@ fn the_clone_gc_prunes_only_old_unreachable_objects_under_free_locks() {
         .open(git_dir.join("belt-workspace.lock"))
         .unwrap();
     shared.lock_shared().unwrap();
+    // (a gc that a stop or its bound ended while it wrote the commit-graph
+    // left that lock: the next gc does not trip on it, nor removes it)
+    let graph_lock = git_dir.join("objects/info/commit-graph.lock");
+    std::fs::create_dir_all(graph_lock.parent().unwrap()).unwrap();
+    std::fs::write(&graph_lock, "").unwrap();
     assert_eq!(gc(&|| false).unwrap(), CloneGc::Ran);
+    assert!(graph_lock.exists(), "a lock file was removed");
     drop((own, shared));
     // (a newer one may have moved into a cruft pack: asked by id)
     assert!(!present(&old.0), "an object older than 14 days stayed");

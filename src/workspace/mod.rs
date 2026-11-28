@@ -61,13 +61,18 @@ const GC_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 /// no reflog expiry (it would take ref
 /// locks in the linked worktrees: with both set to `never` gc skips its
 /// reflog step), no auto gc or maintenance of its own.
-const GC_CONFIG: [&str; 6] = [
+const GC_CONFIG: [&str; 7] = [
     "gc.packRefs=false",
     "gc.worktreePruneExpire=never",
     "gc.reflogExpire=never",
     "gc.reflogExpireUnreachable=never",
     "gc.auto=0",
     "maintenance.auto=false",
+    // (a gc ended by `stop` or its bound may die while it writes the
+    // commit-graph and leave `objects/info/commit-graph.lock`; since a lock
+    // file in the clone is never removed, every later gc would then fail
+    // on it for good)
+    "gc.writeCommitGraph=false",
 ];
 /// For belt's gits that move the main checkout's HEAD (review round 1, M1).
 const NO_REFLOG: &str = "core.logAllRefUpdates=false";
@@ -476,10 +481,10 @@ impl Workspaces {
             args.extend(["-c", c]);
         }
         args.extend(["gc", "--quiet", "--prune=14.days.ago"]);
-        match run(&args)? {
+        match git::run_bounded_stderr(&self.env, &git_dir, &root, &args, deadline, stop)? {
             None => Ok(CloneGc::Stopped),
-            Some(0) => Ok(CloneGc::Ran),
-            Some(code) => anyhow::bail!("git gc failed ({code})"),
+            Some((0, _)) => Ok(CloneGc::Ran),
+            Some((code, err)) => anyhow::bail!("git gc failed ({code}): {err}"),
         }
     }
 
