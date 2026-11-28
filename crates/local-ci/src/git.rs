@@ -1,0 +1,1174 @@
+//! The git plumbing local-ci needs: what to test, what changed, and a
+//! throwaway worktree to test it in.
+
+use crate::context::ExecContext;
+use anyhow::{bail, Context, Result};
+use regex::Regex;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+pub fn git(ctx: &ExecContext, dir: &Path, args: &[&str]) -> Result<String> {
+    let out = ctx
+        .command("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("failed to run git")?;
+    if !out.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+fn git_ok(ctx: &ExecContext, dir: &Path, args: &[&str]) -> Option<String> {
+    git(ctx, dir, args).ok().filter(|s| !s.is_empty())
+}
+
+/// `git worktree add` / `prune` / `remove`, one at a time per repository, in
+/// this process and across `local-ci` runs. Side by side, an add reads the
+/// `.git/worktrees/<name>/commondir` another add is still writing ("failed to
+/// read ... commondir"), and a prune can drop an entry that is half made.
+fn worktree_admin<T>(ctx: &ExecContext, repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs2::FileExt;
+    static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _local = LOCAL.lock().unwrap_or_else(|e| e.into_inner());
+    let common = git(
+        ctx,
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(Path::new(&common).join("local-ci-worktrees.lock"))
+        .context("cannot open the worktree lock")?;
+    lock.lock_exclusive()?;
+    f()
+}
+
+pub fn toplevel(ctx: &ExecContext, dir: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        git(ctx, dir, &["rev-parse", "--show-toplevel"]).context("not inside a git repository")?,
+    ))
+}
+
+pub fn rev(ctx: &ExecContext, dir: &Path, r: &str) -> Result<String> {
+    git(
+        ctx,
+        dir,
+        &["rev-parse", "--verify", &format!("{r}^{{commit}}")],
+    )
+}
+
+pub fn is_dirty(ctx: &ExecContext, dir: &Path) -> bool {
+    git(ctx, dir, &["status", "--porcelain", "--untracked-files=no"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn current_branch(ctx: &ExecContext, dir: &Path) -> Option<String> {
+    git_ok(ctx, dir, &["symbolic-ref", "--short", "-q", "HEAD"])
+}
+
+/// The branch name `branches:` filters see. A `--base` that is not a branch
+/// (a SHA, `HEAD~3`) stands for origin's default branch.
+pub fn base_branch_name(ctx: &ExecContext, dir: &Path, base: &str) -> String {
+    let is_branch = ["refs/heads/", "refs/remotes/", "refs/remotes/origin/"]
+        .iter()
+        .any(|p| {
+            git(
+                ctx,
+                dir,
+                &["show-ref", "--verify", "--quiet", &format!("{p}{base}")],
+            )
+            .is_ok()
+        });
+    if is_branch {
+        return branch_name(base);
+    }
+    default_base(ctx, dir)
+        .map(|b| branch_name(&b))
+        .unwrap_or_else(|_| "main".into())
+}
+
+/// The ref to compare against: origin's default branch, else a local main/master.
+pub fn default_base(ctx: &ExecContext, dir: &Path) -> Result<String> {
+    if let Some(r) = git_ok(
+        ctx,
+        dir,
+        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+    ) {
+        return Ok(r);
+    }
+    for b in ["origin/main", "origin/master", "main", "master"] {
+        if rev(ctx, dir, b).is_ok() {
+            return Ok(b.to_string());
+        }
+    }
+    bail!("cannot find a base branch; pass --base <ref>")
+}
+
+/// `origin/main` → `main`
+pub fn branch_name(r: &str) -> String {
+    r.strip_prefix("origin/")
+        .or_else(|| r.strip_prefix("refs/remotes/origin/"))
+        .or_else(|| r.strip_prefix("refs/heads/"))
+        .unwrap_or(r)
+        .to_string()
+}
+
+pub fn changed_files(ctx: &ExecContext, dir: &Path, base: &str, sha: &str) -> Result<Vec<String>> {
+    let from = git_ok(ctx, dir, &["merge-base", base, sha]).unwrap_or_else(|| base.to_string());
+    let out = git(
+        ctx,
+        dir,
+        &["diff", "--name-only", "--no-renames", &from, sha],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Where a workflow directory was named, for the error when it holds none.
+#[derive(Clone, Copy, PartialEq)]
+enum Named {
+    /// `.github/workflows` with no `.local-ci.toml` to replace it: may be empty.
+    Default,
+    Config,
+    Flag,
+}
+
+/// Workflow files at `sha`, as (path, text): each of `configured` (the
+/// `workflows-dirs` of `.local-ci.toml`; `.github/workflows` when `None`) and
+/// then each of `extra` (`--workflows-dir`). All are relative to the
+/// repository root, and every one but the unconfigured `.github/workflows`
+/// must hold some.
+pub fn workflows_at(
+    ctx: &ExecContext,
+    dir: &Path,
+    sha: &str,
+    configured: Option<&[String]>,
+    extra: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut dirs: Vec<(String, Named)> = match configured {
+        Some(c) => c.iter().map(|d| (d.clone(), Named::Config)).collect(),
+        None => vec![(
+            crate::config::DEFAULT_WORKFLOWS_DIR.to_string(),
+            Named::Default,
+        )],
+    };
+    for d in extra {
+        if Path::new(d).is_absolute() {
+            bail!("--workflows-dir {d}: give a path relative to the repository root");
+        }
+        let d = crate::plan::norm_dir(d);
+        if !dirs.iter().any(|(x, _)| x == &d) {
+            dirs.push((d, Named::Flag));
+        }
+    }
+    // Resolve once before listing and reading. Metadata keeps its existing
+    // trimmed representation; workflow contents use the shared exact-byte IO.
+    let commit = git(
+        ctx,
+        dir,
+        &[
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--literal-pathspecs",
+            "-c",
+            "protocol.allow=never",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{sha}^{{commit}}"),
+        ],
+    )?;
+    let mut reader = crate::source_execute::GitWorkflowReader::new(ctx, dir, &commit)?;
+    let mut out = Vec::new();
+    for (d, named) in &dirs {
+        let list = reader.paths(d)?;
+        let files: Vec<&str> = list
+            .split('\0')
+            .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
+            .collect();
+        if files.is_empty() && *named != Named::Default {
+            let source = match named {
+                Named::Config => format!("{}: workflows-dirs", crate::config::FILE),
+                _ => "--workflows-dir".to_string(),
+            };
+            bail!(
+                "{source} {d}: no .yml / .yaml files there at {} (workflows are read from the commit; commit them first)",
+                &sha[..sha.len().min(7)]
+            );
+        }
+        for f in files {
+            out.push((
+                f.to_string(),
+                String::from_utf8(reader.read(f)?).context("workflow is not UTF-8")?,
+            ));
+        }
+    }
+    reader.finish()?;
+    Ok(out)
+}
+
+/// `owner/name` from origin's URL.
+pub fn repo_slug(ctx: &ExecContext, dir: &Path) -> Option<String> {
+    let url = git_ok(ctx, dir, &["remote", "get-url", "origin"])?;
+    let s = url.trim_end_matches(".git").trim_end_matches('/');
+    let tail = s.rsplit_once(':').map(|(_, t)| t).unwrap_or(s);
+    let parts: Vec<&str> = tail.rsplit('/').take(2).collect();
+    if parts.len() == 2 {
+        Some(format!("{}/{}", parts[1], parts[0]))
+    } else {
+        None
+    }
+}
+
+/// The host and `owner/name` of a remote URL (`https://`, `ssh://`, scp-style
+/// `user@host:owner/name`). `None` for a local path, a `file://` URL, or
+/// anything with no host or fewer than two path segments. The host is
+/// lowercased and has no user or port.
+pub fn remote_host_and_slug(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    let (authority, path) = if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        rest.split_once('/')?
+    } else {
+        // scp-style has a `:` before any `/`; a lone letter is a drive (`C:`).
+        let (host, path) = url.split_once(':')?;
+        if host.contains('/') || host.contains('\\') || host.len() <= 1 {
+            return None;
+        }
+        (host, path)
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        Some((
+            host.to_ascii_lowercase(),
+            format!("{}/{}", parts[1], parts[0]),
+        ))
+    } else {
+        None
+    }
+}
+
+/// The origin remote's URL, as configured.
+pub fn origin_url(ctx: &ExecContext, dir: &Path) -> Option<String> {
+    git_ok(ctx, dir, &["remote", "get-url", "origin"])
+}
+
+pub fn add_worktree(ctx: &ExecContext, repo: &Path, path: &Path, sha: &str) -> Result<()> {
+    add_worktree_with(ctx, repo, path, sha, true)
+}
+
+/// A worktree at `sha` with nothing checked out and an empty index: the
+/// caller writes the files (and no smudge filter or line-ending conversion
+/// runs on them).
+pub fn add_worktree_no_checkout(
+    ctx: &ExecContext,
+    repo: &Path,
+    path: &Path,
+    sha: &str,
+) -> Result<()> {
+    add_worktree_with(ctx, repo, path, sha, false)
+}
+
+/// Remove the worktree at `path` that was just added, whatever is in it.
+pub fn remove_new_worktree(ctx: &ExecContext, repo: &Path, path: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        let p = path.to_string_lossy();
+        git(ctx, repo, &["worktree", "remove", "--force", &p]).map(|_| ())
+    })
+}
+
+/// Let worktrees of `repo` have a config of their own (`git config
+/// --worktree`). The switch is in the shared config, so it is written under
+/// the same lock as worktree adds, and only when it is not on yet.
+pub fn enable_worktree_config(ctx: &ExecContext, repo: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        let on = git_ok(
+            ctx,
+            repo,
+            &["config", "--type=bool", "extensions.worktreeConfig"],
+        );
+        if on.as_deref() != Some("true") {
+            git(ctx, repo, &["config", "extensions.worktreeConfig", "true"])?;
+        }
+        Ok(())
+    })
+}
+
+fn add_worktree_with(
+    ctx: &ExecContext,
+    repo: &Path,
+    path: &Path,
+    sha: &str,
+    checkout: bool,
+) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        let mut args = vec!["worktree", "add", "--detach", "--quiet"];
+        if !checkout {
+            args.push("--no-checkout");
+        }
+        let p = path.to_string_lossy();
+        args.push(&p);
+        args.push(sha);
+        git(ctx, repo, &args)
+    })
+    .map(|_| ())
+}
+
+/// Another worktree of `sha` at `to`, holding a copy of everything in `from`
+/// (setup output included). Files are cloned copy-on-write where the
+/// filesystem allows it, so this is quick and a write in one copy is never
+/// seen in the other. With `link_node_modules` (`link-node-modules` in
+/// `.local-ci.toml`) each `node_modules` holds links to what is in `from`'s
+/// instead. That is off by default: tools that follow a link to where it
+/// really is and then refuse paths outside the project (TypeScript emitting
+/// declarations, Turbopack's workspace root) fail with it.
+pub fn clone_worktree(
+    ctx: &ExecContext,
+    repo: &Path,
+    from: &Path,
+    to: &Path,
+    sha: &str,
+    link_node_modules: bool,
+) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        git(
+            ctx,
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                "--quiet",
+                &to.to_string_lossy(),
+                sha,
+            ],
+        )
+    })?;
+    let index = |d: &Path| {
+        git(
+            ctx,
+            d,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .map(PathBuf::from)
+    };
+    std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
+    let mut holders = HashSet::new();
+    if link_node_modules {
+        for nm in node_modules_dirs(from) {
+            holders.extend(nm.ancestors().skip(1).map(Path::to_path_buf));
+        }
+    }
+    let mut rest = Vec::new();
+    copy_entries(
+        ctx,
+        from,
+        to,
+        Path::new(""),
+        link_node_modules,
+        &holders,
+        &mut rest,
+    )?;
+    for (into, srcs) in rest {
+        cp(ctx, &srcs, &into)?;
+    }
+    Ok(())
+}
+
+/// The `node_modules` directories under `root` (relative to it), not looking
+/// inside them or `.git`.
+fn node_modules_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name();
+            if name == "node_modules" {
+                found.push(rel.join(&name));
+            } else if name != ".git" {
+                todo.push(rel.join(&name));
+            }
+        }
+    }
+    found
+}
+
+/// Copy what is in `from` (at `rel` in the worktree) into `to`. With `link`, a
+/// `node_modules` directory is linked into, not copied: setup installed it and the
+/// units read it, while a copy is tens of thousands of files per project to
+/// make and then delete again, each one also an event for fseventsd. A unit
+/// that writes into it first makes it its own ([`own_node_modules`]). A
+/// directory with one further down (`holders`) is walked into; anything else
+/// is cloned whole, or left in `rest` for `cp`.
+fn copy_entries(
+    ctx: &ExecContext,
+    from: &Path,
+    to: &Path,
+    rel: &Path,
+    link: bool,
+    holders: &HashSet<PathBuf>,
+    rest: &mut Vec<(PathBuf, Vec<PathBuf>)>,
+) -> Result<()> {
+    let mut left = Vec::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        if rel.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        let (src, dst, r) = (e.path(), to.join(&name), rel.join(&name));
+        // a matrix entry's copy is made from a unit's: link to setup's again
+        let shared = std::fs::read_to_string(src.join(SHARED)).map(PathBuf::from);
+        let real = shared.as_deref().unwrap_or(&src);
+        if is_dir && name == "node_modules" && link && !links_out(real) && !emits_declarations(from)
+        {
+            link_node_modules(real, &dst)
+                .with_context(|| format!("cannot link {}", dst.display()))?;
+        } else if is_dir && name == "node_modules" && shared.is_ok() {
+            copy_dir(ctx, real, &dst)?;
+        } else if is_dir && holders.contains(&r) {
+            std::fs::create_dir(&dst)?;
+            copy_entries(ctx, &src, &dst, &r, link, holders, rest)?;
+        } else if !clone_tree(&src, &dst) {
+            left.push(src);
+        }
+    }
+    if !left.is_empty() {
+        rest.push((to.to_path_buf(), left));
+    }
+    Ok(())
+}
+
+/// Copy `srcs` into the directory `into`, cloning where the filesystem allows it.
+fn cp(ctx: &ExecContext, srcs: &[PathBuf], into: &Path) -> Result<()> {
+    let flags: &[&str] = if cfg!(target_os = "macos") {
+        &["-Rp"]
+    } else {
+        &["-a", "--reflink=auto"]
+    };
+    let out = ctx
+        .command("cp")
+        .args(flags)
+        .args(srcs)
+        .arg(into)
+        .output()
+        .context("failed to run cp")?;
+    if !out.status.success() {
+        bail!(
+            "cp into {}: {}",
+            into.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Make every `node_modules` in the copy `ws` that links into setup's a copy
+/// of its own, before a step that may write into one (an install,
+/// `prisma generate`): the other units read setup's. All of them, as a step
+/// can `cd` anywhere.
+pub fn own_node_modules(ctx: &ExecContext, ws: &Path) -> Result<()> {
+    for rel in node_modules_dirs(ws) {
+        let nm = ws.join(rel);
+        let Ok(target) = std::fs::read_to_string(nm.join(SHARED)) else {
+            continue;
+        };
+        let tmp = nm.with_file_name(".node_modules.local-ci");
+        let _ = std::fs::remove_dir_all(&tmp);
+        copy_dir(ctx, Path::new(&target), &tmp)?;
+        // removes the links, not what they point to
+        std::fs::remove_dir_all(&nm)?;
+        std::fs::rename(&tmp, &nm)?;
+    }
+    Ok(())
+}
+
+/// `from` copied to `to` (which must not exist), cloned where the filesystem allows it.
+fn copy_dir(ctx: &ExecContext, from: &Path, to: &Path) -> Result<()> {
+    if clone_tree(from, to) {
+        return Ok(());
+    }
+    std::fs::create_dir(to)?;
+    let entries: Vec<PathBuf> = std::fs::read_dir(from)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    if !entries.is_empty() {
+        cp(ctx, &entries, to)?;
+    }
+    Ok(())
+}
+
+/// Whether a package in `nm` is a link that leaves it (a workspace or
+/// `file:` dependency). Through a link to setup's it would resolve into
+/// setup's tree rather than the unit's, so such a `node_modules` is copied.
+fn links_out(nm: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(nm) else {
+        return false;
+    };
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if e.file_name().to_string_lossy().starts_with('@') && p.is_dir() {
+            entries.extend(
+                std::fs::read_dir(&p)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+        } else {
+            entries.push(p);
+        }
+    }
+    entries.iter().any(|p| {
+        std::fs::read_link(p).is_ok_and(|t| {
+            let to = p.parent().unwrap_or(nm).join(t);
+            !normalize(&to).starts_with(normalize(nm))
+        })
+    })
+}
+
+/// Whether a `tsconfig*.json` in `dir` (or one it extends by a relative
+/// path) emits declarations (`declaration` or `composite`). TypeScript
+/// resolves a linked package to where it really is, and a declaration that
+/// would have to name a path outside the project fails with TS2742, even
+/// under `--noEmit`. Such a project's `node_modules` is copied, not linked.
+fn emits_declarations(dir: &Path) -> bool {
+    static ON: OnceLock<Regex> = OnceLock::new();
+    static EXTENDS: OnceLock<Regex> = OnceLock::new();
+    let on = ON.get_or_init(|| Regex::new(r#""(declaration|composite)"\s*:\s*true"#).unwrap());
+    let extends =
+        EXTENDS.get_or_init(|| Regex::new(r#""extends"\s*:\s*(\[[^\]]*\]|"[^"]*")"#).unwrap());
+    let mut todo: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy();
+            n.starts_with("tsconfig") && n.ends_with(".json")
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(f) = todo.pop() {
+        if seen.len() > 20 || !seen.insert(f.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        if on.is_match(&text) {
+            return true;
+        }
+        let base = f.parent().unwrap_or(dir);
+        for c in extends.captures_iter(&text) {
+            for name in c[1].split('"').skip(1).step_by(2) {
+                if name.starts_with('.') {
+                    // as TypeScript does: the name as given, else with `.json` added
+                    let p = base.join(name);
+                    todo.push(if p.is_file() {
+                        p
+                    } else {
+                        PathBuf::from(format!("{}.json", p.display()))
+                    });
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `p` with `.` and `..` taken out, without touching the filesystem.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Names the `node_modules` a unit's one links into; the npm shim reads it too.
+pub const SHARED: &str = ".local-ci-shared";
+
+/// `dst` as a directory of links to what is in `src`. A directory rather than
+/// one link: `node_modules/` in a `.gitignore` matches only a directory, and
+/// a link to one shows up as untracked. Node resolves a package through its
+/// link to setup's copy and its dependencies from there.
+fn link_node_modules(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        std::os::unix::fs::symlink(e.path(), dst.join(e.file_name()))?;
+    }
+    std::fs::write(dst.join(SHARED), src.as_os_str().as_encoded_bytes())?;
+    Ok(())
+}
+
+/// Clone a whole directory tree in one call (APFS). About five times faster
+/// than `cp -c`, which clones file by file.
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let (Ok(f), Ok(t)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), CLONE_NOFOLLOW) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree(_from: &Path, _to: &Path) -> bool {
+    false
+}
+
+/// Move the worktree out of the way, unregister it, and delete the files in the background.
+///
+/// git is run in the repository the worktree itself is registered in, read
+/// from its `.git` file before it is moved, and only falls back to `repo`.
+/// `repo` is where the run was started, and that can be a worktree that is
+/// removed while the run goes on: git cannot be run there any more, and a
+/// registration that is not dropped now is never dropped by local-ci, since
+/// once the files are deleted nothing in the cache says whose it was.
+pub fn remove_worktree(ctx: &ExecContext, repo: &Path, path: &Path, trash: &Path) {
+    let registered = crate::reclaim::registered_in(path);
+    let repo = registered.as_deref().unwrap_or(repo);
+    if let Some(target) = move_to_trash(path, trash) {
+        let _ = prune_worktrees(ctx, repo);
+        delete_in_background(ctx, &[target], trash);
+    } else {
+        let _ = worktree_admin(ctx, repo, || {
+            git(
+                ctx,
+                repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+            )
+        });
+    }
+}
+
+/// Move a directory that is not a worktree (the tools of a run) out of the
+/// way and delete it in the background.
+pub fn remove_dir_later(ctx: &ExecContext, path: &Path, trash: &Path) {
+    match move_to_trash(path, trash) {
+        Some(target) => delete_in_background(ctx, &[target], trash),
+        None => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// Drop the registrations of the worktrees of `repo` whose directory is gone.
+/// `repo` is the repository or its git directory.
+pub fn prune_worktrees(ctx: &ExecContext, repo: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        git(ctx, repo, &["worktree", "prune"]).map(|_| ())
+    })
+}
+
+/// Rename `path` into `trash`, under a name nothing else there has: the
+/// rename is the whole cost of a removal for the run, and it must not fail
+/// because an earlier deletion of the same name is not over. `None` when it
+/// could not be moved. A link is moved as a link.
+pub fn move_to_trash(path: &Path, trash: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(trash).ok()?;
+    if !is_real_dir(trash) {
+        return None;
+    }
+    let target = trash.join(moved_name(path.file_name()?));
+    std::fs::rename(path, &target).ok().map(|()| target)
+}
+
+/// The name a directory called `name` is moved out of the way under:
+/// `<name>.<pid>.<n>`, which nothing else has.
+pub fn moved_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut moved = name.to_os_string();
+    moved.push(format!(
+        ".{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    moved
+}
+
+/// Whether `name` is one [`moved_name`] gives to an entry of `wt`
+/// (`<entry>.<pid>.<n>`), or the name of an entry itself, which is what
+/// earlier versions moved their worktrees to the trash under. Nothing else
+/// in the trash is local-ci's to delete: the cache directory can be one the
+/// user also keeps files in.
+pub fn is_moved_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    let is_entry = |s: &str| crate::reclaim::entry_pid(s).is_some();
+    let mut parts = name.rsplitn(3, '.');
+    let moved = match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(pid), Some(entry)) => digits(n) && digits(pid) && is_entry(entry),
+        _ => false,
+    };
+    moved || is_entry(name)
+}
+
+/// Whether `name` is one local-ci gives to what it moves into the trash: an
+/// entry of `wt` ([`is_moved_name`]) or an entry of the build cache, done or
+/// being written, under [`moved_name`] (`<key>.<pid>.<n>`,
+/// `<key>.tmp-<pid>-<seq>.<pid>.<n>`).
+pub fn is_trash_name(name: &std::ffi::OsStr) -> bool {
+    if is_moved_name(name) {
+        return true;
+    }
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = name.rsplitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(pid), Some(entry)) => {
+            digits(n) && digits(pid) && crate::build_cache::is_entry_name(entry)
+        }
+        _ => false,
+    }
+}
+
+/// A directory itself, not a link to one: what is behind a link is not
+/// local-ci's to list or delete.
+pub fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+fn trashed(trash: &Path) -> Vec<PathBuf> {
+    if !is_real_dir(trash) {
+        return Vec::new();
+    }
+    std::fs::read_dir(trash)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| is_trash_name(&e.file_name()))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Delete in the background what local-ci left in the trash: what a deletion
+/// that was killed (with its run, or by a reboot) left there. Only names
+/// local-ci gives ([`is_trash_name`]) are touched.
+pub fn empty_trash(ctx: &ExecContext, trash: &Path) {
+    for some in trashed(trash).chunks(64) {
+        delete_in_background(ctx, some, trash);
+    }
+}
+
+/// Delete what local-ci left in the trash before returning. Links are
+/// removed, not followed.
+pub fn empty_trash_now(trash: &Path) {
+    for p in trashed(trash) {
+        remove_now(&p);
+    }
+}
+
+/// Delete `path` before returning. A link is removed, not followed.
+pub fn remove_now(path: &Path) {
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if !is_dir {
+        let _ = std::fs::remove_file(path);
+    } else if std::fs::remove_dir_all(path).is_err() {
+        // a background deletion may be in the same tree, and a job may
+        // have left directories that cannot be written
+        make_dirs_writable(path);
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+fn make_dirs_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        make_dirs_writable(&e.path());
+    }
+}
+
+fn delete_in_background(ctx: &ExecContext, targets: &[PathBuf], trash: &Path) {
+    if targets.is_empty() {
+        return;
+    }
+    if spawn_quiet(delete_later(ctx, targets, &trash.join(".lock"))).is_err() {
+        let mut rm = ctx.command("rm");
+        rm.args(["-rf", "--"]).args(targets);
+        let _ = spawn_quiet(rm);
+    }
+}
+
+/// `rm -rf` at the lowest priority, one deletion at a time across runs. Many
+/// units end together, and a dozen copies holding `node_modules` deleted side
+/// by side took several cores, and as many again in fseventsd and the kernel,
+/// from the jobs still running. On macOS `lockf` waits for the deletion before
+/// it. Only the CPU priority is lowered: `taskpolicy -b` also throttled the
+/// disk, and on a busy machine it deleted a thousand files in two minutes, so
+/// the copies would pile up faster than they went.
+///
+/// A tree with directories that cannot be written (a module cache a job
+/// sealed) is not deleted by `rm -rf`; its directories are made writable and
+/// it is tried again. Only directories: files may be hard links shared with a
+/// worktree that is in use. Neither `rm` nor `find` follows a link.
+fn delete_later(ctx: &ExecContext, targets: &[PathBuf], lock: &Path) -> Command {
+    let mut cmd = ctx.command("nice");
+    cmd.args(["-n", "19"]);
+    if cfg!(target_os = "macos") {
+        cmd.args(["lockf", "-k"]).arg(lock);
+    }
+    cmd.args([
+        "sh",
+        "-c",
+        r#"for t; do rm -rf -- "$t" 2>/dev/null || { find -- "$t" -type d -exec chmod u+rwx {} + ; rm -rf -- "$t"; }; done"#,
+        "sh",
+    ])
+    .args(targets);
+    cmd
+}
+
+/// Start a command that outlives the run: in a process group of its own, so
+/// that a Ctrl-C in the terminal, or whatever stops the group of local-ci
+/// when it ends, does not stop a deletion halfway.
+fn spawn_quiet(mut cmd: Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests build their own commands
+mod tests {
+    #[test]
+    fn remote_host_and_slug_forms() {
+        let ok = |u: &str| remote_host_and_slug(u);
+        let want = |h: &str, s: &str| Some((h.to_string(), s.to_string()));
+        assert_eq!(ok("https://github.com/o/n.git"), want("github.com", "o/n"));
+        assert_eq!(ok("https://github.com/o/n/"), want("github.com", "o/n"));
+        assert_eq!(
+            ok("https://user:tok@GitHub.com:443/o/n"),
+            want("github.com", "o/n")
+        );
+        assert_eq!(ok("git@github.com:o/n.git"), want("github.com", "o/n"));
+        assert_eq!(ok("github.com:o/n"), want("github.com", "o/n"));
+        assert_eq!(
+            ok("ssh://git@ghe.example.com:2222/o/n.git"),
+            want("ghe.example.com", "o/n")
+        );
+        assert_eq!(
+            ok("git@gitlab.com:grp/sub/n.git"),
+            want("gitlab.com", "sub/n")
+        );
+        assert_eq!(ok("ssh://git@[::1]:22/o/n"), want("::1", "o/n"));
+    }
+
+    #[test]
+    fn remote_host_and_slug_rejects_without_host() {
+        for u in [
+            "/srv/git/o/n.git",
+            "../o/n",
+            "./n",
+            "~/o/n",
+            "file:///srv/o/n.git",
+            "C:/o/n",
+            "C:\\o\\n",
+            "https://github.com/n",
+            "https://github.com",
+            "git@github.com:n",
+            "",
+            "n",
+        ] {
+            assert_eq!(remote_host_and_slug(u), None, "{u}");
+        }
+    }
+
+    use super::*;
+
+    fn ctx() -> ExecContext {
+        ExecContext::new(
+            [
+                ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+                ("HOME", "/tmp"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn names() {
+        assert_eq!(branch_name("origin/main"), "main");
+        assert_eq!(branch_name("refs/heads/dev"), "dev");
+        assert_eq!(branch_name("develop"), "develop");
+    }
+
+    /// Many units make and drop their copies at the same moment.
+    #[test]
+    fn a_copy_links_node_modules_and_owns_it_before_a_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let w = |p: &str| {
+            let f = repo.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, p).unwrap();
+        };
+        w("a.txt");
+        w("api/src/b.ts");
+        let ok = Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        git(&ctx(), &repo, &["add", "."]).unwrap();
+        git(
+            &ctx(),
+            &repo,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        )
+        .unwrap();
+        // setup output
+        w("node_modules/top/index.js");
+        w("api/node_modules/x/index.js");
+        w("mobile/.dart_tool/package_config.json");
+        let sha = rev(&ctx(), &repo, "HEAD").unwrap();
+        // by default every node_modules is a copy, as before
+        let plain = tmp.path().join("plain");
+        clone_worktree(&ctx(), &repo, &repo, &plain, &sha, false).unwrap();
+        for p in ["node_modules/top", "api/node_modules/x"] {
+            assert!(!plain.join(p).is_symlink(), "{p}");
+            assert!(plain.join(p).join("index.js").is_file(), "{p}");
+        }
+        assert!(!plain.join("api/node_modules").join(SHARED).exists());
+        let to = tmp.path().join("copy");
+        clone_worktree(&ctx(), &repo, &repo, &to, &sha, true).unwrap();
+        let link = |p: &str| std::fs::read_link(to.join(p)).ok();
+        // a directory of links, which `node_modules/` in a .gitignore matches
+        assert!(to
+            .join("api/node_modules")
+            .symlink_metadata()
+            .unwrap()
+            .is_dir());
+        assert_eq!(
+            link("node_modules/top"),
+            Some(repo.join("node_modules/top"))
+        );
+        assert_eq!(
+            link("api/node_modules/x"),
+            Some(repo.join("api/node_modules/x"))
+        );
+        assert_eq!(link("api/src"), None);
+        assert_eq!(link("mobile/.dart_tool"), None);
+        assert!(to.join("api/node_modules/x/index.js").is_file());
+        assert!(to.join("mobile/.dart_tool/package_config.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(to.join("api/src/b.ts")).unwrap(),
+            "api/src/b.ts"
+        );
+        // a matrix entry's copy, made from the unit's, links to setup's too
+        let to2 = tmp.path().join("copy2");
+        clone_worktree(&ctx(), &repo, &to, &to2, &sha, true).unwrap();
+        assert_eq!(
+            std::fs::read_link(to2.join("api/node_modules/x")).ok(),
+            Some(repo.join("api/node_modules/x"))
+        );
+        own_node_modules(&ctx(), &to2).unwrap();
+        assert!(!to2.join("api/node_modules/x").is_symlink());
+        assert!(to2.join("api/node_modules/x/index.js").is_file());
+        // owning every node_modules, wherever the step runs
+        own_node_modules(&ctx(), &to).unwrap();
+        assert_eq!(link("api/node_modules/x"), None);
+        assert_eq!(link("node_modules/top"), None);
+        assert!(!to.join("api/node_modules").join(SHARED).exists());
+        assert!(repo.join("api/node_modules/x/index.js").is_file());
+        std::fs::write(to.join("api/node_modules/x/index.js"), "changed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("api/node_modules/x/index.js")).unwrap(),
+            "api/node_modules/x/index.js"
+        );
+        assert!(!to.join("api/.node_modules.local-ci").exists());
+    }
+
+    #[test]
+    fn a_project_emitting_declarations_does_not_share_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api = tmp.path().join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        // comments and trailing commas, as tsconfig allows
+        std::fs::write(
+            api.join("tsconfig.json"),
+            "{\n  // shared\n  \"extends\": \"../tsconfig.base\",\n  \"compilerOptions\": { \"strict\": true, },\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            api.join("tsconfig.build.json"),
+            "{ \"extends\": \"./tsconfig.json\" }",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"declaration\": false } }",
+        )
+        .unwrap();
+        assert!(!emits_declarations(&api));
+        std::fs::write(
+            tmp.path().join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"declaration\": true } }",
+        )
+        .unwrap();
+        assert!(emits_declarations(&api));
+        std::fs::write(
+            api.join("tsconfig.json"),
+            "{ \"extends\": [\"@tsconfig/node20\"], \"compilerOptions\": { \"composite\": true } }",
+        )
+        .unwrap();
+        assert!(emits_declarations(&api));
+        assert!(!emits_declarations(tmp.path().join("web").as_path()));
+    }
+
+    #[test]
+    fn a_node_modules_linking_into_the_repository_is_not_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("web/node_modules");
+        std::fs::create_dir_all(nm.join("@s")).unwrap();
+        std::fs::create_dir_all(nm.join("plain")).unwrap();
+        std::os::unix::fs::symlink("plain", nm.join("alias")).unwrap();
+        assert!(!links_out(&nm));
+        std::os::unix::fs::symlink("../../../shared", nm.join("@s/w")).unwrap();
+        assert!(links_out(&nm));
+    }
+
+    #[test]
+    fn copies_made_and_removed_side_by_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-qm", "a"]);
+        let sha = rev(&ctx(), &repo, "HEAD").unwrap();
+        let trash = tmp.path().join("trash");
+        std::thread::scope(|s| {
+            for i in 0..24 {
+                let (repo, sha, trash) = (&repo, &sha, &trash);
+                let to = tmp.path().join(format!("c{i}"));
+                s.spawn(move || {
+                    clone_worktree(&ctx(), repo, repo, &to, sha, false).unwrap();
+                    assert!(to.join("a.txt").is_file());
+                    remove_worktree(&ctx(), repo, &to, trash);
+                });
+            }
+        });
+        assert_eq!(
+            git(&ctx(), &repo, &["worktree", "list"])
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // The deletions queue behind one another and still all finish.
+        let left = || {
+            std::fs::read_dir(&trash)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != ".lock")
+                .count()
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while left() > 0 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(left(), 0);
+    }
+}

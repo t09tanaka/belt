@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# 100% line coverage for the pure modules, measured over the whole test suite
+# (unit tests and tests/*.rs): dag and frozen are exercised through the
+# planner in the integration tests, not by unit tests.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+if cargo llvm-cov --json --output-path target/llvm-cov.json >"$output"; then
+    rm -f "$output"
+else
+    status=$?
+    cat "$output"
+    exit "$status"
+fi
+python3 - <<'PY'
+import json, os, sys
+root = os.getcwd()
+data = json.load(open("target/llvm-cov.json"))
+want = {
+    "src/matrix.rs",
+    "src/filter.rs",
+    "src/source/gate.rs",
+    "src/dag.rs",
+    "src/frozen.rs",
+    "src/artifact.rs",
+    "src/shard.rs",
+    "src/shard/adapters.rs",
+    "src/shard/coverage.rs",
+    "src/shard/isolation.rs",
+    "src/demand.rs",
+    "src/result_wire.rs",
+    "src/driver.rs",
+    "src/driver/atomic.rs",
+    "src/driver/dispatch.rs",
+    "src/driver/shards.rs",
+    "src/job_evaluate.rs",
+}
+seen = set()
+bad = []
+for f in data["data"][0]["files"]:
+    name = f["filename"]
+    rel = os.path.relpath(name, root)
+    if rel not in want:
+        continue
+    seen.add(rel)
+    lines = f["summary"]["lines"]
+    print(f"{rel}: {lines['covered']}/{lines['count']} lines ({lines['percent']:.1f}%)")
+    if lines["covered"] != lines["count"]:
+        bad.append(rel)
+missing = want - seen
+if missing:
+    print("not measured:", ", ".join(sorted(missing)))
+    sys.exit(1)
+if bad:
+    print("below 100%:", ", ".join(bad))
+    sys.exit(1)
+PY
