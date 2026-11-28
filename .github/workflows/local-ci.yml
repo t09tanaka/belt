@@ -2,7 +2,9 @@ name: local-ci
 
 # The gates of crates/local-ci, ported from its own repository's ci.yml. Every
 # run step starts in crates/local-ci, so cargo acts on the member only and its
-# scripts and `cargo schemata --file src/...` paths keep their old meaning.
+# scripts run unchanged. cargo-schemata 0.4.0 names files relative to the
+# workspace root even from a member, so the mutation gates' file arguments
+# carry the crates/local-ci/ prefix; every other argument is the old one.
 # belt's ci.yml keeps belt's gates.
 on:
   push:
@@ -168,6 +170,10 @@ jobs:
           shared-key: local-ci-coverage
       # without the `browser-tests` feature: the gate measures the unit tests of
       # the adapters, not a browser
+      # the script writes target/llvm-cov.json next to the crate, but in the
+      # workspace cargo builds into the root's target/, so make the directory
+      - name: Make the crate's target directory for the report
+        run: mkdir -p target
       - name: 100% line coverage on pure modules
         run: ./scripts/coverage-gate.sh
 
@@ -190,11 +196,11 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/matrix.rs src/filter.rs src/source/gate.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/matrix.rs crates/local-ci/src/filter.rs crates/local-ci/src/source/gate.rs
       - name: zero survivors in matrix / filter / source gate
         # two at a time: the unit tests that reach the matrix now include those
         # of the driver, and one test process at a time took three times as long
-        run: cargo schemata -j 2 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+        run: cargo schemata -j 2 --file crates/local-ci/src/matrix.rs --file crates/local-ci/src/filter.rs --file crates/local-ci/src/source/gate.rs -- --lib --test job_dag --test source_capture
 
   mutants-artifact:
     name: mutation gate (artifact)
@@ -212,9 +218,9 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/artifact.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/artifact.rs
       - name: zero survivors in artifact
-        run: cargo schemata --file src/artifact.rs -- --lib artifact
+        run: cargo schemata --file crates/local-ci/src/artifact.rs -- --lib artifact
 
   mutants-frozen:
     name: mutation gate (frozen)
@@ -232,9 +238,9 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/frozen.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/frozen.rs
       - name: zero survivors in frozen
-        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
+        run: cargo schemata --file crates/local-ci/src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
 
   mutants-shard:
     name: mutation gate (shard)
@@ -252,9 +258,9 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/shard.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/shard.rs
       - name: zero survivors in shard
-        run: cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
+        run: cargo schemata --file crates/local-ci/src/shard.rs -- --lib shard::tests --test shard_plan
 
   mutants-demand:
     name: mutation gate (demand)
@@ -272,9 +278,9 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/demand.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/demand.rs
       - name: zero survivors in demand
-        run: cargo schemata --file src/demand.rs -- --lib --test task_demand
+        run: cargo schemata --file crates/local-ci/src/demand.rs -- --lib --test task_demand
 
   mutants-wire:
     name: mutation gate (wire)
@@ -292,9 +298,9 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/wire.rs src/result_wire.rs src/digest.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/wire.rs crates/local-ci/src/result_wire.rs crates/local-ci/src/digest.rs
       - name: zero survivors in wire, result_wire and digest
-        run: cargo schemata -j 2 --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
+        run: cargo schemata -j 2 --file crates/local-ci/src/wire.rs --file crates/local-ci/src/result_wire.rs --file crates/local-ci/src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
 
   # The 300 mutants of these files take about 26 minutes in one process, almost
   # all of it the tests that run for each of them. Three parts side by side
@@ -323,7 +329,7 @@ jobs:
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
       - name: every target file has mutants
-        run: scripts/mutation-targets-check.sh src/driver.rs src/driver/atomic.rs src/driver/dispatch.rs src/driver/shards.rs src/job_evaluate.rs
+        run: scripts/mutation-targets-check.sh crates/local-ci/src/driver.rs crates/local-ci/src/driver/atomic.rs crates/local-ci/src/driver/dispatch.rs crates/local-ci/src/driver/shards.rs crates/local-ci/src/job_evaluate.rs
       - name: zero survivors in transactional driver and shared evaluation
         run: |
-          cargo schemata -j 2 --shard ${{ matrix.part }}/3 --file src/driver.rs --file src/driver/atomic.rs --file src/driver/dispatch.rs --file src/driver/shards.rs --file src/job_evaluate.rs -- --lib -- driver:: job_evaluate::
+          cargo schemata -j 2 --shard ${{ matrix.part }}/3 --file crates/local-ci/src/driver.rs --file crates/local-ci/src/driver/atomic.rs --file crates/local-ci/src/driver/dispatch.rs --file crates/local-ci/src/driver/shards.rs --file crates/local-ci/src/job_evaluate.rs -- --lib -- driver:: job_evaluate::
