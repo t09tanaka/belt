@@ -192,8 +192,8 @@ jobs:
           shared-key: local-ci-mutants-pure
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -214,8 +214,8 @@ jobs:
           shared-key: local-ci-mutants-artifact
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -234,8 +234,8 @@ jobs:
           shared-key: local-ci-mutants-frozen
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -254,8 +254,8 @@ jobs:
           shared-key: local-ci-mutants-shard
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -274,8 +274,8 @@ jobs:
           shared-key: local-ci-mutants-demand
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -294,8 +294,8 @@ jobs:
           shared-key: local-ci-mutants-wire
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
@@ -325,8 +325,8 @@ jobs:
           shared-key: local-ci-mutants-driver
       - name: install cargo-schemata
         run: |
-          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.7.0'; then
-            cargo install cargo-schemata --locked --version 0.7.0 --force
+          if true; then
+            cargo install --git https://github.com/t09tanaka/cargo-schemata --rev 6bf05afb3d7fe615aac9104d21c26640a7a57fd6 --locked --force cargo-schemata
           fi
           cargo-schemata --version | grep -Fx 'cargo-schemata 0.7.0'
       - name: every target file has mutants
