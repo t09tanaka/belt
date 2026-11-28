@@ -931,13 +931,16 @@ mod tests {
         holder.join().unwrap();
     }
 
-    /// The source index held by a writer on another connection for `ms`:
-    /// `EXCLUSIVE`, as a writer holds it while it commits, which is when
-    /// a reader of a rollback-journal database is refused. Returns once
-    /// the lock is held.
-    fn hold_index(f: &crate::ci::execute::tests::Fixture, ms: u64) -> std::thread::JoinHandle<()> {
+    /// The source index held by a writer on another connection until the
+    /// returned sender is sent to (or dropped): `EXCLUSIVE`, as a writer
+    /// holds it while it commits, which is when a reader of a
+    /// rollback-journal database is refused. Returns once the lock is held.
+    fn hold_index(
+        f: &crate::ci::execute::tests::Fixture,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let path = f.area.join("state").join("sources").join("retention.db");
         let (held, taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             let c = rusqlite::Connection::open(path).unwrap();
             c.execute_batch(
@@ -945,11 +948,11 @@ mod tests {
             )
             .unwrap();
             held.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(ms));
+            let _ = released.recv();
             c.execute_batch("COMMIT").unwrap();
         });
         taken.recv().unwrap();
-        holder
+        (release, holder)
     }
 
     /// Acceptance's reads are foreground work: a writer that holds the
@@ -960,11 +963,18 @@ mod tests {
         let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
         let (machine, p) = machine_with_source(&f, None);
         let held = machine.store.mutation_guard().unwrap();
-        let holder = hold_index(&f, 2000);
+        let (release, holder) = hold_index(&f);
+        // The writer commits 2 s on: past the 1 s maintenance budget,
+        // within the 5 s foreground one.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            release.send(()).unwrap();
+        });
         let started = Instant::now();
         let m = manifest_in(&machine.store, &p, Wait::No, Some(&held)).unwrap();
         assert_eq!(m.source_id, f.manifest.source_id);
         assert!(started.elapsed() >= Duration::from_millis(1500));
+        releaser.join().unwrap();
         holder.join().unwrap();
     }
 
@@ -975,8 +985,12 @@ mod tests {
         let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
         let (machine, p) = machine_with_source(&f, None);
         let held = machine.store.mutation_guard().unwrap();
-        let holder = hold_index(&f, 6500);
-        let e = manifest_in(&machine.store, &p, Wait::No, Some(&held)).unwrap_err();
+        // Held until the read has answered: it cannot outlast the writer.
+        let (release, holder) = hold_index(&f);
+        let answer = manifest_in(&machine.store, &p, Wait::No, Some(&held));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let e = answer.unwrap_err();
         assert_eq!(e.code, ErrorCode::Overloaded, "{e:?}");
         assert_eq!(
             e.overloaded_reason,
@@ -984,7 +998,6 @@ mod tests {
             "{e:?}"
         );
         assert!(e.message.starts_with("source store: "), "{e:?}");
-        holder.join().unwrap();
     }
 
     /// (g)15, review round 1: while a deleting pass holds the exclusive
