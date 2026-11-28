@@ -277,28 +277,44 @@ fn concurrency_never_exceeds_budget() {
 
 #[test]
 fn head_reserves_and_light_entry_does_not_overtake() {
-    let env = TestEnv::new().with_config("budget = 3\n");
+    let env = TestEnv::new().with_config(
+        "budget = 3
+",
+    );
     let dir = env.marker_dir();
-    let mut big = env.spawn_exec(&["--weight", "2"], &marker_script(&dir, "big", "1"));
+    // `big` runs until released, so `light` is surely queued behind the
+    // head while `big` still holds the budget.
+    let big_gate = Gate::new(&dir, "big");
+    let mut big = env.spawn_exec(&["--weight", "2"], &gated_script(&dir, "big"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
-    let mut heavy = env.spawn_exec(&["--weight", "2"], &marker_script(&dir, "heavy", "0.3"));
+    // The head takes the whole budget, so once it runs nothing can run
+    // beside it: `light` and the head can never be admitted together, and the
+    // order of their start marks is decided by the scheduler alone.
+    let mut heavy = env.spawn_exec(&["--weight", "3"], &marker_script(&dir, "heavy", "0.3"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries()
             .iter()
-            .any(|e| e["weight"] == 2 && e["state"] == "waiting")
+            .any(|e| e["weight"] == 3 && e["state"] == "waiting")
     }));
     // Nothing has been learned about `light`, so it is not short and may not
-    // backfill (see short_command_backfills_behind_a_head_that_does_not_fit).
+    // backfill (see short_command_backfills_behind_a_head_that_does_not_fit),
+    // although it fits beside `big`.
     let mut light = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "light", "0.3"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries()
+            .iter()
+            .any(|e| e["weight"] == 1 && e["state"] == "waiting")
+    }));
+    big_gate.release();
     assert!(big.wait().unwrap().success());
     assert!(heavy.wait().unwrap().success());
     assert!(light.wait().unwrap().success());
-    let heavy_start = read_ns(&dir.join("heavy.start"));
+    let heavy_end = read_ns(&dir.join("heavy.end"));
     let light_start = read_ns(&dir.join("light.start"));
     assert!(
-        light_start >= heavy_start,
+        light_start >= heavy_end,
         "light overtook the reserving head"
     );
 }
