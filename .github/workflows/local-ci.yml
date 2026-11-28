@@ -1,12 +1,42 @@
-name: CI
+name: local-ci
 
+# The gates of crates/local-ci, ported from its own repository's ci.yml. Every
+# run step starts in crates/local-ci, so cargo acts on the member only and its
+# scripts and `cargo schemata --file src/...` paths keep their old meaning.
+# belt's ci.yml keeps belt's gates.
 on:
   push:
     branches: [main]
+    paths:
+      - "crates/local-ci/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/local-ci.yml"
   pull_request:
+    paths:
+      - "crates/local-ci/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+      - ".github/workflows/local-ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: crates/local-ci
 
 jobs:
   test:
@@ -25,23 +55,25 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-test
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: |
-            examples/sharding/node/package-lock.json
-            examples/sharding/playwright/package-lock.json
-            examples/sharding/cypress/package-lock.json
+            crates/local-ci/examples/sharding/node/package-lock.json
+            crates/local-ci/examples/sharding/playwright/package-lock.json
+            crates/local-ci/examples/sharding/cypress/package-lock.json
 
       - name: Install the Node example (the shard adapter tests run Vitest and Jest)
         run: npm ci
-        working-directory: examples/sharding/node
+        working-directory: crates/local-ci/examples/sharding/node
 
       - name: Install the Playwright example
         run: npm ci
-        working-directory: examples/sharding/playwright
+        working-directory: crates/local-ci/examples/sharding/playwright
 
       # the browser is cached by the lock file (it holds Playwright's version)
       - name: Cache Playwright's browser
@@ -49,23 +81,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.os == 'macOS' && '~/Library/Caches/ms-playwright' || '~/.cache/ms-playwright' }}
-          key: playwright-${{ runner.os }}-${{ hashFiles('examples/sharding/playwright/package-lock.json') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/local-ci/examples/sharding/playwright/package-lock.json') }}
 
       - name: Install the system libraries of Chromium
         if: runner.os == 'Linux'
         run: npx playwright install-deps chromium
-        working-directory: examples/sharding/playwright
+        working-directory: crates/local-ci/examples/sharding/playwright
 
       - name: Install Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: npx playwright install chromium
-        working-directory: examples/sharding/playwright
+        working-directory: crates/local-ci/examples/sharding/playwright
 
       # Cypress runs here on Linux only: its test is ignored on macOS
       - name: Install the Cypress example
         if: runner.os == 'Linux'
         run: npm ci
-        working-directory: examples/sharding/cypress
+        working-directory: crates/local-ci/examples/sharding/cypress
         env:
           CYPRESS_INSTALL_BINARY: "0"
 
@@ -75,7 +107,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/Cypress
-          key: cypress-${{ runner.os }}-${{ hashFiles('examples/sharding/cypress/package-lock.json') }}
+          key: cypress-${{ runner.os }}-${{ hashFiles('crates/local-ci/examples/sharding/cypress/package-lock.json') }}
 
       - name: Install the system libraries of Cypress
         if: runner.os == 'Linux'
@@ -84,22 +116,22 @@ jobs:
       - name: Install the Cypress binary
         if: runner.os == 'Linux' && steps.cypress-cache.outputs.cache-hit != 'true'
         run: npx cypress install
-        working-directory: examples/sharding/cypress
+        working-directory: crates/local-ci/examples/sharding/cypress
 
       - name: Verify Cypress
         if: runner.os == 'Linux'
         run: npx cypress verify
-        working-directory: examples/sharding/cypress
+        working-directory: crates/local-ci/examples/sharding/cypress
 
       - name: cargo fmt --check
-        run: cargo fmt --all --check
+        run: cargo fmt -p local-ci --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy -p local-ci --all-targets --all-features -- -D warnings
 
       # with the tests that run Chromium (and Cypress on Linux) for real
       - name: cargo test
-        run: cargo test --features browser-tests
+        run: cargo test -p local-ci --features browser-tests
 
   msrv:
     name: MSRV (1.89)
@@ -109,7 +141,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.89"
-      - run: cargo check --all-targets
+      - run: cargo check -p local-ci --all-targets
 
   coverage:
     name: coverage gate (pure modules)
@@ -125,13 +157,15 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: |
-            examples/sharding/node/package-lock.json
+            crates/local-ci/examples/sharding/node/package-lock.json
 
       - name: Install the Node example (the shard adapter tests run Vitest and Jest)
         run: npm ci
-        working-directory: examples/sharding/node
+        working-directory: crates/local-ci/examples/sharding/node
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-coverage
       # without the `browser-tests` feature: the gate measures the unit tests of
       # the adapters, not a browser
       - name: 100% line coverage on pure modules
@@ -147,6 +181,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-pure
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -167,6 +203,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-artifact
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -185,6 +223,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-frozen
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -203,6 +243,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-shard
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -221,6 +263,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-demand
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -239,6 +283,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-wire
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
@@ -268,6 +314,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ci-mutants-driver
       - name: install cargo-schemata
         run: |
           if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then

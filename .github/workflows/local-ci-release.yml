@@ -1,12 +1,12 @@
-name: Release
+name: local-ci release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["local-ci-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach binaries to (e.g. v0.10.1)"
+        description: "Existing tag to build and attach binaries to (e.g. local-ci-v0.20.2)"
         required: true
 
 env:
@@ -43,15 +43,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: local-ci-release
           key: ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p local-ci --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
           set -euo pipefail
-          archive="local-ci-${TAG}-${{ matrix.target }}.tar.gz"
+          # The archive keeps the old name, local-ci-vX.Y.Z-<target>, so
+          # install scripts that read it keep working.
+          archive="local-ci-v${TAG#local-ci-v}-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" local-ci
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
