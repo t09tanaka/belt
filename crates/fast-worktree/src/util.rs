@@ -1,0 +1,444 @@
+//! Small helpers shared by the commands.
+
+use std::cell::RefCell;
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+/// Open the lock file `path` (making its directory first when `make_dir`
+/// and it is gone) and take an exclusive `flock` on it: waiting for it, or
+/// with `wait` false giving `Ok(None)` when another process holds it. The
+/// lock file of a directory that is removed when it is empty is unlinked
+/// with it, so once the lock is held it is checked that `path` still names
+/// the file that was locked, and otherwise the lock is taken again on the
+/// file there now. That check is what makes it safe to unlink a lock file.
+pub fn lock_path(
+    path: &Path,
+    wait: bool,
+    make_dir: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    for _ in 0..100 {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+        };
+        let f = match open() {
+            Err(e) if make_dir && e.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                open()?
+            }
+            other => other?,
+        };
+        loop {
+            let op = if wait {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_EX | libc::LOCK_NB
+            };
+            // SAFETY: a valid open descriptor; the lock goes when it is closed.
+            if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                ErrorKind::Interrupted => {}
+                ErrorKind::WouldBlock if !wait => return Ok(None),
+                _ => return Err(e),
+            }
+        }
+        let same = match (f.metadata(), std::fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        };
+        if same {
+            return Ok(Some(f));
+        }
+    }
+    Err(std::io::Error::other("the lock file keeps being replaced"))
+}
+
+pub fn home() -> PathBuf {
+    env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+/// Mark this process as one that embeds the library: it lives on after a
+/// command would have exited, so the detached children it starts must be
+/// reaped (see [`release`]).
+pub fn set_embedded() {
+    EMBEDDED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn is_embedded() -> bool {
+    EMBEDDED.load(Ordering::Relaxed)
+}
+
+/// Let go of a detached child that is not waited for. The command exits
+/// soon after, and init reaps the child; a long-lived embedding process
+/// would keep a zombie for every one, so a thread waits for it there.
+pub fn release(child: std::process::Child) {
+    if is_embedded() {
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
+}
+
+/// Which stream a line of output belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+pub type Sink = Box<dyn FnMut(Stream, &str)>;
+
+/// What the library sets for the duration of one call: where the output
+/// goes instead of the terminal, and which executable runs the detached
+/// helper commands (`pool fill`, `install --changed`). The CLI sets nothing,
+/// so output goes to stdout and stderr and the helper is the running binary,
+/// unless it is embedded with a helper (`cli::run_with_helper`): then it sets
+/// only the helper.
+struct Context {
+    /// `None`: stdout and stderr, and what a child writes goes there
+    /// directly.
+    sink: Option<Sink>,
+    exe: Option<PathBuf>,
+}
+
+/// The environment of the tools that one library call runs (key commands,
+/// installs, hooks, helper processes), set by the embedding program.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tools {
+    /// Variables set on every command, over the process environment
+    /// (`PATH` among them).
+    pub env: Vec<(OsString, OsString)>,
+    /// An identity of the toolchain, part of every cache key.
+    pub identity: Option<String>,
+}
+
+/// The variable that hands [`Tools::identity`] to a helper process; the
+/// CLI also reads it.
+pub const KEY_IDENTITY_VAR: &str = "FAST_WORKTREE_KEY_IDENTITY";
+
+thread_local! {
+    static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    static TOOLS: RefCell<Tools> = RefCell::new(Tools::default());
+}
+
+/// Run `f` with the output of this thread sent to `sink`, and `exe` as the
+/// helper executable. Nests; the previous context is restored.
+pub fn with_context<T>(sink: Option<Sink>, exe: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+    with_tools(sink, exe, Tools::default(), f)
+}
+
+/// [`with_context`], with `tools` for the commands that `f` runs.
+pub fn with_tools<T>(
+    sink: Option<Sink>,
+    exe: Option<PathBuf>,
+    tools: Tools,
+    f: impl FnOnce() -> T,
+) -> T {
+    let prev = CONTEXT.with(|c| c.borrow_mut().replace(Context { sink, exe }));
+    struct Restore(Option<Context>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            CONTEXT.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(prev);
+    in_tools(tools, f)
+}
+
+/// This thread's [`Tools`], to hand to a thread it starts ([`in_tools`]).
+pub fn tools() -> Tools {
+    TOOLS.with(|t| t.borrow().clone())
+}
+
+/// Run `f` with `tools` for the commands it runs; the previous ones are
+/// restored. For threads that a call starts.
+pub fn in_tools<T>(tools: Tools, f: impl FnOnce() -> T) -> T {
+    let prev = TOOLS.with(|t| t.replace(tools));
+    struct Restore(Option<Tools>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                TOOLS.with(|t| *t.borrow_mut() = prev);
+            }
+        }
+    }
+    let _restore = Restore(Some(prev));
+    f()
+}
+
+fn to_sink(stream: Stream, s: &str) -> bool {
+    CONTEXT.with(|c| match c.borrow_mut().as_mut() {
+        Some(Context {
+            sink: Some(sink), ..
+        }) => {
+            sink(stream, s);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The variable `name` as the commands see it: the context's value, else
+/// the process's.
+pub fn env_var(name: &str) -> Option<OsString> {
+    let set = TOOLS.with(|t| {
+        t.borrow()
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    });
+    set.or_else(|| env::var_os(name))
+}
+
+/// Set the context's variables on `c`; for a helper process also the
+/// toolchain identity, so that its keys are the same.
+pub fn apply_env(c: &mut Command) -> &mut Command {
+    TOOLS.with(|t| {
+        let t = t.borrow();
+        for (k, v) in &t.env {
+            c.env(k, v);
+        }
+        if let Some(id) = &t.identity {
+            c.env(KEY_IDENTITY_VAR, id);
+        }
+    });
+    c
+}
+
+/// The toolchain identity that goes into every cache key: the context's,
+/// else a non-empty `FAST_WORKTREE_KEY_IDENTITY`; `None` for neither.
+pub fn key_identity() -> Option<String> {
+    TOOLS
+        .with(|t| t.borrow().identity.clone())
+        .or_else(|| env::var(KEY_IDENTITY_VAR).ok().filter(|v| !v.is_empty()))
+}
+
+/// The executable that runs `pool fill` and `install --changed` detached:
+/// the running binary, or the one the embedding program configured.
+pub fn helper_exe() -> std::io::Result<PathBuf> {
+    let configured = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.exe.clone()));
+    match configured {
+        None => env::current_exe(),
+        Some(Some(exe)) => Ok(exe),
+        Some(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no `fast-worktree` executable is configured for background work",
+        )),
+    }
+}
+
+/// The executable for background work that only this version knows how to
+/// do (`cache retire`): [`helper_exe`], except that a program that embeds
+/// the library and has no helper in place (as in [`crate::sweep_trash`])
+/// gets none, since the running binary is then not `fast-worktree`.
+pub fn background_exe() -> Option<PathBuf> {
+    let configured = CONTEXT.with(|c| c.borrow().is_some());
+    if !configured && is_embedded() {
+        return None;
+    }
+    helper_exe().ok()
+}
+
+/// `Command::status`, except that while the library captures output, what
+/// the command writes goes to the sink too and not to this process's own
+/// stdout and stderr.
+pub fn run_status(c: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    if !CONTEXT.with(|ctx| ctx.borrow().as_ref().is_some_and(|c| c.sink.is_some())) {
+        return c.status();
+    }
+    let out = c.output()?;
+    to_sink(Stream::Stdout, &String::from_utf8_lossy(&out.stdout));
+    to_sink(Stream::Stderr, &String::from_utf8_lossy(&out.stderr));
+    Ok(out.status)
+}
+
+/// Write to stdout, ignoring errors. `print!` panics when stdout is a pipe
+/// whose reader has gone (EPIPE); `check` promises to exit 0 whatever
+/// happens to its output.
+pub fn say(s: &str) {
+    use std::io::Write;
+    if to_sink(Stream::Stdout, s) {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(s.as_bytes()).and_then(|()| out.flush());
+}
+
+/// [`say`] for stderr.
+pub fn warn(s: &str) {
+    use std::io::Write;
+    if to_sink(Stream::Stderr, s) {
+        return;
+    }
+    let _ = std::io::stderr().lock().write_all(s.as_bytes());
+}
+
+/// `print!` through [`say`]: a reader that has gone (`fast-worktree pool
+/// status | head -1`) ends the output, not the command.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::util::say(&format!($($arg)*))
+    };
+}
+
+/// `println!` through [`say`].
+macro_rules! outln {
+    () => {
+        $crate::util::say("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::util::say(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// `eprintln!` through [`warn`].
+macro_rules! errln {
+    () => {
+        $crate::util::warn("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::util::warn(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+pub(crate) use {errln, out, outln};
+
+/// `1.2s`, the format every timing line uses.
+pub fn elapsed(start: Instant) -> String {
+    format!("{:.1}s", start.elapsed().as_secs_f64())
+}
+
+/// Show a path with `$HOME` abbreviated to `~`.
+pub fn tilde(path: &Path) -> String {
+    tilde_with(path, &home())
+}
+
+fn tilde_with(path: &Path, home: &Path) -> String {
+    if home != Path::new("/") {
+        if let Ok(rest) = path.strip_prefix(home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    path.display().to_string()
+}
+
+/// Find an executable on `PATH`, then in `~/.cargo/bin` (where `cargo
+/// install` puts tools even when that directory is not on `PATH`).
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    find_tool_in(name, env_var("PATH").as_deref(), &home())
+}
+
+fn find_tool_in(name: &str, path: Option<&std::ffi::OsStr>, home: &Path) -> Option<PathBuf> {
+    if name.contains('/') {
+        let p = PathBuf::from(name);
+        return is_executable(&p).then_some(p);
+    }
+    let on_path = path
+        .into_iter()
+        .flat_map(env::split_paths)
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.join(name));
+    let cargo = std::iter::once(home.join(".cargo/bin").join(name));
+    on_path.chain(cargo).find(|p| is_executable(p))
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The last `n` lines of `s`.
+pub fn tail(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn tilde_abbreviates_home_only_as_a_path_prefix() {
+        let home = Path::new("/home/me");
+        assert_eq!(tilde_with(Path::new("/home/me/a/b"), home), "~/a/b");
+        assert_eq!(tilde_with(Path::new("/home/me"), home), "~");
+        assert_eq!(tilde_with(Path::new("/home/meow/a"), home), "/home/meow/a");
+        assert_eq!(tilde_with(Path::new("/x"), Path::new("/")), "/x");
+    }
+
+    #[test]
+    fn the_helper_is_the_one_in_context_and_else_the_running_binary() {
+        let exe = PathBuf::from("/opt/x/fast-worktree");
+        let got = with_context(None, Some(exe.clone()), helper_exe).unwrap();
+        assert_eq!(got, exe);
+        assert_eq!(helper_exe().unwrap(), env::current_exe().unwrap());
+        let none = with_context(None, None, helper_exe);
+        assert_eq!(none.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn find_tool_prefers_path_then_cargo_bin() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("bin");
+        let cargo = t.path().join(".cargo/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&cargo).unwrap();
+        let mk = |p: &Path| {
+            fs::write(p, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        mk(&cargo.join("tool"));
+        let path = std::ffi::OsString::from(bin.as_os_str());
+        assert_eq!(
+            find_tool_in("tool", Some(&path), t.path()),
+            Some(cargo.join("tool"))
+        );
+        mk(&bin.join("tool"));
+        assert_eq!(
+            find_tool_in("tool", Some(&path), t.path()),
+            Some(bin.join("tool"))
+        );
+        assert_eq!(find_tool_in("nope", Some(&path), t.path()), None);
+        // Not executable: ignored.
+        fs::write(bin.join("plain"), "").unwrap();
+        assert_eq!(find_tool_in("plain", Some(&path), t.path()), None);
+    }
+
+    #[test]
+    fn tail_keeps_last_lines() {
+        assert_eq!(tail("a\nb\nc", 2), "b\nc");
+        assert_eq!(tail("a", 5), "a");
+    }
+}

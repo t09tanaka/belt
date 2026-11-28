@@ -1,0 +1,615 @@
+//! Thin wrappers around the `git` CLI.
+
+use crate::error::{bail, Error, Kind, Result};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+fn command(dir: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).stdin(Stdio::null());
+    c
+}
+
+/// Run git in `dir` and return stdout. A non-zero exit becomes an error
+/// carrying git's stderr.
+pub fn output(dir: &Path, args: &[&str]) -> Result<String> {
+    output_with_env(dir, args, &[])
+}
+
+/// [`output`] with extra environment variables for git and its hooks.
+pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let registration = if args.windows(2).any(|a| a[0] == "worktree")
+        || matches!(args, ["branch", "-d" | "-D", ..])
+    {
+        Some(registration_lock(dir)?)
+    } else {
+        None
+    };
+    let mut child = command(dir);
+    if let Some(held) = &registration {
+        child.env(REGISTRATION_OWNER, &held.key);
+    }
+    let out = child
+        .args(args)
+        .envs(env.iter().copied())
+        .output()
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {}: {}", args.join(" "), err.trim()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`output`] for a command that reads `input` on its standard input and
+/// takes no part in worktree registration (`update-ref --stdin`).
+pub fn output_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    use std::io::Write;
+    let fail = |e: std::io::Error| Error::of(Kind::Git, format!("cannot run git: {e}"));
+    let mut child = command(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    // Written from another thread: git may fill its output pipes before it
+    // has read everything.
+    let mut stdin = child.stdin.take();
+    let text = input.to_string();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut pipe) = stdin.take() {
+            let _ = pipe.write_all(text.as_bytes());
+        }
+    });
+    let out = child.wait_with_output().map_err(fail)?;
+    let _ = writer.join();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {}: {}", args.join(" "), err.trim()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run git in `dir` with inherited stdout/stderr (for commands whose
+/// output the user should see, like `git worktree add`), with extra
+/// environment variables for git and its hooks.
+pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let registration = registration_lock(dir)?;
+    let mut c = command(dir);
+    c.env(REGISTRATION_OWNER, &registration.key)
+        .args(args)
+        .envs(env.iter().copied());
+    let status = crate::util::run_status(&mut c)
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
+    if !status.success() {
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {} failed ({status})", args.join(" ")),
+        ));
+    }
+    Ok(())
+}
+
+/// The marker identifies inherited, synchronous calls from a Git hook. It
+/// never bypasses the lock: even a stale marker must acquire it normally.
+const REGISTRATION_OWNER: &str = "FAST_WORKTREE_REGISTRATION_OWNER";
+
+struct RegistrationLock {
+    _file: File,
+    key: PathBuf,
+}
+
+/// Serialize native Git metadata operations and their hooks. Dependency
+/// preparation and fast-worktree's own hooks run after this guard is dropped.
+fn registration_lock(dir: &Path) -> Result<RegistrationLock> {
+    let out = command(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "cannot locate common Git directory: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    lock_common(Path::new(
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+    ))
+}
+
+/// The lock file, in the repository's common git directory. It is never
+/// unlinked: the versions from 0.4.0 on take the lock on whatever file
+/// they opened, without looking at the path again, so one that waited on a
+/// file that was unlinked meanwhile would hold "the lock" together with
+/// the next operation, and two registrations would run side by side. It is
+/// one empty file for a repository, and goes with the repository.
+const REGISTRATION_LOCK: &str = "fast-worktree-registration.lock";
+
+fn lock_common(common: &Path) -> Result<RegistrationLock> {
+    let key = common.canonicalize()?;
+    let path = key.join(REGISTRATION_LOCK);
+    let file = match crate::util::lock_path(&path, false, false)? {
+        Some(f) => f,
+        None => {
+            if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
+                bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
+            }
+            // A separate operation waits; only inherited same-repository reentry
+            // fails. The marker is never permission to access incomplete metadata.
+            crate::util::lock_path(&path, true, false)?.ok_or_else(|| Error::msg("lock"))?
+        }
+    };
+    Ok(RegistrationLock { _file: file, key })
+}
+
+pub fn toplevel(dir: &Path) -> Result<PathBuf> {
+    let s = output(dir, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(s.trim_end_matches('\n')))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// Short branch name, `None` for a detached HEAD or a bare entry.
+    pub branch: Option<String>,
+    pub locked: bool,
+}
+
+/// Registered worktrees. The main checkout comes first.
+pub fn worktrees(dir: &Path) -> Result<Vec<Worktree>> {
+    Ok(parse_worktrees(&output(
+        dir,
+        &["worktree", "list", "--porcelain"],
+    )?))
+}
+
+pub fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
+    let mut out = Vec::new();
+    let mut cur: Option<Worktree> = None;
+    for line in porcelain.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            out.extend(cur.take());
+            cur = Some(Worktree {
+                path: PathBuf::from(p),
+                branch: None,
+                locked: false,
+            });
+        } else if let Some(w) = cur.as_mut() {
+            if let Some(b) = line.strip_prefix("branch ") {
+                w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+            } else if line == "locked" || line.starts_with("locked ") {
+                w.locked = true;
+            }
+        }
+    }
+    out.extend(cur);
+    out
+}
+
+/// The administrative directory of the linked worktree whose root is
+/// `path`: `<common dir>/worktrees/<id>`, where git keeps its `HEAD`,
+/// index and the `gitdir` file pointing back at `path/.git`. Taken while
+/// the worktree is still in place, for [`unregister`]. An error when `path`
+/// is not a linked worktree (the main checkout has none).
+pub fn admin_dir(path: &Path) -> Result<PathBuf> {
+    let out = output(
+        path,
+        &[
+            "rev-parse",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        bail!(
+            "git rev-parse printed no git directory for {}",
+            path.display()
+        );
+    };
+    let real = |p: &str| {
+        let p = PathBuf::from(p);
+        p.canonicalize().unwrap_or(p)
+    };
+    let (admin, common) = (real(git_dir), real(common));
+    // Absolute, or relative to the entry (`worktree.useRelativePaths`), as
+    // in [`find_admin`].
+    let gitdir_file = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+    let points_back = admin
+        .join(gitdir_file.trim_end_matches('\n'))
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|p| p == path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    if admin.parent() != Some(common.join("worktrees").as_path()) || !points_back {
+        bail!(
+            "{}: cannot find its entry under {}",
+            path.display(),
+            common.join("worktrees").display()
+        );
+    }
+    Ok(admin)
+}
+
+/// Unregister one worktree whose files have been moved away, by deleting
+/// its administrative directory (from [`admin_dir`]). This is what `git
+/// worktree prune` does for that entry, without touching the others: a
+/// worktree on a volume that is not mounted right now also looks missing to
+/// `prune`, and must keep its registration.
+pub fn unregister(admin: &Path) -> Result<()> {
+    let common = admin
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::msg("not a worktree administrative directory"))?;
+    let _registration = lock_common(common)?;
+    if admin
+        .symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Unregistered meanwhile ([`unregister_where`]).
+        return Ok(());
+    }
+    let is_entry = admin
+        .parent()
+        .is_some_and(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+        && admin.join("gitdir").is_file();
+    if !is_entry {
+        bail!("{}: not a worktree entry; left alone", admin.display());
+    }
+    fs::remove_dir_all(admin).map_err(|e| Error::msg(format!("{}: {e}", admin.display())))
+}
+
+/// Unregister the worktrees whose administrative directory under
+/// `<common>/worktrees` `pick` chooses, holding the registration lock.
+/// `pick` is asked twice: before the lock is taken (nothing chosen: no lock
+/// is taken at all), and again once it is held, when no `git worktree`
+/// command of fast-worktree can be in the middle of changing an entry. The
+/// lock is not waited for: when it is held, nothing is done this time.
+/// Returns how many entries were deleted.
+pub fn unregister_where(common: &Path, pick: &dyn Fn(&Path) -> bool) -> usize {
+    let picked = |common: &Path| -> Vec<PathBuf> {
+        fs::read_dir(common.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|admin| pick(admin))
+            .collect()
+    };
+    if picked(common).is_empty() {
+        return 0;
+    }
+    let Ok(key) = common.canonicalize() else {
+        return 0;
+    };
+    let Ok(Some(_registration)) =
+        crate::util::lock_path(&key.join(REGISTRATION_LOCK), false, false)
+    else {
+        return 0;
+    };
+    picked(&key)
+        .iter()
+        .filter(|admin| fs::remove_dir_all(admin).is_ok())
+        .count()
+}
+
+/// Tracked files under `root` matching the pathspecs, relative to `root`.
+pub fn tracked(root: &Path, pathspecs: &[&str]) -> Result<Vec<String>> {
+    let mut args = vec!["ls-files", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    let s = output(root, &args)?;
+    Ok(s.split('\0')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether a branch's work is in a branch that stays, for `remove
+/// --delete-branch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// Its commit (this one) is reachable from one of the references.
+    Yes(String),
+    /// It is reachable from none of these (short names).
+    No(Vec<String>),
+    /// Git cannot tell (the branch does not resolve): `git branch -d`
+    /// decides.
+    Unknown,
+}
+
+/// Whether the commit of the local `branch` is reachable, in the
+/// repository of `dir`, from its upstream (when that ref exists),
+/// `origin/<default>` or the local `<default>` branch, where `<default>`
+/// is origin's default branch as `refs/remotes/origin/HEAD` records it
+/// (nothing is fetched). Without that record, the `HEAD` of `dir` takes
+/// the place of the two, as for `git branch -d`. So a branch merged on the
+/// remote counts as merged even when the main checkout is behind or on
+/// another branch.
+pub fn merged(dir: &Path, branch: &str) -> Merged {
+    let Ok(sha) = output(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    ) else {
+        return Merged::Unknown;
+    };
+    let sha = sha.trim().to_string();
+    // `<branch>@{upstream}` resolves only when the upstream ref exists.
+    let upstream = output(
+        dir,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            &format!("refs/heads/{branch}@{{upstream}}"),
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| s.starts_with("refs/"));
+    let mut refs: Vec<String> = upstream.into_iter().collect();
+    match origin_head(dir) {
+        Some(d) => {
+            refs.push(format!("refs/remotes/origin/{d}"));
+            refs.push(format!("refs/heads/{d}"));
+        }
+        None => refs.push("HEAD".to_string()),
+    }
+    refs.dedup();
+    let exists = |r: &str| succeeds(dir, &["rev-parse", "--verify", "-q", r]);
+    let refs: Vec<String> = refs.into_iter().filter(|r| exists(r)).collect();
+    if refs
+        .iter()
+        .any(|r| succeeds(dir, &["merge-base", "--is-ancestor", &sha, r]))
+    {
+        return Merged::Yes(sha);
+    }
+    let short = |r: &str| {
+        r.strip_prefix("refs/remotes/")
+            .or_else(|| r.strip_prefix("refs/heads/"))
+            .unwrap_or(r)
+            .to_string()
+    };
+    let mut names: Vec<String> = refs.iter().map(|r| short(r)).collect();
+    names.dedup();
+    Merged::No(names)
+}
+
+/// The administrative directory of the worktree registered at `path`, for
+/// when `path` is gone or broken and [`admin_dir`] cannot ask git there:
+/// the one entry of `<common dir>/worktrees/*` whose `gitdir` file points
+/// at `path/.git` and that `git worktree list`, run in `dir` (any checkout
+/// of the repository), lists at `path`. `None` unless exactly one matches.
+pub fn find_admin(dir: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    let common = output(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim_end_matches('\n'));
+    let listed = worktrees(dir)?;
+    let same = |a: &Path| comparable(a) == comparable(path);
+    if !listed.iter().any(|w| same(&w.path)) {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for e in fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let admin = e.path();
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let gitdir = admin.join(text.trim_end_matches('\n'));
+        if gitdir.file_name().is_some_and(|n| n == ".git") && gitdir.parent().is_some_and(same) {
+            found.push(admin);
+        }
+    }
+    Ok(match found.len() {
+        1 => found.pop(),
+        _ => None,
+    })
+}
+
+/// `path` with symlinks resolved as far as it exists: a path that is gone
+/// is its parent's real path plus its name (`/tmp` and `/private/tmp` are
+/// one place on macOS).
+fn comparable(path: &Path) -> PathBuf {
+    if let Ok(p) = path.canonicalize() {
+        return p;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => comparable(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Whether `git` in `dir` exits 0, with its output discarded.
+pub fn succeeds(dir: &Path, args: &[&str]) -> bool {
+    command(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether the local branch exists.
+pub fn branch_exists(dir: &Path, branch: &str) -> bool {
+    succeeds(
+        dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+/// The ssh command for a fetch that must not wait for a password, a
+/// passphrase or a host key confirmation: the one git would use
+/// (`GIT_SSH_COMMAND`, else `core.sshCommand`, else `ssh`) with `-o
+/// BatchMode=yes` added. `None` when only `GIT_SSH` names the program: it
+/// takes no options, so it is left as it is.
+pub fn batch_ssh_command(
+    env_command: Option<&str>,
+    config_command: Option<&str>,
+    git_ssh: bool,
+) -> Option<String> {
+    fn nonempty(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let base = match (nonempty(env_command), nonempty(config_command)) {
+        (Some(c), _) | (None, Some(c)) => c.to_string(),
+        (None, None) if git_ssh => return None,
+        (None, None) => "ssh".to_string(),
+    };
+    Some(format!("{base} -o BatchMode=yes"))
+}
+
+/// The environment for a fetch that never prompts: `GIT_TERMINAL_PROMPT=0`
+/// and [`batch_ssh_command`].
+fn batch_env(dir: &Path) -> Vec<(&'static str, String)> {
+    let var = |k: &str| std::env::var(k).ok();
+    let config = output(dir, &["config", "--get", "core.sshCommand"]).ok();
+    let mut env = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
+    if let Some(c) = batch_ssh_command(
+        var("GIT_SSH_COMMAND").as_deref(),
+        config.as_deref(),
+        var("GIT_SSH").is_some_and(|s| !s.is_empty()),
+    ) {
+        env.push(("GIT_SSH_COMMAND", c));
+    }
+    env
+}
+
+/// `git fetch -q origin <branch>` that never waits for a password, a
+/// passphrase or a host key confirmation ([`batch_env`]): it fails
+/// instead. With `limit`, a fetch still running after that long is stopped
+/// and counts as failed.
+pub fn fetch_quietly(dir: &Path, branch: &str, limit: Option<Duration>) -> Result<()> {
+    let args = ["fetch", "-q", "origin", branch];
+    let env = batch_env(dir);
+    let Some(limit) = limit else {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        return output_with_env(dir, &args, &env).map(|_| ());
+    };
+    let mut child = command(dir)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(s) if s.success() => return Ok(()),
+            Some(_) => bail!("git fetch origin {branch} failed"),
+            None if start.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "git fetch origin {branch} took longer than {}s",
+                    limit.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// The remote's default branch, from `refs/remotes/origin/HEAD`. When that
+/// ref is not set (a repository that was not cloned, or one whose remote
+/// changed its default), ask the remote once with `git remote set-head
+/// origin -a` and read it again. Never guesses `main`.
+pub fn origin_default_branch(dir: &Path) -> Result<String> {
+    if let Some(b) = origin_head(dir) {
+        return Ok(b);
+    }
+    output(dir, &["remote", "set-head", "origin", "-a"])
+        .map_err(|e| Error::msg(format!("cannot resolve origin's default branch: {e}")))?;
+    origin_head(dir).ok_or_else(|| Error::msg("cannot resolve origin's default branch"))
+}
+
+/// Origin's default branch as `refs/remotes/origin/HEAD` records it, without
+/// asking the remote.
+fn origin_head(dir: &Path) -> Option<String> {
+    output(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| {
+        s.trim()
+            .strip_prefix("origin/")
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetches_use_the_users_ssh_command_in_batch_mode() {
+        let b = |e, c, s| batch_ssh_command(e, c, s);
+        assert_eq!(
+            b(None, None, false).as_deref(),
+            Some("ssh -o BatchMode=yes")
+        );
+        assert_eq!(
+            b(None, Some("ssh -i k\n"), false).as_deref(),
+            Some("ssh -i k -o BatchMode=yes")
+        );
+        assert_eq!(
+            b(Some("ssh -p 2"), Some("ssh -i k"), true).as_deref(),
+            Some("ssh -p 2 -o BatchMode=yes"),
+            "the environment wins, as in git"
+        );
+        assert_eq!(
+            b(None, Some("ssh -i k"), true).as_deref(),
+            Some("ssh -i k -o BatchMode=yes"),
+            "core.sshCommand wins over GIT_SSH, as in git"
+        );
+        assert_eq!(b(Some(" "), None, true), None, "GIT_SSH takes no options");
+    }
+
+    #[test]
+    fn a_missing_path_compares_by_its_real_parent() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().canonicalize().unwrap();
+        assert_eq!(comparable(&t.path().join("gone/x")), real.join("gone/x"));
+        assert_eq!(comparable(t.path()), real);
+    }
+
+    #[test]
+    fn parses_worktree_porcelain() {
+        let s = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+                 worktree /repo/.worktrees/a\nHEAD def\nbranch refs/heads/feature/a\nlocked\n\n\
+                 worktree /repo/.worktrees/b\nHEAD 123\ndetached\nlocked reason here\n\n";
+        let w = parse_worktrees(s);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].path, PathBuf::from("/repo"));
+        assert_eq!(w[0].branch.as_deref(), Some("main"));
+        assert!(!w[0].locked);
+        assert_eq!(w[1].branch.as_deref(), Some("feature/a"));
+        assert!(w[1].locked);
+        assert_eq!(w[2].branch, None);
+        assert!(w[2].locked);
+    }
+}
