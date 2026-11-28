@@ -45,6 +45,29 @@ fn an_x86_64_rust_host_with_an_underscore_plans_a_rustup_install() {
         .iter()
         .any(|a| a == "1.2.3-x86_64-unknown-linux-gnu"));
 }
+#[test]
+fn the_fixture_host_tools_end_at_once_and_never_call_themselves() {
+    let f = fixture(AdapterKind::Corepack, "pnpm");
+    let hostdir = f.made.2.search_path[0].clone();
+    for name in ["manager", "node", "node-build", "shell", "shim.js"] {
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new(hostdir.join(name))
+            .arg("--version")
+            .env_clear()
+            .env("PATH", &hostdir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}: {out:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{name}: {out:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{name}"
+        );
+    }
+}
 fn fixture_for_host(kind: AdapterKind, tool: &str, rust_host: &str) -> Fixture {
     fixture_with(kind, tool, rust_host, &[])
 }
@@ -56,7 +79,13 @@ fn fixture_with(kind: AdapterKind, tool: &str, rust_host: &str, grown: &[(&str, 
     let hostdir = state.join("host");
     fs::create_dir(&hostdir).unwrap();
     for name in ["manager", "node", "node-build", "shell", "shim.js"] {
-        executable(&hostdir.join(name), name.as_bytes());
+        // A body that names the file itself (`node` in `host/node`) is run by
+        // `/bin/sh` when exec refuses it, finds itself on the PATH and calls
+        // itself again, until fork fails for every test of the run.
+        executable(
+            &hostdir.join(name),
+            format!("#!/bin/sh\n# {name}\nexit 0\n").as_bytes(),
+        );
     }
     for (name, len) in grown {
         File::options()
