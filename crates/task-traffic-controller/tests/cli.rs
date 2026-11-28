@@ -277,10 +277,7 @@ fn concurrency_never_exceeds_budget() {
 
 #[test]
 fn head_reserves_and_light_entry_does_not_overtake() {
-    let env = TestEnv::new().with_config(
-        "budget = 3
-",
-    );
+    let env = TestEnv::new().with_config("budget = 3\n");
     let dir = env.marker_dir();
     // `big` runs until released, so `light` is surely queued behind the
     // head while `big` still holds the budget.
