@@ -1,0 +1,5 @@
+# Clippy reads the nearest clippy.toml upward from the crate. Without this
+# file the member would inherit belt's root clippy.toml (which bans libc::kill
+# for belt's code; portool calls libc::kill(pid, 0) in leftovers.rs), and its
+# gates would no longer match its own repository's.
+# Empty on purpose: portool is linted with clippy's defaults.

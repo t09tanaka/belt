@@ -1,12 +1,12 @@
-name: Release
+name: portool release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["portool-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach binaries to (e.g. v0.10.1)"
+        description: "Existing tag to build and attach binaries to (e.g. portool-v0.14.1)"
         required: true
 
 env:
@@ -43,15 +43,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: portool-release
           key: ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p portool --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
           set -euo pipefail
-          archive="portool-${TAG}-${{ matrix.target }}.tar.gz"
+          # The archive keeps the old name, portool-vX.Y.Z-<target>, so
+          # install scripts that read it keep working.
+          archive="portool-v${TAG#portool-v}-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" portool
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
