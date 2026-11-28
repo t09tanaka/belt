@@ -345,6 +345,7 @@ S25 の完了条件は「実機不要の A がすべて自動で緑」。main `8
 - 依存の自作ツール（fast-worktree、続いて local-ci・task-traffic-controller・portool）はこのリポジトリの Cargo workspace の member として `crates/<name>` に置く（2026-11-28、fast-worktree から開始）。root package は `belt-ci` のままで、`-p`・`--workspace` を付けない cargo は従来どおり belt だけを対象にする。member は `git subtree add`（履歴つき、squash なし）で取り込み、lock は root の 1 つ、`clippy.toml` は member ごとに置いて root の設定を継がない。belt からは `path` と `version = "=X.Y.Z"` の両方で参照し、member は単独で `cargo publish -p <name>` できる状態を保つ。member の CI は `.github/workflows/<name>.yml`（path で絞る）、リリースは `<name>-v*` のタグで動く `.github/workflows/<name>-release.yml` に置く。
 - local-ci は 0.20.1 を `crates/local-ci` に取り込んだ（2026-11-28、2 つ目）。CI の step は `crates/local-ci` で動かし、coverage・mutation の script は crate の中のものをそのまま使う（belt の `scripts/` には足さない）。cargo-schemata 0.4.0 は member の中でも file を workspace root からの相対で名づけるので、mutation の gate の file 引数だけ `crates/local-ci/` を前に付け、ほかの引数は元のままにした。
 - task-traffic-controller は 0.12.5 を `crates/task-traffic-controller` に取り込んだ（2026-11-28、3 つ目）。local-ci と同じく step は crate の中で動かし、mutation の gate の file 引数に `crates/task-traffic-controller/` を前に付けた。cargo-schemata 0.1.0 は `.cargo/mutants.toml` も workspace root から読むので、`--config .cargo/mutants.toml` で crate の設定（`iteration_cap` の除外）を読ませ、変異の数を元の 680 に揃えた。
+- portool は 0.14.0 を `crates/portool` に取り込んだ（2026-11-28、4 つ目）。gate は test（fmt・clippy・test）と MSRV 1.85 だけで、どちらも `-p portool` を付けて crate の中で動かす。`libc::kill(pid, 0)` を使うので、member の空の `clippy.toml` で root の禁止を継がない。
 
 ### S15 public init integration
 
