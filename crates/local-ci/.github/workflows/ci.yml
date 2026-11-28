@@ -1,0 +1,281 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            examples/sharding/node/package-lock.json
+            examples/sharding/playwright/package-lock.json
+            examples/sharding/cypress/package-lock.json
+
+      - name: Install the Node example (the shard adapter tests run Vitest and Jest)
+        run: npm ci
+        working-directory: examples/sharding/node
+
+      - name: Install the Playwright example
+        run: npm ci
+        working-directory: examples/sharding/playwright
+
+      # the browser is cached by the lock file (it holds Playwright's version)
+      - name: Cache Playwright's browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/ms-playwright' || '~/.cache/ms-playwright' }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('examples/sharding/playwright/package-lock.json') }}
+
+      - name: Install the system libraries of Chromium
+        if: runner.os == 'Linux'
+        run: npx playwright install-deps chromium
+        working-directory: examples/sharding/playwright
+
+      - name: Install Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
+        working-directory: examples/sharding/playwright
+
+      # Cypress runs here on Linux only: its test is ignored on macOS
+      - name: Install the Cypress example
+        if: runner.os == 'Linux'
+        run: npm ci
+        working-directory: examples/sharding/cypress
+        env:
+          CYPRESS_INSTALL_BINARY: "0"
+
+      - name: Cache Cypress's binary
+        if: runner.os == 'Linux'
+        id: cypress-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: cypress-${{ runner.os }}-${{ hashFiles('examples/sharding/cypress/package-lock.json') }}
+
+      - name: Install the system libraries of Cypress
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends libgtk-3-0t64 libgbm-dev libnotify-dev libnss3 libxss1 libasound2t64 libxtst6 xauth xvfb
+
+      - name: Install the Cypress binary
+        if: runner.os == 'Linux' && steps.cypress-cache.outputs.cache-hit != 'true'
+        run: npx cypress install
+        working-directory: examples/sharding/cypress
+
+      - name: Verify Cypress
+        if: runner.os == 'Linux'
+        run: npx cypress verify
+        working-directory: examples/sharding/cypress
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # with the tests that run Chromium (and Cypress on Linux) for real
+      - name: cargo test
+        run: cargo test --features browser-tests
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - run: cargo check --all-targets
+
+  coverage:
+    name: coverage gate (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            examples/sharding/node/package-lock.json
+
+      - name: Install the Node example (the shard adapter tests run Vitest and Jest)
+        run: npm ci
+        working-directory: examples/sharding/node
+
+      - uses: Swatinem/rust-cache@v2
+      # without the `browser-tests` feature: the gate measures the unit tests of
+      # the adapters, not a browser
+      - name: 100% line coverage on pure modules
+        run: ./scripts/coverage-gate.sh
+
+  # Each mutant reruns the tests, so a module is checked against the test
+  # targets that pin it. dag.rs is covered (above) but not mutation-gated yet:
+  # its survivors need more tests and a whole-suite run takes about 25 minutes.
+  mutants-pure:
+    name: mutation gate (matrix, filter, gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/matrix.rs src/filter.rs src/source/gate.rs
+      - name: zero survivors in matrix / filter / source gate
+        # two at a time: the unit tests that reach the matrix now include those
+        # of the driver, and one test process at a time took three times as long
+        run: cargo schemata -j 2 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+
+  mutants-artifact:
+    name: mutation gate (artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/artifact.rs
+      - name: zero survivors in artifact
+        run: cargo schemata --file src/artifact.rs -- --lib artifact
+
+  mutants-frozen:
+    name: mutation gate (frozen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/frozen.rs
+      - name: zero survivors in frozen
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
+
+  mutants-shard:
+    name: mutation gate (shard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/shard.rs
+      - name: zero survivors in shard
+        run: cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
+
+  mutants-demand:
+    name: mutation gate (demand)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/demand.rs
+      - name: zero survivors in demand
+        run: cargo schemata --file src/demand.rs -- --lib --test task_demand
+
+  mutants-wire:
+    name: mutation gate (wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/wire.rs src/result_wire.rs src/digest.rs
+      - name: zero survivors in wire, result_wire and digest
+        run: cargo schemata -j 2 --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
+
+  # The 300 mutants of these files take about 26 minutes in one process, almost
+  # all of it the tests that run for each of them. Three parts side by side
+  # (`--shard`, round-robin, so the slow mutants are spread) run every mutant
+  # exactly once; each part fails on its own survivors.
+  mutants-driver:
+    name: mutation gate (driver and shared job evaluation, part ${{ matrix.part }} of 3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2]
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: |
+          if ! cargo-schemata --version 2>/dev/null | grep -Fxq 'cargo-schemata 0.4.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
+          fi
+          cargo-schemata --version | grep -Fx 'cargo-schemata 0.4.0'
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/driver.rs src/driver/atomic.rs src/driver/dispatch.rs src/driver/shards.rs src/job_evaluate.rs
+      - name: zero survivors in transactional driver and shared evaluation
+        run: |
+          cargo schemata -j 2 --shard ${{ matrix.part }}/3 --file src/driver.rs --file src/driver/atomic.rs --file src/driver/dispatch.rs --file src/driver/shards.rs --file src/job_evaluate.rs -- --lib -- driver:: job_evaluate::
